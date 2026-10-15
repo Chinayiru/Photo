@@ -33,7 +33,7 @@ from typing import Any
 from . import events as events_mod
 from .auth import auth_middleware
 from .config import Config, check_bind_safety, ensure_dirs, get as get_config, is_first_run
-from .db import Database, get_db
+from .db import Database, get_db, make_db
 from .errors import AppError
 from .indexer import Indexer
 from .routers import build_router
@@ -91,22 +91,25 @@ def build_state(cfg: Config | None = None, *, db: Database | None = None) -> App
     ensure_dirs(cfg)
 
     if db is None:
+        # 优先复用全局单例（同一个文件只保留一个 Database 对象，
+        # 也就只有一把写锁、一套线程本地连接）。
         db = get_db()
-        # 校验：调用方给的 cfg 指向的库，必须正是全局单例那个库。
-        # 不相等说明调用方在用临时配置跑测试/脚本，却忘了传 db ——
-        # 这正是上次事故的成因，宁可当场报错也不要污染真实库。
+        # ★ 但路径不一致时必须按 cfg 另造一个，不能连错库。
+        # `cfg` 可能来自 `--config`，指向完全另一个数据目录；
+        # 此时全局单例仍指向安装目录那份配置解析出的真实照片库。
+        # 曾经因此出过一次真实事故：测试用 `--config` 指向临时照片库，
+        # 数据库却仍是用户的真实库，扫描结束后把真实库 4915 行
+        # 全标成了 missing=1，用户的时间线变成空白。
+        # 这里不再报错而是**按 cfg 造一个** —— 生产路径必须能跑起来，
+        # 而"造对了"本身就是对那次事故的修复。
         try:
             want = Path(cfg.db_path).resolve()
             got = Path(db.path).resolve()
         except OSError:       # pragma: no cover —— 路径不可解析时不做判断
             want = got = None
         if want is not None and want != got:
-            raise RuntimeError(
-                f"build_state() 收到了指向 {want} 的配置，但没传 db=，"
-                f"而全局数据库单例指向 {got}。\n"
-                f"这会让测试数据写进真实照片库（曾经真的发生过）。\n"
-                f"请改用：db = make_db(cfg); build_state(cfg, db=db)"
-            )
+            log.info("配置指向独立的数据库 %s（全局单例是 %s），按配置新建", want, got)
+            db = make_db(cfg)
     db.init()
 
     bus = events_mod.get_bus()
@@ -213,8 +216,14 @@ def _count_hint(cfg: Config) -> str:
     return f"{total}+ 个条目" if total else "数千"
 
 
-async def serve(cfg: Config | None = None) -> None:
-    """启动服务并阻塞，直到收到中断信号。"""
+async def serve(cfg: Config | None = None, *,
+                on_ready: Any = None) -> None:
+    """启动服务并阻塞，直到收到中断信号。
+
+    `on_ready(transport, state, loop, stop)` 在**端口已监听、所有依赖就绪**
+    之后被调用一次，用于系统托盘这类需要拿到真实地址与停止句柄的外部外壳。
+    回调抛异常只记日志，不会让服务起不来。
+    """
     cfg = cfg or get_config()
 
     if is_first_run():
@@ -276,6 +285,14 @@ async def serve(cfg: Config | None = None) -> None:
     await transport.start()
     log.info("PhotoBridge 已启动：%s", ", ".join(transport.urls))
 
+    # 把控制权交给外壳（系统托盘）。放在 transport.start() 之后 ——
+    # 此刻端口真的在监听、urls 是真实端口，二维码扫了才连得上。
+    if on_ready is not None:
+        try:
+            on_ready(transport, st, loop, stop)
+        except Exception:       # noqa: BLE001
+            log.exception("启动回调失败（服务继续运行）")
+
     try:
         await stop.wait()
     finally:
@@ -309,15 +326,26 @@ async def _shutdown(st: AppState, transport: Any) -> None:
     log.info("PhotoBridge 已停止")
 
 
-def run(cfg: Config | None = None) -> int:
-    """命令行入口：配置日志、跑事件循环、返回退出码。"""
+def run(cfg: Config | None = None, *, tray: bool = False) -> int:
+    """命令行入口：配置日志、跑事件循环、返回退出码。
+
+    `tray=True` 时额外挂上系统托盘（`backend/app/tray.py`）。
+    托盘只是外壳：它拿到的 `transport.urls` 已经是真实端口。
+    """
     from .logging_setup import setup_logging
 
     cfg = cfg or get_config()
     setup_logging(cfg)
 
+    on_ready = None
+    if tray:
+        from .tray import TrayController       # noqa: PLC0415
+
+        controller = TrayController(cfg)
+        on_ready = controller.on_ready
+
     try:
-        asyncio.run(serve(cfg))
+        asyncio.run(serve(cfg, on_ready=on_ready))
     except KeyboardInterrupt:
         return 0
     except AppError as exc:
@@ -325,8 +353,22 @@ def run(cfg: Config | None = None) -> int:
         # 否则他只会看到"启动失败"而不知道是端口冲突。
         log.error("启动失败：%s", exc.detail or exc.code)
         print(f"启动失败：{exc.detail or exc.code}", file=sys.stderr)
+        if on_ready is not None:
+            try:
+                from .tray import notify_error    # noqa: PLC0415
+
+                notify_error(f"启动失败：{exc.detail or exc.code}")
+            except Exception:       # noqa: BLE001
+                pass
         return 2
     except Exception:       # noqa: BLE001
         log.exception("未预期错误，程序退出")
+        if on_ready is not None:
+            try:
+                from .tray import notify_error    # noqa: PLC0415
+
+                notify_error("PhotoBridge 启动失败，详见 data/logs/agent.log")
+            except Exception:       # noqa: BLE001
+                pass
         return 1
     return 0

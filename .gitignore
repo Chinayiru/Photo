@@ -34,7 +34,10 @@ certs/
 # 构建产物
 build/
 dist/
-*.spec
+# ⚠️ 不要忽略 *.spec：PyInstaller 的 spec 文件是**手写的源码**
+# （里面写着 hiddenimports、datas、excludes 等只有人才知道的决定），
+# 不是构建输出。忽略它会导致换台机器再也打不出同样的包。
+# 真正的构建产物是 build/ 与 dist/，上面已经排除。
 
 # 编辑器与系统
 .vscode/

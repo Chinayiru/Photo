@@ -26,14 +26,18 @@
    让后面的守卫知道要防谁。
 2. `test_make_db_never_touches_real_db` —— 验证新 API `make_db(cfg)`
    的行为：按 cfg 解析路径，与全局单例无关。
-3. `test_build_state_refuses_mismatched_db` —— 验证 `build_state` 在
-   "cfg 指向临时库但没传 db" 时**当场报错**，而不是悄悄连到真实库。
+3. `test_build_state_uses_cfg_db_when_not_passed` —— 验证 `build_state` 在
+   "cfg 指向临时库但没传 db" 时**按 cfg 建库**，绝不回退到真实库。
    这是最关键的一条：它是那个事故的直接防线。
 4. `test_scan_does_not_touch_other_databases` —— 端到端：在临时库上跑
    一次完整扫描 + 标记 missing，然后断言真实库的行数与 missing 计数
    **一个字节都没变**。
 
 第 4 条是真正能抓住事故重演的那条 —— 前三条都是它失败时的定位辅助。
+
+⚠️ 第 3 条曾经是断言 `raise RuntimeError`。改成"按 cfg 建库"是因为
+报错方案让 `--config` 完全不可用（`serve()` 自己就不传 `db=`），
+而 `--config` 指向另一个数据目录恰恰是第二次事故的场景。
 """
 from __future__ import annotations
 
@@ -53,6 +57,7 @@ from backend.app.config import (                                      # noqa: E4
     DATA_DIR,
     Config,
 )
+from backend.app.config import get as get_config                      # noqa: E402
 from backend.app.db import Database, make_db                          # noqa: E402
 from backend.app.indexer import Indexer                               # noqa: E402
 from backend.app.server import build_state                            # noqa: E402
@@ -168,11 +173,20 @@ def test_make_db_does_not_touch_global_singleton(tmp_path, real_db_before) -> No
 # 2. build_state 的防线
 # ---------------------------------------------------------------------------
 
-def test_build_state_refuses_mismatched_db(tmp_path, real_db_before) -> None:
-    """★ 事故的直接防线。
+def test_build_state_uses_cfg_db_when_not_passed(tmp_path, real_db_before) -> None:
+    """★ 事故的直接防线（第二版：从"报错"改为"造对"）。
 
-    `build_state(cfg)` 而 cfg 指向临时库、又没传 `db=` 时，
-    以前会静默回退到全局单例（=真实库）。现在必须当场报错。
+    历史：这里最初断言 `build_state(cfg)` 会 `raise RuntimeError`。
+    但那条防线有个更严重的问题 —— **它让 `--config` 根本无法工作**：
+    `serve()` 自己就调 `build_state(cfg)` 不传 `db=`，于是任何用
+    `--config` 指向另一个数据目录的启动都会直接崩掉。而"测试用
+    `--config` 指向临时照片库、数据库却仍是真实库"正是第二次事故的
+    根因，报错只是把崩溃从"污染数据"换成了"启动不了"，两者都不可接受。
+
+    正确行为：`db is None` 时按 **cfg** 解析路径建库。这样
+    `--config H:/tmp/x/cfg.json` 会连 `H:/tmp/x/data/photobridge.db`，
+    与真实库毫无关系。关键断言不是"报没报错"，而是
+    **真实库一个字节都没变**。
     """
     real_path = _real_db_path()
     if not real_path.is_file():
@@ -182,11 +196,34 @@ def test_build_state_refuses_mismatched_db(tmp_path, real_db_before) -> None:
     lib.mkdir()
     cfg = _tmp_cfg(tmp_path, lib)
 
-    with pytest.raises(RuntimeError) as ei:
-        build_state(cfg)          # 故意不传 db=
-    msg = str(ei.value)
-    assert "make_db" in msg, "报错信息必须告诉调用方正确写法"
-    assert str(Path(cfg.db_path).resolve()) in msg or "临时" in msg
+    st = build_state(cfg)          # 故意不传 db=
+    try:
+        assert Path(st.db.path).resolve() == Path(cfg.db_path).resolve(), (
+            "build_state 必须按 cfg 解析数据库路径，不能回退到全局单例"
+        )
+        assert Path(st.db.path).resolve() != real_path.resolve(), (
+            "build_state 连到了真实照片库 —— 这就是那次事故的成因"
+        )
+    finally:
+        st.db.close()
+
+
+def test_build_state_still_uses_global_singleton_for_real_config(real_db_before) -> None:
+    """反过来：cfg 就是磁盘上那份配置时，仍然复用全局单例。
+
+    生产路径不该每次启动都新建一个 Database 对象 —— 同一个文件
+    两个 Database 实例意味着两把写锁，WAL 下仍可能互相 SQLITE_BUSY。
+    """
+    real_path = _real_db_path()
+    if not real_path.is_file():
+        pytest.skip("这台机器上没有真实库")
+
+    cfg = get_config()
+    assert Path(cfg.db_path).resolve() == real_path.resolve(), (
+        "前提：磁盘配置指向的正是真实库"
+    )
+    st = build_state(cfg)
+    assert Path(st.db.path).resolve() == real_path.resolve()
 
 
 def test_build_state_accepts_explicit_db(tmp_path, real_db_before) -> None:

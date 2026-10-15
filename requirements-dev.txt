@@ -25,3 +25,9 @@ pytest-timeout>=2.3
 # 这里保留 httpx 是为了将来写异步集成测试（ASGITransport 直连 app，
 # 不经过网络，适合测中间件与错误收敛）。
 httpx>=0.27
+
+# --- 打包 ---
+# 只在发布时用，普通开发不需要：
+#   .venv/Scripts/python.exe -m PyInstaller packaging/photobridge.spec --noconfirm
+# 选 onedir（见 packaging/photobridge.spec 的注释），产物约 75 MB。
+PyInstaller>=6.0

@@ -600,3 +600,118 @@ def test_transport_stop_is_idempotent() -> None:
         await t.stop()   # 第二次不应抛异常
 
     asyncio.run(main())
+
+
+# ---------------------------------------------------------------------------
+# 端口占用：uvicorn 用 SystemExit(3) 报错，必须被翻译成 AppError
+# ---------------------------------------------------------------------------
+
+def test_occupied_port_raises_app_error_not_system_exit() -> None:
+    """★ 端口被占时必须抛 AppError，绝不能漏出 SystemExit。
+
+    ## 这个 bug 的完整链条（实测复现过）
+
+    `uvicorn/server.py` 在绑定失败时走的是：
+
+        except OSError as exc:
+            logger.error(exc)
+            await self.lifespan.shutdown()
+            sys.exit(STARTUP_FAILURE)      # STARTUP_FAILURE = 3
+
+    `SystemExit` 继承 `BaseException` 而非 `Exception`，所以：
+
+    1. `except Exception` 抓不到，`_serve()` 里什么都记不到；
+    2. `start()` 里 `task.exception()` 对 SystemExit **会重新抛出**
+       （asyncio 规定 BaseException 一律重抛）；
+    3. 异常绕过 `run()` 的 `except AppError` 友好提示与托盘通知，
+       用户看到"程序一闪而过"；
+    4. 此时事件循环正在关闭，异常在 logging 内部二次触发
+       （`logging → traceback → linecache`），冻结态下打出
+       `NameError: name 'open' is not defined`，把"端口被占"
+       这个真正原因彻底掩盖。
+
+    现在改为自己 `bind()`（见 `_bind_socket`），uvicorn 拿到已绑好的
+    socket 不会走到那条分支。这条测试用**真的占住端口**来验证。
+    """
+    import socket
+
+    from app.errors import AppError
+    from app.transports.local_http import LocalHttpTransport
+
+    # 占住一个端口（用 EXCLUSIVEADDRUSE，模拟另一个 PhotoBridge 实例）
+    holder = socket.socket()
+    excl = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+    if excl is not None:
+        holder.setsockopt(socket.SOL_SOCKET, excl, 1)
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    taken = holder.getsockname()[1]
+
+    async def main():
+        t = LocalHttpTransport(_make_cfg(), _build_router(), port=taken)
+        try:
+            await t.start()
+        except AppError as exc:
+            # 必须是人话，而不是 "SystemExit(3)" 或裸 errno
+            detail = exc.detail or ""
+            assert "占用" in detail or "无法" in detail, detail
+            assert "SystemExit" not in detail, (
+                f"不该把 SystemExit 暴露给用户：{detail}"
+            )
+            assert str(taken) in detail, f"应指明是哪个端口：{detail}"
+            return
+        except SystemExit as exc:       # noqa: BLE001
+            raise AssertionError(
+                f"SystemExit({exc.code}) 漏出来了 —— 这正是要修掉的 bug"
+            ) from exc
+        finally:
+            await t.stop()
+        raise AssertionError("端口被占用时 start() 竟然成功了")
+
+    try:
+        asyncio.run(main())
+    finally:
+        holder.close()
+
+
+def test_bind_uses_exclusive_addr_on_windows() -> None:
+    """★ Windows 上必须用 SO_EXCLUSIVEADDRUSE，否则两个实例能同时绑同一端口。
+
+    Windows 的 `SO_REUSEADDR` 语义与 Linux **完全不同**：它允许两个
+    进程绑同一端口。实测：
+
+        a.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1); a.bind(port)  # 成功
+        b.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1); b.bind(port)  # ← 也成功
+
+    后果：用户双击两次 exe，第二个实例不报错而是静默绑成功，两个进程
+    同时监听，连接被随机分发 —— 手机上一半请求正常一半失败，且两个
+    进程各自持有同一个 SQLite 库。
+
+    `SO_EXCLUSIVEADDRUSE` 声明端口独占，第二个实例会被拒（WinError
+    10048 或 10013）。这条测试直接验证 `_bind_socket()` 用了它。
+    """
+    import socket
+
+    from app.transports.local_http import LocalHttpTransport
+
+    excl = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+    if excl is None:
+        pytest.skip("非 Windows 平台没有 SO_EXCLUSIVEADDRUSE")
+
+    async def main():
+        t = LocalHttpTransport(_make_cfg(), _build_router(), port=_free_port())
+        sock = await t._bind_socket()
+        try:
+            # 我们的 socket 占住了端口，另一个用 SO_REUSEADDR 的
+            # （即 uvicorn 的默认行为）必须绑不上。
+            other = socket.socket()
+            other.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                with pytest.raises(OSError):
+                    other.bind(("127.0.0.1", t.port))
+            finally:
+                other.close()
+        finally:
+            sock.close()
+
+    asyncio.run(main())

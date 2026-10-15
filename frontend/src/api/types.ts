@@ -121,6 +121,30 @@ export interface SystemInfo {
     bind_scope: string;
   };
   limits: LimitsInfo;
+  /**
+   * 电脑端外壳（托盘/自启）的状态，`GET /api/system/info` 的 `host_app`。
+   *
+   * ★ 每个字段都可能缺失：服务端 `_host_app_info()` 把每项都用
+   * try/except 包住（注册表读不到、pystray 没装等），因为这是**展示型**
+   * 字段 —— 读失败不该让整个 `/api/system/info` 返回 500，
+   * 那会让手机端首页白屏。所以前端消费时也要按可选处理。
+   */
+  host_app?: {
+    /** 是否运行在 PyInstaller 打包的 exe 里（false = 源码/命令行运行）。 */
+    packaged: boolean;
+    /** 系统托盘是否在运行（用户能看到右下角图标）。 */
+    tray: boolean;
+    autostart: {
+      supported: boolean;
+      enabled: boolean;
+      /** 注册表里当前登记的命令行。 */
+      command: string | null;
+      /** 当前程序**应该**登记的命令行。 */
+      expected: string | null;
+      /** command 与 expected 不一致 —— 说明程序被移动过，自启会静默失效。 */
+      stale: boolean;
+    };
+  };
   time: { server_time: number; tz_offset_minutes: number };
 }
 

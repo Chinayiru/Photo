@@ -160,6 +160,10 @@ class LocalHttpTransport(ServerTransport):
         self._app: Starlette | None = None
         self._actual_port = self.port
         self._started = asyncio.Event()
+        #: uvicorn 的启动失败原因。见 _serve() 的长注释 ——
+        #: uvicorn 用 `sys.exit(3)` 表示绑定失败，而 SystemExit 是
+        #: BaseException，`except Exception` 抓不到。
+        self._failure: BaseException | None = None
 
     # ------------------------------------------------------------------
     # ASGI 应用
@@ -221,6 +225,22 @@ class LocalHttpTransport(ServerTransport):
         )
         self._server = uvicorn.Server(config)
 
+        # ★ 先自己绑定端口，再把 socket 交给 uvicorn。
+        #
+        # 为什么不直接让 uvicorn 绑：uvicorn 绑定失败时走的是
+        #     except OSError as exc:
+        #         logger.error(exc)
+        #         sys.exit(STARTUP_FAILURE)      # = 3
+        # 而 SystemExit 是 BaseException，`except Exception` 抓不到，
+        # 于是异常会从 `start()` 一路冒到事件循环关闭过程里，把真正的
+        # 原因（WinError 10048 端口被占）彻底掩盖 —— 用户看到的是
+        # "程序一闪而过"或一串 logging 内部错误。
+        #
+        # 自己绑的好处：`socket.bind()` 直接抛带 errno 的 OSError，
+        # 我们能拿到 "WinError 10048" 并翻译成人话；uvicorn 拿到的是
+        # 已经绑好的 socket，根本不会走到 sys.exit 那条分支。
+        sock = await self._bind_socket()
+
         # uvicorn.Server.serve() 会一直阻塞，放到独立任务里。
         # ⚠️ 绝不能设 `config.loaded = True` 来"加速"启动：
         # uvicorn 的 config.load() 负责填 lifespan_class / http_protocol_class
@@ -228,15 +248,15 @@ class LocalHttpTransport(ServerTransport):
         #
         # 也不用 sleep 猜启动时长：端口被占用时 sleep 会让启动日志出现
         # "已启动"却连不上的假象。改为轮询 uvicorn 自己的 started 标志。
-        self._task = asyncio.create_task(self._serve(), name="uvicorn")
+        self._task = asyncio.create_task(self._serve(sock), name="uvicorn")
 
         deadline = asyncio.get_running_loop().time() + STARTUP_TIMEOUT
         while not self._server.started:
             if self._task.done():
                 # serve() 已退出：通常是端口被占用或权限不足。
-                exc = self._task.exception()
+                exc = self._failure or self._task.exception()
                 await self.stop()
-                raise AppError(E3001, f"端口 {self.port} 无法监听：{exc!r}")
+                raise AppError(E3001, self._bind_error_message(exc))
             if asyncio.get_running_loop().time() > deadline:
                 await self.stop()
                 raise AppError(E3001, f"HTTP 服务启动超时（端口 {self.port}）")
@@ -253,11 +273,143 @@ class LocalHttpTransport(ServerTransport):
 
         log.info("HTTP 服务已启动 %s", " ".join(self.urls) or f"{self.host}:{self._actual_port}")
 
-    async def _serve(self) -> None:
+    async def _bind_socket(self) -> Any:
+        """自己绑定监听 socket，失败时抛带 errno 的 OSError。
+
+        复刻 `uvicorn/config.py:bind_socket()` 的 AF_INET 分支，但有两处
+        **必须不同**：
+
+        ## 1. 不吞掉异常去 `sys.exit`（见 `start()` 的注释）
+
+        ## 2. Windows 上用 `SO_EXCLUSIVEADDRUSE` 而不是 `SO_REUSEADDR`
+
+        这是本次实测发现的真问题。Windows 的 `SO_REUSEADDR` 语义与
+        Linux **完全不同**：它允许**两个进程绑同一个端口**。实测：
+
+            a = socket(); a.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+            a.bind(('127.0.0.1', 0)); a.listen(1)      # 成功
+            b = socket(); b.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+            b.bind(('127.0.0.1', port)); b.listen(1)   # ← 也成功！
+
+        后果：用户双击两次 exe，第二个实例不会报"端口被占用"，而是
+        **静默地绑成功**，两个进程同时监听 8787，连接被随机分给其中
+        一个 —— 手机上一半请求正常、一半失败，而用户完全看不出原因。
+        更糟的是两个进程各自持有同一个 SQLite 库。
+
+        Windows 的正确做法是 `SO_EXCLUSIVEADDRUSE`：它声明"这个端口
+        只归我"，第二个进程绑定会被拒。实测组合：
+
+            两个都用 EXCLUSIVE   → 第二个拒绝，WinError 10048
+            第一个 EXCLUSIVE，第二个 REUSEADDR → 第二个拒绝，WinError 10013
+            第一个普通，第二个 EXCLUSIVE       → 第二个拒绝，WinError 10048
+
+        ⚠️ 所以 **10013 在绑定时通常意味着"端口已被一个独占的进程占着"，
+        而不是"没有权限"** —— 见 `_bind_error_message()`。
+        Linux/macOS 上保持 `SO_REUSEADDR`（那里它是正确语义：只影响
+        TIME_WAIT 状态的端口重用，不会让两个活进程共享端口）。
+        """
+        import socket as _socket
+
+        family = _socket.AF_INET
+        if self.host and ":" in self.host:
+            family = _socket.AF_INET6
+
+        sock = _socket.socket(family=family)
+        # ⚠️ 必须用 getattr：SO_EXCLUSIVEADDRUSE 是 Windows 专有常量，
+        # Linux/macOS 的 socket 模块里根本没有它，直接取属性会 AttributeError。
+        exclusive = getattr(_socket, "SO_EXCLUSIVEADDRUSE", None)
+        if exclusive is not None:                        # Windows
+            sock.setsockopt(_socket.SOL_SOCKET, exclusive, 1)
+        else:                                            # Linux / macOS
+            sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+
+        try:
+            sock.bind((self.host, self.port))
+        except OSError as exc:
+            sock.close()
+            # ★ 这里抛出去的是**真正的** OSError（含 WinError 10048/10013），
+            # 而不是 uvicorn 那个丢失了 errno 的 SystemExit(3)。
+            log.error("无法绑定 %s:%s —— %s", self.host, self.port, exc)
+            raise AppError(E3001, self._bind_error_message(exc)) from exc
+        sock.set_inheritable(True)
+        return sock
+
+    def _bind_error_message(self, exc: BaseException | None) -> str:
+        """把绑定失败翻译成用户能看懂的一句话。
+
+        uvicorn 的失败信号是 `SystemExit(3)`，直接 `{exc!r}` 会显示
+        "SystemExit(3)" —— 用户看不懂，也不知道该改什么。所以按
+        WinError 分派。
+
+        ⚠️ **10013 在绑定时不是"权限不足"**。实测（Windows 11）：
+
+            第一个进程用 SO_EXCLUSIVEADDRUSE 占住端口
+            第二个进程（哪怕用 SO_REUSEADDR）绑定 → WinError 10013
+
+        也就是说 10013 最常见的成因是"端口已被另一个 PhotoBridge
+        实例独占"，其次才是真的权限问题（绑 80 等特权端口）。文案要
+        把这两种可能都说出来，否则用户会去改防火墙、重启电脑，
+        而真正该做的是关掉那个已经在运行的实例。
+        """
+        text = "" if exc is None else str(exc)
+        low = text.lower()
+        if "10048" in text or "address already in use" in low or "eaddrinuse" in low:
+            return (f"端口 {self.port} 已被其他程序占用。"
+                    f"请关闭占用该端口的程序，或在设置里换一个端口。")
+        if "10013" in text:
+            return (f"端口 {self.port} 无法使用：可能已经有一个 PhotoBridge "
+                    f"在运行（请检查任务栏托盘图标），或该端口被其他程序独占。"
+                    f"也可能是权限不足（绑 1024 以下的端口需要管理员权限）。")
+        if "10049" in text or "cannot assign requested address" in low:
+            return (f"本机没有 {self.host} 这个地址，无法监听。"
+                    f"请在设置里确认 server.host。")
+        return f"端口 {self.port} 无法监听：{text or '未知原因'}"
+
+    async def _serve(self, sock: Any = None) -> None:
+        """跑 uvicorn，并把**启动失败**转换成可处理的异常。
+
+        ## 为什么必须在这里吞掉 SystemExit
+
+        uvicorn 在端口被占用时走的是这条路径
+        （`uvicorn/server.py` 的 `startup()`）：
+
+            except OSError as exc:
+                logger.error(exc)
+                await self.lifespan.shutdown()
+                sys.exit(STARTUP_FAILURE)      # STARTUP_FAILURE = 3
+
+        `SystemExit` 继承自 `BaseException` 而不是 `Exception`，
+        所以 `except Exception` **抓不到它**。后果链是：
+
+        1. 任务以 SystemExit 结束，`_serve()` 里什么都记不到；
+        2. `start()` 里 `self._task.done()` 为真，但
+           `task.exception()` 对 SystemExit **会把它重新抛出**
+           （asyncio 的规定：BaseException 一律重抛）；
+        3. 于是异常从 `start()` 冒出，绕过 `run()` 里
+           `except AppError` 的友好提示，也绕过托盘通知；
+        4. 更要命的是此时事件循环正在关闭，异常在 logging
+           内部再次触发（`logging → traceback → linecache`），
+           冻结态下会打出 `NameError: name 'open' is not defined`，
+           把真正的原因"端口被占"完全掩盖。
+
+        所以现在改成**自己在 `_bind_socket()` 里绑**（失败直接抛带 errno
+        的 OSError），uvicorn 拿到的是已绑好的 socket，压根不会走到
+        `sys.exit` 那条分支。下面这个兜底捕获保留着，因为 uvicorn 的
+        其他启动环节（如 lifespan）仍可能 `sys.exit`。
+        """
         assert self._server is not None
         try:
-            await self._server.serve()
-        except Exception:  # noqa: BLE001
+            await self._server.serve(sockets=[sock] if sock is not None else None)
+        except SystemExit as exc:
+            # uvicorn 的启动失败信号（见上面的注释）。
+            self._failure = exc
+            log.error("HTTP 服务启动失败：端口 %s 无法监听（可能被其他程序占用）",
+                      self.port)
+        except asyncio.CancelledError:
+            # 正常停止路径（stop() 会 cancel 我们），不算失败。
+            raise
+        except BaseException as exc:  # noqa: BLE001
+            self._failure = exc
             log.exception("HTTP 服务异常退出")
 
     async def stop(self) -> None:
@@ -285,11 +437,18 @@ class LocalHttpTransport(ServerTransport):
                 # 否则任务会一直挂着直到事件循环关闭。
                 try:
                     await task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                except asyncio.CancelledError:
                     pass
-            except Exception:  # noqa: BLE001
+                except BaseException:  # noqa: BLE001
+                    # ★ 必须是 BaseException 而不是 Exception：
+                    # 任务里若冒出 SystemExit/KeyboardInterrupt（uvicorn
+                    # 的启动失败就是 SystemExit），`except Exception`
+                    # 放它过去，它会在**事件循环关闭过程中**重新抛出，
+                    # 让关机流程半途而废（数据库不关、WAL 残留）。
+                    log.debug("关闭 uvicorn 任务时捕获到异常", exc_info=True)
+            except BaseException:  # noqa: BLE001
                 # serve() 内部已把异常记进日志，这里不再重复抛。
-                pass
+                log.debug("等待 uvicorn 任务结束时捕获到异常", exc_info=True)
 
         self._server = None
         log.info("HTTP 服务已停止")

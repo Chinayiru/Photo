@@ -18,12 +18,35 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Literal, Mapping
 
+import logging
+
+log = logging.getLogger(__name__)
+
 # --------------------------------------------------------------------------
 # 路径常量
 # --------------------------------------------------------------------------
 
-#: 仓库根 = 本文件的上两级（backend/app/config.py → backend/app → backend → 根）
-APP_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
+#: 程序根目录。
+#:
+#: * 源码运行：本文件的上两级（backend/app/config.py → backend/app → backend → 仓库根）。
+#: * **打包后（PyInstaller）**：必须是 **exe 所在目录**，不能是
+#:   `__file__` 推导出来的路径 —— 冻结后 `__file__` 指向
+#:   `.../_internal/backend/app/config.py`，于是 DATA_DIR 会变成
+#:   `.../_internal/data`，把数据库与缩略图缓存写进**程序目录内部**。
+#:   实测后果：整个 `_internal` 目录会被写脏，用户升级时删掉旧目录
+#:   就等于删掉数据库（几千张照片的索引与所有缩略图重新生成）。
+#:   正确的打包布局是 data/ 与 exe 平级。
+def _resolve_app_root() -> Path:
+    import sys
+
+    if getattr(sys, "frozen", False):
+        # onedir：exe 在 dist/PhotoBridge/PhotoBridge.exe，
+        # 数据目录就是 dist/PhotoBridge/data/。
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+APP_ROOT: Final[Path] = _resolve_app_root()
 DATA_DIR: Final[Path] = APP_ROOT / "data"
 CONFIG_PATH: Final[Path] = DATA_DIR / "config.json"
 SECRETS_PATH: Final[Path] = DATA_DIR / "secrets.json"
@@ -90,6 +113,10 @@ DEFAULT_CONFIG: Final[dict[str, Any]] = {
         "version": "0.1.0",
         # mode: readonly | upload | readwrite。作为未单独指定 root.mode 时的兜底。
         "mode": "readwrite",
+        # 托盘默认开：双击 exe 的用户需要一个看得见的图标与退出入口，
+        # 否则只能去任务管理器杀进程，而强杀会留下 WAL 日志。
+        # 命令行前台运行时用 `--no-tray` 关掉。
+        "tray": True,
     },
     "server": {
         # ★ 默认 127.0.0.1（只本机）。要让手机连上**必须**显式改成 0.0.0.0，
@@ -660,29 +687,177 @@ def _looks_virtual(addr: str) -> bool:
 
 
 def bootstrap_default_root() -> Config:
-    """首次运行时，用本机实际的照片库写出一份可用的 config.json。
+    """首次运行时写出一份 config.json。
 
-    本机实测：D:\\Photos 含 3 个子目录（全部备份\\、相册1\\、青甘环线\\），
-    4952 个文件，其中 4789 jpg / 68 png / 49 jpeg / 22 .jpg-lx2 / 12 mov / 7 webp
-    / 3 mp4 / 2 gif。用户已确认此目录为媒体库，且允许程序写入
-    （上传直接落库，归档为 年\\年-月\\）。
+    ## 为什么不再硬编码 `D:\\Photos`
+
+    这段代码原本直接写死开发机的照片库路径。后果：**任何别的用户**
+    装好程序后，它会去索引一个他机器上不存在的 `D:\\Photos`
+    （或更糟 —— 那个路径恰好存在但装的是别人的东西）。
+    本机（开发机）当然有这个目录，所以这个 bug 在开发机上完全
+    看不出来，只在分发后才暴露。
+
+    现在的策略：**自动探测常见位置**，探测不到就写一个空的 roots
+    并留下明确提示，由用户在设置页里选目录。宁可让用户点一次
+    "选择照片库"，也不要让程序去翻一个猜出来的路径。
     """
     cfg = load()
     if cfg.roots:
         return cfg
-    cfg.raw["roots"] = [
-        {
-            "id": "library",
-            "path": r"D:\Photos",
-            "label": "我的照片库",
-            "mode": "readwrite",
-            "enabled": True,
-            "recursive": True,
-        }
-    ]
+
+    found = _guess_library_paths()
+    if found:
+        path, label = found[0]
+        log.info("首次运行：自动发现照片库 %s", path)
+        cfg.raw["roots"] = [
+            {
+                "id": "library",
+                "path": str(path),
+                "label": label,
+                "mode": "readwrite",
+                "enabled": True,
+                "recursive": True,
+            }
+        ]
+    else:
+        log.warning(
+            "首次运行：未能自动发现照片库，请在设置页手动选择目录"
+            "（config.json 里 roots 为空）"
+        )
+        cfg.raw["roots"] = []
+
     cfg.save()
     load(reload=True)
     return get()
+
+
+#: 自动探测时的候选目录名。**精确匹配**（大小写不敏感），
+#: 不做子串匹配 —— 本机实测 `Adobe_Photoshop_2020` 会被
+#: "photos" 子串命中，把一个 Photoshop 安装目录当成照片库。
+_LIBRARY_DIR_NAMES: Final[frozenset[str]] = frozenset({
+    "相册", "照片", "图片", "我的照片", "照片库", "媒体库",
+    "图片库", "相片", "我的相册", "手机照片", "手机相册",
+    "pictures", "photos", "photolibrary", "photo library",
+    "my pictures", "my photos", "dcim", "images",
+})
+
+#: 自动探测的起始位置。只在每个盘符下**有界地**看两层 ——
+#: 无界递归会花几分钟，而用户会以为程序卡死了。
+#: 为什么是两层：常见布局既有 `D:\Photos`（一层），也有
+#: 本机这种 `D:\Photos`（两层）。三层以上就交给用户手选。
+_PROBE_ROOTS: Final[tuple[str, ...]] = ("E:\\", "D:\\", "F:\\", "G:\\")
+
+#: 探测时**不进入**的目录名（系统目录、程序目录、依赖目录）。
+#: 不排除的话，`C:\Program Files` 下几万个目录会让探测慢得离谱。
+_PROBE_SKIP: Final[frozenset[str]] = frozenset({
+    "windows", "program files", "program files (x86)", "programdata",
+    "$recycle.bin", "system volume information", "recovery",
+    "appdata", "application data", "node_modules", ".git", ".cache",
+    "intel", "amd", "nvidia", "drivers", "temp", "tmp", "msocache",
+})
+
+
+def _guess_library_paths() -> list[tuple[Path, str]]:
+    """在常见位置找照片库，返回 [(路径, 显示名)]，最多两个。
+
+    ## 为什么是"枚举 + 比对名字"而不是"遍历前 N 个目录再筛"
+
+    第一版实现是"有界 BFS 遍历前 N 个目录，遇到名字匹配的就采纳"。
+    实测在本机**完全失败**：`E:\\` 根下先被枚举的是
+    `Chat software`、`Config.Msi`、`Galgame`、`software`… 等 120 个
+    无关目录，预算耗尽时还没走到 `D:\\Photos`。
+    调大预算不解决问题 —— 只是把"漏掉"换成"慢"。
+
+    ## 为什么也不能"按候选名拼路径"
+
+    第二版改成 `base / name` 直接拼（`name` 来自名字集合）。
+    在 Windows 上拼出来的路径**大小写来自集合**：集合里存的是
+    `"photos"`，`E:\\Photos` 也能 `is_dir()` 成功（NTFS 大小写不敏感），
+    于是返回的 Path 显示成 `photos` —— 用户会看到一个自己从没创建过的
+    目录名。实测确认：`Path('E:/software/相册')` 正常，但
+    `Path(drive)/'photos'` 对真实存在的 `Photos` 也成立。
+
+    现在的做法是**枚举目录、拿文件系统里的真名字去比对**：
+    比对用 `.lower()`（大小写不敏感），但采纳的是 `entry` 本身，
+    所以大小写永远是磁盘上的真实形态。枚举的层数有界（每个盘符
+    两层），实测本机 0.01 秒。
+    """
+    hits: list[tuple[Path, str]] = []
+    seen_paths: set[str] = set()
+
+    def _consider(entry: Path) -> bool:
+        """名字匹配且含图片 → 采纳。返回是否已凑够 2 个。"""
+        if entry.name.lower() not in _LIBRARY_DIR_NAMES:
+            return False
+        key = str(entry).lower()
+        if key in seen_paths:
+            return False
+        seen_paths.add(key)
+        if _has_any_image(entry):
+            hits.append((entry, entry.name))
+        return len(hits) >= 2
+
+    for drive in _PROBE_ROOTS:
+        base = Path(drive)
+        if not base.is_dir():
+            continue
+        try:
+            level1 = list(base.iterdir())
+        except OSError:
+            continue
+
+        # ① 一层布局：<盘符>\<候选名>（D:\Photos）
+        for entry in level1:
+            if _consider(entry):
+                return hits
+
+        # ② 两层布局：<盘符>\<一级目录>\<候选名>（D:\Photos）
+        #    一级目录里跳过系统目录（Program Files / Windows / …），
+        #    否则每个盘符都会白枚举几十个与照片无关的目录。
+        for parent in level1:
+            if not _is_plausible_parent(parent):
+                continue
+            try:
+                level2 = list(parent.iterdir())
+            except OSError:
+                continue
+            for entry in level2:
+                if _consider(entry):
+                    return hits
+
+    return hits
+
+
+def _is_plausible_parent(entry: Path) -> bool:
+    """一级目录是否值得再往下探一层。"""
+    try:
+        if not entry.is_dir():
+            return False
+    except OSError:
+        return False
+    lname = entry.name.lower()
+    if lname.startswith(".") or lname.startswith("$"):
+        return False
+    return lname not in _PROBE_SKIP
+
+
+def _has_any_image(folder: Path, *, limit: int = 400) -> bool:
+    """目录里（含子目录）是否有可索引的图片。
+
+    最多看 `limit` 个条目就放弃 —— 一个放着几万张照片的库
+    在第 3 个文件时就该判定成功，不需要遍历完。
+    """
+    seen = 0
+    try:
+        for p in folder.rglob("*"):
+            seen += 1
+            if seen > limit:
+                return False
+            if p.is_file() and p.suffix.lower().lstrip(".") in ALLOWED_IMAGE_EXTS:
+                return True
+    except OSError:
+        return False
+    return False
 
 
 __all__ = [

@@ -86,6 +86,9 @@ async def info(ctx: Ctx) -> Reply:
             "bind_scope": "private",
         },
         "limits": st.limits_info(),
+        # 电脑端外壳的状态。手机端在"设置 → 电脑端"里展示，
+        # 让用户知道自启有没有生效（他没法直接看电脑的注册表）。
+        "host_app": _host_app_info(),
         "time": {
             "server_time": time.time(),
             "tz_offset_minutes": int(cfg.tz_offset_minutes),
@@ -182,3 +185,31 @@ def _db_stats(st: AppState) -> dict[str, Any]:
 def _lan_ips() -> list[str]:
     from ..config import local_ipv4_addresses
     return list(local_ipv4_addresses())
+
+
+def _host_app_info() -> dict[str, Any]:
+    """电脑端外壳（打包形态 / 托盘 / 开机自启）的状态。
+
+    任何一项取不到都返回保守值而不是抛异常 —— 这是展示型字段，
+    它失败不该让整个 `/api/system/info` 500（那会让手机端首页白屏）。
+    """
+    import sys
+
+    out: dict[str, Any] = {
+        "packaged": bool(getattr(sys, "frozen", False)),
+        "tray": False,
+        "autostart": {"supported": False, "enabled": False, "stale": False},
+    }
+    try:
+        from ..autostart import status as autostart_status
+
+        out["autostart"] = autostart_status()
+    except Exception:       # noqa: BLE001
+        pass
+    try:
+        from ..tray import is_tray_running
+
+        out["tray"] = is_tray_running()
+    except Exception:       # noqa: BLE001
+        pass
+    return out
