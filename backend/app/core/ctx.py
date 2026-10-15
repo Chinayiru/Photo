@@ -388,28 +388,35 @@ def empty_reply(status: int = 204) -> Reply:
 
 def stream_reply(chunks: AsyncIterator[bytes], media_type: str,
                  status: int = 200, *,
-                 length: int | None = None) -> Reply:
+                 length: int | None = None,
+                 headers: Mapping[str, str] | None = None) -> Reply:
     """流式响应。
 
     传 length 时会带上 Content-Length，让客户端能显示下载进度；
     不传则用分块传输。缩略图知道大小（文件 stat），原图也大多知道。
+
+    headers 用于附加协议头 —— 206 分片下载必须带 Content-Range，
+    没有它就只是"一个碰巧少了几百字节的 200"，客户端无法判断续传位置。
     """
     r = Reply(status=status, body=chunks, media_type=media_type)
     r.headers["Content-Type"] = media_type
     if length is not None:
         r.headers["Content-Length"] = str(length)
+    for k, v in (headers or {}).items():
+        r.headers[k] = v
     return r
 
 
 def file_reply(chunks: AsyncIterator[bytes], media_type: str, length: int,
                status: int = 200, *,
-               filename: str | None = None) -> Reply:
+               filename: str | None = None,
+               headers: Mapping[str, str] | None = None) -> Reply:
     """文件下载响应。
 
     ⚠️ 不使用 301/302 重定向到文件 URL：重定向会丢 Authorization 头，
     而照片是私有的，不能靠"URL 猜不到"来保护。
     """
-    r = stream_reply(chunks, media_type, status, length=length)
+    r = stream_reply(chunks, media_type, status, length=length, headers=headers)
     if filename:
         # 文件名可能是中文，必须用 RFC 5987 编码，否则某些浏览器会乱码。
         from urllib.parse import quote
