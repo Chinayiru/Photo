@@ -208,7 +208,11 @@ def _read_exif(info: ExifInfo, exif: Any, im: Any) -> None:
     """从已打开的 Image 里填 ExifInfo。所有字段读取都是尽力而为。"""
     # --- 0th IFD ---
     info.camera = _clean_pair(exif.get(_TAG_MAKE), exif.get(_TAG_MODEL))
-    info.orientation = _int_or_none(exif.get(_TAG_ORIENTATION))
+    # ⚠️ Orientation 合法值只有 1..8，但真实照片里存在 0（实测本库 73 个文件，
+    # 多为安卓机写入的畸形值）。DB 有 CHECK(orientation BETWEEN 1 AND 8)，
+    # 若原样写入会让整批 500 行 upsert 全部失败 —— 一个坏值毁掉一批。
+    # 0/负值/超范围一律视为"未指定"，让缩略图按原样输出。
+    info.orientation = _orientation_or_none(exif.get(_TAG_ORIENTATION))
 
     # --- Exif 子 IFD ---
     try:
@@ -295,6 +299,17 @@ def _int_or_none(v: Any) -> int | None:
         return int(v) if v is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _orientation_or_none(v: Any) -> int | None:
+    """Orientation 只接受 1..8。
+
+    实测本库有 73 个文件写着 Orientation=0（畸形 EXIF）。这个值必须在这里
+    就归零，否则会撞上 media 表的 CHECK(orientation BETWEEN 1 AND 8)，
+    让**整批 500 行** upsert 一起失败。
+    """
+    n = _int_or_none(v)
+    return n if n is not None and 1 <= n <= 8 else None
 
 
 def _float_or_none(v: Any) -> float | None:

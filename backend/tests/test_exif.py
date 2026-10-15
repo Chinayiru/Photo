@@ -28,6 +28,7 @@ from app.exif import (  # noqa: E402
     _dms_to_deg,
     _float_or_none,
     _int_or_none,
+    _orientation_or_none,
     _ratio_to_float,
     _ts_in_range,
     extract_sync,
@@ -375,6 +376,50 @@ def test_extract_sync_decompression_bomb_rejected(tmp_path: Path) -> None:
         info = extract_sync(p)
     assert info.error is not None, "解压炸弹必须被拒绝"
     assert "bomb" in info.error
+
+
+def test_orientation_or_none_accepts_only_1_to_8() -> None:
+    """Orientation 只接受 1..8。
+
+    实测真实库 D:\\Photos 有 73 个文件写着 Orientation=0。
+    media 表有 CHECK(orientation BETWEEN 1 AND 8)，若让 0 落库，
+    executemany 会让同批 500 张照片一起失败。
+    """
+    for good in (1, 2, 3, 4, 5, 6, 7, 8):
+        assert _orientation_or_none(good) == good
+    for bad in (0, -1, 9, 99, 255, 65535):
+        assert _orientation_or_none(bad) is None
+    assert _orientation_or_none(None) is None
+    assert _orientation_or_none("x") is None
+    # 元组形式（EXIF 里出现过 (0,)）
+    assert _orientation_or_none((6,)) == 6
+    assert _orientation_or_none((0,)) is None
+
+
+def test_extract_sync_orientation_zero_becomes_none(tmp_path: Path) -> None:
+    """端到端确认：文件里写 Orientation=0，抽出来必须是 None 而不是 0。"""
+    from PIL import Image
+    p = tmp_path / "zero_orient.jpg"
+    im = Image.new("RGB", (32, 32), (10, 20, 30))
+    ex = Image.Exif()
+    ex[0x0112] = 0
+    im.save(p, "JPEG", exif=ex.tobytes())
+
+    info = extract_sync(p)
+    assert info.orientation is None, "0 是非法值，必须归零为 None"
+    assert info.width == 32 and info.height == 32
+
+
+def test_extract_sync_orientation_six_kept(tmp_path: Path) -> None:
+    """合法值必须原样保留（竖拍照片靠它转正）。"""
+    from PIL import Image
+    p = tmp_path / "six_orient.jpg"
+    im = Image.new("RGB", (32, 32), (10, 20, 30))
+    ex = Image.Exif()
+    ex[0x0112] = 6
+    im.save(p, "JPEG", exif=ex.tobytes())
+
+    assert extract_sync(p).orientation == 6
 
 
 def test_max_image_pixels_allows_48mp() -> None:
