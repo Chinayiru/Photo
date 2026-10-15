@@ -192,6 +192,14 @@ export interface TimelineResponse extends PageInfo {
   items: MediaItem[];
 }
 
+/**
+ * `GET /api/search` 的响应。
+ *
+ * 结构与时间线完全一致（`backend/app/handlers/browse.py: search()` 复用
+ * 同一套分页与 `row_to_item`），单独起个名字只是为了让调用点读起来更清楚。
+ */
+export type SearchResponse = TimelineResponse;
+
 /** `backend/app/handlers/common.py: row_to_detail()`（common.py:99-146）。 */
 export interface ExifInfo {
   camera: string | null;

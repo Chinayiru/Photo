@@ -12,7 +12,7 @@
  *     照片还在电脑上，只是被移走了。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import ConfirmDialog, { confirmDialog } from "../components/ConfirmDialog.vue";
+import { confirmDialog, setConfirmBusy } from "../stores/confirm";
 import { ApiError } from "../api/client";
 import {
   cameraText,
@@ -32,7 +32,6 @@ import { toastError, toastOk, toastWarn } from "../stores/toast";
 
 const s = viewerStore.state;
 const isOpen = computed(() => s.open);
-const dialog = ref<InstanceType<typeof ConfirmDialog> | null>(null);
 
 /** 手势状态。 */
 let startX = 0;
@@ -159,14 +158,14 @@ async function doDelete(): Promise<void> {
   if (!d) return;
   const ok = await confirmDialog({
     title: "移到回收站？",
-    message: `「${d.name}」会从照片库里移除。\n\n照片**不会**被永久删除，它会进电脑上的回收站，之后还能找回来。`,
+    message: `「${d.name}」会从照片库里移除。\n\n照片不会被永久删除 —— 它会进电脑上的回收站，之后还能找回来。`,
     note: "如果电脑端没开「允许手机删除」，这一步会被拒绝。",
     okText: "移到回收站",
     danger: true,
   });
   if (!ok) return;
 
-  dialog.value?.setBusy(true);
+  setConfirmBusy(true);
   try {
     const r = await deleteCurrent();
     if (r.deleted > 0) {
@@ -182,7 +181,7 @@ async function doDelete(): Promise<void> {
       toastError(e instanceof Error ? e.message : "删除失败");
     }
   } finally {
-    dialog.value?.setBusy(false);
+    setConfirmBusy(false);
   }
 }
 </script>
@@ -294,8 +293,6 @@ async function doDelete(): Promise<void> {
         </footer>
       </div>
     </Transition>
-
-    <ConfirmDialog ref="dialog" />
   </Teleport>
 </template>
 

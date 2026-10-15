@@ -1,0 +1,27 @@
+# PhotoBridge 开发依赖
+#
+#   .venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+#
+# 运行依赖由 requirements.txt 提供，本文件用 `-r` 引进来，
+# 避免两处各写一份版本号导致漂移。
+-r requirements.txt
+
+# 测试框架。选 pytest 而不是 unittest：
+# 大量用例是"输入 → 期望 → 理由"的参数化表格（见 docs/07），
+# pytest.mark.parametrize 能把它们写成数据而非 30 个方法。
+pytest>=8.0
+
+# ★ 单条用例超时（pyproject.toml 里的 timeout = 120）。
+# 这不是"锦上添花"：曾经上传接口的 patch_upload 里多套了一层
+# 不可重入的 threading.Lock，请求永不返回，4 个端到端用例各挂 10~25 秒
+# 才被 urllib 自己的超时打断 —— 服务端一行日志都没有，
+# 而测试输出看起来只是"慢"。装上它，卡住的用例会直接报出栈。
+pytest-timeout>=2.3
+
+# 端到端测试用的 HTTP 客户端。
+# ★ 注意：backend/tests/test_server.py 刻意用**标准库 urllib** 而不是
+# httpx —— 它要在后台线程里对着真跑起来的 uvicorn 发同步请求，
+# 而 httpx 的同步客户端在 asyncio 事件循环里用会死锁。
+# 这里保留 httpx 是为了将来写异步集成测试（ASGITransport 直连 app，
+# 不经过网络，适合测中间件与错误收敛）。
+httpx>=0.27

@@ -158,6 +158,20 @@ function pending(t: UploadTask): boolean {
 }
 
 /**
+ * 读取任务状态。
+ *
+ * 为什么包一层函数：TypeScript 会把 `task.status` 的类型**收窄**到
+ * 最后一次赋值的字面量（比如 `task.status = "UPLOADING"` 之后，
+ * 编译器就认定它永远是 `"UPLOADING"`）。但 `doUpload()` 是异步的，
+ * 它在 `await` 内部会改状态，编译器看不到 —— 于是
+ * `if (task.status === "PAUSED")` 会被报成"类型没有重叠"的假错误。
+ * 通过一个函数返回，收窄就被打断，拿到的是真实的联合类型。
+ */
+function statusOf(t: UploadTask): TaskStatus {
+  return t.status;
+}
+
+/**
  * 调度器：把 PENDING/RETRY 的任务填到并发上限。
  * 每次任务状态变化后都要调一次（包括失败与完成）。
  */
@@ -191,17 +205,16 @@ async function runTask(task: UploadTask): Promise<void> {
 
   try {
     await doUpload(task, ctrl.signal);
-    if (task.status === "UPLOADING" || task.status === "COMPLETING") {
-      // doUpload 内部会置 DONE/DEDUPED
-      if (task.status !== "DONE" && task.status !== "DEDUPED") task.status = "DONE";
-    }
+    // doUpload 内部会把状态置成 DONE/DEDUPED/PAUSED，这里只兜底
+    const st = statusOf(task);
+    if (st === "UPLOADING" || st === "COMPLETING") task.status = "DONE";
     task.finishedAt = Date.now();
     task.rate = 0;
   } catch (e) {
     if (e instanceof UploadAborted || ctrl.signal.aborted) {
       task.status = "CANCELED";
       task.error = "";
-    } else if (task.status !== "PAUSED") {
+    } else if (statusOf(task) !== "PAUSED") {
       const err = e instanceof ApiError ? e : null;
       task.status = "FAILED";
       task.error = err?.friendly ?? (e instanceof Error ? e.message : "上传失败");

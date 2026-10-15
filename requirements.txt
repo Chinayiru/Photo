@@ -1,0 +1,38 @@
+# PhotoBridge 电脑端运行依赖（一期：局域网直连，只做图片）
+#
+# 安装：
+#   python -m venv .venv
+#   .venv/Scripts/python.exe -m pip install -r requirements.txt
+#
+# ★ 版本下限而非上限。照片库是"装好就不动"的软件，钉死上限
+#   反而会让安全补丁装不上；这里只保证"不会装到已知不兼容的旧版"。
+
+# --- Web 框架与服务器 ---
+# 直接用 starlette 而不是 fastapi：本项目所有业务逻辑都写在
+# handlers/ 里、只接受 Ctx 返回 Reply（见 backend/app/core/ctx.py），
+# FastAPI 的依赖注入与 pydantic 模型校验在这里用不上 ——
+# 二期云隧道通路上根本没有 Request 对象，Depends 无法工作。
+# 少一层依赖也少一处版本冲突。
+starlette>=0.37
+uvicorn>=0.30
+
+# --- 图片处理 ---
+# Pillow 负责所有非 HEIC 格式的缩略图与尺寸探测。
+Pillow>=10.3
+# ★ HEIC 必需：iPhone 默认就是 HEIC，没有它用户导入 iPhone 照片时
+#   会得到"不支持的格式"，而 HEIC 恰恰是照片库里最常见的一种。
+#   它必须在 Pillow 之后导入（依赖 Pillow 的插件机制）。
+pillow-heif>=0.16
+
+# --- 删除到回收站 ---
+# 本项目**没有**永久删除路径：所有删除都经 Send2Trash 进系统回收站，
+# 用户在资源管理器里右键"还原"就能找回。见 backend/app/handlers/browse.py。
+Send2Trash>=1.8
+
+# --- 二期预留（一期不启用，但装了不会有副作用）---
+# watchdog：文件系统监听（config.index.watch）。一期默认关闭 ——
+# 手机上传走的是我们自己的 API，本来就知道文件变了；
+# 而监听整个照片库在机械硬盘上会持续占用 IO。
+watchdog>=4.0
+# websockets：二期云端隧道的传输层（shared/protocol.py 已实现帧协议）。
+websockets>=12.0

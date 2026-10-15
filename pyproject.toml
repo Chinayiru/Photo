@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "photobridge"
+version = "0.1.0"
+description = "PhotoBridge —— 把电脑里的照片库安全地开放给手机（一期：局域网直连，只做图片）"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "yi_ru", email = "1824040048@qq.com" }]
+keywords = ["photos", "self-hosted", "lan", "heic", "exif"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics :: Viewers",
+]
+
+# 运行依赖的唯一权威来源是 requirements.txt（那里写了每个依赖的取舍理由）。
+# 这里用 dynamic 引进来而不是再抄一遍版本号 —— 抄一遍就有两处会漂移。
+dynamic = ["dependencies", "optional-dependencies"]
+
+[project.urls]
+Repository = "https://github.com/Chinayiru/Photo"
+
+[project.scripts]
+photobridge = "backend.app.main:main"
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+optional-dependencies = { dev = { file = ["requirements-dev.txt"] } }
+
+[tool.setuptools.packages.find]
+include = ["backend*", "shared*"]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+# 不用 conftest.py 注入 sys.path：每个测试文件顶部显式写
+#     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# 这样用 IDE 单独跑一个文件、或直接 python -m pytest 时行为一致，
+# 而 conftest 的 rootdir 推断在不同调用方式下会变。
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+# -p no:cacheprovider：照片库项目经常在只读介质/同步网盘上跑测试，
+# 写 .pytest_cache 会失败并让整轮测试报错退出。
+addopts = "-q -p no:cacheprovider"
+# 端到端测试会真起 uvicorn 并扫描临时照片库，单条超过 30 秒说明卡死了
+# （曾经因为上传接口自我死锁，测试挂到 102 秒才超时，掩盖了真实原因）。
+timeout = 120
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [".venv", "frontend", "data", "docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = [
+    "E501",  # 行宽由 formatter 管；注释里的表格与 URL 不该被硬拆
+    "B008",  # 允许函数调用作默认值（本项目用不到，但 fastapi 风格常见）
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试文件允许 assert、允许重复字面量、允许长函数
+"backend/tests/*" = ["S101", "PLR2004"]
+# 脚本是一次性排查工具，允许打印与宽泛异常
+"scripts/*" = ["T201", "BLE001"]

@@ -128,10 +128,17 @@ export function clearTimeline(): void {
 }
 
 /** 按本地日期分组。 */
-export const groups = computed<DayGroup[]>(() => {
+export const groups = computed<DayGroup[]>(() =>
+  groupByDay(timelineStore.state.items));
+
+/**
+ * 把一串媒体项按本地日期切成分组。
+ * 抽出来给搜索页复用（搜索结果同样按天分组，用户视角一致）。
+ */
+export function groupByDay(items: MediaItem[]): DayGroup[] {
   const out: DayGroup[] = [];
   let cur: DayGroup | null = null;
-  for (const it of timelineStore.state.items) {
+  for (const it of items) {
     const key = dayKey(it.taken_at);
     if (!cur || cur.key !== key) {
       cur = { key, label: dayLabel(it.taken_at), items: [] };
@@ -140,7 +147,7 @@ export const groups = computed<DayGroup[]>(() => {
     cur.items.push(it);
   }
   return out;
-});
+}
 
 /** `2024-05-12`（本地时区）。 */
 export function dayKey(ts: number): string {

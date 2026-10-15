@@ -1,91 +1,36 @@
 <script setup lang="ts">
 /**
- * 通用二次确认对话框。
+ * 二次确认对话框（纯展示）。
  *
- * 为什么不用 `window.confirm`：iOS 上 confirm 的按钮文案只能是"确定/取消"，
- * 而删除照片必须让用户看清"是进回收站，不是永久删除"——
- * 这直接决定了用户按下去时有多犹豫。自定义弹窗才能把这句话写在按钮上。
+ * 状态与 `confirmDialog()` 都在 `src/stores/confirm.ts` ——
+ * 因为 `<script setup>` 里不能写 ES module 导出，函数没法从这里导出去。
+ * 本组件只负责画，并且**必须挂在 App 根上**（全局只有一个）。
  */
-import { ref } from "vue";
+import { confirmState, settleConfirm } from "../stores/confirm";
 
-export interface ConfirmOptions {
-  title: string;
-  /** 支持多行；用 `\n` 分段。 */
-  message: string;
-  /** 确认按钮文案。默认"确定"。 */
-  okText?: string;
-  cancelText?: string;
-  /** true 时确认按钮是红色（危险操作）。 */
-  danger?: boolean;
-  /** 强调提示（黄字），用于"进回收站"这类关键说明。 */
-  note?: string;
-}
-
-const open = ref(false);
-const opts = ref<ConfirmOptions>({
-  title: "",
-  message: "",
-  okText: "确定",
-  cancelText: "取消",
-  danger: false,
-});
-const busy = ref(false);
-
-let resolver: ((v: boolean) => void) | null = null;
-
-/** 弹出确认框，resolve 用户的选择。 */
-export function confirmDialog(o: ConfirmOptions): Promise<boolean> {
-  // 前一个还没关（连点两次）→ 先把前一个当作取消
-  resolver?.(false);
-  opts.value = {
-    okText: "确定",
-    cancelText: "取消",
-    danger: false,
-    ...o,
-  };
-  open.value = true;
-  busy.value = false;
-  return new Promise<boolean>((resolve) => {
-    resolver = resolve;
-  });
-}
-
-function finish(v: boolean): void {
-  if (busy.value) return;
-  open.value = false;
-  const r = resolver;
-  resolver = null;
-  r?.(v);
-}
-
-/** 让调用方在异步确认后标记忙碌（例如删除请求进行中）。 */
-function setBusy(v: boolean): void {
-  busy.value = v;
-}
-
-defineExpose({ setBusy });
+const s = confirmState;
 </script>
 
 <template>
   <Teleport to="body">
     <Transition name="fade">
-      <div v-if="open" class="mask" @click.self="finish(false)">
-        <div class="dlg" role="dialog" aria-modal="true">
-          <h3 class="dlg-title">{{ opts.title }}</h3>
-          <p class="dlg-msg">{{ opts.message }}</p>
-          <p v-if="opts.note" class="dlg-note">{{ opts.note }}</p>
+      <div v-if="s.open" class="mask" @click.self="settleConfirm(false)">
+        <div class="dlg" role="alertdialog" aria-modal="true">
+          <h3 class="dlg-title">{{ s.opts.title }}</h3>
+          <p class="dlg-msg">{{ s.opts.message }}</p>
+          <p v-if="s.opts.note" class="dlg-note">{{ s.opts.note }}</p>
           <div class="dlg-actions">
-            <button class="btn ghost grow" type="button" @click="finish(false)">
-              {{ opts.cancelText }}
+            <button class="btn ghost grow" type="button" @click="settleConfirm(false)">
+              {{ s.opts.cancelText }}
             </button>
             <button
               class="btn grow"
-              :class="opts.danger ? 'danger' : 'primary'"
+              :class="s.opts.danger ? 'danger' : 'primary'"
               type="button"
-              :disabled="busy"
-              @click="finish(true)"
+              :disabled="s.busy"
+              @click="settleConfirm(true)"
             >
-              {{ busy ? "处理中…" : opts.okText }}
+              {{ s.busy ? "处理中…" : s.opts.okText }}
             </button>
           </div>
         </div>
@@ -104,7 +49,6 @@ defineExpose({ setBusy });
   align-items: center;
   justify-content: center;
   padding: 20px;
-  /* 弹窗打开时不让背后的内容跟着滚 */
   backdrop-filter: blur(2px);
 }
 
@@ -126,6 +70,7 @@ defineExpose({ setBusy });
   color: var(--fg-1);
   font-size: 14px;
   line-height: 1.55;
+  /* 调用方用 \n 分段，这里保留换行 */
   white-space: pre-line;
 }
 

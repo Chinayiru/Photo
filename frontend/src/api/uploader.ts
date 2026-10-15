@@ -9,7 +9,8 @@
  * 因为重试需要知道 `Content-Range` 与 offset，那是队列的状态。
  */
 
-import { ApiError, backoffMs, currentBase, getClientName, getToken, sleep } from "./client";
+import { ApiError, backoffMs, currentBase, sleep } from "./client";
+import { getClientName, getToken } from "./storage";
 import type { UploadPatchResponse } from "./types";
 
 export interface UploadProgress {
