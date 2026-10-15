@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / 前端
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# 运行时数据（绝不入版本库）
+data/
+*.db
+*.db-wal
+*.db-shm
+logs/
+audit.log
+uploads_tmp/
+thumbs/
+transcode/
+
+# 配置与密钥（绝不入版本库）
+.env
+*.env
+config.local.json
+secrets.json
+certs/
+
+# 构建产物
+build/
+dist/
+*.spec
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# 临时文件
+*.tmp
+*.part
