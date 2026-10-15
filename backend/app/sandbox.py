@@ -1,0 +1,362 @@
+"""路径沙箱 —— 所有文件访问的唯一入口（安全核心）。
+
+权威设计：docs/03-详细设计说明书.md §4.5。
+
+**硬约束**：除本模块外，任何模块都禁止直接拼路径访问库文件。
+自检：`grep -rn "open(" backend/app/ | grep -v sandbox.py` 的结果必须能逐条解释。
+
+为什么这层不能省：库根 `D:\\Photos` 是**可写**的（用户已授权上传/删除）。
+一旦手机端能构造 `../../Windows/System32/x.dll`，程序就从"相册工具"变成
+"远程任意文件读写器"。七步校验是这个系统里唯一挡住它的东西。
+
+七步（顺序不可调换，每一步都对应一类真实绕过手法）：
+  1 形态拒绝      —— 绝对路径/盘符/UNC/设备路径
+  2 段级拒绝      —— `..`、空段、NTFS 数据流 `:`、Windows 保留名、结尾空格/点
+  3 字符与长度    —— 非法字符 `<>:"|?*` 与控制字符、单段 >255、总长 >1024
+  4 归一化拼装    —— realpath(root) 后拼接（root 自身可能是 junction）
+  5 逐段 reparse  —— **必须逐段**：中间目录是 junction 就足以越界
+  6 前缀断言      —— commonpath 而非 startswith（否则 /root2 会被判为 /root 子路径）
+  7 权限位        —— 与 root.mode 及 auth.allow_delete 一致
+"""
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path, PurePosixPath
+from typing import Final, Literal
+
+from .config import Config, RootConfig, TMP_DIRNAME, get as get_config
+from .errors import E1009, E1015, SandboxError
+
+Need = Literal["read", "write", "delete"]
+
+# --------------------------------------------------------------------------
+# 常量
+# --------------------------------------------------------------------------
+
+#: Windows 文件名非法字符。':' 单独在步 2 处理（NTFS 数据流语义更具体）。
+ILLEGAL_CHARS: Final[frozenset[str]] = frozenset('<>"|?*') | frozenset(chr(c) for c in range(0x20))
+
+#: Windows 保留设备名。带扩展名的形式（`CON.txt`）同样保留。
+RESERVED_NAMES: Final[frozenset[str]] = frozenset(
+    {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+)
+
+MAX_SEGMENT: Final[int] = 255
+MAX_RELPATH: Final[int] = 1024
+FILE_ATTRIBUTE_REPARSE_POINT: Final[int] = 0x400
+
+#: upload_id 白名单：uuid4().hex 是 32 位十六进制；容忍 16–32 位的 [A-Za-z0-9_-]。
+#: 这个校验是必需的：upload_id 会拼进临时文件路径，不校验就是路径注入。
+_UPLOAD_ID_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_-]{16,32}\Z")
+
+_DRIVE_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z]:")
+
+
+class _Reject(Exception):
+    """内部信号：携带拒绝的规则名。统一在 resolve() 里转成 SandboxError。"""
+
+    __slots__ = ("rule", "detail")
+
+    def __init__(self, rule: str, detail: str = "") -> None:
+        super().__init__(f"{rule}: {detail}")
+        self.rule = rule
+        self.detail = detail
+
+
+# --------------------------------------------------------------------------
+# 七步校验
+# --------------------------------------------------------------------------
+
+
+def resolve(root: RootConfig, rel_path: str, need: Need = "read", *, cfg: Config | None = None) -> Path:
+    """把相对路径解析为可安全访问的绝对路径。
+
+    参数
+    ----
+    root : RootConfig
+        媒体根配置。其 `path` 会被 realpath 后作为基准。
+    rel_path : str
+        相对根的路径，`/` 或 `\\` 分隔均可。**不接受绝对路径**。
+    need : {"read","write","delete"}
+        所需权限。与 root.mode 及 auth.allow_delete 共同决定是否放行。
+
+    返回
+    ----
+    Path
+        已确认位于根内、且不经过任何 reparse point 的绝对路径。
+        **不保证该路径存在**（read 时由调用方处理 FileNotFoundError，
+        write 时父目录可能尚需创建）。
+
+    异常
+    ----
+    SandboxError
+        任何一步拒绝。异常上的 `rule` 属性标明是哪一步，供审计日志使用。
+    """
+    try:
+        norm, parts = _steps_1_to_3(rel_path)
+        real_root = _real_root(root)
+        _step_5_reparse(real_root, parts)
+        p = _step_6_assert_inside(real_root, norm)
+        _step_7_permission(root, need, cfg)
+        return p
+    except _Reject as r:
+        raise SandboxError(r.rule, r.detail or None, E1009) from None
+
+
+def _steps_1_to_3(rel_path: str) -> tuple[str, list[str]]:
+    """步 1–3：形态、段级、字符与长度。返回 (归一化路径, 段列表)。"""
+    # ---------- 步 1：形态 ----------
+    if not isinstance(rel_path, str) or not rel_path or not rel_path.strip():
+        raise _Reject("empty_path", repr(rel_path)[:80])
+
+    # 设备路径（\\?\ 与 \\.\）必须**先于** UNC 判断：两者都以 \\ 开头
+    if rel_path.startswith(("\\\\?\\", "\\\\.\\", "//?/", "//./")):
+        raise _Reject("device_path")
+    if rel_path.startswith(("\\\\", "//")):
+        raise _Reject("unc_path")
+    if rel_path.startswith(("/", "\\")):
+        raise _Reject("leading_separator")
+    if _DRIVE_RE.match(rel_path):
+        raise _Reject("drive_letter")
+
+    # 归一化分隔符：Windows 上 '\' 与 '/' 等价，必须一并处理，
+    # 否则 "..\..\x" 会绕过只查 '/' 的段级检查。
+    norm = rel_path.replace("\\", "/")
+
+    # ---------- 步 2：段级 ----------
+    raw_parts = norm.split("/")
+    parts: list[str] = []
+    for seg in raw_parts:
+        if seg == "":
+            # 允许末尾单个 '/'（"a/b/" → "a/b"），但中间的 "a//b" 是空段，拒绝
+            if seg is raw_parts[-1]:
+                continue
+            raise _Reject("empty_segment")
+        if seg == ".":
+            continue                        # '.' 段无害，直接丢弃
+        if seg == "..":
+            # 不因为"归一化后结果仍在根内"就放行（如 sub/.. ）——
+            # 规则要简单一致，且这类路径是攻击探测的典型特征。
+            raise _Reject("parent_traversal")
+        if ":" in seg:
+            raise _Reject("ntfs_data_stream", seg)
+        # 保留名判断用扩展名前的部分：CON.txt 同样保留
+        if seg.split(".", 1)[0].upper() in RESERVED_NAMES:
+            raise _Reject("reserved_name", seg)
+        if seg.endswith((" ", ".")):
+            # Windows 会静默去掉结尾空格/点 → 校验时的名字 ≠ 实际创建的名字，
+            # 这个差异正是"校验通过但落到别处"的经典绕过。
+            raise _Reject("trailing_space_or_dot", seg)
+        parts.append(seg)
+
+    if not parts:
+        raise _Reject("empty_path")
+
+    # ---------- 步 3：字符与长度 ----------
+    for seg in parts:
+        if len(seg) > MAX_SEGMENT:
+            raise _Reject("segment_too_long", f"{len(seg)}>{MAX_SEGMENT}")
+        bad = ILLEGAL_CHARS.intersection(seg)
+        if bad:
+            raise _Reject("illegal_chars", "".join(sorted(bad)))
+    joined = "/".join(parts)
+    if len(joined) > MAX_RELPATH:
+        raise _Reject("path_too_long", str(len(joined)))
+
+    return joined, parts
+
+
+def _real_root(root: RootConfig) -> Path:
+    """步 4 的基准：realpath(root)。
+
+    为什么不用 root.path 原值：root 自身可能就是 junction（例如用户把库
+    放在一个指向别处的联接目录上）。不先解引用，后续的"逐段检查"会把
+    第一段之外的所有路径都算在错误的基准上。
+    """
+    return Path(os.path.realpath(str(root.path)))
+
+
+def _step_5_reparse(real_root: Path, parts: list[str]) -> None:
+    """步 5：逐段检查 symlink / junction / reparse point。
+
+    必须逐段：中间目录是 junction 就足以越界，只查最终路径会漏掉
+    `junction_out/x.jpg` 这种形态。
+    """
+    cur = real_root
+    for seg in parts:
+        cur = cur / seg
+        try:
+            st = os.lstat(cur)              # ★ lstat：stat 会跟随链接，等于自废检查
+        except FileNotFoundError:
+            return                          # 后续段都不存在，没有可检查的对象
+        except NotADirectoryError:
+            # 前面某段是文件，后面还有段 → 路径不可能成立。
+            # 交给调用方按 FileNotFoundError 处理更自然，但这里不能静默通过。
+            raise _Reject("not_a_directory", str(cur)) from None
+        except OSError as e:
+            raise _Reject("stat_failed", type(e).__name__) from None
+        if _is_reparse_or_link(cur, st):
+            raise _Reject("reparse_point", seg)
+
+
+def _is_reparse_or_link(path: Path, st: os.stat_result) -> bool:
+    """Windows 上判断 symlink / junction / reparse point。
+
+    为什么不能只看 `os.path.islink`：**junction（目录联接）不是 symlink**，
+    islink() 返回 False，但它能把路径指向任意位置。这是 Windows 上
+    最容易被忽略的越界方式，也是 docs/05 §10 指出的真实盲点。
+    判断依据是 `st_file_attributes` 的 FILE_ATTRIBUTE_REPARSE_POINT (0x400) 位。
+    """
+    if os.path.islink(path):
+        return True
+    attrs = getattr(st, "st_file_attributes", 0)
+    return bool(attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _step_6_assert_inside(real_root: Path, norm: str) -> Path:
+    """步 6：断言结果位于根内。
+
+    两个易错点：
+      * 必须 normcase（Windows 大小写不敏感，`E:\\Photos` 与 `e:\\photos` 是同一路径）；
+      * 必须 commonpath 而非 startswith —— 字符串前缀比较会把
+        `D:\\photos2` 判为 `D:\\photos` 的子路径。
+    """
+    candidate = real_root / norm
+    p = Path(os.path.realpath(str(candidate)))
+    a = os.path.normcase(str(real_root))
+    b = os.path.normcase(str(p))
+    if a == b:
+        return p                          # 恰好等于根（如 rel_path 指向根本身）
+    try:
+        common = os.path.commonpath([a, b])
+    except ValueError:
+        # 不同盘符时 commonpath 抛 ValueError —— 本身就是越界的强证据
+        raise _Reject("outside_root", "different drive") from None
+    if common != a:
+        raise _Reject("outside_root", norm)
+    return p
+
+
+def _step_7_permission(root: RootConfig, need: Need, cfg: Config | None) -> None:
+    """步 7：权限位。
+
+    三级语义（docs/03 §4.2）：
+      readonly  → 只读浏览
+      upload    → 只读 + 可新增（不能删/不能改已有文件）
+      readwrite → 只读 + 新增 + 删除（进回收站）+ 移动 + 改名
+    """
+    mode = root.mode
+    if need == "read":
+        # 三种模式都能读，此处无需拒绝；保留分支是为了未来加 'hidden' 模式
+        if mode not in ("readonly", "upload", "readwrite"):
+            raise _Reject("read_not_permitted", mode)
+    elif need == "write":
+        if mode not in ("upload", "readwrite"):
+            raise _Reject("write_not_permitted", mode)
+    elif need == "delete":
+        if mode != "readwrite":
+            raise _Reject("delete_not_permitted", f"mode={mode}")
+        c = cfg or get_config()
+        if not c.auth.get("allow_delete", False):
+            # 这条不是沙箱规则而是用户偏好，用 E1015 更准确；但保持
+            # "所有路径校验从同一出口抛出"的一致性，由调用方决定映射。
+            raise _Reject("delete_disabled_by_config")
+    else:
+        raise _Reject("unknown_need", str(need))
+
+
+# --------------------------------------------------------------------------
+# 便捷封装
+# --------------------------------------------------------------------------
+
+
+def exists(root: RootConfig, rel_path: str, cfg: Config | None = None) -> bool:
+    """安全地判断路径是否存在。路径非法时返回 False 而不抛异常。"""
+    try:
+        return resolve(root, rel_path, "read", cfg=cfg).exists()
+    except SandboxError:
+        return False
+
+
+def is_dir(root: RootConfig, rel_path: str, cfg: Config | None = None) -> bool:
+    try:
+        return resolve(root, rel_path, "read", cfg=cfg).is_dir()
+    except SandboxError:
+        return False
+
+
+def normalize_rel(rel_path: str) -> str:
+    """把路径归一成库内统一形式：`/` 分隔、无首尾斜杠、无 `.` 段。
+
+    仅做**展示与入库**用的归一化，**不做安全检查**。
+    任何真正访问文件系统的动作都必须走 resolve()。
+    """
+    p = PurePosixPath(rel_path.replace("\\", "/"))
+    parts = [seg for seg in p.parts if seg not in ("", ".", "/")]
+    return "/".join(parts)
+
+
+def tmp_dir(root: RootConfig, *, create: bool = False) -> Path:
+    """上传临时区目录：`<库根>/.photobridge_tmp`。
+
+    **必须在库根下**（而不是 data/ 下）：`os.replace` 只有同卷才是原子的。
+    库在 E 盘、data 在 H 盘时跨卷 replace 会抛 `OSError: [WinError 17]`，
+    退化成"复制+删除"——中途断电就留下半个文件。
+    这是 docs/03 §4.3.2 与 docs/05 §10.1 ① 的裁决。
+    """
+    real_root = _real_root(root)
+    d = real_root / TMP_DIRNAME
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def tmp_path(root: RootConfig, upload_id: str, *, create_dir: bool = True) -> Path:
+    """临时分片文件的绝对路径。
+
+    upload_id 会拼进文件路径，因此**必须**白名单校验。
+    没有这一步，`upload_id = "../../evil"` 就能把临时文件写到库外。
+    """
+    if not isinstance(upload_id, str) or not _UPLOAD_ID_RE.match(upload_id):
+        raise SandboxError("bad_upload_id", f"upload_id 必须匹配 [A-Za-z0-9_-]{{16,32}}", E1009)
+    return tmp_dir(root, create=create_dir) / f"{upload_id}.part"
+
+
+def safe_display(rel_path: str) -> str:
+    """把路径裁剪成适合写日志/审计的形式。
+
+    审计日志需要**可定位**（记全路径），但响应体里绝不能出现绝对路径。
+    本函数只处理相对路径，用于响应体与前端展示。
+    """
+    r = normalize_rel(rel_path)
+    return r if len(r) <= 512 else "…" + r[-511:]
+
+
+def is_within(child: Path, parent: Path) -> bool:
+    """判断 child 是否在 parent 内（normcase + commonpath，语义同步 6）。"""
+    a = os.path.normcase(str(Path(os.path.realpath(str(parent)))))
+    b = os.path.normcase(str(Path(os.path.realpath(str(child)))))
+    if a == b:
+        return True
+    try:
+        return os.path.commonpath([a, b]) == a
+    except ValueError:
+        return False
+
+
+def assert_writable(root: RootConfig, need: Need = "write") -> None:
+    """只校验权限位、不碰文件系统。用于"提前告知用户此操作不被允许"。"""
+    try:
+        _step_7_permission(root, need, None)
+    except _Reject as r:
+        spec = E1015 if r.rule.endswith("by_config") else E1009
+        raise SandboxError(r.rule, r.detail or None, spec) from None
+
+
+__all__ = [
+    "FILE_ATTRIBUTE_REPARSE_POINT", "ILLEGAL_CHARS", "MAX_RELPATH", "MAX_SEGMENT",
+    "Need", "RESERVED_NAMES",
+    "assert_writable", "exists", "is_dir", "is_within", "normalize_rel",
+    "resolve", "safe_display", "tmp_dir", "tmp_path",
+]
