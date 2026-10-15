@@ -52,6 +52,7 @@ E1014: Final = ErrorSpec("E1014", 409, "upload_incomplete", "文件未传完，�
 E1015: Final = ErrorSpec("E1015", 403, "write_disabled", "此操作已被电脑端设置禁用")
 E1016: Final = ErrorSpec("E1016", 403, "pair_code_wrong_device", "配对码不属于这台电脑")
 E1017: Final = ErrorSpec("E1017", 400, "ext_not_allowed", "不支持的文件格式")
+E1018: Final = ErrorSpec("E1018", 405, "method_not_allowed", "该操作不被支持")
 
 # --- E2xxx 认证/授权类 ------------------------------------------------------
 E2001: Final = ErrorSpec("E2001", 401, "account_token_invalid", "登录已过期，请重新登录")
@@ -100,7 +101,7 @@ SPECS: Final[dict[str, ErrorSpec]] = {
     s.code: s
     for s in (
         E1001, E1002, E1003, E1004, E1005, E1006, E1007, E1008, E1009,
-        E1010, E1011, E1012, E1013, E1014, E1015, E1016, E1017,
+        E1010, E1011, E1012, E1013, E1014, E1015, E1016, E1017, E1018,
         E2001, E2002, E2003, E2004, E2005, E2006,
         E3001, E3002, E3003, E3004, E3005, E3006, E3007, E3008, E3009,
         E3010, E3011, E3012,
