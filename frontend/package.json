@@ -1,0 +1,23 @@
+{
+  "name": "photobridge-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "PhotoBridge 手机端网页前端（一期：局域网直连）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit -p tsconfig.json && vite build",
+    "build:only": "vite build",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.json",
+    "preview": "vite preview --host"
+  },
+  "dependencies": {
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.11",
+    "vue-tsc": "^2.2.0"
+  }
+}

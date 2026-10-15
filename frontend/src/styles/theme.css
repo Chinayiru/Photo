@@ -1,0 +1,61 @@
+/* ==================================================================
+ * PhotoBridge 手机端 —— 设计令牌
+ *
+ * 深色主题是刻意的选择：手机上看照片，浅色底会把瞳孔收缩，
+ * 照片显得发灰；而且夜间躺着看照片时白底非常刺眼。
+ * ================================================================== */
+
+:root {
+  /* 背景层次：由深到浅，用 4 级而不是 2 级，卡片才有立体感 */
+  --bg: #0b0b0d;
+  --bg-1: #141417;
+  --bg-2: #1c1c21;
+  --bg-3: #26262d;
+  --bg-hover: #2e2e36;
+
+  /* 文字 */
+  --fg: #ececf1;
+  --fg-1: #b9b9c4;
+  --fg-2: #85858f;
+  --fg-3: #5c5c66;
+
+  /* 分隔线：深色下用半透明白比纯灰更自然 */
+  --line: rgba(255, 255, 255, 0.09);
+  --line-strong: rgba(255, 255, 255, 0.16);
+
+  /* 主色：偏暖的橙，在深色底上比蓝色更"照片" */
+  --accent: #ff8a3d;
+  --accent-dim: rgba(255, 138, 61, 0.16);
+  --accent-press: #e5762c;
+
+  /* 语义色 */
+  --ok: #3ddc84;
+  --ok-dim: rgba(61, 220, 132, 0.14);
+  --warn: #ffc93c;
+  --warn-dim: rgba(255, 201, 60, 0.14);
+  --bad: #ff5c5c;
+  --bad-dim: rgba(255, 92, 92, 0.14);
+
+  /* 尺寸 */
+  --radius: 12px;
+  --radius-sm: 8px;
+  --radius-lg: 18px;
+  --tabbar-h: 54px;
+  --topbar-h: 46px;
+
+  /* 安全区：iPhone 底部横条 / 刘海屏 */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+
+  /* 动效：手机上 160ms 已经"够快"，再长就显得拖 */
+  --dur: 160ms;
+  --ease: cubic-bezier(0.32, 0.72, 0, 1);
+
+  /* 缩略图网格：3 列。用 CSS 变量而不是写死，方便以后加"4 列紧凑"模式 */
+  --grid-cols: 3;
+  --grid-gap: 2px;
+
+  color-scheme: dark;
+}

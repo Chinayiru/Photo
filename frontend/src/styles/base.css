@@ -1,0 +1,261 @@
+/* ==================================================================
+ * 全局基础样式
+ * ================================================================== */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  /* 手机上点按高亮是浅蓝色块，深色主题下很难看，一律关掉 */
+  -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
+  /* 照片库不该有横向滚动；纵向用 contain 让滚动在容器内完成 */
+  overflow: hidden;
+  overscroll-behavior: none;
+  text-size-adjust: 100%;
+  -webkit-text-size-adjust: 100%;
+}
+
+#app {
+  height: 100%;
+  height: 100dvh; /* 移动端地址栏收起时 dvh 才是真实高度 */
+  display: flex;
+  flex-direction: column;
+  /* 顶部安全区留白：状态栏下面才是内容 */
+  padding-top: var(--safe-top);
+  padding-left: var(--safe-left);
+  padding-right: var(--safe-right);
+}
+
+h1, h2, h3, h4 {
+  margin: 0;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+p {
+  margin: 0;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  /* iOS 上双击会缩放；关掉后再配合 viewport 的 user-scalable=no */
+  touch-action: manipulation;
+}
+
+input,
+select,
+textarea {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  width: 100%;
+  outline: none;
+  /* iOS 上 font-size < 16px 会在聚焦时自动放大页面，这里靠下面的
+     .input-lg 保证关键输入框 ≥16px */
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+input::placeholder {
+  color: var(--fg-3);
+}
+
+/* 通用工具类 */
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.grow {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.muted {
+  color: var(--fg-2);
+}
+
+.tiny {
+  font-size: 12px;
+}
+
+.ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* 按钮 */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 16px;
+  border-radius: var(--radius);
+  background: var(--bg-3);
+  color: var(--fg);
+  font-weight: 500;
+  transition: background var(--dur) var(--ease), transform var(--dur) var(--ease);
+  user-select: none;
+}
+
+.btn:active:not(:disabled) {
+  transform: scale(0.97);
+  background: var(--bg-hover);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn.primary {
+  background: var(--accent);
+  color: #1a0e04;
+  font-weight: 600;
+}
+
+.btn.primary:active:not(:disabled) {
+  background: var(--accent-press);
+}
+
+.btn.danger {
+  background: var(--bad-dim);
+  color: var(--bad);
+}
+
+.btn.danger:active:not(:disabled) {
+  background: rgba(255, 92, 92, 0.24);
+}
+
+.btn.ghost {
+  background: transparent;
+  border: 1px solid var(--line-strong);
+}
+
+.btn.block {
+  width: 100%;
+}
+
+.btn.lg {
+  padding: 14px 18px;
+  font-size: 16px;
+}
+
+/* 输入框放大版：iOS 聚焦不缩放 */
+.input-lg {
+  font-size: 16px;
+  padding: 12px 14px;
+}
+
+/* 卡片 */
+.card {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px;
+}
+
+/* 滚动容器 */
+.scroll {
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+}
+
+/* 滚动条（桌面调试时可见，手机上不显示） */
+.scroll::-webkit-scrollbar {
+  width: 6px;
+}
+
+.scroll::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 3px;
+}
+
+/* 骨架屏 */
+@keyframes pb-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--bg-2) 25%,
+    var(--bg-3) 37%,
+    var(--bg-2) 63%
+  );
+  background-size: 200% 100%;
+  animation: pb-shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes pb-spin {
+  to { transform: rotate(360deg); }
+}
+
+.spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--line-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: pb-spin 0.7s linear infinite;
+}
+
+/* 尊重系统的"减少动态效果" */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

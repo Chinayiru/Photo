@@ -688,6 +688,33 @@ def test_search_chinese_filename(tmp_path, library) -> None:
     assert [it["name"] for it in b["items"]] == ["敦煌.jpg"]
 
 
+def test_search_matches_directory_path(tmp_path, library) -> None:
+    """搜索必须能命中**目录名**，不能只看文件名。
+
+    归档会把文件名改成 `20240512_183000.jpg`，用户记不住那个名字 ——
+    他记得的是"敦煌那张""青甘环线里的"。只搜 file_name 时搜"敦煌"
+    返回 0 条，用户会认为整个搜索功能坏了（真实库实测踩到：搜"敦煌"命中 0 条，而库里有 `青甘环线/敦煌/` 整个目录）。
+    """
+    st = _state(tmp_path, library)
+    from app.indexer import Indexer
+
+    _img(library / "青甘环线" / "敦煌" / "20240512_183000.jpg")
+    _img(library / "其他地方" / "20240512_183001.jpg")
+    asyncio.run(Indexer(st.cfg, st.db).scan_root(st.cfg.root_by_id("library")))
+    b = _json(_call(st, "GET", "/api/search", query={"q": "敦煌"}))
+    assert len(b["items"]) == 1
+    assert b["items"][0]["dir"] == "青甘环线/敦煌"
+
+
+def test_search_matches_camera(tmp_path, library) -> None:
+    """用户常搜相机型号（"iPhone"/"vivo"），这也要能命中。"""
+    st = _state(tmp_path, library)
+    _seed(st, library)
+    st.db.execute("UPDATE media SET camera = 'vivo iQOO Neo9' WHERE id = 1")
+    b = _json(_call(st, "GET", "/api/search", query={"q": "iQOO"}))
+    assert len(b["items"]) == 1
+
+
 def test_search_percent_is_literal(tmp_path, library) -> None:
     """`%` 在文件名里是字面量，不能当通配符（否则匹配全库）。"""
     st = _state(tmp_path, library)

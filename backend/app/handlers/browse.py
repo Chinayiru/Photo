@@ -674,8 +674,20 @@ async def search(ctx: Ctx) -> Reply:
         # （如 "敦煌"）在没有自定义分词器时反而匹配不到，
         # 因为 unicode61 不切中文。LIKE 虽慢但**行为可预期**。
         # 5000 行规模下 LIKE 全扫约 3ms，完全可接受。
-        where += " AND file_name LIKE ? ESCAPE '\\'"
-        params.append("%" + _esc(q) + "%")
+        #
+        # ★ 必须同时匹配 rel_path，只搜 file_name 是不够的：
+        # 归档会把文件名改成 `20240512_183000.jpg`，用户早就记不住
+        # 那个名字了 —— 他记得的是"敦煌那张""青甘环线里的"。
+        # 只搜文件名时搜"敦煌"返回 0 条，用户会认为整个搜索坏了。
+        # rel_path 里保留着原目录结构，是唯一还认得出来的线索。
+        # （归档按设计**不保留原文件名**，原文件名只在
+        #   upload_sessions.declared_name 与审计日志里。）
+        # camera 也一并匹配：用户常搜 "iPhone" 或 "vivo"。
+        pattern = "%" + _esc(q) + "%"
+        where += (" AND (file_name LIKE ? ESCAPE '\\'"
+                  " OR rel_path LIKE ? ESCAPE '\\'"
+                  " OR camera LIKE ? ESCAPE '\\')")
+        params.extend([pattern, pattern, pattern])
 
     cursor = ctx.q("cursor")
     if cursor:
