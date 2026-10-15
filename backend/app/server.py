@@ -36,6 +36,7 @@ from .db import Database, get_db
 from .errors import AppError
 from .indexer import Indexer
 from .routers import build_router
+from .static import StaticFiles
 from .state import AppState, set_state
 from .thumbs import ThumbEngine
 from .transports.local_http import LocalHttpTransport
@@ -86,8 +87,26 @@ def build_app(cfg: Config | None = None, *, state: AppState | None = None) -> An
     router.use(auth_middleware)
     router.enable_cors()
 
+    # 静态前端兜底：手机访问 http://<电脑IP>:8787/ 直接看到界面。
+    # 用 set_fallback 而不是再注册一条 `/{path:path}` 路由 —— 后者会
+    # 与所有 API 路由竞争匹配，一旦正则顺序变化就可能把 API 请求
+    # 吃掉交给前端外壳，表现为"接口返回 index.html"。
+    router.set_fallback(StaticFiles(_dist_dir(cfg)))
+
     transport = LocalHttpTransport(cfg, router)
     return router, transport, st
+
+
+def _dist_dir(cfg: Config) -> Path | None:
+    """前端构建产物位置。
+
+    允许配置覆盖（`app.dist_dir`），因为打包成 exe 后目录结构与
+    源码仓库不同：PyInstaller 会把 dist 解到 `_MEIPASS` 下。
+    """
+    override = cfg.get("app.dist_dir")
+    if override:
+        return Path(str(override))
+    return None      # None 让 StaticFiles 用自己的默认值
 
 
 async def _request_log_middleware(ctx, nxt):

@@ -38,6 +38,7 @@ __all__ = ["Route", "Router", "Handler", "Middleware", "NotFoundRoute"]
 
 #: 处理函数签名：接收 Ctx，返回 Reply。
 Handler = Callable[[Ctx], Awaitable[Reply]]
+Fallback = Callable[[Ctx], Awaitable[Reply]]
 #: 中间件签名：接收 (Ctx, next)，返回 Reply。
 Middleware = Callable[[Ctx, Callable[[Ctx], Awaitable[Reply]]], Awaitable[Reply]]
 
@@ -104,7 +105,7 @@ class Router:
     """
 
     __slots__ = ("_routes", "_by_method", "_exact", "_middleware", "_cors",
-                 "_on_error", "name", "app")
+                 "_on_error", "_fallback", "name", "app")
 
     def __init__(self, name: str = "router", *, app: Any = None) -> None:
         self.name = name
@@ -121,6 +122,7 @@ class Router:
         self._middleware: list[Middleware] = []
         self._cors: dict[str, Any] | None = None
         self._on_error: Callable[[Ctx, BaseException], None] | None = None
+        self._fallback: Fallback | None = None
 
     # ------------------------------------------------------------------
     # 注册
@@ -189,6 +191,18 @@ class Router:
             "expose": expose_headers,
             "max_age": str(max_age),
         }
+
+    def set_fallback(self, fn: "Fallback") -> None:
+        """注册兜底处理函数，只在**所有路由都没匹配上**时调用。
+
+        用于静态前端：手机访问 `/` 或任何前端路由时，由它返回
+        `frontend/dist` 里的文件。它**不是**中间件 —— 中间件会包住
+        每一个 API 请求，而这个只该在 404 那一刻介入。
+
+        兜底函数自己抛 `AppError(E1004)` 就等价于"确实没有这个路径"，
+        仍然返回标准的 404 错误体。
+        """
+        self._fallback = fn
 
     def on_error(self, fn: Callable[[Ctx, BaseException], None]) -> None:
         """注册错误回调，用于审计/告警。回调自身抛错会被吞掉。"""
@@ -274,6 +288,23 @@ class Router:
                 err = AppError(E1018)
                 err.headers = {"Allow": ", ".join(allowed)}
                 raise err
+            if self._fallback is not None:
+                # 静态前端兜底。放在 405 判断**之后**：某个路径确实
+                # 注册了别的 HTTP 方法时，应该老实回 405，而不是让
+                # 前端外壳用 200 把问题盖住。
+                #
+                # ⚠️ 兜底**故意不经过中间件**。前端外壳（HTML/JS/CSS）
+                # 必须匿名可取 —— 它就是配对页本身，要求 token 才能
+                # 拿到它就成了死锁。dist 里只有我们自己构建的代码，
+                # 没有任何用户数据；真正的照片仍然走 /api/** 并照常鉴权。
+                #
+                # 但 `/api/**` 与 `/panel/**` **绝不兜底**：接口路径拼错时
+                # 必须拿到 404 错误体。让前端外壳接管会返回 200 + HTML，
+                # 前端只会报"JSON 解析失败"，排查方向完全错。
+                clean = ctx.path.rstrip("/") or "/"
+                if clean.startswith(("/api/", "/panel/")) or clean in ("/api", "/panel"):
+                    raise AppError(E1004) from None
+                return await self._fallback(ctx)
             raise AppError(E1004) from None
 
         ctx.params = params
