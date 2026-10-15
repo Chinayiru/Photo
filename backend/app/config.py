@@ -92,10 +92,19 @@ DEFAULT_CONFIG: Final[dict[str, Any]] = {
         "mode": "readwrite",
     },
     "server": {
-        "host": "0.0.0.0",
+        # ★ 默认 127.0.0.1（只本机）。要让手机连上**必须**显式改成 0.0.0.0，
+        # 这个改动本身就是一次有意识的安全决策，而不是被默认值悄悄做掉。
+        #
+        # 为什么不干脆默认 0.0.0.0：那会让"程序装好了但用户还没配对"的窗口期里，
+        # 同网段任何人（含访客 Wi-Fi、公司网络）都能探测到 8787 并尝试访问照片库。
+        # 首次运行向导会把这一项改成 0.0.0.0 并同时开启 require_pairing。
+        "host": "127.0.0.1",
         "port": 8787,
         # 局域网直连开关。二期加 "relay" 时只需在 transports/ 注册新适配器。
         "transport": "local_http",
+        # 是否允许绑到非回环地址。False 时 server 启动前会拒绝 0.0.0.0/::，
+        # 防止"配置里写错了就整个库暴露在公网"。
+        "allow_lan": True,
     },
     "roots": [],                    # [{id, path, label, mode, enabled, ...}]
     "upload": {
@@ -483,6 +492,131 @@ def is_first_run() -> bool:
         return True
 
 
+# --------------------------------------------------------------------------
+# 绑定地址安全校验
+# --------------------------------------------------------------------------
+
+#: 回环地址。绑这些地址只有本机可访问，无需配对即可视为安全。
+LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "::1", "localhost"})
+
+#: 明确表示"监听所有网卡"的地址。绑定它们等于把服务暴露给整个可达网段。
+WILDCARD_HOSTS: Final[frozenset[str]] = frozenset({"0.0.0.0", "::", "*"})
+
+
+def is_loopback_host(host: str) -> bool:
+    h = (host or "").strip().lower()
+    if h in LOOPBACK_HOSTS:
+        return True
+    # 127.0.0.0/8 整段都是回环
+    return h.startswith("127.")
+
+
+def check_bind_safety(host: str, cfg: Config | None = None) -> tuple[bool, str]:
+    """判断绑定该地址是否安全。返回 (ok, 说明)。
+
+    三条规则：
+      1. 回环地址永远允许。
+      2. 通配地址（0.0.0.0/::）要求 `server.allow_lan` 为真**且**已配置媒体根
+         **且** `auth.require_pairing` 为真 —— 三者缺一不可。任何一个缺失都意味着
+         "任何人都能访问照片库"，这比服务起不来严重得多。
+      3. 具体 IP 地址要求 `server.allow_lan` 为真；若是公网 IP 则一律拒绝。
+
+    这个函数只做判断，不抛异常 —— 调用方（server 启动流程）决定是拒绝启动
+    还是仅打警告。托盘与首启向导用同一函数给出提示文案。
+    """
+    c = cfg or get()
+    h = (host or "").strip().lower()
+
+    if is_loopback_host(h):
+        return True, "仅本机可访问"
+
+    if h in WILDCARD_HOSTS:
+        if not c.server.get("allow_lan", True):
+            return False, "server.allow_lan 为 false，不允许监听所有网卡"
+        if not c.roots:
+            return False, "尚未配置媒体根目录，拒绝监听所有网卡"
+        if not c.auth.get("require_pairing", True):
+            return False, "auth.require_pairing 为 false，监听所有网卡将无鉴权暴露照片库"
+        return True, "局域网可访问（需配对）"
+
+    if not c.server.get("allow_lan", True):
+        return False, f"server.allow_lan 为 false，不允许绑定 {host}"
+
+    if _is_public_ip(h):
+        return False, (
+            f"{host} 是公网地址。本程序一期只做局域网访问，"
+            "公网暴露请走二期云中继（不需要端口映射）。"
+        )
+
+    return True, f"绑定到 {host}（需确认该地址属于可信网段）"
+
+
+def _is_public_ip(host: str) -> bool:
+    """判断是否公网 IP。非 IP 字面量（主机名）一律当作公网处理 —— 保守优先。"""
+    import ipaddress
+
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True         # 域名 → 可能解析到公网，保守拒绝
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved)
+
+
+def local_ipv4_addresses() -> list[str]:
+    """列出本机可用于局域网访问的 IPv4 地址（已过滤虚拟网卡网段）。
+
+    为什么要过滤：本机实测有 5 个 IPv4，其中 26.26.192.40、192.168.64.1、
+    192.168.226.1、192.168.32.1 来自 Hyper-V / WSL / VMware 虚拟网卡。
+    把这些地址显示给用户会让手机连一个永远连不上的地址，
+    而真正的局域网地址只有 192.0.2.10。过滤依据是这些虚拟网段的
+    固定前缀（WSL 用 172.x，Hyper-V 默认用 172.x，VMware 用 192.168.x.1 的
+    特定网关形态），无法穷举，因此采用"优先返回默认网关所在网段的地址"策略。
+    """
+    import socket
+
+    found: list[str] = []
+    # 主路由探测：连一个外部地址（不实际发包，UDP connect 只做路由选择）
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("223.5.5.5", 80))
+        primary = probe.getsockname()[0]
+        if primary and not primary.startswith("127."):
+            found.append(primary)
+    except OSError:
+        pass
+    finally:
+        probe.close()
+
+    # 补充：主机名解析出的其他地址（去重）
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            addr = info[4][0]
+            if addr.startswith("127.") or addr in found:
+                continue
+            if _looks_virtual(addr):
+                continue
+            found.append(addr)
+    except OSError:
+        pass
+    return found
+
+
+def _looks_virtual(addr: str) -> bool:
+    """已知虚拟网卡网段的启发式过滤。
+
+    Hyper-V 默认给虚拟交换机分配 172.16–172.31 段，WSL2 也用 172.x；
+    VMware 的 host-only 网卡习惯用 x.x.x.1 且属于 192.168.0.0/16 的
+    非默认网关段。这里只过滤确定性最高的两类，其余交给调用方展示给用户确认。
+    """
+    if addr.startswith("172."):
+        try:
+            second = int(addr.split(".")[1])
+        except (ValueError, IndexError):
+            return False
+        return 16 <= second <= 31          # Hyper-V / WSL2 默认段
+    return False
+
+
 def bootstrap_default_root() -> Config:
     """首次运行时，用本机实际的照片库写出一份可用的 config.json。
 
@@ -512,7 +646,8 @@ def bootstrap_default_root() -> Config:
 __all__ = [
     "ALLOWED_IMAGE_EXTS", "APP_ROOT", "CONFIG_PATH", "Config", "ConfigError",
     "DATA_DIR", "DEFAULT_CONFIG", "DEFAULT_EXCLUDE_DIRS", "DEFAULT_TZ_OFFSET_MIN",
-    "FUTURE_RAW_EXTS", "FUTURE_VIDEO_EXTS", "ROOT_MODES", "RootConfig",
-    "SECRETS_PATH", "TMP_DIRNAME",
-    "bootstrap_default_root", "ensure_dirs", "get", "is_first_run", "load",
+    "FUTURE_RAW_EXTS", "FUTURE_VIDEO_EXTS", "LOOPBACK_HOSTS", "ROOT_MODES",
+    "RootConfig", "SECRETS_PATH", "TMP_DIRNAME", "WILDCARD_HOSTS",
+    "bootstrap_default_root", "check_bind_safety", "ensure_dirs", "get",
+    "is_first_run", "is_loopback_host", "load", "local_ipv4_addresses",
 ]
