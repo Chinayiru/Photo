@@ -10,7 +10,7 @@
 import { computed, onMounted, ref } from "vue";
 import { ApiError } from "../api/client";
 import { buildBase } from "../api/storage";
-import { authStore, pair, pairParamsFromLocation, parsePairInput } from "../stores/auth";
+import { pair, pairParamsFromLocation, parsePairInput } from "../stores/auth";
 import { toastError, toastOk } from "../stores/toast";
 
 const host = ref("");

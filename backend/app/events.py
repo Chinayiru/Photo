@@ -100,8 +100,13 @@ class EventBus:
         self._loop: asyncio.AbstractEventLoop | None = None
         self.published = 0
 
-    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
-        """记录事件循环，供跨线程 `publish_threadsafe` 使用。"""
+    def bind_loop(self, loop: asyncio.AbstractEventLoop | None) -> None:
+        """记录事件循环，供跨线程 `publish_threadsafe` 使用。
+
+        允许传 None：同步上下文（脚本、不跑事件循环的测试）里调用时
+        没有 running loop 可绑，此时 `publish` 照常工作，
+        只有 `publish_threadsafe` 变成静默 no-op（见它的实现）。
+        """
         self._loop = loop
 
     @property

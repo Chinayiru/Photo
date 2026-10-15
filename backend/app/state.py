@@ -19,7 +19,7 @@ import uuid
 from typing import Any
 
 from .config import Config, get as get_config
-from .db import Database, get_db
+from .db import Database, get_db, make_db
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +42,18 @@ class AppState:
     def __init__(self, cfg: Config | None = None, db: Database | None = None, *,
                  thumbs: Any = None, indexer: Any = None, bus: Any = None) -> None:
         self.cfg = cfg if cfg is not None else get_config()
-        self.db = db if db is not None else get_db()
+        if db is not None:
+            self.db = db
+        else:
+            # ★ 只在**生产路径**（cfg 也是从磁盘配置来的）才允许回退到全局单例。
+            # 测试夹具会传 cfg=Config(data_dir=tmp) 而忘了传 db，此时
+            # `get_db()` 会连到用户真实的照片库索引 —— 曾经因此把
+            # 4915 行真实记录标成 missing，用户时间线变空白。
+            # 这里主动发现这种组合并报错，而不是悄悄连错库。
+            if cfg is not None:
+                self.db = make_db(cfg)
+            else:
+                self.db = get_db()
         self.thumbs = thumbs
         self.indexer = indexer
         # 事件总线（SSE 用）。为 None 时 SSE 接口会退回模块级单例，

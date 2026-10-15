@@ -27,6 +27,7 @@ from app.db import Database  # noqa: E402
 from app.errors import AppError  # noqa: E402
 from app.handlers import browse, system  # noqa: E402
 from app.state import AppState  # noqa: E402
+from app.thumbs import thumb_path  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -279,6 +280,93 @@ def test_timeline_order_asc_is_rejected_not_ignored(tmp_path, library) -> None:
     r = _call(st, "GET", "/api/timeline", query={"order": "asc"})
     assert r.status == 400
     assert _json(r)["error"]["code"] == "E1001"
+
+
+def test_thumb_v_is_never_null_even_when_pending(tmp_path, library) -> None:
+    """★ thumb_v 恒有值，pending 时也不能是 null。
+
+    它是"源文件版本"（mtime-size 签名），不是"缩略图生成好了没"。
+
+    早期版本写成 `if state == "ok" else None`，造成**死锁**：
+      前端 `showImage = thumb_state === "ok" && !!thumb_v`
+      → pending 的项连 `<img>` 都不渲染
+      → 永远不会请求缩略图 URL
+      → 而服务端恰恰靠"被请求"来按需生成（`browse._serve_thumb`）
+      → 后台队列满时 `enqueue` 会**刻意丢弃**任务（不阻塞索引器）
+      → 被丢的项永远停在 pending，前端永远不请求 → 永久灰块
+
+    所以这条断言锁住的是"照片一定会显示出来"，不是字段格式。
+    """
+    st = _state(tmp_path, library)
+    _seed(st, library)
+
+    # 造一张 pending 的：直接把所有行的 thumb_state 改成 pending。
+    # 真实场景里它来自"后台队列满被丢弃"，库里就是这个状态。
+    st.db.execute("UPDATE media SET thumb_state = 'pending', thumb_etag = NULL")
+
+    b = _json(_call(st, "GET", "/api/timeline"))
+    assert b["items"], "时间线不该为空"
+    for item in b["items"]:
+        assert item["thumb_state"] == "pending", "前置条件：确实是 pending"
+        assert item["thumb_v"], (
+            f"pending 项的 thumb_v 是空的 → 前端不会请求缩略图 → 死锁。"
+            f"item={item}"
+        )
+        assert item["thumb_v"].startswith("w320-"), item["thumb_v"]
+
+    # 详情接口同样恒给值
+    mid = b["items"][0]["id"]
+    d = _json(_call(st, "GET", f"/api/items/{mid}",
+                    params={"media_id": str(mid)}))
+    assert d["thumb_v"], "详情接口的 thumb_v 也不能为空"
+
+
+def test_pending_thumb_is_generated_on_demand(tmp_path, library) -> None:
+    """★ 死锁的另一半：pending 项被请求时，服务端要真的生成出图。
+
+    只让 thumb_v 恒有值还不够 —— 如果服务端对 pending 只回占位图，
+    前端拿到 200 就再也不会重试，用户看到的仍然是灰块。
+    """
+    st = _state(tmp_path, library)
+    _seed(st, library)
+
+    b = _json(_call(st, "GET", "/api/timeline"))
+    mid = b["items"][0]["id"]
+    # 造出"缓存被删 + DB 说 pending"的真实场景
+    st.db.execute(
+        "UPDATE media SET thumb_state = 'pending', thumb_etag = NULL WHERE id = ?",
+        (mid,),
+    )
+    for size in (320, 1600):
+        p = thumb_path(st.cfg, "library", _rel_of(st, mid), size)
+        if p.exists():
+            p.unlink()
+
+    r = _call(st, "GET", f"/api/items/{mid}/thumb",
+              query={"size": "320"}, params={"media_id": str(mid)})
+    assert r.status == 200
+    body = _body(r)
+    assert body[:4] == b"RIFF", "必须返回真 WebP，不能是空体"
+
+    # 真图与灰色占位图必须能区分开：占位图是纯灰渐变，真图不会那么巧
+    # 与占位图逐字节相同。用这个区分"真生成了"与"回了占位图"。
+    from backend.app.thumbs import placeholder_webp
+
+    assert body != placeholder_webp(320), (
+        "返回的是灰色占位图 —— 服务端没有真的生成缩略图，"
+        "前端拿到 200 后不会再重试，用户永远看到灰块"
+    )
+
+    # 生成后 DB 应被标成 ok（下次请求走缓存）
+    row = st.db.query_one("SELECT thumb_state, thumb_etag FROM media WHERE id = ?",
+                          (mid,))
+    assert row["thumb_state"] == "ok", row["thumb_state"]
+    assert row["thumb_etag"], "生成后必须写回签名，否则每次都判定陈旧"
+
+
+def _rel_of(st, media_id: int) -> str:
+    row = st.db.query_one("SELECT rel_path FROM media WHERE id = ?", (media_id,))
+    return str(row["rel_path"])
 
 
 def test_timeline_limit_is_clamped(tmp_path, library) -> None:

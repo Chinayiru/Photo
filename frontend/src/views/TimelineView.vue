@@ -20,8 +20,6 @@ import {
 import { open as openViewer } from "../stores/viewer";
 
 const grid = ref<InstanceType<typeof PhotoGrid> | null>(null);
-/** 用户在查看器里删除后需要回到原来位置，简单起见只记住滚动位置。 */
-const savedScroll = ref(0);
 
 const loading = computed(() => timelineStore.state.loading);
 const error = computed(() => timelineStore.state.error);
@@ -47,7 +45,6 @@ function poke(): void {
 }
 
 function onOpen(id: number): void {
-  savedScroll.value = grid.value?.rootEl?.scrollTop ?? 0;
   openViewer(id);
 }
 

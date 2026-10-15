@@ -30,7 +30,7 @@ const loading = ref(false);
 const searched = ref(false);
 const error = ref("");
 
-const groups = computed(() => groupByDay(items));
+const groups = computed(() => groupByDay(items.value));
 
 const canSearch = computed(() =>
   Boolean(q.value.trim() || from.value || to.value || camera.value.trim() || hasGps.value));

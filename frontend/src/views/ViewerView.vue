@@ -271,7 +271,7 @@ async function doDelete(): Promise<void> {
               <div class="row"><dt>相机</dt><dd>{{ cameraText }}</dd></div>
               <div class="row"><dt>尺寸</dt><dd>{{ sizeText }}</dd></div>
               <div v-if="exifText" class="row"><dt>参数</dt><dd>{{ exifText }}</dd></div>
-              <div class="row"><dt>路径</dt><dd class="mono">{{ detail.dir }}</dd></div>
+              <div class="row"><dt>路径</dt><dd class="mono">{{ detail.rel_path }}</dd></div>
             </dl>
           </div>
         </Transition>

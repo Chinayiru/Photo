@@ -577,6 +577,21 @@ _db_lock = threading.Lock()
 
 
 def get_db(reload: bool = False) -> Database:
+    """取全局数据库句柄（按 `data/config.json` 解析出的**真实**路径）。
+
+    ⚠️ 生产代码用它；**测试与脚本绝不能用**。
+
+    它按配置文件解析路径，而 `data/config.json` 在开发机上指向用户
+    真实的照片库索引。开发期曾因此出过一次事故：测试夹具构造
+    `Config(data_dir=tmp)` 后只把 `cfg` 传下去、没传 `db`，
+    落到这里的 `get_db()` 拿到真实库，于是
+    ① 合成测试行被写进真实库；② 测试库只有 3 个文件，扫描后
+    `_mark_missing` 把真实库的 4915 行全标成"文件已丢失"，
+    用户的时间线变成空白。
+
+    所以新增了 `make_db(cfg)`：**永远按传入的 cfg 解析路径**，
+    测试与脚本一律用它，从源头上不可能再落到真实库。
+    """
     global _db
     if _db is None or reload:
         with _db_lock:
@@ -584,6 +599,17 @@ def get_db(reload: bool = False) -> Database:
                 cfg = cfgmod.load()
                 _db = Database(cfg.db_path)
     return _db
+
+
+def make_db(cfg: Config) -> Database:
+    """按给定配置造一个**独立**的数据库句柄（不碰全局单例）。
+
+    与 `get_db()` 的区别只有一点，但这一点至关重要：路径来自传入的
+    `cfg` 而不是磁盘上的 `data/config.json`。测试用
+    `Config({...}, data_dir=tmp_path/"data")` 构造配置后调它，
+    就绝无可能写到用户真实的照片库里。
+    """
+    return Database(cfg.db_path)
 
 
 def init_db() -> Database:
@@ -604,4 +630,5 @@ def close_db() -> None:
         _db = None
 
 
-__all__ = ["Database", "SCHEMA", "SCHEMA_NAME", "SCHEMA_VERSION", "close_db", "get_db", "init_db"]
+__all__ = ["Database", "SCHEMA", "SCHEMA_NAME", "SCHEMA_VERSION", "close_db",
+           "get_db", "init_db", "make_db"]

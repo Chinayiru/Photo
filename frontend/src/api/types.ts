@@ -177,6 +177,11 @@ export interface MediaItem {
    * ★ 必须拼进图片 URL（`?v=`）：后端对缩略图发
    *   `Cache-Control: immutable, max-age=31536000`，不带版本串时
    *   用户替换了同名文件，手机也永远看旧图。
+   *
+   * ★ 后端**恒给值**（不因 thumb_state 是 pending 而为 null）。
+   *   它是"源文件版本"而非"生成好了没"——若 pending 时为 null，
+   *   前端就不发请求，而服务端恰恰靠请求按需生成，会死锁。
+   *   能不能长期缓存由响应头决定（占位图 `max-age=60`）。
    */
   thumb_v: string | null;
   size: number;
@@ -230,6 +235,7 @@ export interface MediaDetail {
   exif: ExifInfo;
   gps: { lat: number; lon: number } | null;
   thumb_state: string;
+  /** 见 `MediaItem.thumb_v` 的说明：恒有值，不因 pending 而为 null。 */
   thumb_v: string | null;
   /** true 表示"记录在但文件被移动了"，后端仍返回 200。 */
   missing: boolean;

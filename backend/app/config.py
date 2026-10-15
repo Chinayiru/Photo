@@ -212,10 +212,37 @@ class Config:
         self._path = path
         self._roots: list[RootConfig] | None = None
         self._secrets: dict[str, Any] | None = None
-        # data_dir 可覆盖：测试必须能把缩略图/审计日志写到 tmp_path，
-        # 否则跑一次测试就会往真实 data/ 目录里留垃圾，
-        # 更糟的是会**覆盖真实库里已有的缩略图缓存**。
-        self._data_dir = Path(data_dir) if data_dir is not None else DATA_DIR
+        # data_dir 的解析规则（顺序不能变）：
+        #
+        #   1. 显式传了 data_dir  → 用它。测试必须能把缩略图/审计日志/
+        #      数据库写到 tmp_path，否则跑一次测试就会往真实 data/ 目录里
+        #      留垃圾，更糟的是会**覆盖真实库里已有的缩略图缓存**。
+        #   2. 否则 → 跟着**配置文件所在目录**走（`<config 的目录>/data`）。
+        #   3. 都没有 → 安装目录下的 DATA_DIR。
+        #
+        # ★ 第 2 条是修一个真实事故：`main.py --config H:/tmp/pbtest/cfg.json`
+        # 会从那个文件读 roots（指向测试照片库），但 data_dir 若固定成
+        # 安装目录的 DATA_DIR，数据库仍然是**用户真实库的索引**。
+        # 于是测试扫描完自己的 6 个文件后，`_mark_missing(root_id='library')`
+        # 把真实库的 4915 行全部标成"文件已丢失" —— 用户打开 App 看到空相册。
+        #
+        # 默认情况（CONFIG_PATH == DATA_DIR/"config.json"）下第 2 条
+        # 算出来的正是 DATA_DIR，行为与从前完全一致，不影响老用户。
+        if data_dir is not None:
+            self._data_dir = Path(data_dir)
+        elif path is not None:
+            parent = Path(path).resolve().parent
+            # 默认布局下配置文件**就在**数据目录里（`DATA_DIR/config.json`），
+            # 此时 data_dir 就是它所在的目录，绝不能再拼一层 "data"。
+            # 判断用两条：等于默认 DATA_DIR，或目录本身叫 "data"
+            # （用户把整个程序拷到别处时 __file__ 会跟着变，DATA_DIR 仍然对；
+            #  而 "叫 data" 这条覆盖手工指定数据目录的约定用法）。
+            if parent == Path(DATA_DIR).resolve() or parent.name.lower() == "data":
+                self._data_dir = parent
+            else:
+                self._data_dir = parent / "data"
+        else:                                       # pragma: no cover
+            self._data_dir = DATA_DIR
 
     # --- 分节访问 ---------------------------------------------------------
 

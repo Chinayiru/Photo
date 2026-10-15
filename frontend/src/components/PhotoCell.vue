@@ -6,7 +6,8 @@
  *   - `loading="lazy"` + `decoding="async"`（任务要求 + docs/03 §5.3.3）
  *   - 显式 `width`/`height`：不写的话图片解码完会撑开格子，
  *     整个网格重排（CLS 抖动），手机上表现为"照片一格格跳"
- *   - `thumb_state !== "ok"` → 灰块占位，**不是破图**
+ *   - `thumb_state === "failed"` → 灰块占位，**不是破图**
+ *     （pending 照常发请求：服务端靠"被请求"按需生成，见下面 showImage）
  *
  * 为什么用 `aspect-ratio` 而不是后端给的 w/h：后端的 w/h 是**原图**尺寸，
  * 而缩略图是等比缩放后裁到正方形的，直接用会拉伸变形。
@@ -31,9 +32,23 @@ const props = defineProps<{
 const failed = ref(false);
 const loaded = ref(false);
 
-/** thumb_state === "ok" 且没加载失败，才真的显示图。 */
-const showImage = computed(() =>
-  props.item.thumb_state === "ok" && !!props.item.thumb_v && !failed.value);
+/**
+ * 显示条件：**只**排除 failed，不排除 pending。
+ *
+ * ★ 早期版本写的是 `thumb_state === "ok" && !!thumb_v`，那会造成死锁：
+ *   pending 的项连 `<img>` 都不渲染 → 永远不会请求缩略图 URL →
+ *   而服务端恰恰是靠"被请求"来按需生成的。后台队列满时 `enqueue`
+ *   会**刻意丢弃**任务（不阻塞索引器），被丢的项就永远停在 pending，
+ *   前端也永远不请求 → 永久灰块。
+ *
+ * 现在 pending 也发请求：服务端 `_serve_thumb` 会在引擎没生成出来时
+ * 当场同步生成并返回真图。代价是首屏可能多几次真实生成（每张约 30ms，
+ * 且只发生一次），换来"照片一定会出现"。
+ *
+ * failed 仍然不请求 —— 那种图服务端会直接回 500，请求了也是白费，
+ * 还会让浏览器控制台刷错误。
+ */
+const showImage = computed(() => props.item.thumb_state !== "failed" && !failed.value);
 
 const src = computed(() => thumbUrl(props.item.id, props.item.thumb_v, 320));
 
@@ -56,13 +71,13 @@ function onLoad(): void {
     :aria-label="item.name"
   >
     <!--
-      灰块占位：thumb_state 是 pending/failed/none 时显示。
+      灰块占位：只在缩略图**加载失败**或后端标记 failed 时显示。
       比 <img> 破图好得多 —— 破图图标会让用户以为程序坏了。
+      pending 不显示占位块：它已经发了请求，服务端会当场生成。
     -->
     <span v-if="!showImage" class="ph" aria-hidden="true">
       <span class="ph-icon">🖼</span>
       <span v-if="item.thumb_state === 'failed'" class="ph-tag">缩略图失败</span>
-      <span v-else-if="item.thumb_state === 'pending'" class="ph-tag">生成中</span>
     </span>
 
     <img

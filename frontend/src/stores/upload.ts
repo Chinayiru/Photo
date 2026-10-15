@@ -276,13 +276,14 @@ async function doUpload(task: UploadTask, signal: AbortSignal): Promise<void> {
   }
 
   if (signal.aborted) throw new UploadAborted();
-  if (task.status === "PAUSED") return;
+  if (statusOf(task) === "PAUSED") return;
 
   /* ② 循环发分片 */
   let guard = 0;
   while (task.offset < task.size) {
     if (signal.aborted) throw new UploadAborted();
-    if (task.status === "PAUSED") return;
+    // 用户可能在传的过程中点了暂停 —— 状态是异步改的，必须重读
+    if (statusOf(task) === "PAUSED") return;
     // 死循环保护：正常最多 ceil(size/chunk)+几次重对齐
     guard += 1;
     if (guard > 100_000) throw new Error("分片次数异常，已中止");

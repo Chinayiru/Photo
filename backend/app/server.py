@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 import time
@@ -46,21 +47,70 @@ log = logging.getLogger(__name__)
 __all__ = ["build_state", "build_app", "run"]
 
 
+def _bind_bus_loop(bus: Any) -> None:
+    """把事件总线绑到当前事件循环（用于跨线程投递）。
+
+    ⚠️ 不能用 `asyncio.get_event_loop()`：在**没有正在运行的事件循环**时
+    （同步测试、脚本、或 Python 3.12+ 的主线程里从未创建过 loop），
+    它会抛 `RuntimeError: There is no current event loop in thread 'MainThread'`。
+    `build_state()` 本来是可以在纯同步上下文里调用的（测试就这么用），
+    不该因为它顺带做的事而整体失败。
+
+    `get_running_loop()` 才是正确的问法："现在有没有正在跑的循环？"
+    没有就返回 None，总线退化成"只能从本线程发布"（`publish` 照常可用，
+    只有 `publish_threadsafe` 会静默 no-op）。真正的服务启动路径里
+    `serve()` 是协程，必然有 running loop，行为不受影响。
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    bus.bind_loop(loop)
+
+
 def build_state(cfg: Config | None = None, *, db: Database | None = None) -> AppState:
-    """构造 AppState 并启动缩略图引擎。
+    """构造 AppState。
 
     与 `run()` 分开是为了让测试与脚本能在不起 HTTP 服务的情况下
     拿到一个完全装配好的状态对象。
+
+    ★ **测试与脚本必须传 `db=`**（用 `db_mod.make_db(cfg)` 造一个）。
+
+    这里的 `db=None` 会回退到全局单例 `get_db()`，而它按磁盘上的
+    `data/config.json` 解析路径 —— 在开发机上那就是用户真实的照片库
+    索引。曾经因此出过一次真实事故：测试夹具传了
+    `Config(data_dir=tmp)` 但没传 `db`，于是合成测试行写进了真实库，
+    而且扫描结束后把真实库的 4915 行全标成了 missing=1，
+    用户的时间线变成空白。
+
+    为了不再犯，这里加了显式校验：**只要 cfg 的数据库路径与全局
+    单例指向的不是同一个文件，就必须传 db**，否则直接报错而不是
+    悄悄连到别的库上去。
     """
     cfg = cfg or get_config()
     ensure_dirs(cfg)
 
     if db is None:
         db = get_db()
+        # 校验：调用方给的 cfg 指向的库，必须正是全局单例那个库。
+        # 不相等说明调用方在用临时配置跑测试/脚本，却忘了传 db ——
+        # 这正是上次事故的成因，宁可当场报错也不要污染真实库。
+        try:
+            want = Path(cfg.db_path).resolve()
+            got = Path(db.path).resolve()
+        except OSError:       # pragma: no cover —— 路径不可解析时不做判断
+            want = got = None
+        if want is not None and want != got:
+            raise RuntimeError(
+                f"build_state() 收到了指向 {want} 的配置，但没传 db=，"
+                f"而全局数据库单例指向 {got}。\n"
+                f"这会让测试数据写进真实照片库（曾经真的发生过）。\n"
+                f"请改用：db = make_db(cfg); build_state(cfg, db=db)"
+            )
     db.init()
 
     bus = events_mod.get_bus()
-    bus.bind_loop(asyncio.get_event_loop())
+    _bind_bus_loop(bus)
 
     workers = int(cfg.thumbs.get("workers", 4) or 4)
     thumbs = ThumbEngine(cfg, db, workers=workers, bus=bus)
@@ -100,12 +150,26 @@ def build_app(cfg: Config | None = None, *, state: AppState | None = None) -> An
 def _dist_dir(cfg: Config) -> Path | None:
     """前端构建产物位置。
 
-    允许配置覆盖（`app.dist_dir`），因为打包成 exe 后目录结构与
-    源码仓库不同：PyInstaller 会把 dist 解到 `_MEIPASS` 下。
+    三种情形，按优先级：
+    1. 配置显式覆盖（`app.dist_dir`）—— 开发时想指向别处，或用户自己
+       改了部署布局。
+    2. **打包成 exe 后**：PyInstaller 把 `--add-data` 的东西解到
+       `sys._MEIPASS` 下，此时 `static.py` 的 `DEFAULT_DIST`
+       （按 `__file__` 往上两级算）会指到临时解包目录之外的地方，
+       前端会 404 —— 而现象是"页面白屏"，看不出跟路径有关。
+    3. 源码仓库：返回 None，让 `StaticFiles` 用自己的默认值
+       （`<仓库根>/frontend/dist`）。
     """
     override = cfg.get("app.dist_dir")
     if override:
         return Path(str(override))
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidate = Path(meipass) / "frontend" / "dist"
+        if candidate.is_dir():
+            return candidate
+
     return None      # None 让 StaticFiles 用自己的默认值
 
 
@@ -137,6 +201,18 @@ async def _startup_scan(st: AppState) -> None:
         log.exception("启动扫描失败（不影响服务）")
 
 
+def _count_hint(cfg: Config) -> str:
+    """给首次索引的日志一个量级提示，让用户知道要等多久。"""
+    total = 0
+    for root in cfg.enabled_roots:
+        try:
+            with os.scandir(root.path) as it:
+                total += sum(1 for _ in it)
+        except OSError:
+            pass
+    return f"{total}+ 个条目" if total else "数千"
+
+
 async def serve(cfg: Config | None = None) -> None:
     """启动服务并阻塞，直到收到中断信号。"""
     cfg = cfg or get_config()
@@ -153,7 +229,29 @@ async def serve(cfg: Config | None = None) -> None:
 
     st.thumbs.start()
 
-    if cfg.index.get("scan_on_start", True):
+    # ★ "首次索引"的判定不能只看配置文件在不在。
+    # 用户可能：删掉 data/ 重新开始、换了照片库路径、或者程序曾经
+    # 启动失败过（配置写好了但一张也没扫）。这些情况下库里都是空的，
+    # 手机连上来会看到空时间线。以"media 表里有没有数据"为准才可靠。
+    is_first_run_scan = (
+        cfg.index.get("scan_on_start", True)
+        and not st.db.scalar("SELECT 1 FROM media LIMIT 1", default=None)
+    )
+
+    # ★ 首次运行必须先把根目录索引进库，不能丢给后台任务。
+    # 原因：首次运行的时间点是"用户刚装好、手机正要连上来"。
+    # 若扫描在后台跑，用户在手机上看到的是空时间线 —— 他无法区分
+    # "程序坏了"与"还在扫"，而正确的第一印象是"照片都在"。
+    # 4915 张实测 17.6 秒，这个等待是一次性的且值得。
+    # （后续启动才走后台：那时库里已有数据，手机能立刻看到内容。）
+    if is_first_run_scan:
+        log.info("首次索引：正在扫描照片库（约 %s），预计 20 秒内完成…", _count_hint(cfg))
+        try:
+            stats = await st.indexer.scan_all()
+            log.info("首次索引完成：%s", "；".join(s.summary() for s in stats) or "无根目录")
+        except Exception:       # noqa: BLE001
+            log.exception("首次索引失败（服务照常启动）")
+    elif cfg.index.get("scan_on_start", True):
         # 不 await：4915 张要 20 秒，先让手机能连上来。
         asyncio.create_task(_startup_scan(st), name="startup-scan")
 

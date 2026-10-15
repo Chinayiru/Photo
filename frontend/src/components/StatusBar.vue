@@ -5,14 +5,9 @@
  * 一期只有局域网直连，所以只有 🟢 与 🔴 两态；
  * 二期接云隧道时这里再加 🔵 云端中继（docs/03 §5.1.3）。
  */
-import { authStore, connClass, connText, deviceLabel } from "../stores/auth";
+import { authStore, connClass, connText, deviceLabel, probe } from "../stores/auth";
 
 defineProps<{ title: string }>();
-
-async function retry(): Promise<void> {
-  const { probe } = await import("../stores/auth");
-  await probe();
-}
 </script>
 
 <template>
@@ -23,7 +18,7 @@ async function retry(): Promise<void> {
       :class="connClass"
       type="button"
       :aria-label="`连接状态：${connText}，点击重新探测`"
-      @click="retry"
+      @click="probe"
     >
       <span class="dot" aria-hidden="true" />
       <span class="conn-text ellipsis">{{ connText }}</span>

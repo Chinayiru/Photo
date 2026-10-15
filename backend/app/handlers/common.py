@@ -73,11 +73,25 @@ def row_to_item(row: Any) -> dict[str, Any]:
         "taken_src": row["taken_src"],
         "w": row["width"],
         "h": row["height"],
-        # thumb_v 是缩略图 URL 的版本参数，服务端忽略它、只用于缓存分桶。
-        # 只有真的生成好（ok）才给值：pending 时给值会让浏览器把一个
-        # 稍后才生成的图缓存一年，用户之后**永远**看到占位图。
-        # 值取自源签名（与 ETag 同源），保证"URL 版本变了 ⇔ ETag 变了"。
-        "thumb_v": (thumb_etag(320, row) if state == "ok" else None),
+        # ★ thumb_v 恒有值，**不**按 thumb_state 分档。
+        #
+        # 它是"这张图的源文件版本"（mtime-size 签名），不是"缩略图生成好了没"。
+        # 早期版本写成 `if state == "ok" else None`，理由是"pending 时给值会让
+        # 浏览器把稍后才生成的图缓存一年"—— 这个理由站不住：能不能长期缓存
+        # 由**服务端的响应头**决定（占位图发 `max-age=60`，真图才发 immutable），
+        # 与 URL 里有没有 `v` 无关。
+        #
+        # 而那个写法会造成**死锁**：
+        #   前端 `showImage = thumb_state === "ok" && !!thumb_v`，pending 的项
+        #   连 `<img>` 都不渲染 → 永远不会请求缩略图 URL → 而服务端恰恰是靠
+        #   "被请求"来按需生成的（`browse._serve_thumb` → `engine.ensure`）。
+        #   结果：后台队列被丢弃的那些项（`enqueue` 队列满时**刻意**丢弃，
+        #   不阻塞索引器）永远停在 pending，前端永远不请求 → 永久灰块。
+        #   唯一的出路是重扫，而重扫又会再次丢队列。
+        #
+        # 恒给值之后，pending 项也会发请求，服务端当场同步生成并返回真图
+        # （`_serve_thumb` 里引擎没生成出来时会退回 `_generate_sync`）。
+        "thumb_v": thumb_etag(320, row),
         "size": int(row["size"]),
         "thumb_state": state,
         "has_gps": bool(row["has_gps"]),
@@ -133,7 +147,9 @@ def row_to_detail(row: Any, *, prev_id: int | None = None,
         "gps": ({"lat": lat, "lon": lon} if lat is not None and lon is not None
                 else None),
         "thumb_state": row["thumb_state"],
-        "thumb_v": (thumb_etag(320, row) if row["thumb_state"] == "ok" else None),
+        # 与 row_to_item 同理：恒给值，否则 pending 的项在前端根本不发请求，
+        # 服务端就永远没机会按需生成（死锁）。详见 row_to_item 的注释。
+        "thumb_v": thumb_etag(320, row),
         "missing": bool(row["missing"]),
         "indexed_at": row["indexed_at"],
         "urls": {
