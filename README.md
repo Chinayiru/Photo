@@ -72,12 +72,12 @@
 
 ## 当前状态
 
-**已实现并跑通**（475 条自动化测试 + 真实库端到端冒烟 34 项全绿）：
+**一期已完成**（519 条自动化测试 + 真实库端到端冒烟 35 项全绿）：
 
 | 模块 | 状态 | 关键实测数据 |
 |---|---|---|
 | 路径沙箱（七步校验 + junction 防护） | ✅ | 56 条专项用例全过 |
-| 配置系统 | ✅ | 首次运行自动生成 `data/config.json` |
+| 配置系统 | ✅ | 首次运行自动生成 `data/config.json`；`--config` 会连数据目录一起跟着走 |
 | EXIF 提取 + 文件名日期回退 | ✅ | 真实库 4915 张：exif 4366 / filename 312 / mtime 237 |
 | 索引器（手写栈式遍历 + 批量 upsert） | ✅ | **4915 张 17.6 秒**（验收要求 ≤10 分钟）；重扫幂等 0.1 秒 |
 | 缩略图引擎（320/1600 两级、EXIF 转正） | ✅ | 平均 **7.5 KB**/张，最大 14.1 KB |
@@ -86,23 +86,40 @@
 | 归档（年/年-月布局 + 绝不覆盖） | ✅ | 12 线程同秒并发无丢失 |
 | 配对鉴权 + 设备撤销 + 审计日志 | ✅ | 48 条用例含并发抢码 |
 | 局域网 HTTP 服务 + 静态托管 | ✅ | 真起 uvicorn 的端到端 19 条 |
-| 手机端网页（Vue 3 + Vite + TS） | 🚧 构建中 | — |
-| 打包 exe + 系统托盘 + 开机自启 | ⬜ 未开始 | — |
-| 二期：云端中继 / 视频 / E2E | ⬜ 未开始 | — |
+| 手机端网页（Vue 3 + Vite + TS） | ✅ | dist 140 KB JS + 24 KB CSS（gzip 53 + 5 KB） |
+| 打包 exe + 系统托盘 + 开机自启 | ✅ | onedir 75 MB；真产物上验证端口占用提示与数据目录位置 |
+| 二期：云端中继 / 视频 / E2E | ⬜ 未开始 | 接口已留（`shared/protocol.py`） |
 
 分页翻完整个库：**10 页 4915 条无重复无遗漏，0.09 秒**。
+
+> 桌面端外壳（托盘 + 开机自启）只做 Windows。照片库本身与操作系统无关，
+> 但 `backend/app/autostart.py` 写的是 `HKCU\...\Run` 注册表键。
 
 ---
 
 ## 快速开始
 
-### 你需要准备
+### 方式一：直接用 exe（推荐给最终用户）
+
+从 [Releases](https://github.com/Chinayiru/Photo/releases) 下载 `PhotoBridge.zip`，
+解压到任意目录（**不要在 Program Files 或 U 盘里**，程序要在自己旁边写数据），双击 `PhotoBridge.exe`。
+
+- 右下角出现托盘图标，菜单里点**「显示配对二维码」**
+- 手机浏览器扫码（或手输 6 位配对码）即可
+- 首次运行会自动探测照片库；探测不到就打开菜单里的「打开设置」手动选
+
+程序的数据（索引库、缩略图缓存、日志）就在 exe 旁边的 `data/` 目录里。
+**整个文件夹就是全部状态**，备份或迁移直接复制它即可。
+
+### 方式二：从源码跑（开发用）
+
+#### 你需要准备
 
 1. 一台 Windows 电脑，装 **Python 3.11+**（[下载](https://www.python.org/downloads/)）
-2. 你的照片文件夹（本项目默认 `D:\Photos`，可在 `data/config.json` 改）
+2. 你的照片文件夹（首次运行会自动探测常见位置，探测不到可在 `data/config.json` 改）
 3. 手机和电脑连**同一个 Wi-Fi**
 
-### 跑起来
+#### 跑起来
 
 ```bash
 git clone https://github.com/Chinayiru/Photo.git
@@ -128,9 +145,22 @@ python -m venv .venv
 ```bash
 python -m backend.app.main --host 0.0.0.0 --port 8787   # 指定监听地址与端口
 python -m backend.app.main --rescan                     # 启动时强制重扫
-python -m backend.app.main --config D:\my.json          # 用别的配置文件
+python -m backend.app.main --config D:\my.json          # 用别的配置文件（数据目录也跟着走）
+python -m backend.app.main --no-tray                    # 前台运行，不要托盘图标
 python -m backend.app.main --version
 ```
+
+### 自己打包
+
+```bash
+.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+.venv/Scripts/python.exe -m PyInstaller packaging/photobridge.spec --noconfirm
+# 产物：dist/PhotoBridge/PhotoBridge.exe（约 75 MB，含 _internal/）
+.venv/Scripts/python.exe scripts/verify_exe.py          # 在真产物上验一遍
+```
+
+用 **onedir** 而不是 onefile：onefile 每次启动都要把整包解压到 `%TEMP%\_MEIxxxxxx`，
+启动慢 1~3 秒、杀毒软件反复扫描甚至拦截、强杀后残留几十 MB 垃圾。
 
 ---
 
@@ -179,12 +209,16 @@ python -m backend.app.main --version
 | **家庭宽带上行小** | 通常 30–50 Mbps，批量下载原图受限 | 局域网内网速通常 300–1000 Mbps，基本不是瓶颈 |
 | **一期没有视频** | 12 个 `.mov` + 3 个 `.mp4` 不索引 | 二期实现 |
 | **归档会改文件名** | 上传的照片按拍摄时间重命名为 `20240512_183000.jpg`（避免 iPhone 的 `IMG_1234` 大量重名） | 原文件名保留在上传记录与审计日志；搜索同时匹配目录名，你记得的"敦煌那张"仍然搜得到 |
+| **托盘/自启只做 Windows** | `HKCU\...\Run` 注册表键是 Windows 专有 | 照片库与 HTTP 服务本身跨平台，Linux 上可用 `--no-tray` 前台运行 |
 
 ---
 
 ## 关于你的照片库
 
-默认指向 `D:\Photos`，实测包含 **4952 个文件**：
+首次运行会**自动探测**常见位置（`D:\Photos`、`D:\Photos` 等两层以内），
+探测不到就留空让用户手动选 —— 程序**不会**去猜一个可能不存在的路径。
+
+开发机实测的照片库包含 **4952 个文件**：
 
 - 图片 4915 张：4789 `.jpg`、68 `.png`、49 `.jpeg`、7 `.webp`、2 `.gif`
 - **跳过 37 个**：12 `.mov` + 3 `.mp4`（视频，二期做）+ **22 `.jpg-lx2`**（小米相册回收站残留，不是真实图片）
@@ -214,15 +248,30 @@ python -m backend.app.main --version
 ```bash
 .venv/Scripts/python.exe -m pip install -r requirements-dev.txt
 
-# 单元 + 集成测试（约 25 秒）
+# 单元 + 集成测试（约 25 秒，519 条）
 .venv/Scripts/python.exe -m pytest backend/tests/
 
 # 路径沙箱专项（56 条）
 .venv/Scripts/python.exe scripts/check_sandbox.py
 
-# 真实库端到端冒烟（真起 uvicorn、真发请求、真扫 4915 张）
+# 真实库端到端冒烟（真起 uvicorn、真发请求、真扫 4915 张，35 项）
 .venv/Scripts/python.exe scripts/smoke_real.py
+
+# 打包产物验证（端口占用提示 + 数据目录位置）
+.venv/Scripts/python.exe scripts/verify_exe.py
+
+# 前端类型检查 + 构建
+cd frontend && npm run build
 ```
+
+### 维护脚本
+
+| 脚本 | 用途 |
+|---|---|
+| `scripts/repair_index.py` | 按**磁盘事实**修复 `missing` 标记（默认演练，`--apply` 才写库；写前自动备份） |
+| `scripts/clean_dev_artifacts.py` | 清掉开发期在真实数据里留下的测试设备/配对码/临时分片（**不动 media 表**） |
+| `scripts/check_docs.py` | 文档一致性（相对链接断链、未完成标记、需求编号覆盖） |
+| `scripts/check_frontend_api.py` | 后端路由 vs 前端引用对照 |
 
 `scripts/smoke_real.py` 是单测的假数据掩盖不了的一层 —— 它发现过两个只有真实照片才会暴露的 bug（73 个文件写着非法的 `Orientation=0` 会让整批 500 行写入失败；搜索命中不了目录名）。
 
