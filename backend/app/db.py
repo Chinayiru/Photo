@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
@@ -28,6 +29,8 @@ from typing import Any, Final
 
 from . import config as cfgmod
 from .errors import E3002, AppError
+
+log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # 建表脚本
@@ -180,7 +183,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
   device_name TEXT,
   client_id   TEXT,
   action      TEXT NOT NULL
-                CHECK (action IN ('upload','delete','move','rename','rescan','config')),
+                CHECK (action IN ('upload','delete','move','rename','rescan',
+                                  'config','pair','revoke','upload_reject')),
   rel_path    TEXT,
   detail      TEXT
 );
@@ -200,6 +204,32 @@ CREATE TABLE IF NOT EXISTS devices (
   created_at REAL,
   revoked    INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0,1))
 );
+
+-- ============================================================
+-- pair_codes：局域网配对码（一期）
+--
+-- 云端方案里这张表在云上；一期不走云，电脑端自己就是签发方，
+-- 因此码也必须存在电脑本地。
+--
+-- ⚠️ 只存 **code_hash** 而不是明文码：这台电脑的数据库会被
+-- 备份到网盘、被同步工具复制、被用户拷走排查问题。明文码在手，
+-- 任何人都能在 5 分钟有效期内换到一枚 90 天有效的 client_token。
+-- 6 位数字的熵很低（100 万种），但配合"5 分钟过期 + 错 5 次锁 10 分钟"
+-- 且只能从局域网发起，暴力枚举在时效内不可行。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS pair_codes (
+  code_hash   TEXT PRIMARY KEY,
+  device_id   TEXT NOT NULL,
+  device_name TEXT,
+  created_at  REAL NOT NULL,
+  expires_at  REAL NOT NULL,
+  tries       INTEGER NOT NULL DEFAULT 0,
+  locked_until REAL,
+  used_at     REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pair_codes_expires ON pair_codes(expires_at);
+CREATE INDEX IF NOT EXISTS idx_pair_codes_device  ON pair_codes(device_id, used_at);
 
 -- ============================================================
 -- albums / tags：一期建表不暴露接口，二期启用
@@ -307,10 +337,11 @@ class Database:
     # --- 初始化 -----------------------------------------------------------
 
     def init(self) -> None:
-        """建表 + 记录版本。幂等，启动时调用一次。"""
+        """建表 + 迁移 + 记录版本。幂等，启动时调用一次。"""
         with self._write_lock:
             conn = self.connect()
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             row = conn.execute(
                 "SELECT version FROM schema_version WHERE version = ?", (SCHEMA_VERSION,)
             ).fetchone()
@@ -321,6 +352,49 @@ class Database:
                     (SCHEMA_VERSION, time.time(), SCHEMA_NAME),
                 )
             self._initialized = True
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """就地迁移。
+
+        ⚠️ 这里处理的都是 `CREATE TABLE IF NOT EXISTS` **改不动**的东西。
+        表已存在时那条语句是空操作，所以后来新增的 CHECK 约束
+        （例如 audit_log 新增 'pair'/'revoke' 动作）对老库完全不生效 ——
+        用户升级后第一次配对就会 `CHECK constraint failed`，
+        而且是发生在"配对成功、写审计"那一刻，token 已经发出去了。
+
+        SQLite 不支持修改 CHECK，只能重建表。这张表只是索引
+        （主记录是 data/audit.log），所以搬数据没有丢失风险。
+        """
+        # --- audit_log：补齐 pair/revoke/upload_reject 动作 ---
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='audit_log'"
+        ).fetchone()
+        if row and row[0] and "'pair'" not in row[0]:
+            log.info("迁移 audit_log：新增 pair/revoke 动作")
+            conn.executescript(
+                "ALTER TABLE audit_log RENAME TO audit_log_old;"
+                "CREATE TABLE audit_log ("
+                "  id          INTEGER PRIMARY KEY,"
+                "  ts          REAL NOT NULL,"
+                "  device_name TEXT,"
+                "  client_id   TEXT,"
+                "  action      TEXT NOT NULL"
+                "                CHECK (action IN ('upload','delete','move','rename',"
+                "                                  'rescan','config','pair','revoke',"
+                "                                  'upload_reject')),"
+                "  rel_path    TEXT,"
+                "  detail      TEXT"
+                ");"
+                "INSERT INTO audit_log(id, ts, device_name, client_id, action,"
+                "                      rel_path, detail)"
+                "  SELECT id, ts, device_name, client_id, action, rel_path, detail"
+                "    FROM audit_log_old;"
+                "DROP TABLE audit_log_old;"
+                "CREATE INDEX IF NOT EXISTS idx_audit_ts     ON audit_log(ts DESC);"
+                "CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action, ts DESC);"
+                "CREATE INDEX IF NOT EXISTS idx_audit_path   ON audit_log(rel_path, ts DESC);"
+            )
 
     @property
     def initialized(self) -> bool:

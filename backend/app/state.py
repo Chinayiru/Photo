@@ -181,6 +181,27 @@ class AppState:
             return (320, 1600)
         return sizes or (320, 1600)
 
+    def cfg_server_ips(self) -> list[str]:
+        """本机可被手机访问的 IPv4 地址。
+
+        过滤掉了 Hyper-V/WSL/VMware 的虚拟网卡地址 —— 那些地址
+        （192.168.64.x、26.x 等）手机根本路由不到，把它们放进
+        二维码里会让用户扫了之后连不上，且完全看不出原因。
+        """
+        from .config import local_ipv4_addresses
+
+        try:
+            return local_ipv4_addresses()
+        except Exception as e:  # noqa: BLE001 —— 拿不到 IP 不该让配对 500
+            log.warning("获取本机 IP 失败：%s", e)
+            return []
+
+    def server_port(self) -> int:
+        try:
+            return int(self.cfg.get("server.port", 8787))
+        except (TypeError, ValueError):
+            return 8787
+
 
 def _default_device_name() -> str:
     try:
