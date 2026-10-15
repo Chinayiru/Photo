@@ -1,0 +1,441 @@
+"""缩略图引擎。
+
+缩略图是全系统**唯一的高 CPU 操作**，也是首屏体验的决定因素。三条设计红线：
+
+1. **永远不为了看一张图而解码原图**。两级尺寸（320 网格 / 1600 查看器）全部
+   预生成并落盘缓存，请求路径只做文件读取。
+2. **必须处理 EXIF Orientation**。手机竖拍的照片在 EXIF 里是横的，不转正
+   90% 的照片躺着显示。
+3. **必须限制并发**。4 核机器被 8 个 Pillow 任务打满后，隧道心跳会被饿死，
+   手机端表现为"图片转圈然后断线"。
+
+另有一个容易低估的风险：一张 100MP 照片解码后是 288MB RGB，4 个 worker
+同时处理就是 1.1GB，直接 OOM。见 `_open_downscaled` 的三层防护。
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Final, Iterable, Literal
+
+from PIL import Image
+
+from . import sandbox
+from .config import Config
+from .exif import _prepare_pillow
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .db import Database
+
+log = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------
+# 常量
+# --------------------------------------------------------------------------
+
+#: 两级尺寸。320 给网格，1600 给查看器。
+#: 1600 是权衡结果：再大在手机屏上无差别（手机宽约 1080 物理像素），
+#: 再小则双指放大后糊。设计文档 §5.1。
+THUMB_SIZES: Final[tuple[int, ...]] = (320, 1600)
+
+#: WebP 质量。78 是实测的拐点：再高体积线性涨而肉眼无差别。
+THUMB_QUALITY: Final[int] = 78
+
+#: 解码时先缩到这个尺寸以内，再精缩到目标尺寸。
+DRAFT_MAX: Final[int] = 2048
+
+#: 失败重试退避（秒）。3 次后标记 failed，不再自动重试。
+RETRY_BACKOFF: Final[tuple[float, ...]] = (5.0, 30.0, 300.0)
+
+#: Pillow 的 WEBP 编码 method。4 是速度/体积的平衡点；
+#: 6 能再省 5% 体积但慢一倍，对 4915 张的首次索引不划算。
+WEBP_METHOD: Final[int] = 4
+
+ThumbState = Literal["pending", "ok", "failed"]
+
+#: EXIF Orientation → Pillow 变换。
+#:
+#: ⚠️ 方向语义最容易搞反：Orientation=6 表示"需要顺时针转 90° 才正"，
+#: 而 Pillow 的 ROTATE_270 是逆时针 270°（等价于顺时针 90°）。
+#: 写成 ROTATE_90 会让竖拍照片转成倒的。
+#:
+#: 用 transpose 而非 rotate：transpose 是 90° 整数倍的无损像素重排，
+#: rotate 会插值并引入模糊。
+ORIENTATION_OPS: Final[dict[int, Image.Transpose]] = {
+    2: Image.Transpose.FLIP_LEFT_RIGHT,
+    3: Image.Transpose.ROTATE_180,
+    4: Image.Transpose.FLIP_TOP_BOTTOM,
+    5: Image.Transpose.TRANSPOSE,
+    6: Image.Transpose.ROTATE_270,   # ★ 手机竖拍最常见
+    7: Image.Transpose.TRANSVERSE,
+    8: Image.Transpose.ROTATE_90,
+}
+
+
+# --------------------------------------------------------------------------
+# 缓存路径
+# --------------------------------------------------------------------------
+
+def thumb_key(root_id: str, rel_path: str) -> str:
+    """缩略图缓存的稳定键。
+
+    ⚠️ 用 sha1(root_id + rel_path) 而不是直接用原路径，三个理由：
+      ① Windows 未开长路径时上限 260 字符，hash 后固定 40 字符，永不超限；
+      ② 避免中文/特殊字符在不同文件系统下的编码差异；
+      ③ 取前 2 位分目录，单目录文件数从 4900 降到约 76，NTFS 遍历更快。
+    代价是无法从缓存路径反推原图 —— 不需要，DB 里有映射。
+    """
+    return hashlib.sha1(f"{root_id}\x00{rel_path}".encode("utf-8")).hexdigest()
+
+
+def thumb_path(cfg: Config, root_id: str, rel_path: str, size: int) -> Path:
+    """缓存文件路径：data/thumbs/{root_id}/{hash 前 2 位}/{hash}_{size}.webp"""
+    h = thumb_key(root_id, rel_path)
+    return cfg.data_path("thumbs", root_id, h[:2], f"{h}_{size}.webp")
+
+
+def source_signature(mtime: float, size: int) -> str:
+    """源文件的"内容指纹"，用于缓存失效判断与 ETag。
+
+    ⚠️ 不用 sha256 全文件哈希：4915 张照片全量哈希要读几十 GB，首次索引
+    从 3 分钟变成 30 分钟，而 mtime+size 的组合在"用户手工替换了同名文件"
+    这个真实场景下已经足够（替换必然改 mtime）。
+    """
+    return f"{int(mtime)}-{size}"
+
+
+# --------------------------------------------------------------------------
+# 纯函数部分（可脱离 asyncio 测试）
+# --------------------------------------------------------------------------
+
+def _apply_orientation(im: Image.Image, orientation: int | None) -> Image.Image:
+    op = ORIENTATION_OPS.get(orientation or 1)
+    if op is not None:
+        im = im.transpose(op)
+    return im
+
+
+def _open_downscaled(path: str | Path, target: int) -> Image.Image:
+    """打开图片并尽量在解码阶段就缩小，控制峰值内存。
+
+    三层防护：
+      ① JPEG draft —— 让 libjpeg 直接按 1/2、1/4、1/8 输出，内存降到 1/64。
+         对 PNG/HEIC 无效（Pillow 自动忽略），所以还需要 ②③。
+      ② MAX_IMAGE_PIXELS —— 拒绝声明超大尺寸的恶意图（见 exif.py）。
+      ③ reduce() —— 先整数倍降采样再精缩，大倍率缩放的峰值内存与耗时都更低。
+    """
+    im = Image.open(path)
+    try:
+        if im.format == "JPEG":
+            im.draft("RGB", (DRAFT_MAX, DRAFT_MAX))
+        factor = max(1, min(im.width, im.height) // (target * 2))
+        if factor >= 2:
+            im = im.reduce(factor)
+    except Exception:  # noqa: BLE001 —— 优化失败不影响正确性，继续用原图
+        log.debug("downscale shortcut failed for %s", path, exc_info=True)
+    return im
+
+
+def generate_thumb(
+    src: str | Path,
+    dst: Path,
+    size: int,
+    *,
+    quality: int = THUMB_QUALITY,
+    orientation: int | None = None,
+) -> tuple[int, int]:
+    """同步生成一张缩略图并原子落盘。返回 (宽, 高)。
+
+    抛出的异常由调用方（ThumbEngine）决定是否重试。
+    """
+    _prepare_pillow()
+    with _open_downscaled(src, size) as im:
+        im = _apply_orientation(im, orientation)
+        if im.mode not in ("RGB", "RGBA"):
+            im = im.convert("RGB")
+        # thumbnail 保证等比且**不会放大**。resize 会把 200x200 的图
+        # 插值成 1600x1600 —— 浪费带宽且更糊。
+        im.thumbnail((size, size), Image.Resampling.LANCZOS)
+        w, h = im.size
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_name(dst.name + f".{os.getpid()}.tmp")
+        try:
+            # ⚠️ exif=b"" 是必须的。变换已经烘焙进像素了，若再把原图的
+            # Orientation 标签写进 WebP，浏览器会**再转一次**，照片就反了。
+            im.save(tmp, "WEBP", quality=quality, method=WEBP_METHOD, exif=b"")
+            os.replace(tmp, dst)          # 原子落盘，避免半截 WebP 被缓存
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+    return w, h
+
+
+def _generate_thumb_kw(
+    src: str, dst: Path, size: int, quality: int, orientation: int | None,
+) -> tuple[int, int]:
+    """run_in_executor 不接受关键字参数，用它把位置参数转成关键字参数。
+
+    直接 `functools.partial` 也行，但 partial 会在异常回溯里丢掉函数名，
+    排查缩略图失败时更难读。多一个两行的包装函数换取可读的回溯是值得的。
+    """
+    return generate_thumb(src, dst, size, quality=quality, orientation=orientation)
+
+
+# --------------------------------------------------------------------------
+# 引擎
+# --------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class ThumbJob:
+    media_id: int
+    attempts: int = 0
+
+
+class ThumbEngine:
+    """后台缩略图生成器。
+
+    设计取舍：**不用线程池直接跑，而是 asyncio 队列 + 信号量 + 线程池**。
+    队列让"索引进度"和"缩略图进度"解耦（索引器不必等缩略图），
+    信号量保证同时最多 `workers` 个 Pillow 任务在跑（不饿死心跳），
+    线程池让 Pillow 的阻塞调用不卡住事件循环。
+    """
+
+    def __init__(
+        self,
+        cfg: Config,
+        db: "Database",
+        *,
+        workers: int = 4,
+        queue_size: int = 2000,
+    ) -> None:
+        self.cfg = cfg
+        self.db = db
+        self.workers = max(1, workers)
+        self.queue: asyncio.Queue[ThumbJob] = asyncio.Queue(maxsize=queue_size)
+        self._pool = ThreadPoolExecutor(
+            max_workers=self.workers, thread_name_prefix="thumb")
+        self._sem = asyncio.Semaphore(self.workers)
+        self._tasks: list[asyncio.Task[None]] = []
+        self._running = False
+        #: 统计，供 /api/system/info 与托盘显示
+        self.done = 0
+        self.failed = 0
+        self.skipped = 0
+
+    # --- 生命周期 ---------------------------------------------------------
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        for i in range(self.workers):
+            self._tasks.append(asyncio.create_task(self._worker(i), name=f"thumb-{i}"))
+        log.info("thumb engine started: %d workers, sizes=%s", self.workers, THUMB_SIZES)
+
+    async def stop(self, *, drain: bool = False) -> None:
+        """停止引擎。
+
+        drain=True 时先把手头的队列跑完 —— 关机/退出时用，避免用户看到
+        "进度 95% 然后全没了"。托盘退出走这条路，超时由调用方控制。
+        """
+        if not self._running:
+            return
+        self._running = False
+        if drain:
+            await self.queue.join()
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+        self._pool.shutdown(wait=False, cancel_futures=True)
+        log.info("thumb engine stopped (done=%d failed=%d skipped=%d)",
+                 self.done, self.failed, self.skipped)
+
+    # --- 入队 -------------------------------------------------------------
+
+    def enqueue(self, media_id: int) -> bool:
+        """非阻塞入队。队列满时返回 False，由调用方决定丢弃还是等待。
+
+        首次索引 4915 张时会瞬间灌满队列。**丢弃是正确的**：缩略图是
+        惰性可补的，`thumb_state` 仍是 pending，下次扫描或用户点开时重入队。
+        阻塞索引器去等缩略图才是错的（会让首次索引从 3 分钟变 20 分钟）。
+        """
+        try:
+            self.queue.put_nowait(ThumbJob(media_id))
+            return True
+        except asyncio.QueueFull:
+            log.debug("thumb queue full, dropping media_id=%s", media_id)
+            return False
+
+    def enqueue_many(self, media_ids: Iterable[int]) -> int:
+        return sum(1 for mid in media_ids if self.enqueue(mid))
+
+    # --- worker -----------------------------------------------------------
+
+    async def _worker(self, idx: int) -> None:
+        while True:
+            job = await self.queue.get()
+            try:
+                # ★ 用返回值区分"真的生成了"与"跳过了"。只看"没抛异常"
+                # 会把 missing 与缓存命中也算成 done，统计里的进度条
+                # 会比实际生成数虚高，用户看到"100% 完成"却有图打不开。
+                if await self._generate_one(job.media_id):
+                    self.done += 1
+                else:
+                    self.skipped += 1
+            except asyncio.CancelledError:
+                self.queue.task_done()
+                raise
+            except Exception as e:  # noqa: BLE001 —— 一个坏文件不能拖垮 worker
+                await self._on_failure(job, e)
+            finally:
+                self.queue.task_done()
+
+    async def _generate_one(self, media_id: int) -> bool:
+        """生成一张图的所有尺寸。返回 True 表示真的做了工作，False 表示跳过。"""
+        row = self.db.query_one(
+            "SELECT id, root_id, rel_path, mtime, size, orientation,"
+            "       thumb_state, thumb_etag, missing"
+            "  FROM media WHERE id = ?",
+            (media_id,),
+        )
+        if row is None or row["missing"]:
+            return False
+
+        root = self.cfg.root_by_id(row["root_id"])
+        # ★ 过沙箱。缩略图读取也必须走唯一入口 —— 索引器写库时的路径
+        # 可能来自更早的配置，配置改了之后旧行仍然指向库外。
+        src = sandbox.resolve(root, row["rel_path"], "read", cfg=self.cfg)
+
+        sig = source_signature(row["mtime"], row["size"])
+        if row["thumb_state"] == "ok" and row["thumb_etag"] == sig:
+            # 全部尺寸都已生成且源文件未变
+            if all(thumb_path(self.cfg, row["root_id"], row["rel_path"], s).exists()
+                   for s in THUMB_SIZES):
+                return False
+
+        loop = asyncio.get_running_loop()
+        async with self._sem:
+            for size in THUMB_SIZES:
+                dst = thumb_path(self.cfg, row["root_id"], row["rel_path"], size)
+                if dst.exists() and row["thumb_etag"] == sig:
+                    continue
+                await loop.run_in_executor(
+                    self._pool, _generate_thumb_kw,
+                    str(src), dst, size, THUMB_QUALITY, row["orientation"],
+                )
+        self._set_state(media_id, "ok", sig)
+        return True
+
+    async def _on_failure(self, job: ThumbJob, exc: Exception) -> None:
+        job.attempts += 1
+        if job.attempts >= len(RETRY_BACKOFF) + 1:
+            self._set_state(job.media_id, "failed", None)
+            self.failed += 1
+            log.warning("thumb permanently failed media_id=%s: %s", job.media_id, exc)
+            return
+        delay = RETRY_BACKOFF[job.attempts - 1]
+        log.info("thumb retry %d/%d media_id=%s in %.0fs",
+                 job.attempts, len(RETRY_BACKOFF), job.media_id, delay)
+        loop = asyncio.get_running_loop()
+        loop.call_later(delay, self._requeue, job)
+
+    def _requeue(self, job: ThumbJob) -> None:
+        """重试入队。队列满时放弃 —— 状态仍是 pending，下次扫描会再试。"""
+        if not self._running:
+            return
+        try:
+            self.queue.put_nowait(job)
+        except asyncio.QueueFull:
+            log.debug("retry dropped (queue full) media_id=%s", job.media_id)
+
+    def _set_state(self, media_id: int, state: ThumbState, etag: str | None) -> None:
+        try:
+            self.db.execute(
+                "UPDATE media SET thumb_state = ?, thumb_etag = ? WHERE id = ?",
+                (state, etag, media_id),
+            )
+        except Exception:  # noqa: BLE001 —— 写状态失败不该中断生成
+            log.warning("failed to persist thumb_state media_id=%s", media_id,
+                        exc_info=True)
+
+    # --- 对外查询 ---------------------------------------------------------
+
+    def pending_count(self) -> int:
+        return int(self.db.scalar(
+            "SELECT COUNT(*) FROM media WHERE thumb_state = 'pending' AND missing = 0",
+            default=0) or 0)
+
+    def failed_count(self) -> int:
+        return int(self.db.scalar(
+            "SELECT COUNT(*) FROM media WHERE thumb_state = 'failed' AND missing = 0",
+            default=0) or 0)
+
+    def queue_depth(self) -> int:
+        return self.queue.qsize()
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "done": self.done,
+            "failed": self.failed,
+            "skipped": self.skipped,
+            "queued": self.queue_depth(),
+            "pending": self.pending_count(),
+            "failed_total": self.failed_count(),
+            "workers": self.workers,
+        }
+
+    def reset_failed(self) -> int:
+        """把 failed 重置为 pending，供托盘"重试失败的缩略图"。"""
+        n = self.db.execute_rowcount(
+            "UPDATE media SET thumb_state = 'pending' WHERE thumb_state = 'failed'"
+        )
+        self.failed = 0
+        return n
+
+
+# --------------------------------------------------------------------------
+# 占位图（thumb_state='failed' 时返回，避免时间线出现破图）
+# --------------------------------------------------------------------------
+
+_PLACEHOLDER_CACHE: dict[int, bytes] = {}
+
+
+def placeholder_webp(size: int) -> bytes:
+    """生成灰色占位图。返回 WebP 字节。
+
+    为什么返回占位图而不是 404/500：时间线上一个破图会让用户以为
+    "照片丢了"，而实际只是缩略图没生成出来。占位图 + 可点击重试更好。
+    """
+    if size in _PLACEHOLDER_CACHE:
+        return _PLACEHOLDER_CACHE[size]
+    import io
+
+    im = Image.new("RGB", (size, size), (58, 58, 62))
+    buf = io.BytesIO()
+    im.save(buf, "WEBP", quality=60, method=2)
+    data = buf.getvalue()
+    _PLACEHOLDER_CACHE[size] = data
+    return data
+
+
+__all__ = [
+    "DRAFT_MAX",
+    "ORIENTATION_OPS",
+    "RETRY_BACKOFF",
+    "THUMB_QUALITY",
+    "THUMB_SIZES",
+    "ThumbEngine",
+    "ThumbJob",
+    "generate_thumb",
+    "placeholder_webp",
+    "source_signature",
+    "thumb_key",
+    "thumb_path",
+]
