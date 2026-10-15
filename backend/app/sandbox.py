@@ -167,6 +167,49 @@ def _steps_1_to_3(rel_path: str) -> tuple[str, list[str]]:
     return joined, parts
 
 
+def _strip_win_prefix(path: str) -> str:
+    """剥掉 realpath 可能带上的 Windows 扩展长度前缀。
+
+    ★ 这里修的是一个**只在并发下出现、且会拒绝合法请求**的 Windows 坑。
+
+    `os.path.realpath()` 在 Windows 上调用 `nt._getfinalpathname()`，
+    它返回两种形态的路径：
+
+      * `C:\\Users\\...\\lib\\a.jpg`        （普通）
+      * `\\\\?\\C:\\Users\\...\\lib\\a.jpg`  （扩展长度前缀）
+
+    哪种形态取决于系统当时的内部状态 —— 实测同一进程内并发调用时
+    **同一个路径会随机返回两者之一**，且删除挂起的文件还会返回
+    `\\\\?\\C:\\$Extend\\$Deleted\\...`。而 `os.path.commonpath` 见到
+    `\\\\?\\c:\\...` 会把它当成 UNC（服务器名是 `?`），于是判为
+    "different drive" 并抛 ValueError。
+
+    后果：两台手机同时上传照片时，**有一半请求被沙箱拒绝**，
+    而照片本身完全合法。更糟的是错误文案（"不在同一磁盘分区"）
+    会把人引向磁盘分区去排查，与真实原因毫无关系。
+
+    前缀剥离是无损的：`\\\\?\\C:\\x` 与 `C:\\x` 指同一个文件。
+    """
+    p = path
+    if p.startswith("\\\\?\\"):
+        p = p[4:]
+        # `\\?\UNC\server\share` 剥掉前缀后要补回前导 `\\`
+        if p[:4].upper() == "UNC\\":
+            p = "\\\\" + p[4:]
+    elif p.startswith("\\\\.\\"):
+        p = p[4:]
+    return p
+
+
+def _norm_final(path: str) -> str:
+    """可比较形式：剥前缀 + normcase。
+
+    normcase 单独用在**比较**上（Windows 大小写不敏感），
+    不能用在返回值上 —— 会把真实磁盘上的大小写抹掉。
+    """
+    return os.path.normcase(_strip_win_prefix(path))
+
+
 def _real_root(root: RootConfig) -> Path:
     """步 4 的基准：realpath(root)。
 
@@ -174,7 +217,7 @@ def _real_root(root: RootConfig) -> Path:
     放在一个指向别处的联接目录上）。不先解引用，后续的"逐段检查"会把
     第一段之外的所有路径都算在错误的基准上。
     """
-    return Path(os.path.realpath(str(root.path)))
+    return Path(_strip_win_prefix(os.path.realpath(str(root.path))))
 
 
 def _step_5_reparse(real_root: Path, parts: list[str]) -> None:
@@ -223,9 +266,15 @@ def _step_6_assert_inside(real_root: Path, norm: str) -> Path:
         `D:\\photos2` 判为 `D:\\photos` 的子路径。
     """
     candidate = real_root / norm
-    p = Path(os.path.realpath(str(candidate)))
-    a = os.path.normcase(str(real_root))
-    b = os.path.normcase(str(p))
+    raw_final = os.path.realpath(str(candidate))
+    if "$Extend" in raw_final or "$Deleted" in raw_final:
+        # 删除挂起：文件正在被删除，Windows 把它解析到 NTFS 的暂存目录。
+        # 这不是越界，而是"这个文件马上就要没了"。给出明确的规则名，
+        # 免得它被当成路径穿越写进审计日志。
+        raise _Reject("file_being_deleted", norm) from None
+    p = Path(_strip_win_prefix(raw_final))
+    a = _norm_final(str(real_root))
+    b = _norm_final(str(p))
     if a == b:
         return p                          # 恰好等于根（如 rel_path 指向根本身）
     try:
