@@ -114,6 +114,12 @@ DEFAULT_CONFIG: Final[dict[str, Any]] = {
         "max_file_mb": 2048,        # 单文件上限 2 GB（设计文档 §1.3）
         "session_ttl_hours": 24,
         "dedup": True,              # sha256 秒传与去重
+        # 一期只收图片。**必须在这里显式列出**而不是让上传接口
+        # 只看"扩展名在不在索引白名单里"：两者将来会分叉 ——
+        # 二期索引要认识视频（能列出来、能播缩略图），
+        # 但一期不接受视频上传。混用一个集合时，某天打开视频索引
+        # 就顺带打开了视频上传，而存储与转码都还没准备好。
+        "allowed_exts": sorted(ALLOWED_IMAGE_EXTS),
     },
     "thumbs": {
         "sizes": [320, 1600],
