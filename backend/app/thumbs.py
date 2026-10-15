@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -105,8 +106,15 @@ def source_signature(mtime: float, size: int) -> str:
     ⚠️ 不用 sha256 全文件哈希：4915 张照片全量哈希要读几十 GB，首次索引
     从 3 分钟变成 30 分钟，而 mtime+size 的组合在"用户手工替换了同名文件"
     这个真实场景下已经足够（替换必然改 mtime）。
+
+    ⚠️ 精度用**微秒**而不是整秒。整秒会漏掉真实场景：用户在文件管理器里
+    复制一张同名照片覆盖原图，两个文件的 mtime 很可能落在**同一秒**内，
+    于是签名不变 → 手机缓存一年且不再校验 → 用户永远看旧图。
+    微秒是 NTFS 时间戳的实际分辨率（100ns），仍比 sha256 便宜几个数量级。
+    浮点安全性：mtime≈1.7e9 秒 × 1e6 ≈ 1.7e15，远在 float64 精确整数
+    范围（2^53≈9e15）之内，不会丢精度。
     """
-    return f"{int(mtime)}-{size}"
+    return f"{int(mtime * 1_000_000)}-{size}"
 
 
 # --------------------------------------------------------------------------
@@ -164,7 +172,12 @@ def generate_thumb(
         w, h = im.size
 
         dst.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dst.with_name(dst.name + f".{os.getpid()}.tmp")
+        # ⚠️ 临时名必须**进程内也唯一**：只用 pid 的话，同一进程里两个协程
+        # 同时为同一张图生成缩略图（索引器后台入队 + 用户点开触发按需生成，
+        # 这是最常见的并发场景）会写到同一个 .tmp 路径上，互相截断，
+        # 最后 os.replace 出去的可能是一张半截图 —— 而且它会被当作成功结果
+        # 写进 thumb_state='ok'，之后永远不再重新生成。
+        tmp = dst.with_name(f"{dst.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
         try:
             # ⚠️ exif=b"" 是必须的。变换已经烘焙进像素了，若再把原图的
             # Orientation 标签写进 WebP，浏览器会**再转一次**，照片就反了。
@@ -298,7 +311,21 @@ class ThumbEngine:
                 self.queue.task_done()
 
     async def _generate_one(self, media_id: int) -> bool:
-        """生成一张图的所有尺寸。返回 True 表示真的做了工作，False 表示跳过。"""
+        """生成一张图的所有尺寸。返回 True 表示真的做了工作，False 表示跳过。
+
+        ★ 新鲜度判定只看**磁盘**：源文件与缓存文件各自的 mtime，
+        完全不依赖 media 表的 `thumb_etag`。
+
+        为什么不能用 DB 的 etag 做判定：DB 的 mtime/size 由索引器写入，
+        而用户可以在"程序没跑"或"两次扫描之间"替换照片。这期间
+        `thumb_etag == sig`（两边都是旧值）会成立，于是每一张旧缓存
+        都被当成新鲜的跳过，最后 `_set_state(ok, 旧sig)` 把 DB 也
+        标记成"已生成" —— 用户永远看到旧图，而且重扫也修不好，
+        因为重扫前 etag 已经等于 sig 了。
+
+        改用"缓存文件是否比源文件新"之后，这条路径自带自愈能力：
+        任何一次替换都会被下一次请求/重扫发现，不需要 DB 参与。
+        """
         row = self.db.query_one(
             "SELECT id, root_id, rel_path, mtime, size, orientation,"
             "       thumb_state, thumb_etag, missing"
@@ -313,24 +340,34 @@ class ThumbEngine:
         # 可能来自更早的配置，配置改了之后旧行仍然指向库外。
         src = sandbox.resolve(root, row["rel_path"], "read", cfg=self.cfg)
 
-        sig = source_signature(row["mtime"], row["size"])
-        if row["thumb_state"] == "ok" and row["thumb_etag"] == sig:
-            # 全部尺寸都已生成且源文件未变
-            if all(thumb_path(self.cfg, row["root_id"], row["rel_path"], s).exists()
-                   for s in THUMB_SIZES):
+        try:
+            src_mtime = src.stat().st_mtime
+        except OSError:
+            return False
+
+        paths = {s: thumb_path(self.cfg, row["root_id"], row["rel_path"], s)
+                 for s in THUMB_SIZES}
+
+        def _fresh(p: Path) -> bool:
+            """缓存文件存在且不比源文件旧。"""
+            try:
+                return p.stat().st_mtime >= src_mtime
+            except OSError:
                 return False
+
+        if all(_fresh(p) for p in paths.values()):
+            return False
 
         loop = asyncio.get_running_loop()
         async with self._sem:
-            for size in THUMB_SIZES:
-                dst = thumb_path(self.cfg, row["root_id"], row["rel_path"], size)
-                if dst.exists() and row["thumb_etag"] == sig:
+            for size, dst in paths.items():
+                if _fresh(dst):
                     continue
                 await loop.run_in_executor(
                     self._pool, _generate_thumb_kw,
                     str(src), dst, size, THUMB_QUALITY, row["orientation"],
                 )
-        self._set_state(media_id, "ok", sig)
+        self._set_state(media_id, "ok", source_signature(src_mtime, row["size"]))
         return True
 
     async def _on_failure(self, job: ThumbJob, exc: Exception) -> None:
@@ -366,6 +403,15 @@ class ThumbEngine:
                         exc_info=True)
 
     # --- 对外查询 ---------------------------------------------------------
+
+    async def ensure(self, media_id: int) -> bool:
+        """按需生成（handler 调用）。返回 True 表示真的生成了。
+
+        与后台 worker 共用同一条 `_generate_one` 路径和同一个信号量：
+        走独立实现的话，两处对"什么算已生成"的判断迟早会不一致，
+        表现为"后台说已完成、点开却 404"。
+        """
+        return await self._generate_one(media_id)
 
     def pending_count(self) -> int:
         return int(self.db.scalar(

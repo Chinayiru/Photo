@@ -148,6 +148,12 @@ class Ctx:
     started_at: float = field(default_factory=time.time)
     params: dict[str, str] = field(default_factory=dict)
     state: dict[str, Any] = field(default_factory=dict)
+    #: 应用级依赖（cfg/db/thumbs/indexer 的容器，类型是 app.state.AppState）。
+    #: 放在 Ctx 上而不是让处理函数 `from ..state import get_state`：
+    #: 后者会让处理函数隐式依赖进程级单例，测试无法注入临时库，
+    #: 且二期云端派发时"同一个进程里两个不同配置"就再也做不到了。
+    #: 这里用 Any 是为了保持 core 层不依赖上层（core 必须能被云端复用）。
+    app: Any = None
 
     def __post_init__(self) -> None:
         """把构造时传入的普通 dict 提升为大小写不敏感的 Headers。

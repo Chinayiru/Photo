@@ -198,13 +198,18 @@ class ConfigError(Exception):
 class Config:
     """配置对象。不可变语义：改配置请改 raw 后 save()。"""
 
-    __slots__ = ("_raw", "_path", "_roots", "_secrets")
+    __slots__ = ("_raw", "_path", "_roots", "_secrets", "_data_dir")
 
-    def __init__(self, raw: dict[str, Any], path: Path = CONFIG_PATH) -> None:
+    def __init__(self, raw: dict[str, Any], path: Path = CONFIG_PATH,
+                 *, data_dir: Path | None = None) -> None:
         self._raw = _merge(DEFAULT_CONFIG, raw)
         self._path = path
         self._roots: list[RootConfig] | None = None
         self._secrets: dict[str, Any] | None = None
+        # data_dir 可覆盖：测试必须能把缩略图/审计日志写到 tmp_path，
+        # 否则跑一次测试就会往真实 data/ 目录里留垃圾，
+        # 更糟的是会**覆盖真实库里已有的缩略图缓存**。
+        self._data_dir = Path(data_dir) if data_dir is not None else DATA_DIR
 
     # --- 分节访问 ---------------------------------------------------------
 
@@ -288,23 +293,27 @@ class Config:
 
     # --- data 目录 --------------------------------------------------------
 
+    @property
+    def data_dir(self) -> Path:
+        return self._data_dir
+
     def data_path(self, *parts: str) -> Path:
-        return DATA_DIR.joinpath(*parts)
+        return self._data_dir.joinpath(*parts)
 
     def thumbs_dir(self, size: int) -> Path:
-        return DATA_DIR / "thumbs" / str(size)
+        return self._data_dir / "thumbs" / str(size)
 
     @property
     def db_path(self) -> Path:
-        return DATA_DIR / "photobridge.db"
+        return self._data_dir / "photobridge.db"
 
     @property
     def audit_log_path(self) -> Path:
-        return DATA_DIR / "audit.log"
+        return self._data_dir / "audit.log"
 
     @property
     def logs_dir(self) -> Path:
-        return DATA_DIR / "logs"
+        return self._data_dir / "logs"
 
     # --- secrets（令牌） --------------------------------------------------
 
@@ -312,7 +321,7 @@ class Config:
     def secrets(self) -> dict[str, Any]:
         """惰性读取 data/secrets.json。文件不存在时返回空 dict（首次运行）。"""
         if self._secrets is None:
-            self._secrets = _read_json(SECRETS_PATH) or {}
+            self._secrets = _read_json(self._data_dir / "secrets.json") or {}
         return self._secrets
 
     def secret(self, key: str, default: str | None = None) -> str | None:
@@ -321,7 +330,7 @@ class Config:
 
     def set_secret(self, key: str, value: str) -> None:
         self.secrets[key] = value
-        _write_json(SECRETS_PATH, self.secrets, private=True)
+        _write_json(self._data_dir / "secrets.json", self.secrets, private=True)
 
     # --- 持久化 -----------------------------------------------------------
 
@@ -476,7 +485,7 @@ def get() -> Config:
 def ensure_dirs(cfg: Config | None = None) -> None:
     """创建运行所需目录。幂等，启动时调用一次。"""
     c = cfg or load()
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    c.data_dir.mkdir(parents=True, exist_ok=True)
     c.logs_dir.mkdir(parents=True, exist_ok=True)
     for size in c.thumbs["sizes"]:
         c.thumbs_dir(int(size)).mkdir(parents=True, exist_ok=True)

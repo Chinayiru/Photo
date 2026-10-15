@@ -141,9 +141,24 @@ def test_thumb_path_layout(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_source_signature_changes_with_mtime_and_size() -> None:
-    assert source_signature(100.9, 5) == source_signature(100.1, 5)  # 秒级足够
     assert source_signature(100.0, 5) != source_signature(101.0, 5)
     assert source_signature(100.0, 5) != source_signature(100.0, 6)
+
+
+def test_source_signature_has_sub_second_resolution() -> None:
+    """微秒精度是必需的，不是锦上添花。
+
+    用户在文件管理器里复制一张同名照片覆盖原图时，新旧 mtime 很容易
+    落在同一秒内。若签名只到整秒，两者相等 → ETag 不变 → 缩略图 URL
+    带 immutable 缓存一年且不再校验 → 用户**永远**看到旧图。
+    """
+    assert source_signature(100.001, 5) != source_signature(100.900, 5)
+    assert source_signature(100.0001, 5) != source_signature(100.0009, 5)
+    # 真实 mtime 量级下不丢精度（float64 精确整数上限 2^53≈9e15）
+    assert source_signature(1_700_000_000.123456, 5) != \
+        source_signature(1_700_000_000.123457, 5)
+    # 亚微秒差异视为相同（NTFS 分辨率 100ns，不会误判）
+    assert source_signature(100.0000001, 5) == source_signature(100.0000002, 5)
 
 
 # --------------------------------------------------------------------------
