@@ -645,10 +645,16 @@ def complete_session(
         }
 
     # --- 归档 ---
+    # ⚠️ 归档目录由**照片自己的 EXIF 拍摄时间**决定，不是上传时间。
+    # 手机相册里翻出一张 2019 年的老照片补传，它应该落进 2019 年目录；
+    # 用上传时间会让整个库的年份结构变成"什么时候传的"，与照片内容
+    # 完全脱节，用户按年份找照片时永远找不到。
     when = taken_at or sess["taken_at"]
     if when is None:
-        # 没有 EXIF 可用时的兜底：用文件自身的 mtime（临时文件是刚
-        # 写出来的，mtime 就是"现在"，至少能落进正确的月份）。
+        # init 时客户端没带 declared_taken_at：自己从临时文件读 EXIF。
+        when = _read_taken_at(temp, sess["declared_name"])
+    if when is None:
+        # 连 EXIF 都没有（截图、社交软件导出的图）才退回 mtime。
         try:
             when = os.path.getmtime(temp)
         except OSError:
@@ -670,6 +676,20 @@ def complete_session(
             # 报错会让用户重传几百 MB，而照片其实就在库里，
             # 下次全量扫描一定会收录它。
             log.exception("上传后索引失败，等待下次扫描：%s", rel_path)
+
+    # 把刚算出来的 sha256 写进 media 行。
+    #
+    # 这一步是**秒传能生效的前提**：索引器的 hash_on_index 默认关闭
+    # （对 4915 张已有照片全量哈希会把首次索引从 20 秒拖到十几分钟），
+    # 所以扫描出来的行 sha256 全是 NULL。而上传路径本来就必须算一次
+    # 哈希来校验完整性 —— 白算的哈希顺手存下来，下次同一张照片再传
+    # 就能命中秒传。不存的话"重复上传同一张照片"永远走完整流程，
+    # 而这正是用户最常做的事（换手机重装 App、相册全量同步）。
+    if media_id is not None and digest:
+        try:
+            db.execute("UPDATE media SET sha256 = ? WHERE id = ?", (digest, media_id))
+        except Exception:      # noqa: BLE001
+            log.debug("回写 sha256 失败：%s", rel_path, exc_info=True)
 
     db.execute(
         "UPDATE upload_sessions SET status = 'completed', received = total_size, "
@@ -693,9 +713,31 @@ def complete_session(
     }
 
 
+def _read_taken_at(path: Path, file_name: str) -> float | None:
+    """从临时文件里读拍摄时间，读不到返回 None。
+
+    优先级与索引器完全一致（EXIF → 文件名 → 交给调用方用 mtime 兜底），
+    这样"上传归档"与"全量扫描"对同一张照片算出同一个时间。
+    两边不一致时，用户会看到照片在时间线上的位置和它所在的目录对不上。
+
+    这里**只读 EXIF 头**（不 decode 像素），一张 20MB 的 HEIC 约 30ms，
+    比走一遍 Pillow 完整解码快两个数量级。
+    """
+    from . import exif as exif_mod
+
+    try:
+        info = exif_mod.extract_sync(path)
+    except Exception:      # noqa: BLE001
+        log.debug("读 EXIF 失败，退回 mtime：%s", path, exc_info=True)
+        return None
+    ts, src = exif_mod.resolve_taken_at(info, file_name, os.path.getmtime(path))
+    # resolve_taken_at 的 mtime 兜底值不算"读到了拍摄时间" —— 那是
+    # 调用方自己也会做的事，返回 None 让调用链只有一处 mtime 逻辑。
+    return ts if src != "mtime" else None
+
+
 def _place_sync(
-    temp: Path, root: RootConfig, cfg: Config, when: float, name: str, subdir: str | None
-) -> tuple[str, Path]:
+    temp: Path, root: RootConfig, cfg: Config, when: float, name: str, subdir: str | None) -> tuple[str, Path]:
     """归档（同步）。在 executor 里跑，避免阻塞事件循环。"""
     ext = archive.normalize_ext(os.path.splitext(name)[1])
     return asyncio_run_sync(archive.place(temp, root, when, ext, subdir=subdir, cfg=cfg))

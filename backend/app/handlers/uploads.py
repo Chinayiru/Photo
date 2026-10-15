@@ -114,10 +114,12 @@ async def patch_upload(ctx: Ctx) -> Reply:
     limit = int(sess["chunk_size"]) + 1024
     data = await ctx.body_bytes(limit=limit)
 
-    with uploads.session_lock(uid):
-        result = uploads.append_chunk(
-            st.db, st.cfg, uid, start=start, end=end, total=total, data=data
-        )
+    # ⚠️ 不要在 handler 里再取一次 session_lock：append_chunk 内部已经
+    # 加了同一把锁，而 threading.Lock **不可重入** —— 重复获取会自我死锁，
+    # 表现为 PATCH 永远不返回（客户端超时），且服务端没有任何异常日志。
+    result = uploads.append_chunk(
+        st.db, st.cfg, uid, start=start, end=end, total=total, data=data
+    )
 
     return json_reply(result, 206)
 

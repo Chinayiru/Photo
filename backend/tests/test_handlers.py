@@ -83,10 +83,10 @@ def _router() -> Router:
         ("GET", "/api/system/info", system.info),
         ("GET", "/api/system/stats", system.stats),
         ("GET", "/api/timeline", browse.timeline),
-        ("GET", "/api/items/{id}", browse.get_item),
-        ("GET", "/api/items/{id}/thumb", browse.get_thumb),
-        ("GET", "/api/items/{id}/preview", browse.get_preview),
-        ("GET", "/api/items/{id}/raw", browse.get_raw),
+        ("GET", "/api/items/{media_id}", browse.get_item),
+        ("GET", "/api/items/{media_id}/thumb", browse.get_thumb),
+        ("GET", "/api/items/{media_id}/preview", browse.get_preview),
+        ("GET", "/api/items/{media_id}/raw", browse.get_raw),
         ("GET", "/api/folders", browse.folders),
         ("GET", "/api/search", browse.search),
         ("POST", "/api/items/delete", browse.delete_items),
@@ -337,7 +337,7 @@ def test_get_item_returns_full_detail(tmp_path, library) -> None:
     st = _state(tmp_path, library)
     ids = _seed(st, library)
     b = _json(_call(st, "GET", f"/api/items/{ids[0]}",
-                    params={"id": str(ids[0])}))
+                    params={"media_id": str(ids[0])}))
     assert b["id"] == ids[0]
     assert set(b["exif"]) == {"camera", "lens", "iso", "fnum", "exposure", "focal"}
     assert "thumb" in b["urls"] and "raw" in b["urls"]
@@ -349,15 +349,15 @@ def test_get_item_prev_next_are_consistent(tmp_path, library) -> None:
     st = _state(tmp_path, library)
     ids = _seed(st, library)            # 已按 taken_at DESC 排列
 
-    first = _json(_call(st, "GET", f"/api/items/{ids[0]}", params={"id": str(ids[0])}))
+    first = _json(_call(st, "GET", f"/api/items/{ids[0]}", params={"media_id": str(ids[0])}))
     assert first["prev_id"] is None
     assert first["next_id"] == ids[1]
 
-    second = _json(_call(st, "GET", f"/api/items/{ids[1]}", params={"id": str(ids[1])}))
+    second = _json(_call(st, "GET", f"/api/items/{ids[1]}", params={"media_id": str(ids[1])}))
     assert second["prev_id"] == ids[0]
     assert second["next_id"] == ids[2]
 
-    last = _json(_call(st, "GET", f"/api/items/{ids[-1]}", params={"id": str(ids[-1])}))
+    last = _json(_call(st, "GET", f"/api/items/{ids[-1]}", params={"media_id": str(ids[-1])}))
     assert last["next_id"] is None
     assert last["prev_id"] == ids[-2]
 
@@ -370,7 +370,7 @@ def test_get_item_taken_at_iso_has_timezone_offset(tmp_path, library) -> None:
     """
     st = _state(tmp_path, library)
     ids = _seed(st, library)
-    b = _json(_call(st, "GET", f"/api/items/{ids[0]}", params={"id": str(ids[0])}))
+    b = _json(_call(st, "GET", f"/api/items/{ids[0]}", params={"media_id": str(ids[0])}))
     iso = b["taken_at_iso"]
     assert iso
     assert ("+" in iso[10:] or "-" in iso[10:] or iso.endswith("Z")), iso
@@ -378,7 +378,7 @@ def test_get_item_taken_at_iso_has_timezone_offset(tmp_path, library) -> None:
 
 def test_get_item_missing_id_is_404(tmp_path, library) -> None:
     st = _state(tmp_path, library)
-    r = _call(st, "GET", "/api/items/99999", params={"id": "99999"})
+    r = _call(st, "GET", "/api/items/99999", params={"media_id": "99999"})
     assert r.status == 404
     assert _json(r)["error"]["code"] == "E1004"
 
@@ -391,7 +391,7 @@ def test_thumb_generates_and_sets_immutable_cache(tmp_path, library) -> None:
     st = _state(tmp_path, library)
     ids = _seed(st, library)
     r = _call(st, "GET", f"/api/items/{ids[0]}/thumb",
-              query={"size": "320"}, params={"id": str(ids[0])})
+              query={"size": "320"}, params={"media_id": str(ids[0])})
     assert r.status == 200
     assert r.headers["Content-Type"] == "image/webp"
     assert "immutable" in r.headers["Cache-Control"]
@@ -405,10 +405,10 @@ def test_thumb_etag_304_on_second_request(tmp_path, library) -> None:
     st = _state(tmp_path, library)
     ids = _seed(st, library)
     r1 = _call(st, "GET", f"/api/items/{ids[0]}/thumb",
-               query={"size": "320"}, params={"id": str(ids[0])})
+               query={"size": "320"}, params={"media_id": str(ids[0])})
     etag = r1.headers["ETag"]
     r2 = _call(st, "GET", f"/api/items/{ids[0]}/thumb", query={"size": "320"},
-               headers={"If-None-Match": etag}, params={"id": str(ids[0])})
+               headers={"If-None-Match": etag}, params={"media_id": str(ids[0])})
     assert r2.status == 304
     assert _body(r2) == b""
 
@@ -418,11 +418,11 @@ def test_weak_etag_also_matches(tmp_path, library) -> None:
     st = _state(tmp_path, library)
     ids = _seed(st, library)
     r1 = _call(st, "GET", f"/api/items/{ids[0]}/thumb",
-               query={"size": "320"}, params={"id": str(ids[0])})
+               query={"size": "320"}, params={"media_id": str(ids[0])})
     etag = r1.headers["ETag"]
     r2 = _call(st, "GET", f"/api/items/{ids[0]}/thumb", query={"size": "320"},
                headers={"If-None-Match": "W/" + etag},
-               params={"id": str(ids[0])})
+               params={"media_id": str(ids[0])})
     assert r2.status == 304
 
 
@@ -434,7 +434,7 @@ def test_thumb_size_not_in_config_is_400(tmp_path, library) -> None:
     st = _state(tmp_path, library)
     ids = _seed(st, library)
     r = _call(st, "GET", f"/api/items/{ids[0]}/thumb",
-              query={"size": "999"}, params={"id": str(ids[0])})
+              query={"size": "999"}, params={"media_id": str(ids[0])})
     assert r.status == 400
 
 
@@ -448,7 +448,7 @@ def test_thumb_etag_changes_when_source_changes(tmp_path, library) -> None:
     ids = _seed(st, library)
     mid = ids[0]
     r1 = _call(st, "GET", f"/api/items/{mid}/thumb",
-               query={"size": "320"}, params={"id": str(mid)})
+               query={"size": "320"}, params={"media_id": str(mid)})
     etag1 = r1.headers["ETag"]
 
     row = st.db.query_one("SELECT root_id, rel_path FROM media WHERE id=?", (mid,))
@@ -463,7 +463,7 @@ def test_thumb_etag_changes_when_source_changes(tmp_path, library) -> None:
                   (mid,))
 
     r2 = _call(st, "GET", f"/api/items/{mid}/thumb",
-               query={"size": "320"}, params={"id": str(mid)})
+               query={"size": "320"}, params={"media_id": str(mid)})
     assert r2.headers["ETag"] != etag1
 
 
@@ -477,7 +477,7 @@ def test_thumb_placeholder_when_generation_fails(tmp_path, library) -> None:
     mid = ids[0]
     st.db.execute("UPDATE media SET thumb_state='failed' WHERE id=?", (mid,))
     r = _call(st, "GET", f"/api/items/{mid}/thumb",
-              query={"size": "320"}, params={"id": str(mid)})
+              query={"size": "320"}, params={"media_id": str(mid)})
     # 已判定 failed：返回 E3004（不反复重试）
     assert r.status == 500
     assert _json(r)["error"]["code"] == "E3004"
@@ -486,7 +486,7 @@ def test_thumb_placeholder_when_generation_fails(tmp_path, library) -> None:
 def test_preview_uses_largest_configured_size(tmp_path, library) -> None:
     st = _state(tmp_path, library)
     ids = _seed(st, library)
-    r = _call(st, "GET", f"/api/items/{ids[0]}/preview", params={"id": str(ids[0])})
+    r = _call(st, "GET", f"/api/items/{ids[0]}/preview", params={"media_id": str(ids[0])})
     assert r.status == 200
     assert r.headers["Content-Type"] == "image/webp"
 
@@ -494,7 +494,7 @@ def test_preview_uses_largest_configured_size(tmp_path, library) -> None:
 def test_raw_full_download(tmp_path, library) -> None:
     st = _state(tmp_path, library)
     ids = _seed(st, library)
-    r = _call(st, "GET", f"/api/items/{ids[0]}/raw", params={"id": str(ids[0])})
+    r = _call(st, "GET", f"/api/items/{ids[0]}/raw", params={"media_id": str(ids[0])})
     assert r.status == 200
     assert r.headers.get("Accept-Ranges") == "bytes"
     assert r.headers["Content-Type"] in ("image/jpeg", "image/png")
@@ -512,11 +512,11 @@ def test_raw_range_returns_206_with_correct_bytes(tmp_path, library) -> None:
     st = _state(tmp_path, library)
     ids = _seed(st, library)
     mid = ids[0]
-    full = _body(_call(st, "GET", f"/api/items/{mid}/raw", params={"id": str(mid)}))
+    full = _body(_call(st, "GET", f"/api/items/{mid}/raw", params={"media_id": str(mid)}))
     total = len(full)
 
     r = _call(st, "GET", f"/api/items/{mid}/raw", headers={"Range": "bytes=10-19"},
-              params={"id": str(mid)})
+              params={"media_id": str(mid)})
     assert r.status == 206
     assert r.headers["Content-Range"] == f"bytes 10-19/{total}"
     part = _body(r)
@@ -532,10 +532,10 @@ def test_raw_suffix_range_means_last_n_bytes(tmp_path, library) -> None:
     st = _state(tmp_path, library)
     ids = _seed(st, library)
     mid = ids[0]
-    full = _body(_call(st, "GET", f"/api/items/{mid}/raw", params={"id": str(mid)}))
+    full = _body(_call(st, "GET", f"/api/items/{mid}/raw", params={"media_id": str(mid)}))
 
     r = _call(st, "GET", f"/api/items/{mid}/raw", headers={"Range": "bytes=-16"},
-              params={"id": str(mid)})
+              params={"media_id": str(mid)})
     assert r.status == 206
     assert _body(r) == full[-16:]
 
@@ -550,7 +550,7 @@ def test_raw_unsatisfiable_range_is_416(tmp_path, library) -> None:
     ids = _seed(st, library)
     mid = ids[0]
     r = _call(st, "GET", f"/api/items/{mid}/raw",
-              headers={"Range": "bytes=99999999-"}, params={"id": str(mid)})
+              headers={"Range": "bytes=99999999-"}, params={"media_id": str(mid)})
     assert r.status == 416
     assert r.headers["Content-Range"].startswith("bytes */")
 
@@ -560,7 +560,7 @@ def test_raw_download_sets_attachment_filename(tmp_path, library) -> None:
     ids = _seed(st, library)
     r = _call(st, "GET", f"/api/items/{ids[0]}/raw",
               query={"download": "1", "name": "我的照片.jpg"},
-              params={"id": str(ids[0])})
+              params={"media_id": str(ids[0])})
     assert "attachment" in r.headers.get("Content-Disposition", "")
 
 
@@ -570,7 +570,7 @@ def test_raw_name_with_crlf_cannot_inject_header(tmp_path, library) -> None:
     ids = _seed(st, library)
     r = _call(st, "GET", f"/api/items/{ids[0]}/raw",
               query={"download": "1", "name": "a\r\nX-Evil: 1"},
-              params={"id": str(ids[0])})
+              params={"media_id": str(ids[0])})
     assert "\r" not in r.headers.get("Content-Disposition", "")
     assert "\n" not in r.headers.get("Content-Disposition", "")
 
@@ -581,7 +581,7 @@ def test_raw_missing_file_is_404(tmp_path, library) -> None:
     mid = ids[0]
     row = st.db.query_one("SELECT rel_path FROM media WHERE id=?", (mid,))
     (library / row["rel_path"]).unlink()
-    r = _call(st, "GET", f"/api/items/{mid}/raw", params={"id": str(mid)})
+    r = _call(st, "GET", f"/api/items/{mid}/raw", params={"media_id": str(mid)})
     assert r.status == 404
 
 
@@ -905,8 +905,8 @@ def test_no_handler_leaks_absolute_path(tmp_path, library) -> None:
     _seed(st, library)
     marker = str(library).replace("\\", "\\\\")
     cases = [
-        ("GET", "/api/items/999999", {}, {"id": "999999"}),
-        ("GET", "/api/items/1/raw", {}, {"id": "1"}),
+        ("GET", "/api/items/999999", {}, {"media_id": "999999"}),
+        ("GET", "/api/items/1/raw", {}, {"media_id": "1"}),
         ("GET", "/api/folders", {"path": "../x"}, {}),
         ("GET", "/api/timeline", {"root": "nope"}, {}),
         ("GET", "/api/search", {}, {}),

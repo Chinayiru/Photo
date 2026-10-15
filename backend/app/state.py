@@ -36,15 +36,18 @@ _SETTING_STARTED_AT = "server_started_at"
 class AppState:
     """一次进程生命周期内的共享依赖。"""
 
-    __slots__ = ("cfg", "db", "thumbs", "indexer", "started_at", "_device_id",
-                 "_device_name")
+    __slots__ = ("cfg", "db", "thumbs", "indexer", "bus", "started_at",
+                 "_device_id", "_device_name")
 
     def __init__(self, cfg: Config | None = None, db: Database | None = None, *,
-                 thumbs: Any = None, indexer: Any = None) -> None:
+                 thumbs: Any = None, indexer: Any = None, bus: Any = None) -> None:
         self.cfg = cfg if cfg is not None else get_config()
         self.db = db if db is not None else get_db()
         self.thumbs = thumbs
         self.indexer = indexer
+        # 事件总线（SSE 用）。为 None 时 SSE 接口会退回模块级单例，
+        # 因此测试里注入一个独立总线即可完全隔离。
+        self.bus = bus
         self.started_at = time.time()
         self._device_id: str | None = None
         self._device_name: str | None = None

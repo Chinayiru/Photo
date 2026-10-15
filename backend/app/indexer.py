@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Callable, Final, Iterable, Iterator
 
 from . import exif, sandbox
 from .config import Config, RootConfig
+from .events import EventBus
 from .errors import AppError
 from .exif import ExifInfo, resolve_taken_at
 
@@ -219,10 +220,14 @@ class Indexer:
         *,
         thumbs: "ThumbEngine | None" = None,
         batch_size: int = BATCH_SIZE,
+        bus: EventBus | None = None,
     ) -> None:
         self.cfg = cfg
         self.db = db
         self.thumbs = thumbs
+        # 事件总线用于把索引进度推给手机端。为 None 时不发事件，
+        # 这样索引器在测试与脚本里可以完全脱离事件系统运行。
+        self.bus = bus
         self.batch_size = max(1, batch_size)
         self._cancel = asyncio.Event()
         self._running = False
@@ -268,6 +273,7 @@ class Indexer:
             return stats
 
         log.info("scan started root=%s path=%s", root.id, root.path)
+        self._emit({"type": "scan_start", "root": root.id, "ts": time.time()})
         try:
             known = self._load_known(root.id)
             batch: list[tuple] = []
@@ -301,6 +307,7 @@ class Indexer:
                     batch.clear()
                     if self.thumbs is not None:
                         stats.thumb_queued += self.thumbs.enqueue_many(ids)
+                    self._emit_progress(root, stats)
                     # 让出事件循环，否则大批量扫描会卡住 API 响应
                     await asyncio.sleep(0)
 
@@ -319,8 +326,43 @@ class Indexer:
             stats.finished_at = time.time()
             self._running = False
             self.last_stats[root.id] = stats
+            self._emit({"type": "scan_done", "root": root.id, "stats": stats.as_dict()})
             log.info("scan finished %s", stats.summary())
         return stats
+
+    # --- 事件 -------------------------------------------------------------
+
+    def _emit(self, event: dict) -> None:
+        """发布一条事件。**永不抛异常**。
+
+        索引进度是"锦上添花"的信息：事件发不出去（没有订阅者、
+        队列满、事件循环已关闭）绝不能影响扫描本身。
+        """
+        if self.bus is None:
+            return
+        try:
+            self.bus.publish(event)
+        except Exception:       # noqa: BLE001
+            log.debug("事件发布失败：%s", event.get("type"), exc_info=True)
+
+    def _emit_progress(self, root: RootConfig, stats: ScanStats) -> None:
+        """每写完一批推一次进度。
+
+        为什么按批而不是按文件：4915 个文件会推 4915 条事件，
+        手机端每秒渲染几十次进度条反而更卡；按批（500 个）推
+        约 10 条，用户看到的进度仍然是连续变化的。
+        """
+        self._emit({
+            "type": "scan_progress",
+            "root": root.id,
+            "seen": stats.seen,
+            "added": stats.added,
+            "updated": stats.updated,
+            "unchanged": stats.unchanged,
+            "missing": stats.missing,
+            "thumb_queued": stats.thumb_queued,
+            "elapsed": stats.elapsed,
+        })
 
     # --- 明细 -------------------------------------------------------------
 

@@ -104,10 +104,15 @@ class Router:
     """
 
     __slots__ = ("_routes", "_by_method", "_exact", "_middleware", "_cors",
-                 "_on_error", "name")
+                 "_on_error", "name", "app")
 
-    def __init__(self, name: str = "router") -> None:
+    def __init__(self, name: str = "router", *, app: Any = None) -> None:
         self.name = name
+        #: 共享依赖容器（AppState）。**在这里注入而不是让处理函数
+        #: 去 import 模块级单例**：处理函数 `from ..state import
+        #: get_state` 会让测试无法注入临时库与临时配置，也让"同一进程
+        #: 里两个不同配置"（二期云端派发）变得不可能。
+        self.app = app
         self._routes: list[Route] = []
         # 精确路径索引：绝大多数请求（缩略图、分片）都会命中，
         # 线性扫 40 条正则虽然不慢，但缩略图瀑布流一秒可能几百个请求。
@@ -230,6 +235,10 @@ class Router:
         """执行请求，**永不抛出**（除 asyncio.CancelledError）。"""
         if not ctx.request_id:
             ctx.request_id = new_request_id()
+        # 补装配 AppState。不覆盖已有值，这样隧道通路可以自己塞
+        # 一个（将来同一进程服务两个库时用得上）。
+        if ctx.app is None and self.app is not None:
+            ctx.app = self.app
 
         # 先建 Ctx 后建 Reply，保证即使中间件崩了也能带上 request_id ——
         # 用户报障时唯一能用来在日志里定位的就是它。
@@ -318,6 +327,10 @@ class Router:
     @property
     def routes(self) -> tuple[Route, ...]:
         return tuple(self._routes)
+
+    def bind_app(self, app: Any) -> None:
+        """注入共享依赖容器。装配顺序上 Router 可能先于 AppState 建好。"""
+        self.app = app
 
     def describe(self) -> list[str]:
         """给启动日志和 /api/system/info 用的路由清单。"""

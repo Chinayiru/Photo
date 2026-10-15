@@ -226,9 +226,12 @@ class ThumbEngine:
         *,
         workers: int = 4,
         queue_size: int = 2000,
+        bus=None,
     ) -> None:
         self.cfg = cfg
         self.db = db
+        #: 事件总线，用于把"缩略图生成进度"推给手机端。为 None 时不发事件。
+        self.bus = bus
         self.workers = max(1, workers)
         self.queue: asyncio.Queue[ThumbJob] = asyncio.Queue(maxsize=queue_size)
         self._pool = ThreadPoolExecutor(
@@ -368,6 +371,14 @@ class ThumbEngine:
                     str(src), dst, size, THUMB_QUALITY, row["orientation"],
                 )
         self._set_state(media_id, "ok", source_signature(src_mtime, row["size"]))
+        # 只报"还剩多少"，不报"刚生成了哪张" —— 后者会让手机端
+        # 为每一张图重排一次时间线，4915 张下来页面直接卡死。
+        self._emit({
+            "type": "thumb_progress",
+            "done": self.done,
+            "failed": self.failed,
+            "pending": self.pending_count(),
+        })
         return True
 
     async def _on_failure(self, job: ThumbJob, exc: Exception) -> None:
@@ -391,6 +402,15 @@ class ThumbEngine:
             self.queue.put_nowait(job)
         except asyncio.QueueFull:
             log.debug("retry dropped (queue full) media_id=%s", job.media_id)
+
+    def _emit(self, event: dict) -> None:
+        """发布事件，永不抛异常（缩略图进度不该影响生成本身）。"""
+        if self.bus is None:
+            return
+        try:
+            self.bus.publish(event)
+        except Exception:       # noqa: BLE001
+            log.debug("缩略图事件发布失败", exc_info=True)
 
     def _set_state(self, media_id: int, state: ThumbState, etag: str | None) -> None:
         try:

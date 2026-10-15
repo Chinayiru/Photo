@@ -165,7 +165,7 @@ async def get_item(ctx: Ctx) -> Reply:
     """`GET /api/items/{id}` —— 完整 EXIF + 前后邻居。"""
     st = _st(ctx)
     db = st.db
-    mid = ctx.param_int("id")
+    mid = ctx.param_int("media_id")
 
     row = db.query_one("SELECT * FROM media WHERE id = ?", (mid,))
     if row is None:
@@ -357,7 +357,7 @@ async def _file_thumb_reply(st: AppState, dst: Path, sig: str, ctx: Ctx) -> Repl
 
 async def get_thumb(ctx: Ctx) -> Reply:
     """`GET /api/items/{id}/thumb?size=320`"""
-    return await _serve_thumb(_st(ctx), ctx, ctx.param_int("id"))
+    return await _serve_thumb(_st(ctx), ctx, ctx.param_int("media_id"))
 
 
 async def get_preview(ctx: Ctx) -> Reply:
@@ -369,7 +369,7 @@ async def get_preview(ctx: Ctx) -> Reply:
     """
     st = _st(ctx)
     db = st.db
-    mid = ctx.param_int("id")
+    mid = ctx.param_int("media_id")
     sizes = st.thumb_sizes()
     default = sizes[-1] if sizes else 1600
     size = parse_size(ctx.q("size"), sizes, name="size") if ctx.q("size") else default
@@ -453,7 +453,7 @@ async def get_raw(ctx: Ctx) -> Reply:
     """
     st = _st(ctx)
     db = st.db
-    mid = ctx.param_int("id")
+    mid = ctx.param_int("media_id")
 
     row = db.query_one(
         "SELECT id, root_id, rel_path, file_name, ext, size, missing"
