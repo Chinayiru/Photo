@@ -47,6 +47,8 @@ def build_router() -> Router:
 
     # --- 修改 ---------------------------------------------------------
     r.add("POST", "/api/items/delete", h_browse.delete_items, name="browse.delete")
+    r.add("POST", "/api/items/move", h_browse.move_items, name="browse.move")
+    r.add("POST", "/api/items/rename", h_browse.rename_item, name="browse.rename")
     r.add("POST", "/api/index/rescan", h_browse.rescan, name="browse.rescan")
 
     # --- 上传 ---------------------------------------------------------

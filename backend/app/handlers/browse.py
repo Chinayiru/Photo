@@ -11,24 +11,30 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any
 
 from .. import audit, sandbox
+from ..config import ALLOWED_IMAGE_EXTS
 from ..core import Ctx, Reply, empty_reply, file_reply, json_reply, stream_reply
 from ..core.cursor import decode_cursor, encode_cursor
 from ..errors import (
     E1001,
     E1004,
     E1008,
+    E1012,
     E1015,
     E3004,
     E3012,
     AppError,
+    ArchiveError,
     BadRequest,
+    Conflict,
     NotFound,
     ReadonlyError,
+    SandboxError,
 )
 from ..state import AppState
 from ..thumbs import placeholder_webp, source_signature, thumb_path
@@ -811,6 +817,462 @@ async def _trash_one(st: AppState, mid: int) -> bool:
         detail={"media_id": mid, "root": row["root_id"]},
     )
     return True
+
+
+# --------------------------------------------------------------------------
+# 写操作：移动与改名
+# --------------------------------------------------------------------------
+#
+# 这两个接口在需求里是明确要做的（P1-2.8「允许移动 / 改名」，docs/01 的 Q-25
+# 业主确认"允许改名"），但此前只有删除实现了。审计动作 `move` / `rename`
+# 早已在 audit.py 与 db.py 的 CHECK 约束里，缺的只是调用点。
+#
+# ## 为什么移动必须区分"同卷"与"跨卷"
+#
+# `os.replace` 在**同卷**内是原子的（NTFS 上是 MFT 记录改写），但在
+# **跨卷**时 Windows 直接抛 `OSError [WinError 17]`（EXDEV）—— 它根本不
+# 会退化成复制。所以跨卷只能走 `shutil.move`（复制 + 删源），而这是
+# **唯一允许的非原子操作**。它必须满足两条，否则宁可失败：
+#
+#   1. 复制完成后校验目标大小与源一致，**校验通过才删源**；
+#   2. 中途任何失败 → 删掉目标半成品，**源文件保持不动**。
+#
+# 违反其中任何一条，用户就可能同时失去两边 —— 这是本模块最不能出的错。
+
+#: 一次移动/改名最多处理多少项。与 delete 的 200 保持一致：
+#: 再多会让"部分成功"难以解释，审计日志也会变成一堵墙。
+_MAX_MOVE_BATCH = 200
+
+
+def _split_dir_name(rel_path: str) -> tuple[str, str]:
+    """`a/b/c.jpg` → `("a/b", "c.jpg")`。根目录返回 `("", name)`。"""
+    p = rel_path.replace("\\", "/")
+    if "/" in p:
+        d, name = p.rsplit("/", 1)
+        return d, name
+    return "", p
+
+
+def _unique_name_in(
+    taken_names: set[str], name: str, *, limit: int = 999
+) -> tuple[str, bool]:
+    """在已占用的名字集合里给 `name` 找一个不冲突的名字。
+
+    冲突时在**扩展名前**追加 `_1`/`_2`…（与归档的序号规则一致，
+    序号从 1 开始，第一张不带序号）。
+
+    返回 `(最终名字, 是否改过名)`。这是纯字符串层面的工具，供
+    `_pick_free_name` 之外的调用方使用（例如未来的"批量重命名"）。
+    """
+    if name not in taken_names:
+        return name, False
+    stem, dot, ext = name.rpartition(".")
+    if not dot or not stem:
+        stem, dot, ext = name, "", ""
+    for seq in range(1, limit + 1):
+        cand = f"{stem}_{seq}{dot}{ext}"
+        if cand not in taken_names:
+            return cand, True
+    raise Conflict(f"目标目录里同名文件过多（{name}）", spec=E3012)
+
+
+def _pick_free_name(
+    root, rel_dir: str, name: str, taken: set[str], *, cfg, limit: int = 999
+) -> tuple[str, str, Path] | None:
+    """给 `name` 找一个**库和磁盘都没有占用**的名字。
+
+    为什么必须同时查两处：
+    - **只看库不够**：用户手动往库里拖了一张照片而扫描还没跑到时，
+      库里查不到它，但磁盘上有 —— 只按库去重会把它覆盖掉。
+    - **只看磁盘不够**：库里有行但文件刚好被回收站拿走的窗口期，
+      磁盘探测看不到它，而那条记录马上就会变成"同名"。
+
+    先试原名（库里没占且磁盘上没有就直接用），再依次试 `_1`/`_2`…
+    序号规则与归档一致（在扩展名前追加，从 1 开始）。
+    全部占用则返回 None，由调用方按 `on_conflict` 记 failed。
+    """
+    stem, dot, ext = name.rpartition(".")
+    if not dot or not stem:
+        stem, dot, ext = name, "", ""
+
+    def _try(cand: str) -> tuple[str, str, Path] | None:
+        rel = f"{rel_dir}/{cand}" if rel_dir else cand
+        p = sandbox.resolve(root, rel, "write", cfg=cfg)
+        if p.exists():
+            return None
+        return cand, rel, p
+
+    if name not in taken:
+        got = _try(name)
+        if got is not None:
+            return got
+    for seq in range(1, limit + 1):
+        cand = f"{stem}_{seq}{dot}{ext}"
+        if cand in taken:
+            continue
+        got = _try(cand)
+        if got is not None:
+            return got
+    return None
+
+
+def _normalize_target_dir(target_dir: str) -> str:
+    """校验目标目录的**形态**并规范化成相对路径（不做沙箱检查）。
+
+    形态检查在循环外做一次：`target_dir` 是整批共用的参数，它非法时
+    整批都该 400，而不是逐项记 failed（那样用户会收到 200 加一屏
+    "失败"，却不知道原因是自己传错了参数）。
+
+    沙箱检查留在循环内 —— 它依赖具体的 `root`，而多根时同一个
+    `target_dir` 字符串在不同根下解析出的绝对路径不同。
+    """
+    rel = (target_dir or "").replace("\\", "/").strip().strip("/")
+    if rel in ("", "."):
+        return ""
+    for seg in rel.split("/"):
+        if seg in ("", ".", ".."):
+            raise BadRequest("目标目录不能包含 . 或 .. 段")
+    return rel
+
+
+def _move_one_sync(src: Path, dst: Path, *, size: int) -> None:
+    """把 `src` 搬到 `dst`。同卷走原子 rename，跨卷走复制+校验+删源。
+
+    这是**同步**函数，由调用方丢进线程池（`run_in_executor`）——
+    跨卷复制一个 2GB 文件会阻塞事件循环几十秒，那期间手机端所有请求
+    全部卡住。
+    """
+    if dst.exists():
+        raise FileExistsError(str(dst))
+    try:
+        os.replace(src, dst)
+        return
+    except OSError as exc:
+        # WinError 17 = EXDEV（跨卷）。**只在这一种情况下降级** ——
+        # 其他 OSError（权限、目标被占用）降级成复制只会掩盖真因，
+        # 而且复制到一半才发现不行，反而多了一次半成品。
+        if getattr(exc, "winerror", None) != 17 and exc.errno != 18:
+            raise
+        log.info("跨卷移动，降级为复制+删除：%s → %s", src.name, dst.name)
+
+    tmp = dst.with_name(dst.name + ".pbmove")
+    try:
+        shutil.copy2(src, tmp)
+        # ★ 校验通过才删源。只比大小（不重算 sha256）：移动的目标是
+        # "别丢数据"，而大小不符已经能抓住截断/磁盘写满这两类真实故障；
+        # 2GB 文件重算哈希要多花十几秒，用户会以为程序卡死。
+        got = tmp.stat().st_size
+        if got != size:
+            raise ArchiveError(f"复制后大小不符：期望 {size}，实际 {got}")
+        os.replace(tmp, dst)
+    except BaseException:
+        # 中途失败 → 删掉半成品，**源文件保持不动**。
+        try:
+            if tmp.exists():
+                os.unlink(tmp)
+        except OSError:
+            log.warning("清理移动半成品失败：%s", tmp, exc_info=True)
+        raise
+    os.unlink(src)
+
+
+async def move_items(ctx: Ctx) -> Reply:
+    """`POST /api/items/move` —— 批量移动到指定目录。
+
+    `on_conflict` 三种语义（默认 `rename`）：
+    - `rename`：目标已存在同名 → 追加 `_1`/`_2`，`renamed=true`；
+    - `skip`：跳过这一项，进 `skipped`；
+    - `fail`：这一项记进 `failed`，其余照常处理。
+
+    注意 `skip`/`fail` 都是**逐项**语义：一项冲突不影响同批其他项。
+    只有"目标目录本身非法"才是整批 400。
+    """
+    st = _st(ctx)
+    db = st.db
+
+    body = await ctx.json()
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not ids:
+        raise BadRequest("ids 必须是非空数组")
+    if len(ids) > _MAX_MOVE_BATCH:
+        raise BadRequest(f"一次最多移动 {_MAX_MOVE_BATCH} 项")
+
+    target_dir = body.get("target_dir")
+    # 空串是**合法**的，表示库根 —— 不能因为"空"就当成参数缺失
+    # （手机端"移到根目录"是正常操作）。
+    if not isinstance(target_dir, str):
+        raise BadRequest("target_dir 必须是字符串（空串表示库根）")
+
+    on_conflict = str(body.get("on_conflict") or "rename").lower()
+    if on_conflict not in ("rename", "skip", "fail"):
+        raise BadRequest("on_conflict 只能是 rename / skip / fail")
+
+    clean: list[int] = []
+    for v in ids:
+        try:
+            clean.append(int(v))
+        except (TypeError, ValueError):
+            raise BadRequest("ids 必须是整数数组") from None
+
+    # 目标目录按每个媒体行自己的 root_id 解析。一期只有一个根，但代码
+    # 不该写死 root_id —— 多根是二期明确定下来的方向，而"根 A 的照片
+    # 移动到根 A 的目录"和"根 B 的照片也移动到同一个 target_dir"是两件
+    # 事（同一个 target_dir 字符串在不同根下解析出不同绝对路径）。
+    # 形态检查在循环外做一次（参数非法 → 整批 400），沙箱检查在循环内。
+    target_rel = _normalize_target_dir(target_dir)
+    moved: list[dict[str, Any]] = []
+    skipped: list[int] = []
+    failed: list[dict[str, Any]] = []
+    resolved_dirs: dict[str, str] = {}
+    loop = asyncio.get_running_loop()
+
+    for mid in clean:
+        row = db.query_one(
+            "SELECT id, root_id, rel_path, file_name, size, missing"
+            "  FROM media WHERE id = ?",
+            (mid,),
+        )
+        if row is None or row["missing"]:
+            failed.append({"id": mid, "code": "E1004", "message": "照片不存在"})
+            continue
+
+        root = st.cfg.root_by_id(row["root_id"])
+        if root is None:
+            failed.append({"id": mid, "code": "E1004", "message": "照片所在目录已移除"})
+            continue
+        if not root.can_write:
+            raise ReadonlyError("当前为只读模式，无法移动")
+
+        try:
+            if root.id not in resolved_dirs:
+                # 空串表示库根 —— 沙箱要求 rel_path 非空，所以根这一档
+                # 不调 sandbox.resolve（它本来就是可信的根配置）。
+                if target_rel:
+                    sandbox.resolve(root, target_rel, "write", cfg=st.cfg)
+                resolved_dirs[root.id] = target_rel
+            rel_dir = resolved_dirs[root.id]
+
+            src_rel = row["rel_path"]
+            src_dir, name = _split_dir_name(src_rel)
+            if rel_dir == src_dir:
+                # 目标就是当前目录 —— 不是错误，但没有任何事要做。
+                # 静默成功比报错好：手机端"全选后移动到当前相册"是常见误操作。
+                skipped.append(mid)
+                continue
+
+            dst_rel = f"{rel_dir}/{name}" if rel_dir else name
+            dst = sandbox.resolve(root, dst_rel, "write", cfg=st.cfg)
+
+            # 目标目录不存在则创建（mkdir -p 语义，见接口文档）
+            if not dst.parent.exists():
+                await loop.run_in_executor(
+                    None, lambda p=dst.parent: p.mkdir(parents=True, exist_ok=True)
+                )
+                # 建完重新解析：新建目录也可能是别人刚放进去的 junction
+                dst = sandbox.resolve(root, dst_rel, "write", cfg=st.cfg)
+
+            if dst.exists():
+                if on_conflict == "skip":
+                    skipped.append(mid)
+                    continue
+                if on_conflict == "fail":
+                    failed.append({"id": mid, "code": "E3012",
+                                   "message": "目标目录已有同名文件"})
+                    continue
+                # rename：找一个**库和磁盘都没有**的名字。
+                #
+                # 只看库不够：用户手动往库里拖了一张照片而扫描还没跑到时，
+                # 库里查不到它，但磁盘上有 —— 此时若只按库里的名字去重，
+                # 会把它覆盖掉。
+                # 只看磁盘也不够：库里有行但文件刚好被回收站拿走的窗口期，
+                # 磁盘探测看不到，而那条记录马上会变成"同名"。
+                #
+                # 所以候选名必须同时通过两道检查，逐号往上试。
+                taken = {
+                    r["file_name"]
+                    for r in db.query(
+                        "SELECT file_name FROM media"
+                        " WHERE root_id = ? AND rel_path LIKE ? AND missing = 0",
+                        (root.id, f"{rel_dir}/%") if rel_dir else "%",
+                    )
+                }
+                picked = _pick_free_name(root, rel_dir, name, taken, cfg=st.cfg)
+                if picked is None:
+                    failed.append({"id": mid, "code": "E3012",
+                                   "message": "目标目录同名文件过多"})
+                    continue
+                name, dst_rel, dst = picked
+                renamed = True
+            else:
+                renamed = False
+
+            src = sandbox.resolve(root, src_rel, "write", cfg=st.cfg)
+            if not src.exists():
+                failed.append({"id": mid, "code": "E1004", "message": "文件已不在磁盘上"})
+                continue
+
+            await loop.run_in_executor(
+                None, lambda s=src, d=dst, n=row["size"]: _move_one_sync(s, d, size=n)
+            )
+        except (SandboxError, ReadonlyError):
+            raise
+        except AppError as exc:
+            failed.append({"id": mid, "code": exc.code, "message": exc.spec.message})
+            continue
+        except Exception as exc:  # noqa: BLE001 —— 一项失败不该中断整批
+            log.warning("move failed media_id=%s: %s", mid, exc)
+            failed.append({"id": mid, "code": "E3006", "message": "移动失败"})
+            continue
+
+        # 先搬文件再改库（与 _trash_one 同源的理由）：反过来如果进程在
+        # 中间被杀，库里指向新路径而文件还在旧路径，下次扫描会把这条
+        # 标 missing，用户以为照片丢了。
+        db.execute(
+            "UPDATE media SET rel_path = ?, file_name = ? WHERE id = ?",
+            (dst_rel, name, mid),
+        )
+        moved.append({
+            "id": mid,
+            "from": src_rel,
+            "to": dst_rel,
+            "renamed": renamed,
+        })
+        audit.record(
+            db, st.cfg, audit.ACTION_MOVE,
+            rel_path=dst_rel, device=st.device_name,
+            detail={"media_id": mid, "from": src_rel, "to": dst_rel,
+                    "renamed": renamed, "root": row["root_id"]},
+        )
+
+    first_dir = next(iter(resolved_dirs.values()), "")
+    return json_reply({
+        "moved": moved,
+        "skipped": skipped,
+        "failed": failed,
+        "target_dir": first_dir,
+    })
+
+
+async def rename_item(ctx: Ctx) -> Reply:
+    """`POST /api/items/rename` —— 重命名单个文件。
+
+    ## 为什么扩展名要单独校验
+
+    新名字必须**仍在图片白名单里**。不校验的话，`new_name="x.exe"` 会把
+    一张照片变成可执行文件（用户在资源管理器里双击就运行），
+    而且它会立刻从时间线消失（索引器按扩展名过滤）。
+
+    ## 为什么 taken_at 可能要重算
+
+    拍摄时间有三个来源（EXIF → 文件名 → mtime）。若原本是
+    **文件名**来源，改名后那个日期就不存在了 —— 此时必须按同一套
+    顺序重算（走 `exif.resolve_taken_at`），否则一张本来有
+    `DateTimeOriginal` 的照片会掉到 mtime 那个时刻，在时间线上跑到
+    错误的位置。
+    """
+    st = _st(ctx)
+    db = st.db
+
+    body = await ctx.json()
+    mid = body.get("id")
+    try:
+        mid = int(mid)
+    except (TypeError, ValueError):
+        raise BadRequest("id 必须是整数") from None
+
+    new_name = body.get("new_name")
+    if not isinstance(new_name, str) or not new_name.strip():
+        raise BadRequest("new_name 必填")
+    new_name = new_name.strip()
+    if len(new_name) > 255:
+        raise BadRequest("文件名过长（上限 255）")
+
+    row = db.query_one(
+        "SELECT id, root_id, rel_path, file_name, size, taken_at, taken_src,"
+        "       missing"
+        "  FROM media WHERE id = ?",
+        (mid,),
+    )
+    if row is None or row["missing"]:
+        raise NotFound("照片不存在")
+
+    root = st.cfg.root_by_id(row["root_id"])
+    if root is None:
+        raise NotFound("照片所在目录已移除")
+    if not root.can_write:
+        raise ReadonlyError("当前为只读模式，无法改名")
+
+    # 名字里不能有路径分隔符 —— 否则"改名"会变成"移动"，而移动是另一个
+    # 接口（它有自己的权限与冲突语义）。这一条必须在沙箱之前拦，
+    # 因为沙箱对 `a/b.jpg` 是合法的（它就是为路径设计的）。
+    if "/" in new_name or "\\" in new_name:
+        raise BadRequest("new_name 不能包含路径分隔符")
+
+    stem, dot, ext = new_name.rpartition(".")
+    if not dot or not stem:
+        raise BadRequest("new_name 必须包含扩展名")
+    if ext.lower().lstrip(".") not in ALLOWED_IMAGE_EXTS:
+        raise BadRequest("new_name 的扩展名不在支持的图片格式内")
+
+    src_rel = row["rel_path"]
+    src_dir, old_name = _split_dir_name(src_rel)
+    if new_name == old_name:
+        # 名字没变：幂等成功，不碰文件系统也不写审计（否则审计日志
+        # 会被"点了没反应"的操作刷满）。
+        return json_reply({
+            "id": mid, "from": src_rel, "to": src_rel,
+            "taken_at": float(row["taken_at"]), "taken_src": row["taken_src"],
+        })
+
+    dst_rel = f"{src_dir}/{new_name}" if src_dir else new_name
+    # 沙箱会一并拒绝 Windows 保留名（CON/PRN/…）、非法字符、结尾空格或点
+    dst = sandbox.resolve(root, dst_rel, "write", cfg=st.cfg)
+    src = sandbox.resolve(root, src_rel, "write", cfg=st.cfg)
+
+    if dst.exists():
+        raise Conflict("同目录下已有同名文件")
+    if not src.exists():
+        raise NotFound("文件已不在磁盘上")
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None, lambda: _move_one_sync(src, dst, size=row["size"])
+    )
+
+    taken_at = float(row["taken_at"])
+    taken_src = row["taken_src"]
+    if taken_src == "filename":
+        # 文件名日期没了 → 按索引器同一套顺序重算（EXIF → 文件名 → mtime）。
+        # **必须走 resolve_taken_at 而不是自己拼**：EXIF 里可能本来就有
+        # DateTimeOriginal，只是当初文件名也解析出了日期才没轮到它 ——
+        # 直接退回 mtime 会让一张有 EXIF 的照片掉到时间线错误的位置。
+        from ..exif import extract_sync, resolve_taken_at  # 局部导入避免循环
+
+        try:
+            st_mtime = dst.stat().st_mtime
+        except OSError:
+            st_mtime = float(row["taken_at"])
+        info = await loop.run_in_executor(None, extract_sync, dst)
+        taken_at, taken_src = resolve_taken_at(info, new_name, st_mtime)
+
+    db.execute(
+        "UPDATE media SET rel_path = ?, file_name = ?, taken_at = ?,"
+        " taken_src = ? WHERE id = ?",
+        (dst_rel, new_name, taken_at, taken_src, mid),
+    )
+    audit.record(
+        db, st.cfg, audit.ACTION_RENAME,
+        rel_path=dst_rel, device=st.device_name,
+        detail={"media_id": mid, "from": src_rel, "to": dst_rel,
+                "root": row["root_id"]},
+    )
+    return json_reply({
+        "id": mid,
+        "from": src_rel,
+        "to": dst_rel,
+        "taken_at": taken_at,
+        "taken_src": taken_src,
+    })
 
 
 # --------------------------------------------------------------------------
