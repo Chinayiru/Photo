@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -267,6 +268,142 @@ def test_locked_code_rejects_even_correct_code(db: Database) -> None:
     with pytest.raises(AppError) as ei:
         consume_pair_code(db, code)
     assert ei.value.code == "E4004"
+
+
+# --------------------------------------------------------------------------
+# "错 5 次锁 10 分钟" 的真实计数路径（AC-5.5）
+#
+# ⚠️ 下面这几条**不允许**自己造前置状态。
+#
+# 上面 `test_lock_after_max_tries` 是 `UPDATE pair_codes SET tries = ?` 直接
+# 把计数器推到上限的 —— 它测的是"读到满值之后怎么判"，而生产代码
+# **从来没有把 tries 推到满值过**：猜错的码按 code_hash 查不到行，
+# 于是直接走 E1002 返回，计数器一次都没动过。那 4 条用例全绿，
+# 而"错 5 次锁 10 分钟"在真实攻击下一次都没生效。
+#
+# 所以这里的每一条都必须**只调用 consume_pair_code 去喂错误码**，
+# 让计数由被测代码自己产生。这是本次修复唯一可靠的验收方式。
+# --------------------------------------------------------------------------
+
+def _active_code_row(db: Database) -> Any:
+    """取当前活跃（未用、未过期）的那枚码的行。"""
+    return db.query_one(
+        "SELECT * FROM pair_codes WHERE used_at IS NULL AND expires_at >= ?",
+        (time.time(),),
+    )
+
+
+def test_wrong_guess_increments_tries(db: Database) -> None:
+    """猜错一次，活跃码的 tries 必须 +1 —— 这条是本次 bug 的回归钉。"""
+    code = _make_code(db)
+    assert _active_code_row(db)["tries"] == 0
+
+    with pytest.raises(AppError) as ei:
+        consume_pair_code(db, "000000")
+    assert ei.value.code == "E1002"
+
+    row = db.query_one("SELECT tries FROM pair_codes WHERE code_hash = ?",
+                       (hash_code(code),))
+    assert row["tries"] == 1, "猜错的尝试没有被记到活跃码上"
+
+
+def test_five_wrong_guesses_lock_the_active_code(db: Database) -> None:
+    """连错 5 次后锁定 10 分钟，且**期间正确码也不通过**（AC-5.5 原文）。"""
+    code = _make_code(db)
+
+    # 前 4 次：只是"码不存在"。
+    for i in range(PAIR_MAX_TRIES - 1):
+        with pytest.raises(AppError) as ei:
+            consume_pair_code(db, f"{i:06d}")
+        assert ei.value.code == "E1002", f"第 {i + 1} 次猜错不该锁"
+
+    # 第 5 次：锁定当场生效，回 429 而不是 400。
+    # 回 400 会让前端以为"码输错了"而继续重输，每次重输都在刷新锁定。
+    with pytest.raises(AppError) as ei:
+        consume_pair_code(db, "999999")
+    assert ei.value.code == "E4004"
+    assert ei.value.status == 429
+
+    row = db.query_one("SELECT tries, locked_until FROM pair_codes"
+                       " WHERE code_hash = ?", (hash_code(code),))
+    assert row["tries"] == PAIR_MAX_TRIES
+    assert row["locked_until"] > time.time()
+
+    # ★ 核心断言：正确码在锁定期内也必须被拒。
+    with pytest.raises(AppError) as ei:
+        consume_pair_code(db, code, device_name="我的手机")
+    assert ei.value.code == "E4004", "锁定期内正确码放行了，锁定形同虚设"
+
+
+def test_wrong_guesses_share_budget_across_active_codes(db: Database) -> None:
+    """多枚活跃码共享同一个 5 次预算。
+
+    `docs/06-安全设计文档.md` §8.2 场景 B 指出：按 code 计数时，
+    N 枚活跃码会把攻击者的预算放大到 5N 次。递增**全部**活跃码
+    关掉了这个绕过 —— 否则这条用例会通过（第一枚被锁，第二枚还能试）。
+    """
+    first = _make_code(db)
+    second = generate_pair_code()
+    store_pair_code(db, second, DEVICE_ID, "测试电脑")
+
+    for i in range(PAIR_MAX_TRIES):
+        with pytest.raises(AppError):
+            consume_pair_code(db, f"{i:06d}")
+
+    for c in (first, second):
+        row = db.query_one("SELECT tries FROM pair_codes WHERE code_hash = ?",
+                           (hash_code(c),))
+        assert row["tries"] == PAIR_MAX_TRIES, "第二枚码逃过了共享预算"
+        with pytest.raises(AppError) as ei:
+            consume_pair_code(db, c)
+        assert ei.value.code == "E4004"
+
+
+def test_wrong_guess_without_active_code_is_just_e1002(db: Database) -> None:
+    """没有任何活跃码时猜错只报 E1002，不能崩。
+
+    用户在托盘点"重新生成"之前，表里可能一枚活跃码都没有；
+    此时猜错无处计数，由 handlers/auth.py 的按 IP 限速兜底。
+    """
+    with pytest.raises(AppError) as ei:
+        consume_pair_code(db, "000000")
+    assert ei.value.code == "E1002"
+
+
+def test_expired_code_does_not_absorb_wrong_guesses(db: Database) -> None:
+    """过期码不该被计入 —— 否则攻击者能靠猜错把老行一直续命。
+
+    `expires_at >= now` 这个条件同时保证了"计数只记在还在生效的码上"。
+    """
+    code = _make_code(db, ttl=-1)
+    with pytest.raises(AppError) as ei:
+        consume_pair_code(db, "000000")
+    assert ei.value.code == "E1002"
+
+    row = db.query_one("SELECT tries FROM pair_codes WHERE code_hash = ?",
+                       (hash_code(code),))
+    assert row["tries"] == 0, "过期码被计入了错误尝试"
+
+
+def test_regenerating_code_clears_the_lock(db: Database) -> None:
+    """用户重新生成配对码后必须能立刻配对。
+
+    这是 `docs/04` 给 E4004 开的恢复路径（「电脑托盘重新生成配对码
+    可立即解除」）。若新码也继承了 tries，用户被锁 10 分钟且**无从自救**，
+    只能重启软件 —— 那才是真正的可用性事故。
+    """
+    _make_code(db)
+    for i in range(PAIR_MAX_TRIES):
+        with pytest.raises(AppError):
+            consume_pair_code(db, f"{i:06d}")
+
+    # 托盘"重新生成"的动作：先作废全部旧码，再存新码。
+    revoke_all_codes(db)
+    fresh = generate_pair_code()
+    store_pair_code(db, fresh, DEVICE_ID, "测试电脑")
+
+    client_id, token = consume_pair_code(db, fresh, device_name="我的手机")
+    assert client_id and token
 
 
 def test_lock_expires_and_code_works_again(db: Database) -> None:
@@ -686,6 +823,33 @@ def test_pair_rate_limit_is_per_ip(tmp_path: Path, db: Database) -> None:
     r = _call(st, "/api/pair", method="POST",
               body=f'{{"code":"{code}"}}'.encode(), client_ip="192.168.0.89")
     assert r.status == 201
+
+
+def test_pair_lockout_end_to_end_over_http(tmp_path: Path, db: Database) -> None:
+    """AC-5.5 的端到端验收：走完整 dispatch，只喂错误码。
+
+    这条是"用户可感知"的那一层 —— 前面 `test_five_wrong_guesses_*` 验的是
+    `consume_pair_code` 的计数，这里验的是 HTTP 状态码序列，
+    因为前端的恢复动作完全取决于它：
+      400 → 用户以为码输错了，继续重输（每次重输都在刷新锁定）
+      429 → 前端提示"请 10 分钟后再试"，用户去电脑上重新生成
+    """
+    st = _state(tmp_path, db)
+    code = _make_code(db)
+
+    for i in range(PAIR_MAX_TRIES - 1):
+        r = _call(st, "/api/pair", method="POST", body=b'{"code":"000001"}',
+                  client_ip="192.168.0.90")
+        assert r.status == 400, f"第 {i + 1} 次猜错不该锁"
+
+    r = _call(st, "/api/pair", method="POST", body=b'{"code":"000002"}',
+              client_ip="192.168.0.90")
+    assert r.status == 429, "第 5 次猜错没有当场锁定"
+
+    # 正确码 + 换一个 IP（绕开按 IP 的限速）仍然必须被拒。
+    r = _call(st, "/api/pair", method="POST",
+              body=f'{{"code":"{code}"}}'.encode(), client_ip="192.168.0.91")
+    assert r.status == 429, "锁定期内正确码放行了，锁定形同虚设"
 
 
 def test_revoke_unknown_device_is_404(tmp_path: Path, db: Database) -> None:

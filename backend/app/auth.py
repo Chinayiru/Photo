@@ -192,6 +192,70 @@ def pair_code_info(db: Any, code: str) -> dict[str, Any] | None:
     return dict(row)
 
 
+def _penalize_active_codes(db: Any, now: float) -> None:
+    """把一次**猜错**记到当前活跃的配对码上。
+
+    ## 为什么需要这个函数（否则 AC-5.5 是一句空话）
+
+    `consume_pair_code` 是按 `code_hash` 主键查行的，而**猜错的码在表里
+    没有行** —— 于是 `row is None` 直接走到 E1002 返回，`tries` 永远
+    没有机会递增。全仓唯一会写 `tries` 的地方曾是测试自己
+    （`UPDATE pair_codes SET tries = ?` 直接造前置状态），所以
+    "错 5 次锁 10 分钟"看起来有实现、测试也全绿，实际上在生产里
+    一次都没生效过：攻击者可以无限次猜。
+
+    计数必须挂在**某个对猜错也存在的行**上。正确的那枚码就是这样的行：
+    用户点"添加手机"时托盘生成它，攻击者攻击的也正是它。
+
+    ## 为什么递增**所有**活跃码而不是最新那一枚
+
+    `docs/06-安全设计文档.md` §8.2 场景 B 自己指出了按 code 锁定的绕过：
+    若同时有 N 枚活跃码，攻击者可以每枚试 5 次，预算变成 5N 次。递增
+    全部活跃码让这 N 枚**共享**同一个 5 次预算，绕过随之关闭。
+    正常使用下同时只有一枚活跃码（`panel_pair_code` 每次都会先
+    `revoke_all_codes`），所以这个加强不改变正常行为。
+
+    ⚠️ 这确实带来一个 DoS 面（攻击者故意错 5 次就能锁住用户 10 分钟），
+    该残余风险在 `docs/06` 的 R-3 里已被显式接受，且用户点托盘
+    "重新生成配对码"可立即解除 —— 新码的 `tries` 从 0 开始。
+    """
+    # 已锁定的活跃码优先报 429：比 E1002「码不存在」更接近真实原因，
+    # 也让攻击者无法靠"继续猜"把锁定状态刷成别的错误码。
+    row = db.query_one(
+        "SELECT locked_until FROM pair_codes"
+        " WHERE used_at IS NULL AND expires_at >= ?"
+        " ORDER BY created_at DESC LIMIT 1",
+        (now,),
+    )
+    if row is None:
+        # 没有任何活跃码可记（用户还没生成，或已全部过期）。
+        # 这种情况由 handlers/auth.py 的按 IP 限速兜底。
+        return
+    locked_until = row["locked_until"]
+    if locked_until is not None and locked_until > now:
+        raise AppError(E4004, f"pair code locked until {locked_until:.0f}")
+
+    db.execute(
+        "UPDATE pair_codes SET tries = tries + 1"
+        " WHERE used_at IS NULL AND expires_at >= ?",
+        (now,),
+    )
+    # 到量就落锁。`tries >= ?` 用更新后的值判断，所以这次 UPDATE 与上一条
+    # 合起来等于"第 5 次失败击锁"。SQLite 的 UPDATE 里不能"用更新后的
+    # tries 去算 locked_until"再写回同一列，故必须分成两条语句。
+    rows = db.execute_rowcount(
+        "UPDATE pair_codes SET locked_until = ?"
+        " WHERE used_at IS NULL AND tries >= ?"
+        "   AND (locked_until IS NULL OR locked_until <= ?)",
+        (now + PAIR_LOCK_SECONDS, PAIR_MAX_TRIES, now),
+    )
+    if rows:
+        # 锁定是这次尝试造成的 → 回 429 而不是 400「码不存在」。
+        # 前端据此显示"请 10 分钟后再试"，而 400 会让用户以为码输错了
+        # 而继续重输，每一次重输都在延长/刷新这个锁定。
+        raise AppError(E4004, "pair code tries exhausted")
+
+
 def consume_pair_code(
     db: Any, code: str, *, device_name: str | None = None,
 ) -> tuple[str, str]:
@@ -204,6 +268,10 @@ def consume_pair_code(
     ⚠️ 校验顺序不能反：**先判锁定，再判过期，最后判尝试次数**。
     反过来的话攻击者可以用一个已锁定的码继续刷 `tries`，
     虽然结果都是拒绝，但会让"错误次数"统计失去意义。
+
+    ⚠️ 猜错的码**查不到行**，所以它走的是 `_penalize_active_codes`
+    而不是本函数里的 `tries` 分支 —— 详见该函数的 docstring，
+    那里记着"错 5 次锁 10 分钟"曾经完全没生效的结构性原因。
     """
     now = time.time()
     code_hash = hash_code(code)
@@ -215,7 +283,10 @@ def consume_pair_code(
         (code_hash,),
     )
     if row is None:
-        # 码不存在也记一次审计：连续的"码不存在"是探测信号。
+        # 猜错的码在表里没有行，所以计数只能记到"当前活跃的那枚码"上
+        # （见 `_penalize_active_codes`）。审计不在这里写：本模块是纯逻辑层，
+        # 审计统一由 handlers 层负责，免得两处都写造成重复记录。
+        _penalize_active_codes(db, now)
         raise AppError(E1002, f"pair code not found name={device_name!r}")
 
     if row["used_at"] is not None:
