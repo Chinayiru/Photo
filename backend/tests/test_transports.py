@@ -715,3 +715,159 @@ def test_bind_uses_exclusive_addr_on_windows() -> None:
             sock.close()
 
     asyncio.run(main())
+
+
+# --------------------------------------------------------------------------
+# 通路注册表（transports.build）
+#
+# 这一节保护的是"远程留接口"这句话的**真实性**。
+#
+# 在此之前 `config.json` 里的 `server.transport` 是个谎言：字段存在、
+# 文档里也写着，但没有任何代码读它，`server.py` 直接写死
+# `LocalHttpTransport(cfg, router)`。用户把值改成 `"relay"` 什么也不会
+# 发生 —— 程序照旧只监听局域网，然后他在外面怎么都连不上，且没有任何
+# 线索指向真正原因。
+#
+# 现在换成注册表 + `build(cfg, router)`，二期接入的全部工作收敛为
+# "写一个模块 + register() 一行"，server.py 与所有 handler 都不用动。
+# --------------------------------------------------------------------------
+
+
+def test_local_http_is_registered_by_default() -> None:
+    """一期自带的通路必须在注册表里，否则默认配置直接启动失败。"""
+    from app.transports import available
+
+    assert "local_http" in available()
+
+
+def test_build_returns_local_http_for_default_config() -> None:
+    """★ 默认配置（不写 server.transport）必须造出局域网通路。
+
+    这是绝大多数用户的路径 —— 他们从不碰这个字段。若这里出错，
+    表现是"程序起不来"，而错误信息里只有一句"未知的传输方式"。
+    """
+    from app.transports import build
+    from app.transports.local_http import LocalHttpTransport
+
+    cfg = _make_cfg()
+    t = build(cfg, router=None)
+    assert isinstance(t, LocalHttpTransport)
+
+
+def test_build_honours_configured_name() -> None:
+    """★ 配置里写了别的通路名时，必须造那一个 —— 而不是静默用局域网。
+
+    静默退回是最坏的失败模式：用户以为自己配的云端通路生效了，
+    带着手机出门，然后在 4G 下发现完全连不上。
+    """
+    from app.transports import build, register
+
+    class _FakeTransport:
+        name = "fake"
+
+        def __init__(self, cfg, router):
+            self.cfg = cfg
+            self.router = router
+
+    register("fake", _FakeTransport)
+    try:
+        cfg = _make_cfg()
+        cfg.raw.setdefault("server", {})["transport"] = "fake"
+        t = build(cfg, router="R")
+        assert isinstance(t, _FakeTransport)
+        assert t.router == "R"
+    finally:
+        from app.transports import _FACTORIES
+
+        _FACTORIES.pop("fake", None)
+
+
+def test_build_raises_on_unknown_transport_with_options() -> None:
+    """★ 通路名写错必须当场报错，且错误信息要列出可选值。
+
+    `UnknownTransport` 是**配置错误**不是运行时故障，所以它跟
+    `ConfigError` 一样直接冒泡给启动日志，不做 API 脱敏 —— 用户需要
+    看到自己写的那个名字和正确的候选。
+    """
+    from app.transports import UnknownTransport, build
+
+    cfg = _make_cfg()
+    cfg.raw.setdefault("server", {})["transport"] = "relay_typo"
+    with pytest.raises(UnknownTransport) as ei:
+        build(cfg, router=None)
+    assert "relay_typo" in str(ei.value)
+    assert "local_http" in str(ei.value), "报错里没列出可用通路，用户无法自救"
+    assert ei.value.known == ["local_http"]
+
+
+def test_build_treats_empty_name_as_default() -> None:
+    """空串 / None / 纯空白都当作"没配"，退回默认通路。
+
+    手写 JSON 很容易留下 `"transport": ""`；把它当错误会让程序起不来，
+    而这显然不是用户的本意。
+    """
+    from app.transports import build
+    from app.transports.local_http import LocalHttpTransport
+
+    for bad in ("", "   ", None):
+        cfg = _make_cfg()
+        cfg.raw.setdefault("server", {})["transport"] = bad
+        assert isinstance(build(cfg, router=None), LocalHttpTransport)
+
+
+def test_server_build_app_uses_the_registry() -> None:
+    """★ 结构回归：build_app() 必须走 build()，不能写死具体通路。
+
+    用 AST 而不是文本匹配 —— 本仓库已多次栽在"注释里出现了被搜索的词"。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from app import server as server_mod
+
+    src = textwrap.dedent(inspect.getsource(server_mod.build_app))
+    tree = ast.parse(src)
+    called = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Name):
+                called.add(f.id)
+            elif isinstance(f, ast.Attribute):
+                called.add(f.attr)
+    assert "build_transport" in called, (
+        "build_app() 没走通路注册表 —— 换通路又得改 server.py 了")
+    assert "LocalHttpTransport" not in called, (
+        "build_app() 直接写死了 LocalHttpTransport —— server.transport 又变成谎言了")
+
+
+def test_build_app_respects_configured_transport(tmp_path) -> None:
+    """★ 端到端：改配置就能换通路，不需要动 server.py。"""
+    from app import server as server_mod
+    from app.transports import _FACTORIES, register
+
+    seen = {}
+
+    class _FakeTransport:
+        name = "fake_e2e"
+
+        def __init__(self, cfg, router):
+            seen["cfg"] = cfg
+            seen["router"] = router
+
+    register("fake_e2e", _FakeTransport)
+    try:
+        # data_dir 必须显式给：默认会落在安装目录的 data/，
+        # 那是**用户真实库**（本仓库已经因为连错库出过两次事故）。
+        data = tmp_path / "data"
+        data.mkdir(parents=True, exist_ok=True)
+        cfg = Config({"server": {"host": "127.0.0.1", "port": 0,
+                                 "transport": "fake_e2e"},
+                      "roots": []},
+                     path=data / "config.json", data_dir=data)
+        _, transport, _ = server_mod.build_app(cfg)
+        assert isinstance(transport, _FakeTransport)
+        assert seen["router"] is not None
+    finally:
+        _FACTORIES.pop("fake_e2e", None)

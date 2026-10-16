@@ -41,7 +41,7 @@ from .routers import build_router
 from .static import StaticFiles
 from .state import AppState, set_state
 from .thumbs import ThumbEngine
-from .transports.local_http import LocalHttpTransport
+from .transports import build as build_transport
 
 log = logging.getLogger(__name__)
 
@@ -147,7 +147,10 @@ def build_app(cfg: Config | None = None, *, state: AppState | None = None) -> An
     # 吃掉交给前端外壳，表现为"接口返回 index.html"。
     router.set_fallback(StaticFiles(_dist_dir(cfg)))
 
-    transport = LocalHttpTransport(cfg, router)
+    # ★ 由配置决定用哪条通路，而不是写死局域网。
+    # 二期的 cloud_tunnel 只要在 transports/ 里 register() 一下，
+    # 这里与所有 handler 都不用改。见 transports/__init__.py。
+    transport = build_transport(cfg, router)
     return router, transport, st
 
 
