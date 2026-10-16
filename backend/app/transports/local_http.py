@@ -123,9 +123,22 @@ def adapt_reply(reply: Reply) -> Response:
     headers.pop("content-type", None)
 
     if reply.body is None:
-        # 204/304 不允许有正文。Starlette 的 Response 在 status 204 时
-        # 不会自动去掉 Content-Length，这里显式清掉避免协议违规。
-        headers.pop("content-length", None)
+        # 204/304 不允许有正文，且 204 不允许带 Content-Length。
+        #
+        # ★★ 但**只有 204/304** 才该清掉 Content-Length，不能对所有
+        # body 为 None 的响应都清。`Router.dispatch` 会给 HEAD 请求把
+        # body 置空 —— 而"告诉客户端 GET 会返回多少字节"**正是 HEAD
+        # 存在的全部意义**。早先这里无条件 `headers.pop("content-length")`，
+        # 于是每个 HEAD 都回 `Content-Length: 0`：Starlette 发现没有这个
+        # 头，就按空 body（`Response(None)` → `b""`）补了一个 0。
+        #
+        # 症状：手机端的"下载原图"在真正开始下载前先探一次大小，
+        # 拿到 0 后显示"文件为空"或直接放弃续传；而 GET 一个字节都不差，
+        # 所以只在 HEAD 上看得出来。这个 bug 由
+        # `test_tc_switch_func_006.py` 的两通路对比发现（直调 dispatch
+        # 时 Content-Length 还在，只有经适配层才丢）。
+        if reply.status in (204, 304):
+            headers.pop("content-length", None)
         resp: Response = Response(content=None, status_code=reply.status,
                                   headers=headers, media_type=media_type)
     elif isinstance(reply.body, bytes):
