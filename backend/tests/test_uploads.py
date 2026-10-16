@@ -27,6 +27,23 @@ from backend.app.errors import AppError
 
 LIB = "lib0000000000001"
 
+#: 一个最小但合法的 JPEG 头（SOI + APP0）。
+#: complete 阶段现在会校验魔术字节（docs/06 §6.1、docs/10 规则 S6），
+#: 所以凡是要走完 complete 的用例，负载必须"看起来真的是 JPEG" ——
+#: 用 `b"hello world"` 这类任意字节会被拒，那正是校验生效的证明。
+JPEG_HEAD = b"\xff\xd8\xff\xe0"
+
+
+def _img(payload: bytes) -> bytes:
+    """把任意负载包成一份合法的 JPEG 字节流。
+
+    补足到 32 字节：`sniff_kind` 需要至少 12 字节才能判定
+    （ISO-BMFF 的 brand 在偏移 8~12），比这短的一律拒绝 ——
+    真实图片没有小于 12 字节的，但测试里 `_img(b"d")` 只有 6 字节。
+    """
+    blob = JPEG_HEAD + payload
+    return blob + b"\x00" * max(0, 32 - len(blob))
+
 
 # --------------------------------------------------------------------------
 # 夹具
@@ -295,7 +312,7 @@ def test_oversized_chunk_rejected(tmp_path, library, db):
 
 def test_complete_places_file_and_returns_rel(tmp_path, library, db):
     cfg = _cfg(tmp_path, library)
-    data = b"photo-bytes"
+    data = _img(b"photo-bytes")
     r = _make(db, cfg, data, name="IMG_1234.jpg", declared_taken_at=1715520600.0)
     _send(db, cfg, r["upload_id"], data)
     out = uploads.complete_session(db, cfg, r["upload_id"])
@@ -311,7 +328,7 @@ def test_complete_places_file_and_returns_rel(tmp_path, library, db):
 
 def test_complete_is_idempotent(tmp_path, library, db):
     cfg = _cfg(tmp_path, library)
-    data = b"abc"
+    data = _img(b"abc")
     r = _make(db, cfg, data)
     _send(db, cfg, r["upload_id"], data)
     first = uploads.complete_session(db, cfg, r["upload_id"])
@@ -335,7 +352,7 @@ def test_complete_incomplete_returns_offset(tmp_path, library, db):
 
 def test_complete_sha256_mismatch_keeps_temp(tmp_path, library, db):
     cfg = _cfg(tmp_path, library)
-    data = b"real-bytes"
+    data = _img(b"real-bytes")
     r = _make(db, cfg, data)
     _send(db, cfg, r["upload_id"], data)
     with pytest.raises(AppError) as ei:
@@ -347,7 +364,7 @@ def test_complete_sha256_mismatch_keeps_temp(tmp_path, library, db):
 
 def test_complete_sha256_match_ok(tmp_path, library, db):
     cfg = _cfg(tmp_path, library)
-    data = b"real-bytes"
+    data = _img(b"real-bytes")
     r = _make(db, cfg, data)
     _send(db, cfg, r["upload_id"], data)
     out = uploads.complete_session(
@@ -362,13 +379,149 @@ def test_never_overwrites_existing_photo(tmp_path, library, db):
     when = 1715520600.0
     rels = []
     for i in range(3):
-        data = f"photo-{i}".encode()
+        data = _img(f"photo-{i}".encode())
         r = _make(db, cfg, data, name=f"p{i}.jpg", declared_taken_at=when)
         _send(db, cfg, r["upload_id"], data)
         rels.append(uploads.complete_session(db, cfg, r["upload_id"])["rel_path"])
     assert len(set(rels)) == 3
     for i, rel in enumerate(rels):
-        assert (library / rel).read_bytes() == f"photo-{i}".encode()
+        assert (library / rel).read_bytes() == _img(f"photo-{i}".encode())
+
+
+# --------------------------------------------------------------------------
+# 魔术字节（docs/06 §6.1、docs/10 规则 S6）
+# --------------------------------------------------------------------------
+
+
+#: `docs/07` TC-UPLOAD-SEC-008 ~ 015 的样本：(用例号, 文件名, 内容)
+_MASQUERADES: list[tuple[str, str, bytes]] = [
+    ("TC-UPLOAD-SEC-008", "fake_executable.jpg", b"MZ\x90\x00\x03" + b"\x00" * 64),
+    ("TC-UPLOAD-SEC-009", "elf.jpg", b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 64),
+    ("TC-UPLOAD-SEC-010", "script.jpg", b"#!/bin/sh\nrm -rf /" + b"\x00" * 64),
+    ("TC-UPLOAD-SEC-011", "svg_payload.png",
+     b'<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>'),
+    ("TC-UPLOAD-SEC-012", "html_payload.jpg", b"<html><script>alert(1)</script></html>"),
+    ("TC-UPLOAD-SEC-013", "doc.jpg", b"%PDF-1.4\n" + b"\x00" * 64),
+    ("TC-UPLOAD-SEC-014", "zip.jpg", b"PK\x03\x04" + b"\x00" * 64),
+    ("TC-UPLOAD-SEC-015", "evil.php.jpg", b"<?php system($_GET[0]); ?>" + b"\x00" * 64),
+]
+
+
+@pytest.mark.parametrize("case,name,payload", _MASQUERADES, ids=[c for c, _, _ in _MASQUERADES])
+def test_magic_mismatch(tmp_path, library, db, case, name, payload):
+    """★ 伪装文件必须被拒、不落盘、临时文件清理。
+
+    这是 `docs/06` 规则 6 点名的用例（`tests/test_uploads.py::test_magic_mismatch`）。
+    此前 `uploads.py` 里**根本没有**魔术字节校验，这 8 个样本全部被接受并
+    归档进了真实照片库（R-014 的缓解措施④是一条不存在的防线）。
+    """
+    cfg = _cfg(tmp_path, library)
+    r = _make(db, cfg, payload, name=name)
+    _send(db, cfg, r["upload_id"], payload)
+    temp = Path(uploads.get_session(db, r["upload_id"])["temp_path"])
+
+    with pytest.raises(AppError) as ei:
+        uploads.complete_session(db, cfg, r["upload_id"])
+    assert ei.value.code == "E1017", case
+
+    # ① 不落盘：归档目录下不能出现任何文件
+    up = library / "手机上传"
+    assert not list(up.rglob("*")) if up.exists() else True
+    # ② 临时文件被清理（与 sha256 不符相反：伪装文件的字节重传一万遍还是 exe）
+    assert not temp.exists()
+    # ③ 会话被标记 aborted，不能停在 open 让人以为还能续传
+    row = db.query_one("SELECT status FROM upload_sessions WHERE id = ?", (r["upload_id"],))
+    assert row["status"] == "aborted"
+
+
+def test_magic_rejects_disguised_video_as_jpg(tmp_path, library, db):
+    """MP4（ftypmp42）改名 .jpg —— brand 不在图片白名单内。"""
+    cfg = _cfg(tmp_path, library)
+    payload = b"\x00\x00\x00\x20ftypmp42" + b"\x00" * 64
+    r = _make(db, cfg, payload, name="video.jpg")
+    _send(db, cfg, r["upload_id"], payload)
+    with pytest.raises(AppError) as ei:
+        uploads.complete_session(db, cfg, r["upload_id"])
+    assert ei.value.code == "E1017"
+
+
+def test_magic_rejects_riff_that_is_not_webp(tmp_path, library, db):
+    """RIFF 只是容器：WAV 也是 RIFF。只查 `RIFF` 会放它进来。"""
+    cfg = _cfg(tmp_path, library)
+    payload = b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 64
+    r = _make(db, cfg, payload, name="sound.webp")
+    _send(db, cfg, r["upload_id"], payload)
+    with pytest.raises(AppError) as ei:
+        uploads.complete_session(db, cfg, r["upload_id"])
+    assert ei.value.code == "E1017"
+
+
+def test_magic_rejects_short_garbage(tmp_path, library, db):
+    """短到无法判定的一律拒绝 —— 不能因为"看不出是坏的"就放行。"""
+    cfg = _cfg(tmp_path, library)
+    payload = b"ab"
+    r = _make(db, cfg, payload, name="tiny.jpg")
+    _send(db, cfg, r["upload_id"], payload)
+    with pytest.raises(AppError) as ei:
+        uploads.complete_session(db, cfg, r["upload_id"])
+    assert ei.value.code == "E1017"
+
+
+def test_magic_accepts_valid_jpeg_and_png(tmp_path, library, db):
+    """真正的图片必须照常通过 —— 校验不能误杀。"""
+    cfg = _cfg(tmp_path, library)
+    for name, head in (
+        ("ok.jpg", b"\xff\xd8\xff\xe1" + b"\x00" * 64),
+        ("ok.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 64),
+        ("ok.gif", b"GIF89a" + b"\x00" * 64),
+        ("ok.webp", b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 64),
+        ("ok.heic", b"\x00\x00\x00\x18ftypheic" + b"\x00" * 64),
+    ):
+        r = _make(db, cfg, head, name=name)
+        _send(db, cfg, r["upload_id"], head)
+        out = uploads.complete_session(db, cfg, r["upload_id"])
+        assert out["dedup"] is False, name
+        assert (library / out["rel_path"]).read_bytes() == head
+
+
+def test_magic_audit_records_reject(tmp_path, library, db):
+    """拒绝要留痕：用户问"我传的那张怎么没进库"时，审计里得答得上来。"""
+    cfg = _cfg(tmp_path, library)
+    payload = b"MZ\x90\x00" + b"\x00" * 64
+    r = _make(db, cfg, payload, name="bad.jpg")
+    _send(db, cfg, r["upload_id"], payload)
+    with pytest.raises(AppError):
+        uploads.complete_session(db, cfg, r["upload_id"])
+    text = cfg.audit_log_path.read_text(encoding="utf-8")
+    assert "upload_reject" in text
+    assert "magic_mismatch" in text
+
+
+def test_sniff_kind_units():
+    """`sniff_kind` 的边界：单测直接覆盖，不依赖上传链路。"""
+    assert uploads.sniff_kind(b"\xff\xd8\xff\xe0" + b"\x00" * 8) == "jpeg"
+    assert uploads.sniff_kind(b"\x89PNG\r\n\x1a\n" + b"\x00" * 4) == "png"
+    assert uploads.sniff_kind(b"GIF87a" + b"\x00" * 6) == "gif"
+    assert uploads.sniff_kind(b"RIFF\x00\x00\x00\x00WEBP" + b"\x00") == "webp"
+    assert uploads.sniff_kind(b"\x00\x00\x00\x18ftypheic") == "heic"
+    assert uploads.sniff_kind(b"\x00\x00\x00\x18ftypavif") == "avif"
+    # 无法识别的
+    assert uploads.sniff_kind(b"MZ\x90\x00" + b"\x00" * 8) is None
+    assert uploads.sniff_kind(b"ab") is None
+    assert uploads.sniff_kind(b"") is None
+    # RIFF 但不是 WEBP
+    assert uploads.sniff_kind(b"RIFF\x00\x00\x00\x00WAVE") is None
+
+
+def test_magic_check_not_bypassed_by_double_extension(tmp_path, library, db):
+    """`evil.php.jpg`：扩展名是 .jpg，内容必须也是 JPEG 才算数。"""
+    cfg = _cfg(tmp_path, library)
+    payload = b"<?php system($_GET[0]); ?>" + b"\x00" * 64
+    r = _make(db, cfg, payload, name="evil.php.jpg")
+    _send(db, cfg, r["upload_id"], payload)
+    with pytest.raises(AppError) as ei:
+        uploads.complete_session(db, cfg, r["upload_id"])
+    assert ei.value.code == "E1017"
 
 
 # --------------------------------------------------------------------------
@@ -435,7 +588,7 @@ def test_instant_upload_skipped_when_size_differs(tmp_path, library, db):
 def test_complete_dedup_without_client_sha256(tmp_path, library, db):
     """客户端没带 sha256 时，complete 阶段仍要去重（并发上传靠这道兜底）。"""
     cfg = _cfg(tmp_path, library)
-    data = b"same-photo"
+    data = _img(b"same-photo")
     _seed_media(db, library, "2024/2024-05/x.jpg", data)
     r = _make(db, cfg, data, name="dup.jpg")
     _send(db, cfg, r["upload_id"], data)
@@ -472,7 +625,7 @@ def test_abort_removes_temp_and_keeps_row(tmp_path, library, db):
 
 def test_abort_completed_session_rejected(tmp_path, library, db):
     cfg = _cfg(tmp_path, library)
-    data = b"d"
+    data = _img(b"d")
     r = _make(db, cfg, data)
     _send(db, cfg, r["upload_id"], data)
     uploads.complete_session(db, cfg, r["upload_id"])
@@ -525,7 +678,7 @@ def test_temp_path_is_not_injectable(tmp_path, library, db):
 
 def test_audit_log_written_on_complete(tmp_path, library, db):
     cfg = _cfg(tmp_path, library)
-    data = b"audited"
+    data = _img(b"audited")
     r = _make(db, cfg, data)
     _send(db, cfg, r["upload_id"], data)
     uploads.complete_session(db, cfg, r["upload_id"])

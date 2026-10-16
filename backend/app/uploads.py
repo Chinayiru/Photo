@@ -257,6 +257,87 @@ def check_extension(cfg: Config, name: str) -> str:
     return ext
 
 
+# --------------------------------------------------------------------------
+# 魔术字节校验（docs/06 §6.1、docs/10 规则 S6）
+# --------------------------------------------------------------------------
+
+#: 文件头 → 真实类型。`(kind, magic, offset)`。
+#: 只看扩展名是不够的：扩展名是**用户可控的字符串**，而文件内容不是。
+#: 把 `payload.exe` 改名成 `photo.jpg` 就能绕过纯扩展名白名单。
+_MAGIC: Final[list[tuple[str, bytes, int]]] = [
+    ("jpeg", b"\xff\xd8\xff", 0),
+    ("png", b"\x89PNG\r\n\x1a\n", 0),
+    ("gif", b"GIF87a", 0),
+    ("gif", b"GIF89a", 0),
+    ("webp", b"RIFF", 0),
+    ("bmp", b"BM", 0),
+    ("tiff", b"II*\x00", 0),
+    ("tiff", b"MM\x00*", 0),
+]
+
+#: ISO-BMFF（HEIC/AVIF）的 brand：偏移 8 处。偏移 4 必须是 `ftyp`。
+_BMFF_BRANDS: Final[frozenset[bytes]] = frozenset({
+    b"avif", b"avis", b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1",
+})
+
+#: 扩展名 → 期望的类型。只列白名单内的扩展名。
+_EXT_KIND: Final[dict[str, str]] = {
+    ".jpg": "jpeg", ".jpeg": "jpeg", ".jpe": "jpeg",
+    ".png": "png", ".gif": "gif", ".webp": "webp", ".bmp": "bmp",
+    ".tif": "tiff", ".tiff": "tiff",
+    ".avif": "avif", ".heic": "heic", ".heif": "heic",
+}
+
+#: 读文件头用的字节数。JPEG 的 SOI 在偏移 0，BMFF 的 brand 在偏移 12，
+#: 32 字节对白名单里的所有格式都够。
+MAGIC_HEAD_BYTES: Final[int] = 32
+
+
+def sniff_kind(head: bytes) -> str | None:
+    """从文件头判定真实类型，无法识别返回 None。
+
+    注意 **不能** 靠"Pillow 能不能打开"来判断：真实库里 22 个 `.jpg-lx2`
+    的真实内容是 PNG，Pillow 打得开，但它们不该进照片库（docs/07 F7）。
+    """
+    if len(head) < 12:
+        # 白名单里的所有格式，最短的合法文件头也有 12 字节可供判定；
+        # 比这更短的不可能是正常照片，直接拒。
+        return None
+    for kind, magic, off in _MAGIC:
+        if head[off:off + len(magic)] == magic:
+            if kind == "webp":
+                # RIFF 只是容器（wav/avi 也是 RIFF），必须再看偏移 8 的 WEBP。
+                # 少了这一步，一个改名为 .webp 的 wav 会被放进去。
+                if head[8:12] != b"WEBP":
+                    continue
+            return kind
+    if head[4:8] == b"ftyp" and head[8:12] in _BMFF_BRANDS:
+        return "avif" if head[8:12] == b"avif" else "heic"
+    return None
+
+
+def check_magic(cfg: Config, name: str, head: bytes) -> str:
+    """扩展名 + 魔术字节双重校验，返回规范扩展名。
+
+    与 `check_extension` 的区别：那个只看名字，这个看内容。
+    `head` 至少要有 `MAGIC_HEAD_BYTES` 字节（不足按截断处理，
+    短到无法判定一律拒绝）。
+    """
+    ext = check_extension(cfg, name)
+    declared = _EXT_KIND.get(ext)
+    actual = sniff_kind(head[:MAGIC_HEAD_BYTES])
+    if declared is None or actual is None or actual != declared:
+        # 统一用 E1017（"不支持的文件格式"）对外，不新增错误码 ——
+        # 手机端对这两种情况的处理完全一样（让用户换一张图重传），
+        # 而区分码会把 docs/04 的错误表契约改宽。审计里留 `reason`
+        # 区分：排查时能看出是"扩展名不对"还是"内容伪装"。
+        raise AppError(
+            E1017,
+            f"文件内容与扩展名不符（声明 {ext}，实际 {actual or '无法识别'}）",
+        )
+    return ext
+
+
 def create_session(
     db: Database,
     cfg: Config,
@@ -628,6 +709,35 @@ def complete_session(
             headers={"X-Upload-Offset": str(actual)},
         )
 
+    # --- 魔术字节：必须在算哈希**之前** ---
+    # 一个改名为 .jpg 的 exe 可能有几百 MB，先算 sha256 再拒绝等于白读
+    # 一整遍磁盘；读 32 字节就能判掉。失败时**删临时文件并置 aborted**，
+    # 与 sha256 不符的处理**相反** —— 后者保留临时文件让客户端重传坏分片
+    # （内容是对的，只是传输坏了），而伪装文件的字节再传一万遍也还是 exe。
+    try:
+        with open(temp, "rb") as fh:
+            head = fh.read(MAGIC_HEAD_BYTES)
+        check_magic(cfg, sess["declared_name"], head)
+    except AppError:
+        _unlink_temp(str(temp))
+        db.execute(
+            "UPDATE upload_sessions SET status = 'aborted', completed_at = ? "
+            "WHERE id = ?",
+            (time.time(), upload_id),
+        )
+        _drop_lock(upload_id)
+        _audit(db, cfg, audit.ACTION_UPLOAD_REJECT, sess["declared_name"], {
+            "upload_id": upload_id,
+            "declared_name": sess["declared_name"],
+            "size": actual,
+            "reason": "magic_mismatch",
+        })
+        log.warning(
+            "上传被拒（魔术字节不符）：%s（%d 字节）",
+            sess["declared_name"], actual,
+        )
+        raise
+
     # --- 哈希：服务端自己算，不信任客户端声明 ---
     digest = hash_file(temp)
     declared = (sha256 or sess["sha256"] or "").strip().lower() or None
@@ -843,10 +953,12 @@ def _audit(db: Database, cfg: Config, action: str, rel_path: str,
 
 __all__ = [
     "HASH_CHUNK",
+    "MAGIC_HEAD_BYTES",
     "MAX_OPEN_SESSIONS",
     "abort_session",
     "append_chunk",
     "check_extension",
+    "check_magic",
     "complete_session",
     "complete_session_async",
     "create_session",
@@ -856,4 +968,5 @@ __all__ = [
     "open_session_count",
     "purge_expired",
     "root_of",
+    "sniff_kind",
 ]
