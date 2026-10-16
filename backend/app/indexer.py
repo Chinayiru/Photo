@@ -65,6 +65,13 @@ class ScanStats:
     started_at: float = field(default_factory=time.time)
     finished_at: float = 0.0
     aborted: str | None = None
+    #: 本轮**在磁盘上确实存在**的相对路径集合，`_mark_missing` 的唯一依据。
+    #:
+    #: ⚠️ 它**故意不参与 `as_dict()` / `summary()`**：增量监听时这个集合是
+    #: 全库路径（4900 条），塞进 SSE 事件与日志里毫无意义且会撑大每一帧。
+    #: 之所以挂在 ScanStats 上而不是用局部变量，是因为增量监听的
+    #: `_index_files` 是逐批调用的，集合必须跨批存活。
+    seen_rels: set[str] = field(default_factory=set, repr=False, compare=False)
 
     @property
     def elapsed(self) -> float:
@@ -106,6 +113,30 @@ def _is_excluded_file(name: str, root: RootConfig) -> bool:
         return True
     # Windows 缩略图缓存与 Office 临时文件：形如 ~$xxx / xxx.tmp
     return low.startswith("~$") or low.endswith(".tmp")
+
+
+def should_index(name: str, root: RootConfig) -> bool:
+    """这个文件名该不该进索引？**与 `_walk` 的过滤条件逐条对齐**。
+
+    为什么单独抽出来：全量扫描（`_walk`）与单文件增量（`index_one_file`）
+    是两条独立入口，但它们**必须给出完全一致的答案**。曾经不一致 ——
+    `index_one_file` 只看 `sandbox.resolve` 能不能通过（即"路径在库内"），
+    完全不看扩展名白名单，于是：
+
+      * 上传接口把 `foo.jpg-lx2` 归档成功后调 `index_one_file`，
+        它会**照收不误**建出一条 `ext="jpg-lx2"` 的行；
+      * 下一次全量扫描走 `_walk`，同一个文件被 `include_exts` 挡掉，
+        不进 `seen_rels`，于是 `_mark_missing` 把它标成 missing。
+
+    结果是用户刚传完的照片先出现在时间线上、几秒后又变成"已丢失"。
+    真实上传路径有扩展名校验挡着，所以这条只在"上传白名单被改宽、
+    而索引白名单没跟着改"时才炸 —— 而那正是最容易被忽略的配置漂移。
+
+    ⚠️ 这里**不含** junction/reparse 检查（那需要 lstat，是调用方的事）。
+    """
+    if _is_excluded_file(name, root):
+        return False
+    return _ext_of(name) in root.include_exts
 
 
 def _ext_of(name: str) -> str:
@@ -187,11 +218,9 @@ def _walk(root: RootConfig, stats: ScanStats) -> Iterator[tuple[str, os.stat_res
             # --- 文件 ---
             if not entry.is_file(follow_symlinks=False):
                 continue
-            if _is_excluded_file(name, root):
-                continue
-            ext = _ext_of(name)
-            if ext not in root.include_exts:
-                stats.skipped_ext += 1
+            if not should_index(name, root):
+                if not _is_excluded_file(name, root):
+                    stats.skipped_ext += 1
                 continue
             # 文件级的 reparse（符号链接文件）同样跳过：它指向库外
             if sandbox._is_reparse_or_link(Path(entry.path), st):
@@ -275,56 +304,9 @@ class Indexer:
         log.info("scan started root=%s path=%s", root.id, root.path)
         self._emit({"type": "scan_start", "root": root.id, "ts": time.time()})
         try:
-            known = self._load_known(root.id)
-            batch: list[tuple] = []
-            seen_rels: set[str] = set()
-
-            for rel, st in _walk(root, stats):
-                if self._cancel.is_set():
-                    stats.aborted = "用户中止"
-                    break
-                stats.seen += 1
-                seen_rels.add(rel)
-
-                prev = known.get(rel)
-                # ★ `prev["missing"]` 必须参与判断。`_load_known` 会把
-                #   missing=1 的行也载入内存，如果只比 mtime/size，
-                #   一张"曾经被标丢失、如今又回来了"的照片会走 unchanged
-                #   分支被 continue 掉，missing 永远清不掉 —— 文件就在
-                #   磁盘上，用户却一直看到"照片已丢失"。
-                #   触发场景很常见：拔了移动硬盘再插回来、临时改名目录后
-                #   又改回去、_mark_missing 因某次根目录不可读而误标。
-                if prev is not None and not prev["missing"] and not self._changed(prev, st):
-                    stats.unchanged += 1
-                    # 未变但仍缺缩略图 → 补入队（上次可能没跑完）
-                    if prev["thumb_state"] == "pending" and self.thumbs is not None:
-                        if self.thumbs.enqueue(prev["id"]):
-                            stats.thumb_queued += 1
-                    continue
-
-                row = await self._build_row(root, rel, st, prev)
-                batch.append(row)
-                if prev is None:
-                    stats.added += 1
-                else:
-                    stats.updated += 1
-
-                if len(batch) >= self.batch_size:
-                    ids = self._flush(batch)
-                    batch.clear()
-                    if self.thumbs is not None:
-                        stats.thumb_queued += self.thumbs.enqueue_many(ids)
-                    self._emit_progress(root, stats)
-                    # 让出事件循环，否则大批量扫描会卡住 API 响应
-                    await asyncio.sleep(0)
-
-            if batch:
-                ids = self._flush(batch)
-                if self.thumbs is not None:
-                    stats.thumb_queued += self.thumbs.enqueue_many(ids)
-
+            await self._index_files(root, _walk(root, stats), stats)
             if not self._cancel.is_set():
-                stats.missing = self._mark_missing(root.id, seen_rels)
+                stats.missing = self._mark_missing(root.id, stats.seen_rels)
         except Exception as e:  # noqa: BLE001 —— 扫描失败不能让整个服务倒下
             stats.errors += 1
             stats.aborted = str(e)
@@ -336,6 +318,86 @@ class Indexer:
             self._emit({"type": "scan_done", "root": root.id, "stats": stats.as_dict()})
             log.info("scan finished %s", stats.summary())
         return stats
+
+    # --- 索引入口（全量扫描与增量监听的共同实现）---------------------------
+
+    async def _index_files(
+        self,
+        root: RootConfig,
+        files: Iterable[tuple[str, os.stat_result]],
+        stats: ScanStats,
+        *,
+        known: dict[str, dict] | None = None,
+    ) -> None:
+        """把一批 (相对路径, stat) 同步进 media 表。
+
+        **全量扫描与 watchdog 增量共用这一份实现**。为什么不各写一份：
+        增量路径要处理的判断（missing 行复活、内容变了才重置缩略图、
+        取消、缩略图补入队）与全量扫描**逐条相同**，复制一份的代价是
+        两边迟早分叉 —— 而分叉的表现是"手动重扫能看到新照片、自动监听
+        看不到"这类只在特定操作序列下复现的问题。
+
+        调用方负责：`seen_rels` 的累积（增量时是全库已知集合）、
+        `_mark_missing`、以及异常兜底。
+
+        ⚠️ 本函数**自己会过一遍 `should_index`**。全量扫描的 `_walk`
+        已经过滤过一次，这里是重复的 —— 但重复是必要的：watchdog
+        增量路径直接调用本函数，它拿到的是"watchdog 报上来的路径"，
+        若不过滤，`.photobridge_tmp/xxx.part`、`Thumbs.db`、
+        `*.jpg-lx2` 这些就会被收录进时间线（而全量扫描不收），
+        表现为"手动重扫后它们消失了、过一会儿又冒出来"。
+        """
+        if known is None:
+            known = self._load_known(root.id)
+        batch: list[tuple] = []
+
+        for rel, st in files:
+            if self._cancel.is_set():
+                stats.aborted = "用户中止"
+                break
+            # 与 `_walk` / `index_one_file` 共用同一份判断，见 `should_index`。
+            if not should_index(rel.rsplit("/", 1)[-1], root):
+                stats.skipped_ext += 1
+                continue
+            stats.seen += 1
+            stats.seen_rels.add(rel)
+
+            prev = known.get(rel)
+            # ★ `prev["missing"]` 必须参与判断。`_load_known` 会把
+            #   missing=1 的行也载入内存，如果只比 mtime/size，
+            #   一张"曾经被标丢失、如今又回来了"的照片会走 unchanged
+            #   分支被 continue 掉，missing 永远清不掉 —— 文件就在
+            #   磁盘上，用户却一直看到"照片已丢失"。
+            #   触发场景很常见：拔了移动硬盘再插回来、临时改名目录后
+            #   又改回去、_mark_missing 因某次根目录不可读而误标。
+            if prev is not None and not prev["missing"] and not self._changed(prev, st):
+                stats.unchanged += 1
+                # 未变但仍缺缩略图 → 补入队（上次可能没跑完）
+                if prev["thumb_state"] == "pending" and self.thumbs is not None:
+                    if self.thumbs.enqueue(prev["id"]):
+                        stats.thumb_queued += 1
+                continue
+
+            row = await self._build_row(root, rel, st, prev)
+            batch.append(row)
+            if prev is None:
+                stats.added += 1
+            else:
+                stats.updated += 1
+
+            if len(batch) >= self.batch_size:
+                ids = self._flush(batch)
+                batch.clear()
+                if self.thumbs is not None:
+                    stats.thumb_queued += self.thumbs.enqueue_many(ids)
+                self._emit_progress(root, stats)
+                # 让出事件循环，否则大批量扫描会卡住 API 响应
+                await asyncio.sleep(0)
+
+        if batch:
+            ids = self._flush(batch)
+            if self.thumbs is not None:
+                stats.thumb_queued += self.thumbs.enqueue_many(ids)
 
     # --- 事件 -------------------------------------------------------------
 
@@ -544,9 +606,16 @@ class Indexer:
         上传路径需要"落盘后立刻能在时间线看到"，重新扫全库不可接受。
         这里只处理一个文件，走与全量扫描完全相同的取 EXIF/解析时间逻辑，
         保证两条路径产出的行一致。
+
+        ★ **扩展名/排除名单必须先过 `should_index`**。不检查的话，
+        这里会建出一条全量扫描永远不收的行 —— 下次扫描把它标成
+        missing，用户刚传的照片就"消失"了。见 `should_index` 的注释。
         """
         try:
             p = sandbox.resolve(root, rel, "read", cfg=self.cfg)
+            if not should_index(p.name, root):
+                log.info("index_one_file 跳过不在索引白名单内的文件 rel=%s", rel)
+                return None
             st = p.stat()
         except (AppError, OSError) as e:
             log.warning("index_one_file failed rel=%s: %s", rel, e)

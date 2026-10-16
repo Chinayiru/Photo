@@ -79,6 +79,28 @@ export interface IndexInfo {
   last_scan_at?: number | null;
 }
 
+/** `GET /api/system/info` → `watch`，来自 `backend/app/state.py: watch_info()`
+ *
+ * ★ 存在的理由：`index.watch` 配置默认为 true，但服务端必须如实报告
+ * 监听器**是否真的在跑**。watchdog 未安装、没有可用根目录、或用户
+ * 在设置里关掉了监听时，`running` 会是 false 而 `reason` 给出原因。
+ * 展示型字段：拿它做 UI 提示，不要用它做逻辑判断。
+ */
+export interface WatchInfo {
+  enabled: boolean;
+  running: boolean;
+  reason?: string;
+  roots?: string[];
+  pending?: number;
+  dropped?: number;
+  debounce_sec?: number;
+  events?: number;
+  indexed?: number;
+  missing?: number;
+  skipped?: number;
+  errors?: number;
+}
+
 /** `GET /api/system/info` → `limits`，来自 `backend/app/state.py: limits_info()` */
 export interface LimitsInfo {
   max_file_bytes: number;
@@ -107,6 +129,11 @@ export interface SystemInfo {
   device: { device_id: string; device_name: string };
   roots: RootInfo[];
   index: IndexInfo;
+  /**
+   * 文件系统监听状态。★ 后端在 `index` 之后新增，老服务端不返回它，
+   * 所以是可选字段（`_assert_fields` 只查必需字段）。
+   */
+  watch?: WatchInfo;
   thumbs: {
     cache_bytes: number;
     cache_files: number;

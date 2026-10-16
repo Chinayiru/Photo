@@ -42,6 +42,7 @@ from .static import StaticFiles
 from .state import AppState, set_state
 from .thumbs import ThumbEngine
 from .transports import build as build_transport
+from .watcher import build_watcher
 
 log = logging.getLogger(__name__)
 
@@ -120,7 +121,12 @@ def build_state(cfg: Config | None = None, *, db: Database | None = None) -> App
     thumbs = ThumbEngine(cfg, db, workers=workers, bus=bus)
     indexer = Indexer(cfg, db, thumbs=thumbs, bus=bus)
 
-    st = AppState(cfg, db, thumbs=thumbs, indexer=indexer, bus=bus)
+    # ★ 文件系统监听（AC-2.15：往库目录拷一张图，30 秒内手机可见）。
+    # 在 build_state 里构造而不是在 serve() 里，是为了让测试与脚本
+    # 也能拿到它；真正的启动/停止由 serve() 负责。
+    watcher = build_watcher(cfg, db, indexer=indexer, thumbs=thumbs, bus=bus)
+
+    st = AppState(cfg, db, thumbs=thumbs, indexer=indexer, bus=bus, watcher=watcher)
     set_state(st)
     return st
 
@@ -313,6 +319,18 @@ async def serve(cfg: Config | None = None, *,
         # 不 await：4915 张要 20 秒，先让手机能连上来。
         asyncio.create_task(_startup_scan(st), name="startup-scan")
 
+    # ★ 文件系统监听必须在**扫描之后**启动。
+    # 反过来的话，扫描期间产生的事件会与扫描抢同一批行：监听先按单文件
+    # 路径打了 missing=1（或插入了一行），扫描的 `_mark_missing` 又把它
+    # 重新算一遍 —— 结果虽然最终一致，但中间态会让手机端看到闪烁。
+    # 放在扫描之后，监听要处理的是"扫描结束之后"发生的变化，语义干净。
+    try:
+        st.watcher.start()
+    except Exception:       # noqa: BLE001
+        # 监听是"锦上添花"：watchdog 缺失、目录权限不足、句柄耗尽都可能失败。
+        # 它绝不能挡住服务启动 —— 用户仍可手动重扫。
+        log.exception("启动文件系统监听失败（服务照常运行，可手动重扫）")
+
     stop = asyncio.Event()
 
     def _on_signal(*_: Any) -> None:
@@ -350,6 +368,15 @@ async def serve(cfg: Config | None = None, *,
 
 async def _shutdown(st: AppState, transport: Any) -> None:
     """按依赖的反序关闭，每一步都不能让后面的步骤被跳过。"""
+    # ★ 监听**最先**停。它是唯一一个在别的线程里跑、并且会主动发起
+    # 索引写入的组件：先停数据库再停监听，监听的回调会撞上已关闭的
+    # 连接（SQLite 抛 ProgrammingError，而它发生在 watchdog 线程里，
+    # 表现为一堆看不出原因的堆栈）。
+    try:
+        await st.watcher.stop()
+    except Exception:       # noqa: BLE001
+        log.warning("关闭文件系统监听失败", exc_info=True)
+
     try:
         await transport.stop()
     except Exception:       # noqa: BLE001

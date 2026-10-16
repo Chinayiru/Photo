@@ -36,11 +36,12 @@ _SETTING_STARTED_AT = "server_started_at"
 class AppState:
     """一次进程生命周期内的共享依赖。"""
 
-    __slots__ = ("cfg", "db", "thumbs", "indexer", "bus", "started_at",
+    __slots__ = ("cfg", "db", "thumbs", "indexer", "bus", "watcher", "started_at",
                  "_device_id", "_device_name")
 
     def __init__(self, cfg: Config | None = None, db: Database | None = None, *,
-                 thumbs: Any = None, indexer: Any = None, bus: Any = None) -> None:
+                 thumbs: Any = None, indexer: Any = None, bus: Any = None,
+                 watcher: Any = None) -> None:
         self.cfg = cfg if cfg is not None else get_config()
         if db is not None:
             self.db = db
@@ -56,6 +57,10 @@ class AppState:
                 self.db = get_db()
         self.thumbs = thumbs
         self.indexer = indexer
+        # 文件系统监听器。为 None 时 /api/system/info 里如实报"未运行"，
+        # 而不是假装 watch=true 就有监听 —— 那个谎言让 AC-2.15 长期
+        # 无法验证（配置写着开、实际没有任何实现）。
+        self.watcher = watcher
         # 事件总线（SSE 用）。为 None 时 SSE 接口会退回模块级单例，
         # 因此测试里注入一个独立总线即可完全隔离。
         self.bus = bus
@@ -177,6 +182,25 @@ class AppState:
             "pending_thumbs": int(pending or 0),
             **last,
         }
+
+    def watch_info(self) -> dict[str, Any]:
+        """文件系统监听状态。
+
+        ★ 存在的理由：`index.watch` 默认是 `True`，但在一期很长时间里
+        `backend/app/` 里**没有任何 watchdog 实现** —— 用户在设置页看到
+        "监听：已开启"，实际往库目录拷照片不会自动出现（AC-2.15 无法通过）。
+        这类"配置说了但没做"的字段比缺一个功能更糟：它让用户以为是自己
+        的操作有问题。所以这里如实反映"监听器到底在不在跑"。
+        """
+        w = self.watcher
+        if w is None:
+            return {"enabled": False, "running": False, "reason": "未构造监听器"}
+        try:
+            return {"enabled": bool(getattr(w, "enabled", False)), **w.stats()}
+        except Exception:       # noqa: BLE001
+            log.debug("读取监听状态失败", exc_info=True)
+            return {"enabled": bool(getattr(w, "enabled", False)),
+                    "running": False, "reason": "状态读取失败"}
 
     def limits_info(self) -> dict[str, Any]:
         return {

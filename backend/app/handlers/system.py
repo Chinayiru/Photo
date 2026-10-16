@@ -72,6 +72,7 @@ async def info(ctx: Ctx) -> Reply:
         },
         "roots": st.roots_info(),
         "index": st.index_info(),
+        "watch": st.watch_info(),
         "thumbs": {
             "cache_bytes": _thumb_cache_bytes(st),
             "cache_files": _thumb_cache_files(st),
