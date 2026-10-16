@@ -16,7 +16,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Literal, Mapping
+from typing import Any, Callable, Final, Literal, Mapping
 
 import logging
 
@@ -631,59 +631,148 @@ def _is_public_ip(host: str) -> bool:
     return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved)
 
 
-def local_ipv4_addresses() -> list[str]:
-    """列出本机可用于局域网访问的 IPv4 地址（已过滤虚拟网卡网段）。
+#: 确定不属于「家庭局域网」的网段。手机不可能通过这些地址连上电脑。
+#:
+#: - `26.0.0.0/8`     Radmin VPN（实测本机 `26.26.192.40`）
+#: - `25.0.0.0/8`     Hamachi
+#: - `100.64.0.0/10`  运营商级 NAT（CGNAT），设备之间不互通
+#: - `169.254.0.0/16` 链路本地，只在没有 DHCP 时自赋值
+#: - `172.16.0.0/12`  Hyper-V / WSL2 默认段
+#: - `127.0.0.0/8`    回环
+#:
+#: 这些是**启发式**，不是安全边界：过滤错了顶多是"少显示一个可用地址"
+#: （用户仍可从 `server.host` 手填），而漏过滤会让手机去连一个永远连不上的
+#: 地址，用户看到的是"应用坏了"。所以宁多滤不少滤。
+_NON_LAN_CIDRS: Final[tuple[str, ...]] = (
+    "26.0.0.0/8",
+    "25.0.0.0/8",
+    "100.64.0.0/10",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "127.0.0.0/8",
+)
 
-    为什么要过滤：本机实测有 5 个 IPv4，其中 26.26.192.40、192.168.64.1、
-    192.168.226.1、192.168.32.1 来自 Hyper-V / WSL / VMware 虚拟网卡。
-    把这些地址显示给用户会让手机连一个永远连不上的地址，
-    而真正的局域网地址只有 192.0.2.10。过滤依据是这些虚拟网段的
-    固定前缀（WSL 用 172.x，Hyper-V 默认用 172.x，VMware 用 192.168.x.1 的
-    特定网关形态），无法穷举，因此采用"优先返回默认网关所在网段的地址"策略。
+
+def _in_non_lan_net(addr: str) -> bool:
+    """`addr` 是否落在已知的非局域网网段内（解析失败也算）。"""
+    import ipaddress
+
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return True                    # 解析不了就当不可用，保守
+    if ip.version != 4:
+        return True
+    return any(
+        ip in ipaddress.ip_network(cidr) for cidr in _NON_LAN_CIDRS
+    )
+
+
+def _routes_off_link(addr: str) -> bool:
+    """把 `addr` 作为源地址去连一个外网地址，判断它是否真的**能出网**。
+
+    这是区分「真实局域网网卡」与「host-only 虚拟网卡」最可靠的手段：
+    Hyper-V 内部交换机与 VMware host-only 网卡没有默认路由，绑定后
+    connect() 会直接抛 `WSAENETUNREACH (10051)`；而真实网卡能拿到路由。
+
+    实测（本机 5 个 IPv4）：
+
+    - `192.0.2.10`  真实网卡        → OK
+    - `26.26.192.40`   Radmin VPN     → OK（VPN 真的能路由，靠网段表过滤）
+    - `192.168.226.1`  VMware VMnet8  → FAIL 10051
+    - `192.168.64.1`   VMware VMnet1  → FAIL 10051
+    - `192.168.32.1`   WSL vEthernet  → FAIL 10051
+
+    注意 UDP connect 不发包，只做路由表查询，因此没有网络开销也不会被防火墙拦。
     """
     import socket
 
-    found: list[str] = []
-    # 主路由探测：连一个外部地址（不实际发包，UDP connect 只做路由选择）
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.bind((addr, 0))
+        s.connect(("223.5.5.5", 80))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _usable_lan_ips(
+    primary: str | None,
+    others: list[str],
+    *,
+    routes_off_link: "Callable[[str], bool] | None" = None,
+) -> list[str]:
+    """从候选地址中挑出手机真能连上的那些。
+
+    与系统调用分离，便于单测注入假的 `routes_off_link`。
+
+    规则：
+      1. 路由选出的 `primary` 永远保留（它就是默认网卡地址）。
+      2. 其余地址必须**同时**满足：不在已知非局域网网段、且真的能出网。
+    """
+    route = routes_off_link or _routes_off_link
+    out: list[str] = []
+
+    def _push(a: str) -> None:
+        if a and a not in out:
+            out.append(a)
+
+    if primary and not _in_non_lan_net(primary):
+        _push(primary)
+
+    for addr in others:
+        if not addr or addr in out:
+            continue
+        if _in_non_lan_net(addr):
+            continue
+        if not route(addr):
+            continue
+        _push(addr)
+    return out
+
+
+def local_ipv4_addresses() -> list[str]:
+    """列出本机**手机真能连上**的 IPv4 地址，默认网卡在前。
+
+    为什么必须过滤：本机实测有 5 个 IPv4，其中 4 个来自虚拟网卡
+    （Radmin VPN `26.26.192.40`、VMware VMnet1 `192.168.64.1`、
+    VMware VMnet8 `192.168.226.1`、WSL vEthernet `192.168.32.1`），
+    **只有 `192.0.2.10` 是真实局域网地址**。
+
+    把它们显示给用户（托盘二维码、`/api/system/info` 的 `lan_ips`）会
+    让手机去连一个永远连不上的地址，而用户的感受是"这个软件坏了" ——
+    这类问题极难自助排查，所以在这里就滤掉。
+
+    早期实现只用网段前缀过滤（只认识 172.16–172.31），实测漏掉 4 个中的 3 个；
+    现在改为「网段表 + 源地址路由探测」双重判据，实测 5 个地址里正确留下 1 个。
+    """
+    import socket
+
+    primary: str | None = None
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
+        # 主路由探测：连一个外部地址（不实际发包，UDP connect 只做路由选择）
         probe.connect(("223.5.5.5", 80))
-        primary = probe.getsockname()[0]
-        if primary and not primary.startswith("127."):
-            found.append(primary)
+        got = probe.getsockname()[0]
+        if got and not got.startswith("127."):
+            primary = got
     except OSError:
         pass
     finally:
         probe.close()
 
-    # 补充：主机名解析出的其他地址（去重）
+    others: list[str] = []
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
             addr = info[4][0]
-            if addr.startswith("127.") or addr in found:
-                continue
-            if _looks_virtual(addr):
-                continue
-            found.append(addr)
+            if addr and addr not in others:
+                others.append(addr)
     except OSError:
         pass
-    return found
 
-
-def _looks_virtual(addr: str) -> bool:
-    """已知虚拟网卡网段的启发式过滤。
-
-    Hyper-V 默认给虚拟交换机分配 172.16–172.31 段，WSL2 也用 172.x；
-    VMware 的 host-only 网卡习惯用 x.x.x.1 且属于 192.168.0.0/16 的
-    非默认网关段。这里只过滤确定性最高的两类，其余交给调用方展示给用户确认。
-    """
-    if addr.startswith("172."):
-        try:
-            second = int(addr.split(".")[1])
-        except (ValueError, IndexError):
-            return False
-        return 16 <= second <= 31          # Hyper-V / WSL2 默认段
-    return False
+    return _usable_lan_ips(primary, others)
 
 
 def bootstrap_default_root() -> Config:

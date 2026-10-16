@@ -26,6 +26,8 @@ import pytest
 from PIL import Image
 
 from backend.app.config import Config
+from backend.app.config import _in_non_lan_net, _usable_lan_ips
+from backend.app.config import local_ipv4_addresses
 from backend.app.db import Database
 from backend.app.server import build_app
 from backend.app.state import AppState
@@ -660,3 +662,138 @@ def test_missing_file_is_flagged_after_rescan(env):
     r = env.get(f"/api/items/{mid}", token=token)
     assert r.status == 200, r.text
     assert r.json()["missing"] == 1
+
+
+# --------------------------------------------------------------------------
+# 局域网地址过滤（本机实测回归）
+#
+# 背景：开发机有 5 个 IPv4，其中 4 个来自虚拟网卡 —— Radmin VPN
+# 26.26.192.40、VMware VMnet8 192.168.226.1、VMnet1 192.168.64.1、
+# WSL vEthernet 192.168.32.1，只有 192.0.2.10 是真实局域网地址。
+#
+# 这些地址会被托盘二维码、`/api/system/info` 的 `lan_ips`、以及
+# `LocalHttpTransport.urls` 展示给用户。展示错了，手机就去连一个永远连不上的
+# 地址，用户看到的是"这个软件坏了" —— 这类问题极难自助排查。
+#
+# 早期实现只用网段前缀过滤（只认识 172.16–172.31），实测 5 个里漏掉 3 个。
+# 下面把两种判据分别钉死：网段表负责 Radmin（它真的能路由，探测不出来），
+# 源地址路由探测负责 host-only 虚拟网卡（它们的网段无法穷举）。
+# --------------------------------------------------------------------------
+
+
+def test_non_lan_net_table_covers_radmin_and_virtual_nets():
+    """网段表必须认识本机实际遇到的每一类非局域网地址。"""
+    for bogus in ("26.26.192.40", "25.1.2.3", "172.20.0.1", "127.0.0.1",
+                  "169.254.1.1", "100.64.0.1"):
+        assert _in_non_lan_net(bogus), f"{bogus} 应被判为非局域网地址"
+
+
+def test_non_lan_net_table_keeps_real_lan_addresses():
+    """真实局域网地址不能被误杀（误杀会让手机连不上，比多显示更严重）。"""
+    for good in ("192.0.2.10", "192.168.1.7", "10.0.0.5", "172.15.0.1",
+                 "172.32.0.1"):
+        assert not _in_non_lan_net(good), f"{good} 是可用地址，不该被过滤"
+
+
+def test_usable_lan_ips_drops_host_only_via_route_probe():
+    """源地址路由探测必须滤掉 host-only 虚拟网卡（它们网段无法穷举）。
+
+    本机实测：绑定 192.168.226.1 / 192.168.64.1 / 192.168.32.1 后
+    connect() 直接抛 WSAENETUNREACH(10051)，而 192.0.2.10 能拿到路由。
+    这里注入假的探测函数，把「不能出网」这件事确定性地表达出来。
+    """
+    def route(addr: str) -> bool:
+        return addr == "192.0.2.10"
+
+    got = _usable_lan_ips(
+        "192.0.2.10",
+        ["26.26.192.40", "192.168.226.1", "192.168.64.1", "192.168.32.1"],
+        routes_off_link=route,
+    )
+    assert got == ["192.0.2.10"], got
+
+
+def test_usable_lan_ips_keeps_second_real_nic():
+    """有多张真实网卡（比如有线 + 无线）时，两张都要保留。"""
+    got = _usable_lan_ips(
+        "192.0.2.10",
+        ["192.168.1.20", "192.168.226.1"],
+        routes_off_link=lambda a: a != "192.168.226.1",
+    )
+    assert got == ["192.0.2.10", "192.168.1.20"], got
+
+
+def test_usable_lan_ips_primary_is_always_first():
+    """默认路由选出的地址必须排第一 —— 二维码用它生成，手机先扫到的应该是能连的。"""
+    got = _usable_lan_ips(
+        "192.0.2.10",
+        ["192.168.1.20"],
+        routes_off_link=lambda a: True,
+    )
+    assert got[0] == "192.0.2.10", got
+
+
+def test_usable_lan_ips_drops_virtual_primary():
+    """★ 默认路由本身落在虚拟网卡上时必须丢弃，而不是因为"是 primary"就放行。
+
+    场景：装了 Radmin / Hamachi 且它的虚拟网卡抢到了默认路由。
+    早期实现无条件 `found.append(primary)`，此时会把唯一保留的名额
+    浪费在一个手机连不上的地址上，同时真实网卡被落在后面。
+    """
+    got = _usable_lan_ips("26.26.192.40", ["192.0.2.10"],
+                          routes_off_link=lambda a: True)
+    assert got == ["192.0.2.10"], got
+
+
+def test_usable_lan_ips_is_deduped_and_safe_on_empty():
+    """primary 同时出现在 others 里时不能重复；全空时返回空列表而不是抛异常。"""
+    assert _usable_lan_ips("192.0.2.10", ["192.0.2.10"],
+                           routes_off_link=lambda a: True) == ["192.0.2.10"]
+    assert _usable_lan_ips(None, [], routes_off_link=lambda a: True) == []
+
+
+def test_usable_lan_ips_ignores_route_probe_for_primary():
+    """primary 不跑路由探测。
+
+    理由：探测要建 socket 并 bind，对默认网卡做一次没有信息量
+    （它就是路由表选出来的），却会在每个请求 `/api/system/info` 时重复执行。
+    """
+    calls: list[str] = []
+
+    def route(addr: str) -> bool:
+        calls.append(addr)
+        return True
+
+    _usable_lan_ips("192.0.2.10", [], routes_off_link=route)
+    assert calls == [], calls
+
+
+def test_local_ipv4_addresses_filters_virtual_nics_on_this_machine():
+    """端到端：在本机（真的存在 4 张虚拟网卡）调用真实实现。
+
+    这条是"真实环境回归" —— 换一台没有虚拟网卡的机器时，断言退化为
+    "结果非空且不含量已知虚拟地址"，仍然有意义。
+    """
+    ips = local_ipv4_addresses()
+    assert ips, "至少应找到一个可用地址"
+    for bogus in ("26.26.192.40", "192.168.226.1", "192.168.64.1",
+                  "192.168.32.1", "127.0.0.1"):
+        assert bogus not in ips, f"{bogus} 不该出现在给用户看的地址列表里: {ips}"
+    assert len(ips) == len(set(ips)), f"地址重复: {ips}"
+
+
+def test_transport_urls_do_not_advertise_virtual_nics():
+    """`transport.urls` 是托盘二维码与"复制地址"菜单的数据源，必须干净。"""
+    from backend.app.transports.local_http import LocalHttpTransport
+
+    cfg = Config({})
+    t = LocalHttpTransport(cfg, router=None, host="0.0.0.0", port=8787)
+    t._actual_port = 8787
+    urls = t.urls
+    for bogus in ("26.26.192.40", "192.168.226.1", "192.168.64.1",
+                  "192.168.32.1"):
+        assert not any(bogus in u for u in urls), f"{bogus} 出现在 {urls}"
+    # 回环绑定时只给回环地址，不受本函数影响
+    t2 = LocalHttpTransport(cfg, router=None, host="127.0.0.1", port=8787)
+    t2._actual_port = 8787
+    assert t2.urls == ["http://127.0.0.1:8787"]
