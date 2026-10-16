@@ -19,9 +19,11 @@ import SearchView from "./views/SearchView.vue";
 import UploadView from "./views/UploadView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import ViewerView from "./views/ViewerView.vue";
+import SelectionBar from "./components/SelectionBar.vue";
 import { onAuthLost } from "./api/client";
 import { closeEvents, connectEvents, reconnectEvents } from "./api/events";
 import { authStore, isPaired, probe } from "./stores/auth";
+import { exit as exitSelect, selectionStore } from "./stores/selection";
 import { startEvents, stopEvents } from "./stores/system";
 import { requeueInterrupted, uploadStore } from "./stores/upload";
 
@@ -56,7 +58,18 @@ const title = computed(() => TABS.find((t) => t.key === tab.value)?.label ?? "")
 /** 上传中有任务时，Tab 上挂个小圆点，切走了也知道还在传。 */
 const uploading = computed(() => uploadStore.state.active > 0);
 
+/** 多选中：底部页签栏换成操作条。 */
+const selActive = computed(() => selectionStore.state.active);
+
+/**
+ * 切 Tab。
+ *
+ * ★ 必须**先退出多选**：选中集是跨视图的（时间线与搜索页共用一套），
+ *   带着 5 个选中项从时间线切到「搜索」，操作条会一直挂着、数字还在，
+ *   用户会以为搜索页里那 5 张也被选上了 —— 而它们根本不在这一页。
+ */
 function switchTab(k: Tab): void {
+  exitSelect();
   tab.value = k;
 }
 
@@ -133,7 +146,7 @@ onBeforeUnmount(() => {
       </KeepAlive>
     </main>
 
-    <nav class="tabbar">
+    <nav v-if="!selActive" class="tabbar">
       <button
         v-for="t in TABS"
         :key="t.key"
@@ -150,6 +163,12 @@ onBeforeUnmount(() => {
         <span class="tab-t">{{ t.label }}</span>
       </button>
     </nav>
+
+    <!--
+      多选时用操作条**替换**页签栏（而不是叠在上面）：底部只有一条横带，
+      叠上去会盖住「上传/我的」，用户想切 Tab 就得先退出多选。
+    -->
+    <SelectionBar v-else />
   </template>
 
   <ViewerView />

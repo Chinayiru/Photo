@@ -12,6 +12,7 @@
 
 import { computed } from "vue";
 import { ApiError, api, previewUrl, rawUrl, thumbUrl } from "../api/client";
+import { getToken } from "../api/storage";
 import type {
   DeleteResponse,
   MediaDetail,
@@ -38,6 +39,168 @@ const initial = {
 
 export const viewerStore = createStore(initial);
 
+/* ------------------------------------------------------------------ *
+ * AC-2.10 第三级：空闲时静默预取原图
+ * ------------------------------------------------------------------ */
+
+/**
+ * 已预取的原图，存成 **Blob URL**。
+ *
+ * ## 为什么要预取
+ *
+ * 前两级（320 模糊占位 → 1600 预览）在**不放大**时已经完全够看，
+ * 用户甚至看不出差别。原图只在双指放大到 1:1 时才有意义 ——
+ * 而那一刻恰恰是最不能等的：手指已经捏在屏幕上，等 4 MB 下完再变清晰，
+ * 中间是几百毫秒到几秒的糊图。预取让这一刻只花**本地解码**的时间。
+ *
+ * ## 为什么存 Blob URL 而不是 `createImageBitmap` 的位图
+ *
+ * 本想让"放大即清晰"完全无等待，但一张 12MP 的 JPEG 解码后是
+ * `4000×3000×4 ≈ 48 MB`，按 §5.4.3 的"最多留 3 张"就是 **144 MB** 常驻 ——
+ * 安卓 Chrome 渲染进程上限约 300–500 MB，低端机更低，这是拿 OOM 换
+ * 一个 200ms 的体感收益，不划算。
+ *
+ * Blob URL 只持有**压缩后的字节**（一张 4 MB，三张 12 MB），只有在真正
+ * 显示时才解码。而且 `<img src="blob:...">` 与现有的预览图用的是同一个
+ * `src` 属性 —— 不需要为"原图"另造一套 canvas 渲染路径。
+ * 代价是首次放大仍有约 100–300ms 的本地解码，但没有网络等待。
+ *
+ * ## 三条硬约束（`docs/03-详细设计说明书.md:3660-3678` §5.4.3）
+ *
+ * ① 同时挂载的图片**最多 3 张**（当前 ±1）→ `RAW_KEEP = 3`；
+ * ② 原图预取并发**最多 1 个**，切换时用 `AbortController` 取消上一个；
+ * ③ 原图**仅当用户放大到 > 1.5× 才用**（见 `ViewerView.vue` 的 `useRaw`），
+ *    预取只是"提前把字节拿到手"，不改变画质决策。
+ */
+const RAW_KEEP = 3;
+/**
+ * 超过这个大小就不预取。
+ *
+ * 一期支持的上传上限是 2 GB（`docs/01` AC-3.10），但**浏览**不该为了
+ * 一张 800 MB 的 TIFF 在后台默默吃掉用户的流量与内存 —— 预取的收益是
+ * "放大快 200ms"，而代价是"毫无提示地下了 800 MB"。24 MB 覆盖了
+ * 手机与相机的绝大多数 JPEG（iPhone 48MP ProRAW 转出的 JPEG 约 5–10 MB）；
+ * 更大的图仍然能看、能放大，只是走一次网络而已。
+ */
+const RAW_PREFETCH_MAX_BYTES = 24 * 1024 * 1024;
+const rawBlobs = new Map<number, string>();
+/** 正在预取的那一张的 id（0 = 空闲）。同时只允许一个。 */
+let rawFetching = 0;
+let rawController: AbortController | null = null;
+/** 预取任务的序号：fetch 回来时若已不是最新任务就丢弃。 */
+let rawSeq = 0;
+
+/** 预取入口：切图后调用，内部自行空闲调度。 */
+export function schedulePrefetchRaw(id: number): void {
+  if (!id) return;
+  if (rawBlobs.has(id) || rawFetching === id) return;
+  if (typeof URL.createObjectURL !== "function") return;  // 极老的浏览器
+  idle(() => void prefetchRaw(id));
+}
+
+/** 空闲调度：优先 requestIdleCallback，退回 300ms 定时器。 */
+function idle(fn: () => void): void {
+  const ric = (window as unknown as {
+    requestIdleCallback?: (cb: () => void, opt?: { timeout: number }) => number;
+  }).requestIdleCallback;
+  if (typeof ric === "function") {
+    ric(fn, { timeout: 1500 });
+    return;
+  }
+  window.setTimeout(fn, 300);
+}
+
+async function prefetchRaw(id: number): Promise<void> {
+  // 同时只跑一个：先取消上一个（约束 ②）。
+  rawController?.abort();
+  const ctrl = new AbortController();
+  rawController = ctrl;
+  const my = ++rawSeq;
+  rawFetching = id;
+
+  const token = getToken();
+  try {
+    const res = await fetch(rawUrl(id), {
+      method: "GET",
+      // ★ 会话走 cookie，与 `<img>` 完全同一条路（见 api/client.ts 的注释：
+      //   `fetch` 加 credentials 是为了自愈 cookie，服务端头优先、cookie 兜底）。
+      credentials: "same-origin",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return;
+    // ★ 检查 Content-Type：某些错误页（如反代返回的 HTML 502）也是 200，
+    //   把它当原图存下来会让放大后显示一坨乱码 —— 那种失败比"没预取"更糟。
+    const ct = res.headers.get("content-type") ?? "";
+    if (ct && !ct.startsWith("image/")) return;
+    const blob = await res.blob();
+    if (my !== rawSeq) return;       // 期间用户又滑了，这次结果作废
+    if (blob.size === 0) return;
+    rawBlobs.set(id, URL.createObjectURL(blob));
+    evictRaw();
+  } catch {
+    // ★ 静默失败：预取是"锦上添花"，任何错误（断网、取消、解码失败）
+    //   都不该冒泡到界面上 —— 用户没做任何操作，弹一个错误框会让他
+    //   以为照片坏了。真正要原图时（放大到 1.5×）会再走一次网络。
+  } finally {
+    if (my === rawSeq) {
+      rawFetching = 0;
+      rawController = null;
+    }
+  }
+}
+
+/** 淘汰超出 RAW_KEEP 的，保留最近插入的。 */
+function evictRaw(): void {
+  while (rawBlobs.size > RAW_KEEP) {
+    // Map 保持插入顺序，第一个就是最老的
+    const oldest = rawBlobs.keys().next();
+    if (oldest.done) break;
+    releaseRaw(oldest.value);
+  }
+}
+
+/** 主动释放某一个的原图（切图、关闭查看器时调用）。 */
+export function releaseRaw(id: number): void {
+  const url = rawBlobs.get(id);
+  if (!url) return;
+  // ★ 必须 revoke：Blob URL 的字节会一直被 hold 住直到 revoke 或页面卸载，
+  //   只从 Map 里删掉是**内存泄漏**（而且泄漏的是几 MB 的整张原图）。
+  URL.revokeObjectURL(url);
+  rawBlobs.delete(id);
+}
+
+/** 已预取到的原图 Blob URL（没有则空串）。 */
+export function cachedRaw(id: number): string {
+  return rawBlobs.get(id) ?? "";
+}
+
+/**
+ * 放大后应该用哪张图的 URL。
+ *
+ * ★ 这是 §5.4.3 约束 ③「原图仅当用户放大到 > 1.5× 才用」的唯一落点。
+ *   在放大之前用原图是纯亏：4 MB 的原图与 1600px 预览在屏幕上
+ *   **一模一样**（手机屏幕只有 400px 宽），却要多下 20 倍字节、
+ *   多解码 48 MB。
+ *
+ * 预取到了本地 Blob 就返回它（零网络等待），否则退回原图 URL
+ * （走一次 Range 请求，服务端支持断点）。
+ */
+export function rawSrcFor(id: number): string {
+  return cachedRaw(id) || rawUrl(id);
+}
+
+/** 是否已经有这张的原图（给界面决定要不要提示"放大即清晰"）。 */
+export function hasRaw(id: number): boolean {
+  return rawBlobs.has(id);
+}
+
+/** 当前这张的详情变化后，重新安排一次预取（`open` / 连滑都会调）。 */
+function prefetchCurrent(): void {
+  const s = viewerStore.state;
+  if (s.open && s.id) schedulePrefetchRaw(s.id);
+}
+
 /** 打开查看器。传 id 即可，详情异步拉。 */
 export function open(id: number): void {
   const s = viewerStore.state;
@@ -48,6 +211,7 @@ export function open(id: number): void {
   s.imageReady = false;
   s.dir = "none";
   void fetchDetail(id);
+  prefetchCurrent();
 }
 
 export function close(): void {
@@ -57,6 +221,13 @@ export function close(): void {
   s.error = "";
   // 立刻释放大图引用，让浏览器回收解码后的位图（手机内存敏感）
   s.id = 0;
+  // ★ 预取的原图也必须一起放掉。不取消的话用户在查看器里翻了 20 张
+  //   再关掉，后台还在继续下原图，而他已经不看了 —— 白耗流量与电量。
+  rawController?.abort();
+  rawController = null;
+  rawFetching = 0;
+  rawSeq++;
+  for (const id of [...rawBlobs.keys()]) releaseRaw(id);
 }
 
 /** 拉详情。用序号丢弃过期响应，避免快速连滑时"跳回上一张"。 */
@@ -74,6 +245,11 @@ export async function fetchDetail(id: number): Promise<void> {
     if (my !== s.seq) return; // 用户已经滑走了
     s.detail = d;
     s.id = d.id;
+    // ★ 详情落地后再预取（而不是在 `open`/`goNext` 里）：
+    //   这里是**所有**切换路径的唯一汇合点（open / goNext / goPrev /
+    //   从时间线点进来），在别处挂就会漏掉某一条；而且拿到 detail 才
+    //   知道这张到底多大 —— 几十 MB 的图不该无脑预取。
+    if (d.size <= RAW_PREFETCH_MAX_BYTES) prefetchCurrent();
   } catch (e) {
     if (my !== s.seq) return;
     const err = e instanceof ApiError ? e : null;

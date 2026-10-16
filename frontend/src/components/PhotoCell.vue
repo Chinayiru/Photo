@@ -11,8 +11,13 @@
  *
  * 为什么用 `aspect-ratio` 而不是后端给的 w/h：后端的 w/h 是**原图**尺寸，
  * 而缩略图是等比缩放后裁到正方形的，直接用会拉伸变形。
+ *
+ * ★ 长按多选（US-12「长按选中，点删除」）：`touchstart/move/end` 三个
+ *   监听器挂在这里而不是委托到 `PhotoGrid` —— 长按是"按住这个格子"的
+ *   手势，交给容器就没法知道手指压的是哪一个；而这三个监听器不查 DOM、
+ *   不分配对象，翻到 1500 张也不构成负担（`click` 仍然走委托，另一回事）。
  */
-import { computed, ref } from "vue";
+import { computed, onBeforeUnmount, ref } from "vue";
 import type { MediaItem } from "../api/types";
 import { thumbUrl } from "../api/client";
 
@@ -20,7 +25,11 @@ const props = defineProps<{
   item: MediaItem;
   /** 选中态（长按多选时用）。 */
   selected?: boolean;
+  /** 是否处于多选模式 —— 决定"点击"是打开大图还是切换选中。 */
+  selectMode?: boolean;
 }>();
+
+const emit = defineEmits<{ (e: "longpress", id: number): void }>();
 
 /**
  * ★ 刻意**不**在这里监听 click。
@@ -29,6 +38,71 @@ const props = defineProps<{
  * 由父组件 `PhotoGrid` 在网格容器上挂**一个** click，靠 `data-id`
  * 反查是哪个格子（事件委托）。键盘可达性也由父组件统一处理。
  */
+
+/**
+ * 长按判定阈值。
+ *
+ * 450ms 取在 iOS（约 500ms）与安卓（约 400ms）之间：短了会把"点开大图前
+ * 手指稍微停一下"误判成多选，长了用户以为没反应就松手了。
+ */
+const LONG_PRESS_MS = 450;
+/** 手指离起点超过这个位移就取消长按（用户其实在滚动列表）。 */
+const MOVE_SLOP = 10;
+
+let timer = 0;
+let sx = 0;
+let sy = 0;
+/** 本次触摸是否已经触发过长按。 */
+let fired = false;
+
+function clearTimer(): void {
+  if (timer) {
+    window.clearTimeout(timer);
+    timer = 0;
+  }
+}
+
+function onTouchStart(e: TouchEvent): void {
+  if (e.touches.length !== 1) return;  // 双指是缩放，不是长按
+  const t = e.touches[0]!;
+  sx = t.clientX;
+  sy = t.clientY;
+  fired = false;
+  clearTimer();
+  timer = window.setTimeout(() => {
+    timer = 0;
+    fired = true;
+    emit("longpress", props.item.id);
+  }, LONG_PRESS_MS);
+}
+
+function onTouchMove(e: TouchEvent): void {
+  const t = e.touches[0];
+  if (!t) return;
+  if (Math.abs(t.clientX - sx) > MOVE_SLOP
+      || Math.abs(t.clientY - sy) > MOVE_SLOP) {
+    clearTimer();
+  }
+}
+
+function onTouchEnd(e: TouchEvent): void {
+  const wasFired = fired;
+  fired = false;
+  clearTimer();
+  // ★ 长按之后浏览器还会补一个 click，那个 click 会被网格的委托监听当成
+  //   "用户点了一下"，在多选模式下就是把刚选中的那张**取消选中**。
+  //   在 touchend 上 preventDefault 能阻止这一串兼容鼠标事件的派发，
+  //   这也是唯一可靠的时机（等 click 到了再判断已经晚了）。
+  if (wasFired) e.preventDefault();
+}
+
+function onTouchCancel(): void {
+  fired = false;
+  clearTimer();
+}
+
+onBeforeUnmount(clearTimer);
+
 const failed = ref(false);
 const loaded = ref(false);
 
@@ -64,11 +138,16 @@ function onLoad(): void {
 <template>
   <div
     class="cell"
-    :class="{ selected, 'has-img': showImage }"
+    :class="{ selected, 'has-img': showImage, multi: selectMode }"
     :data-id="item.id"
     role="button"
     tabindex="-1"
     :aria-label="item.name"
+    @touchstart.passive="onTouchStart"
+    @touchmove.passive="onTouchMove"
+    @touchend="onTouchEnd"
+    @touchcancel="onTouchCancel"
+    @contextmenu.prevent
   >
     <!--
       灰块占位：只在缩略图**加载失败**或后端标记 failed 时显示。
@@ -96,7 +175,19 @@ function onLoad(): void {
     />
 
     <span v-if="item.has_gps" class="badge gps" aria-label="有位置信息">📍</span>
+
+    <!--
+      选中标记：
+        - 多选模式下**已选** → ✓ 实心角标
+        - 多选模式下**未选** → 空心圈（告诉用户"每张都能选"，
+          否则用户看不出哪些格子是可操作的）
+    -->
     <span v-if="selected" class="badge check" aria-hidden="true">✓</span>
+    <span
+      v-else-if="selectMode"
+      class="badge check empty"
+      aria-hidden="true"
+    />
   </div>
 </template>
 
@@ -187,8 +278,19 @@ function onLoad(): void {
   font-size: 12px;
 }
 
+/* 多选模式下**未选中**的圈：半透明黑底 + 白描边，在任何照片上都看得见 */
+.check.empty {
+  background: rgba(0, 0, 0, 0.35);
+  border: 1.5px solid rgba(255, 255, 255, 0.85);
+}
+
 .cell.selected {
   outline: 3px solid var(--accent);
   outline-offset: -3px;
+}
+
+/* 多选模式下取消按压缩放：用户是在"勾选"，格子跳动会让人以为点错了 */
+.cell.multi:active {
+  transform: none;
 }
 </style>

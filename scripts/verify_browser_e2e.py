@@ -30,6 +30,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import socket
@@ -111,6 +112,7 @@ class Browser:
         )
         self.ws = None
         self._id = 0
+        self._events: list[dict] = []
         self._wait_devtools()
 
     def _wait_devtools(self, budget: float = 30.0) -> None:
@@ -131,9 +133,8 @@ class Browser:
             return json.loads(r.read())
 
     def connect(self) -> None:
-        import asyncio
-
         import websockets
+
 
         pages = [t for t in self.targets() if t.get("type") == "page"]
         if not pages:
@@ -143,6 +144,7 @@ class Browser:
         self._loop = asyncio.new_event_loop()
         self.ws = self._loop.run_until_complete(websockets.connect(
             url, max_size=64 * 1024 * 1024))
+        self._events = []
 
     def send(self, method: str, **params):
         self._id += 1
@@ -152,10 +154,34 @@ class Browser:
         while True:
             raw = self._loop.run_until_complete(self.ws.recv())
             msg = json.loads(raw)
-            if msg.get("id") == mid:
-                if "error" in msg:
-                    raise RuntimeError(f"{method}: {msg['error']}")
-                return msg.get("result", {})
+            if msg.get("id") != mid:
+                # 事件通知（页面加载、控制台、异常）一并留档，见 `_drain`。
+                self._events.append(msg)
+                continue
+            if "error" in msg:
+                raise RuntimeError(f"{method}: {msg['error']}")
+            return msg.get("result", {})
+
+    def drain(self, limit: int = 200) -> int:
+        """非阻塞地收掉 CDP 事件，返回收了几条。
+
+        留着它是因为一个真实故障的排查经验：**页面导航之后，向这个标签页
+        派发 `Input.dispatchTouchEvent` 会有 1~2 秒完全收不到 `touchstart`**，
+        而 CDP 不报任何错（`document.readyState` 正常是 `complete`、
+        `navigator.maxTouchPoints` 仍是 5）。`send()` 会把这类事件通知顺手
+        存进 `_events`，下次出这类"命令成功但页面没反应"的怪事时，
+        先 `drain()` 看一眼有没有 `Inspector.targetCrashed` 之类的东西。
+        """
+        got = 0
+        while got < limit:
+            try:
+                raw = self._loop.run_until_complete(
+                    asyncio.wait_for(self.ws.recv(), timeout=0.05))
+            except Exception:                          # noqa: BLE001
+                break
+            self._events.append(json.loads(raw))
+            got += 1
+        return got
 
     def evaluate(self, expr: str):
         r = self.send("Runtime.evaluate", expression=expr,
@@ -168,6 +194,27 @@ class Browser:
     def goto(self, url: str) -> None:
         self.send("Page.enable")
         self.send("Page.navigate", url=url)
+        self.wait_ready()
+
+    def wait_ready(self, *, budget: float = 20.0) -> bool:
+        """等页面真的加载完（`document.readyState === "complete"`）。
+
+        ★★ `Page.navigate` 只是发起导航，**不保证新文档已经就绪**。旧文档
+        在新文档 commit 之前一直存活，`Runtime.evaluate` 会落在旧文档上、
+        并在旧文档被替换时返回被丢弃的结果（实测 `evaluate` 静默返回
+        `None`）。更要命的是：**在一个尚未加载完的新文档里派发触摸，
+        Chrome 会直接丢弃** —— 后面全部手势断言于是建立在一堆没到达的
+        事件上（`[4g]` 长按用例实测触发了这个）。
+        """
+        end = time.time() + budget
+        while time.time() < end:
+            try:
+                if self.evaluate("document.readyState") == "complete":
+                    return True
+            except Exception:                          # noqa: BLE001
+                pass
+            time.sleep(0.2)
+        return False
 
     def enable_touch(self) -> None:
         """开启触摸模拟。
@@ -186,6 +233,45 @@ class Browser:
         self.send("Input.dispatchTouchEvent",
                   type=kind,
                   touchPoints=[{"x": x, "y": y} for x, y in points])
+
+    def new_page(self, url: str = "about:blank") -> None:
+        """新开一个标签页，并把 CDP 连接切到它上面。
+
+        ★ 用于 `[4g]`：连续导航若干次之后，**当前标签页**的触摸派发会彻底
+        失效 —— CDP 接受 `Input.dispatchTouchEvent`、不报任何错，页面却收
+        不到一个事件（实测等 18 轮 × 0.8 秒仍是 0，而 `document.readyState`
+        一直是 `complete`、`navigator.maxTouchPoints` 仍是 5）。同一浏览器
+        里新开的标签页则是干净的。
+        """
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/json/new?"
+            + urllib.parse.quote(url, safe=""),
+            method="PUT")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            info = json.loads(r.read())
+        try:
+            self._loop.run_until_complete(self.ws.close())
+        except Exception:                              # noqa: BLE001
+            pass
+        import websockets
+
+        self._loop = asyncio.new_event_loop()
+        self.ws = self._loop.run_until_complete(websockets.connect(
+            info["webSocketDebuggerUrl"], max_size=64 * 1024 * 1024))
+        self._events = []
+        self._id = 0
+
+    def reconnect(self) -> None:
+        """关掉 CDP WebSocket 再连回来（同一个浏览器 / 同一个标签页）。"""
+        try:
+            if self.ws is not None:
+                self._loop.run_until_complete(self.ws.close())
+        except Exception:                              # noqa: BLE001
+            pass
+        self.ws = None
+        self._id = 0
+        self.connect()
+        self.enable_touch()
 
     def wait_for(self, expr: str, *, budget: float = 20.0, label: str = "") -> bool:
         end = time.time() + budget
@@ -943,6 +1029,454 @@ def main() -> int:
         br.goto(base + "/")
         br.wait_for("document.querySelectorAll('[data-id]').length >= 1",
                     budget=30, label="回到时间线")
+
+        # ---------------------------------------------------------------
+        print("\n[4g] 长按多选（US-12）")
+        # ---------------------------------------------------------------
+        # ★★ 触摸派发是否真的到达页面，必须**验证**。
+        #
+        # 这一节踩过的坑值得记下来：连续导航若干次之后，**当前标签页**的
+        # `Input.dispatchTouchEvent` 会彻底失效 —— CDP 接受命令、不报任何错，
+        # 页面却收不到一个 `touchstart`（实测重试 18 轮 × 0.8 秒仍是 0，
+        # 而 `document.readyState` 一直是 `complete`、
+        # `navigator.maxTouchPoints` 仍是 5、`document.hasFocus()` 为真、
+        # 换到 `data:` 最简页面同样收不到；只有 `Input.dispatchMouseEvent`
+        # 仍然有效）。同一浏览器里**新开的标签页完全正常**，所以下面先
+        # 换一个标签页再开始。
+        #
+        # 不验证的话，后面每条手势断言都建立在"事件根本没到达"之上，失败
+        # 信息还会指向错误的方向（脚本曾把一次滚动位置偏移误报成"长按没
+        # 生效"）。所以这里宁可红，也不要一条由没到达的事件凑出来的假绿。
+        def arm_touch(attempts: int = 5) -> bool:
+            """确认触摸派发真的生效，返回是否验证通过。"""
+            br.evaluate("""
+              (() => {
+                window.__tp = 0;
+                document.addEventListener(
+                  'touchstart', () => { window.__tp++; }, true);
+                return true;
+              })()
+            """)
+            for _ in range(attempts):
+                br.enable_touch()
+                time.sleep(0.6)
+                try:
+                    br.touch("touchStart", [(6.0, 6.0)])
+                    time.sleep(0.2)
+                    got = br.evaluate("window.__tp")
+                    br.touch("touchEnd", [])
+                except Exception:                       # noqa: BLE001
+                    got = 0
+                if got:
+                    return True
+                time.sleep(0.4)
+            return False
+
+        # 换一个干净的标签页：localStorage 按 origin 共享，所以新标签页
+        # 仍然是已配对状态，直接打开时间线即可。
+        br.new_page()
+        br.goto(base + "/")
+        br.wait_for("!!document.querySelector('.grid-root .cell[data-id]')",
+                    budget=30, label="[4g] 新标签页时间线")
+        time.sleep(0.6)
+        n_cells = br.evaluate(
+            "document.querySelectorAll('.grid-root .cell[data-id]').length")
+        check(isinstance(n_cells, int) and n_cells >= 1,
+              f"时间线里有格子可长按  got {n_cells}")
+        check(not br.evaluate("!!document.querySelector('.viewer')"),
+              "进入多选用例前查看器是关闭的")
+        check(arm_touch(), "★ 触摸模拟已生效（事件真的到达页面，不是假绿）")
+        # 长按用例自己的计数器：既用来断言事件真的到达，也用来在失败时
+        # 区分"事件没到达"与"手势逻辑不对"这两类完全不同的故障。
+        br.evaluate("""
+          (() => {
+            window.__lp = {start: 0, end: 0};
+            document.addEventListener(
+              'touchstart', () => { window.__lp.start++; }, true);
+            document.addEventListener(
+              'touchend', () => { window.__lp.end++; }, true);
+            return true;
+          })()
+        """)
+        box = br.evaluate("""
+          (() => {
+            const c = document.querySelector('.grid-root .cell[data-id]');
+            if (!c) return null;
+            const r = c.getBoundingClientRect();
+            return { x: r.left + r.width / 2, y: r.top + r.height / 2,
+                     id: Number(c.dataset.id) };
+          })()
+        """)
+        check(isinstance(box, dict) and box.get("x"), f"能定位第一个格子  got {box}")
+        long_id = int(box["id"])
+        # ★ `Browser.touch()` 收的是 (x, y) 元组列表，不是 CDP 的 {"x":..,"y":..}
+        p = [(box["x"], box["y"])]
+        br.touch("touchStart", p)
+        # ★ 必须真的按住超过 LONG_PRESS_MS（450ms）—— 睡 50ms 的话测的是
+        #   "轻点"，那在多选模式下是打开大图，不是进入多选。
+        # ★★ 但**不能在按住期间不派发 touchmove**：`[4d]` 那一节结束时
+        #    页面的滚动位置/视口可能与测量 `box` 时不同，而更根本的是
+        #    Chrome 会把"按住不动"判成一次滚动手势的起点。补几帧
+        #    **位移为 0** 的 touchmove，既保持按下状态又不会触发滚动。
+        for _ in range(4):
+            br.touch("touchMove", p)
+            time.sleep(0.18)
+        br.touch("touchEnd", p)
+        time.sleep(0.35)
+
+        lp = br.evaluate("JSON.stringify(window.__lp)")
+        cnt = json.loads(lp) if lp else {}
+        # 失败时把"点击落到了哪个元素上"一并打出来：这一条挂了通常不是
+        # 手势的问题，而是测量到的坐标被别的元素盖住了（`[4d]` 遗留的查看
+        # 器、还没滚动到位的容器），没有这个信息只能靠猜。
+        if not cnt.get("start", 0):
+            print("  DBG 点到了", br.evaluate("""
+              (() => {
+                const el = document.elementFromPoint(%f, %f);
+                return JSON.stringify({tag: el && el.tagName,
+                  cls: el && String(el.className),
+                  viewer: !!document.querySelector('.viewer'),
+                  scrollTop: (document.querySelector('.grid-root')||{}).scrollTop});
+              })()
+            """ % (box["x"], box["y"])))
+        check(cnt.get("start", 0) >= 1, f"触摸事件真的到达页面  got {cnt}")
+
+        has_bar = br.evaluate("!!document.querySelector('.selbar')")
+        check(has_bar, "长按后底部换成多选操作条")
+        n_sel = br.evaluate("document.querySelectorAll('.grid-root .cell.selected').length")
+        check(n_sel == 1, f"长按的那一张被选中，且只选中一张  got {n_sel}")
+        bar_txt = br.evaluate("(document.querySelector('.selbar')||{}).innerText || ''")
+        check("已选" in bar_txt and "1" in bar_txt, f"操作条显示已选 1 张  got {bar_txt!r}")
+
+        # ★★ 长按之后浏览器会补一个 click，若没在 touchend 上 preventDefault，
+        #    那个 click 会被网格委托当成"点了一下"，把刚选中的取消掉。
+        #    稍等一会儿再确认仍然是选中的。
+        time.sleep(0.6)
+        n_after = br.evaluate("document.querySelectorAll('.grid-root .cell.selected').length")
+        check(n_after == 1, f"长按后残留的 click 没有取消选中  got {n_after}")
+
+        # 多选模式下点第二个格子 = 切换选中，**不应该**打开查看器
+        box2 = br.evaluate("""
+          (() => {
+            const cs = [...document.querySelectorAll('.grid-root .cell[data-id]')];
+            if (cs.length < 2) return null;
+            const c = cs[1]; const r = c.getBoundingClientRect();
+            return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+          })()
+        """)
+        if isinstance(box2, dict) and box2.get("x"):
+            br.evaluate("""
+              (() => {
+                const cs = [...document.querySelectorAll('.grid-root .cell[data-id]')];
+                const r = cs[1].getBoundingClientRect();
+                const opts = { bubbles: true, cancelable: true, clientX: r.left + r.width/2,
+                               clientY: r.top + r.height/2 };
+                cs[1].dispatchEvent(new MouseEvent('click', opts));
+                return true;
+              })()
+            """)
+            time.sleep(0.25)
+            n_sel2 = br.evaluate("document.querySelectorAll('.grid-root .cell.selected').length")
+            viewer_open = br.evaluate("!!document.querySelector('.viewer')")
+            check(n_sel2 == 2, f"多选模式下点第二张是选中而不是打开  got {n_sel2} selected")
+            check(not viewer_open, "多选模式下点击不会弹出查看器")
+
+        # 退出多选：页签栏必须回来
+        br.evaluate("""
+          (() => {
+            const b = [...document.querySelectorAll('.selbar button')]
+              .find(x => (x.textContent||'').includes('退出'));
+            if (b) b.click();
+            return true;
+          })()
+        """)
+        time.sleep(0.3)
+        back = br.evaluate("!!document.querySelector('.tabbar') && !document.querySelector('.selbar')")
+        check(back, "退出多选后页签栏回来了")
+
+        # ---------------------------------------------------------------
+        print("\n[4h] 批量删除真的把照片移进回收站（US-12）")
+        # ---------------------------------------------------------------
+        # 用一组**新拷进来的**照片，绝不动已有的那几张（后面 [8] 要核对真实库）
+        del_dir = lib / "todel"
+        del_dir.mkdir(exist_ok=True)
+        del_names = ["del_a.jpg", "del_b.jpg", "del_c.jpg"]
+        for i, nm in enumerate(del_names):
+            make_image(del_dir / nm, (200, 60 + i * 40, 90))
+
+        # ★ 轮询而不是死等一个固定秒数：watchdog 的事件到写库有延迟，
+        #   固定 sleep 在不同的机器负载下会随机变成假失败。
+        def find_del_ids() -> list[int]:
+            r = urllib.request.urlopen(urllib.request.Request(
+                base + "/api/search?q=del_&limit=20",
+                headers={"Authorization": f"Bearer {tok}"}))
+            got = json.loads(r.read().decode("utf-8")).get("items", [])
+            return sorted(int(x["id"]) for x in got
+                          if str(x["name"]).startswith("del_"))
+
+        del_ids: list[int] = []
+        end = time.time() + 20
+        while time.time() < end:
+            del_ids = find_del_ids()
+            if len(del_ids) == 3:
+                break
+            time.sleep(0.5)
+        check(len(del_ids) == 3, f"三张待删照片都已入库  got {del_ids}")
+
+        # 走真的接口删（前端按钮会弹确认框，这里直接验后端行为 + 文件真的进了回收站）
+        req = urllib.request.Request(
+            base + "/api/items/delete",
+            data=json.dumps({"ids": del_ids}).encode("utf-8"),
+            headers={"Authorization": f"Bearer {tok}",
+                     "Content-Type": "application/json"},
+            method="POST")
+        try:
+            dresp = json.loads(urllib.request.urlopen(req).read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            dresp = json.loads(e.read().decode("utf-8"))
+        check(int(dresp.get("deleted", 0)) == 3,
+              f"三张全部被移进回收站  got {dresp}")
+
+        # ★ 必须是"移进回收站"而不是"永久删除"：源文件应该已经从库目录消失
+        still = [n for n in del_names if (del_dir / n).exists()]
+        check(not still, f"库目录里已经看不到这三张  got {still}")
+
+        # 库里也不该再返回它们
+        conn = sqlite3.connect(cfg.db_path)
+        try:
+            marks = ",".join("?" * len(del_ids))
+            gone = conn.execute(
+                f"SELECT COUNT(*) FROM media WHERE id IN ({marks})"
+                " AND missing = 0", del_ids).fetchone()[0]
+        finally:
+            conn.close()
+        check(gone == 0, f"库里也不再返回这三张  got {gone}")
+        # ---------------------------------------------------------------
+        print("\n[4i] 下拉刷新（设置页承诺过「下拉刷新可手动更新」）")
+        # ---------------------------------------------------------------
+        # ★ 先往库里补一批照片：只有 3 张时列表根本滚不动，
+        #   "不在顶部时不该触发下拉刷新"这条就永远跑不到（实测被跳过），
+        #   而那正是下拉刷新最需要防的误触场景。
+        many = lib / "many"
+        many.mkdir(exist_ok=True)
+        for i in range(1, 37):
+            nm = f"many_{i:02d}.jpg"
+            if not (many / nm).exists():
+                make_image(many / nm, (30 + i * 5, 90, 150))
+        for _ in range(60):
+            r = urllib.request.urlopen(urllib.request.Request(
+                base + "/api/search?q=many_&limit=50",
+                headers={"Authorization": f"Bearer {tok}"}))
+            if len(json.loads(r.read().decode("utf-8")).get("items", [])) >= 36:
+                break
+            time.sleep(0.5)
+
+        # `[4g]` 换过标签页，触摸在这里是好的；仍然先验证一次再断言，
+        # 否则整节建立在一堆没到达的事件上（这条坑 `[4d]`/`[4g]` 都踩过）。
+        br.new_page()
+        br.goto(base + "/")
+        br.wait_for("!!document.querySelector('.grid-root .cell[data-id]')",
+                    budget=30, label="[4i] 时间线")
+        time.sleep(0.6)
+        check(arm_touch(), "★ 下拉刷新前触摸模拟已生效（不是假绿）")
+
+        # 指针放在网格**第一张缩略图**上，而不是视口几何中心：时间线按天
+        # 分组，中心点可能落在日期标题或分组间隙上。
+        cs = br.evaluate("""
+          (() => {
+            const c = document.querySelector('.grid-root .cell[data-id] img');
+            if (!c) return null;
+            const r = c.getBoundingClientRect();
+            return {x: r.left + r.width / 2, y: r.top + r.height / 2};
+          })()
+        """)
+        if isinstance(cs, dict) and cs.get("x"):
+            sx, sy = float(cs["x"]), float(cs["y"])
+        else:
+            sx, sy = 195.0, 300.0
+
+        # 先确认指针真的落在**滚动容器内部**：落在某个悬浮按钮上的话，
+        # 后面"下拉后列表顶部下移"就无从谈起。
+        probe = br.evaluate("""
+          (() => {
+            const el = document.elementFromPoint(%f, %f);
+            return JSON.stringify({tag: el && el.tagName,
+              cls: el && String(el.className),
+              inGrid: !!(el && el.closest('.grid-root'))});
+          })()
+        """ % (sx, sy))
+        print("   下拉起点:", probe)
+
+        def scroll_top() -> int:
+            return int(br.evaluate(
+                "(document.querySelector('.grid-root')||{}).scrollTop || 0") or 0)
+
+        def pull_down(steps: int, dy: float) -> None:
+            """从 (sx, sy) 往下拖。
+
+            ★ 必须分多步并逐步增加 y：同一个 `(x, y)` 连发多次 `touchMove`
+              时 Chrome 会把"按住不动"判成一次滚动手势的起点，带位移的
+              多次 move 才稳定触发 `touchmove`。
+            """
+            br.touch("touchStart", [(sx, sy)])
+            time.sleep(0.12)
+            for i in range(1, steps + 1):
+                br.touch("touchMove", [(sx, sy + dy * i / steps)])
+                time.sleep(0.07)
+            time.sleep(0.25)
+
+        check(scroll_top() == 0, f"下拉前列表在顶部  scrollTop={scroll_top()}")
+        # 先确认列表真的能滚（不能滚的话下面"滚过顶部"那一步会静默失效）
+        scrollable = br.evaluate("""
+          (() => {
+            const sc = document.querySelector('.grid-root');
+            return sc ? (sc.scrollHeight - sc.clientHeight) : 0;
+          })()
+        """)
+        check(isinstance(scrollable, (int, float)) and scrollable > 200,
+              f"列表足够长、真的能滚（反向检查的前提）  got {scrollable}")
+        pull_down(10, 130.0)   # 130 × 0.5 阻尼 ≈ 65 > PULL_THRESHOLD(60)
+        indicator = br.evaluate("!!document.querySelector('.tl .pull')")
+        check(indicator, "拉动时出现下拉刷新指示器")
+        pull_txt = br.evaluate(
+            "(document.querySelector('.tl .pull')||{}).innerText || ''")
+        check(pull_txt != "", f"指示器有文案  got {pull_txt!r}")
+        br.touch("touchEnd", [(sx, sy + 130.0)])
+        time.sleep(1.6)
+        # 刷新完成后列表必须回到原位（卡在中途等于界面被顶下去一截）
+        moved = br.evaluate(
+            "(document.querySelector('.tl')||{}).style.transform || ''")
+        check(moved in ("", "none") or "translateY(0" in moved,
+              f"松开后指示器收回去、列表归位  transform={moved!r}")
+
+        # 反向：列表**已经滚过顶部**时不该触发下拉刷新（否则用户翻到
+        # 两百张的位置想往上回看，一滑就整页重载——那比"不刷新"更糟）。
+        br.evaluate("""
+          (() => {
+            const sc = document.querySelector('.grid-root');
+            if (sc) sc.scrollTop = 400;
+            return sc ? sc.scrollTop : -1;
+          })()
+        """)
+        time.sleep(0.3)
+        if scroll_top() > 0:
+            pull_down(8, 130.0)
+            mid = br.evaluate(
+                "(document.querySelector('.tl')||{}).style.transform || ''")
+            check(not (mid and "translateY(" in mid and mid != "translateY(0px)"),
+                  f"不在顶部时下拉不触发刷新  transform={mid!r}")
+            br.touch("touchEnd", [(sx, sy + 130.0)])
+            time.sleep(0.4)
+        else:
+            check(False, "★ 列表足够长（否则'不在顶部'的反向检查根本跑不到）"
+                         f"  scrollTop={scroll_top()}")
+
+        def install_raw_probe() -> None:
+            """在当前页面上下文里记录浏览器**真的**请求了哪些 `/raw`。
+
+            ★ 用 `Runtime.evaluate` 注入而不是 `Page.addScriptToEvaluateOnNewDocument`：
+              后者依赖脚本自己重放，而本脚本的 `goto`/`new_page` 不会重放，
+              `[4j]` 实测因此拿不到任何记录（探针没装上，不是预取没发生）。
+              `window.fetch` 是页面级对象，注入一次、页面不换就一直有效。
+            """
+            br.evaluate("""
+              (() => {
+                if (window.__raw) { window.__raw.length = 0; return true; }
+                window.__raw = [];
+                const Native = window.fetch;
+                window.fetch = function (input, init) {
+                  try {
+                    const u = String((input && input.url) || input);
+                    if (u.indexOf('/raw') >= 0) window.__raw.push(u);
+                  } catch (e) {}
+                  return Native.apply(this, arguments);
+                };
+                return true;
+              })()
+            """)
+
+        # ---------------------------------------------------------------
+        print("\n[4j] AC-2.10 第三级：空闲时后台预取原图")
+        # ---------------------------------------------------------------
+        install_raw_probe()
+        # 复用 `[4i]` 那个干净标签页（触摸在这里是好的）。
+        br.evaluate("""
+          (() => {
+            const c = document.querySelector('.grid-root .cell[data-id]');
+            if (c) c.dispatchEvent(new MouseEvent('click',
+              {bubbles: true, cancelable: true}));
+            return !!c;
+          })()
+        """)
+        ok_open = br.wait_for("!!document.querySelector('.viewer')",
+                              budget=15, label="[4j] 打开查看器")
+        check(ok_open, "打开一张照片进入查看器")
+        time.sleep(1.0)
+
+        # 预取是"空闲时"做的，给它几秒。断言的是**浏览器真的发了 /raw**，
+        # 不是"某张图看着清楚了"——后者无法判定。
+        raw_urls: list[str] = []
+        for _ in range(20):
+            got = br.evaluate("JSON.stringify(window.__raw || [])")
+            raw_urls = json.loads(got) if got else []
+            if raw_urls:
+                break
+            time.sleep(0.5)
+        check(bool(raw_urls), f"★ 空闲时后台真的预取了原图  got {raw_urls[:2]}")
+
+        # ★ 约束③（`docs/03-详细设计说明书.md` §5.4.3）：原图**只在放大到
+        #   1.5× 以上**才参与显示。没放大就挂上原图 = 每张都解码一次全尺寸
+        #   位图，是拿 OOM 换一个用户根本感知不到的收益。
+        n_raw_1x = br.evaluate("document.querySelectorAll('.v-img.raw').length")
+        check(n_raw_1x == 0, f"没放大时不挂原图（省内存）  got {n_raw_1x}")
+
+        # 双击放大到 2× 之后才应该换成原图 —— 且必须走 blob，不是重新请求一遍
+        box = br.evaluate("""
+          (() => {
+            const el = document.querySelector('.v-img.main');
+            if (!el) return null;
+            const r = el.getBoundingClientRect();
+            return {x: r.left + r.width / 2, y: r.top + r.height / 2};
+          })()
+        """)
+        if isinstance(box, dict) and box.get("x"):
+            p0 = (float(box["x"]), float(box["y"]))
+            br.touch("touchStart", [p0])
+            br.touch("touchEnd", [p0])
+            time.sleep(0.08)
+            br.touch("touchStart", [p0])
+            br.touch("touchEnd", [p0])
+            time.sleep(0.6)
+            check(br.evaluate("document.querySelectorAll('.v-img.raw').length") == 1,
+                  "双击放大后挂上原图层")
+            raw_src = br.evaluate("""
+              (() => {
+                const a = document.querySelector('.v-img.raw');
+                return a ? String(a.getAttribute('src')) : '';
+              })()
+            """)
+            check(str(raw_src).startswith("blob:"),
+                  f"★ 原图走 blob（已下载的字节复用，不重复请求）  got {raw_src}")
+            # 两层必须用同一个 transform，否则放大拖动时"清晰的那张不动、
+            # 模糊的那张在动"，看起来像屏幕撕裂。
+            same = br.evaluate("""
+              (() => {
+                const a = document.querySelector('.v-img.raw');
+                const b = document.querySelector('.v-img.main');
+                if (!a || !b) return 'missing';
+                return getComputedStyle(a).transform === getComputedStyle(b).transform;
+              })()
+            """)
+            check(same is True, f"原图层与预览层用同一个 transform  got {same}")
+            # 关掉查看器之后不该再多出 /raw 请求（预取被取消 + blob 释放）
+            n0 = len(raw_urls)
+            br.evaluate("window.history.back()")
+            time.sleep(1.2)
+            got2 = br.evaluate("JSON.stringify(window.__raw || [])")
+            check(len(json.loads(got2) if got2 else []) <= n0 + 1,
+                  "关闭查看器后不再继续拉原图")
+        else:
+            check(False, "★ 拿到了主图坐标（否则放大验证根本跑不到）")
 
         # ---------------------------------------------------------------
         print("\n[5] 切 Tab（KeepAlive 缓存 + 不报错）")

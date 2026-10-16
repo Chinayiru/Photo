@@ -10,12 +10,20 @@
  * 结果按日期分组复用时间线的分组函数，点开也走同一个查看器 ——
  * 查看器的左右滑动靠 `prev_id`/`next_id`，与来源列表无关，天然可用。
  */
-import { computed, ref } from "vue";
+import { computed, onBeforeUnmount, ref } from "vue";
 import PhotoGrid from "../components/PhotoGrid.vue";
 import { ApiError, api } from "../api/client";
 import type { MediaItem, SearchResponse } from "../api/types";
 import { groupByDay } from "../stores/timeline";
 import { open as openViewer } from "../stores/viewer";
+import {
+  enter as enterSelect,
+  onRemoved,
+  selectAll,
+  selectedSet,
+  selectionStore,
+  toggle as toggleSelect,
+} from "../stores/selection";
 
 const q = ref("");
 const from = ref("");
@@ -31,6 +39,49 @@ const searched = ref(false);
 const error = ref("");
 
 const groups = computed(() => groupByDay(items.value));
+
+/* ------------------------------------------------------------------ *
+ * 多选（US-12「长按选中，点删除」）
+ * ------------------------------------------------------------------ */
+
+const selActive = computed(() => selectionStore.state.active);
+const selected = selectedSet;
+
+function onLongPress(id: number): void {
+  enterSelect(id);
+}
+
+function onToggle(id: number): void {
+  toggleSelect(id);
+}
+
+/** 全选当前**已搜出**的结果（不是全库 —— 全库要几千次勾选，没有意义）。 */
+function onSelectAll(): void {
+  selectAll(items.value.map((x) => x.id));
+}
+
+/** 搜索页有自己的一份列表，删除后要摘的是这里的。 */
+function removeItem(id: number): void {
+  const i = items.value.findIndex((x) => x.id === id);
+  if (i >= 0) items.value.splice(i, 1);
+}
+
+let offRemoved: (() => void) | null = null;
+
+onBeforeUnmount(() => {
+  offRemoved?.();
+  offRemoved = null;
+});
+
+/**
+ * 挂上"删除后摘格子"的回调。
+ *
+ * ★ 与时间线共用同一个槽位：哪个视图当前在显示，哪个视图的回调就生效
+ *   （见 `stores/selection.ts: onRemoved` ）。两个视图都挂的话后挂的
+ *   会覆盖先挂的，于是"在搜索页删照片，时间线里那张还在" ——
+ *   而 KeepAlive 让两个视图**同时**活着，这不是假想的问题。
+ */
+offRemoved = onRemoved(removeItem);
 
 const canSearch = computed(() =>
   Boolean(q.value.trim() || from.value || to.value || camera.value.trim() || hasGps.value));
@@ -167,9 +218,29 @@ function onOpen(id: number): void {
       :groups="groups"
       :loading="loading"
       :has-more="hasMore"
+      :selected="selected"
+      :select-mode="selActive"
       @open="onOpen"
       @load-more="run(false)"
+      @toggle="onToggle"
+      @longpress="onLongPress"
     />
+
+    <!-- 多选模式下的"全选"（当前已搜出的结果） -->
+    <button v-if="selActive && groups.length > 0" class="sel-all" type="button" @click="onSelectAll">
+      全选已搜出
+    </button>
+
+    <!-- 多选入口：长按是隐藏手势，必须有一个看得见的入口 -->
+    <button
+      v-if="!selActive && groups.length > 0"
+      class="sel-entry"
+      type="button"
+      aria-label="多选"
+      @click="enterSelect()"
+    >
+      ☑
+    </button>
 
     <div v-else-if="searched && !loading" class="empty">
       <div class="empty-icon" aria-hidden="true">🔍</div>
@@ -193,6 +264,8 @@ function onOpen(id: number): void {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  /* 多选入口/全选按钮是 absolute，需要这里有定位上下文 */
+  position: relative;
 }
 
 .form {
@@ -294,5 +367,39 @@ function onOpen(id: number): void {
   font-size: 13px;
   line-height: 1.6;
   max-width: 24em;
+}
+
+/* 多选入口：右下角悬浮，避开页签栏与最后一行照片 */
+.sel-entry {
+  position: absolute;
+  right: 14px;
+  bottom: calc(var(--tabbar-h) + var(--safe-bottom) + 14px);
+  z-index: 20;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  color: var(--fg-1);
+  font-size: 19px;
+  line-height: 1;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28);
+}
+
+.sel-entry:active {
+  transform: scale(0.94);
+}
+
+.sel-all {
+  position: absolute;
+  right: 12px;
+  top: 6px;
+  z-index: 20;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  color: var(--fg-1);
+  font-size: 12px;
 }
 </style>

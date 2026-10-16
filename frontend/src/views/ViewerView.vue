@@ -28,6 +28,7 @@ import {
   gpsMapUrl,
   gpsText,
   moveCurrent,
+  rawSrcFor,
   renameCurrent,
   sizeText,
   takenText,
@@ -37,6 +38,56 @@ import { toastError, toastOk, toastWarn } from "../stores/toast";
 
 const s = viewerStore.state;
 const isOpen = computed(() => s.open);
+
+/* ------------------------------------------------------------------ *
+ * AC-2.10 第三级：放大到 1.5× 以上才切原图
+ * ------------------------------------------------------------------ */
+
+/**
+ * 放大到多少倍才用原图。
+ *
+ * ★ 这是 `docs/03-详细设计说明书.md:3660-3678` §5.4.3 约束 ③「原图仅当
+ *   用户放大到 > 1.5× 才用」的唯一落点。在放大之前用原图是纯亏：
+ *   1600px 预览在手机屏幕上与 4 MB 的原图**完全一样**（屏幕只有 400px 宽），
+ *   却要多下二十倍字节、多解码 48 MB —— 而安卓渲染进程上限只有 300–500 MB。
+ *
+ * 1.5 而不是 1.2：1600px 预览放到 1.5× 是 2400px 有效，已经超过多数
+ * 手机屏幕的物理像素；再往下调只会让"用户还没看出模糊就先背上了原图的代价"。
+ */
+const RAW_ZOOM = 1.5;
+const useRaw = computed(() => zoom.value > RAW_ZOOM);
+
+/**
+ * 主图当前该用哪张。
+ *
+ * ★ 这里**不**改主图的 `src`，而是在它上面再叠一层原图。
+ *   原因：`<img>` 的 `src` 变了以后浏览器会先把旧图留在屏幕上再慢慢解新图，
+ *   用户看到的是"放大之后卡住不动"；换成"换 key 重建节点"又会先闪黑一下
+ *   （旧节点已经销毁、新节点还在解码）。两层叠着最稳 —— 预览图一直在，
+ *   原图解码完成后盖上去，全程没有白屏与黑闪。
+ */
+const mainSrc = computed(() => currentPreviewUrl.value);
+
+/** 原图层是否该挂着（用户放大到 1.5× 以上且原图没失败过）。 */
+const rawSrc = computed(() => {
+  if (!s.detail || !useRaw.value || rawFailed.value) return "";
+  return rawSrcFor(s.detail.id);
+});
+
+/**
+ * 原图解码失败的标记。
+ *
+ * ★ 必须单独记、且**不能**写进 `s.error`：库里有一批 HEIC
+ *   （`backend/app/config.py` 的 `ALLOWED_IMAGE_EXTS` 含 heic/heif），
+ *   而它们经 `/raw` 拿回来的是**原样的 HEIC 字节**，Chrome 解不了。
+ *   把这种失败显示成"图片加载失败"，用户会以为照片坏了 ——
+ *   实际上预览图一直好好的，只是"放大到 1:1"这条路对 HEIC 不通。
+ */
+const rawFailed = ref(false);
+
+watch(() => s.id, () => {
+  rawFailed.value = false;
+});
 
 /** 手势状态。 */
 let startX = 0;
@@ -626,15 +677,45 @@ async function doDelete(): Promise<void> {
             class="v-img main"
             :class="[{ drag: dragging }, slideClass]"
             :style="imageTransform ? { transform: imageTransform } : undefined"
-            :src="currentPreviewUrl"
+            :src="mainSrc"
             :alt="detail.name"
             decoding="async"
             @load="s.imageReady = true"
             @error="s.error = '图片加载失败'"
           />
 
+          <!--
+            原图层：只在放大到 1.5× 以上才挂（§5.4.3 约束 ③）。
+            ★ 与主图**同时存在**，解码完成后自然盖在上面，全程无白屏无黑闪。
+            ★ key 带 id 与 URL 两段：切图或"预取完成 / 预取失败退回网络"
+              变化时必须换节点，否则浏览器会沿用旧的原图像素。
+          -->
+          <img
+            v-if="rawSrc"
+            :key="`raw-${detail?.id}-${rawSrc}`"
+            class="v-img raw"
+            :class="{ drag: dragging }"
+            :style="imageTransform ? { transform: imageTransform } : undefined"
+            :src="rawSrc"
+            alt=""
+            decoding="async"
+            @error="rawFailed = true"
+          />
+
           <div v-if="!s.imageReady && !s.error" key="loading" class="v-loading">
             <span class="spinner big" />
+          </div>
+
+          <!--
+            原图解码失败的提示（放大到 1.5× 以上时才有意义）。
+            ★ 必须说出来：用户捏到 1:1 却发现"照片没变清楚"，而他什么都
+              没做错 —— 库里真的有 HEIC/TIFF/AVIF 这类浏览器解不了的格式
+              （`backend/app/config.py` 的 ALLOWED_IMAGE_EXTS 里有 heic/heif/tif）。
+              不说的话他会以为照片坏了或者软件有问题。
+            ★ 不写进 `s.error`：那会把整个查看器换成错误页，而预览图明明好好的。
+          -->
+          <div v-if="rawFailed && useRaw" key="rawfail" class="v-rawnote">
+            这张的原始格式浏览器无法显示，正在用预览图（最多 1600px）
           </div>
 
           <div v-if="s.error" key="error" class="v-error">
@@ -871,6 +952,37 @@ async function doDelete(): Promise<void> {
 
 .v-img.main {
   will-change: transform;
+}
+
+/*
+ * 原图层（AC-2.10 第三级）。
+ *
+ * ★ 必须与 `.main` 用**同一个 transform**：只加在第一层上的话，
+ *   用户放大+拖动时会出现"清晰的那张不动、模糊的那张在动" ——
+ *   因为两层位置一致，视觉上像是图片在重影。
+ *   这里刻意不做任何"代替主图"的优化（比如隐藏 `.main`），
+ *   两层渲染同一张图的开销只在客户端合成，没有额外解码。
+ */
+.v-img.raw {
+  pointer-events: none;
+  /* 盖在预览之上（两者都是 absolute，靠 z-index 决定谁在上） */
+  z-index: 1;
+}
+
+/* 原图格式不支持时的提示条：贴在底部，不挡图片中心 */
+.v-rawnote {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  max-width: 88%;
+  padding: 7px 12px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.66);
+  color: #e8e8ee;
+  font-size: 12px;
+  text-align: center;
+  z-index: 3;
 }
 
 .v-img.drag {

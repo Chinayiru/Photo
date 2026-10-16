@@ -41,9 +41,6 @@ _PATH_RE = re.compile(r"""["'`](/api/[^"'`\s]*)["'`]""")
 #: 一期前端**故意**不调的接口。每一条都要写明理由，否则这份清单会
 #: 变成"漂移的垃圾桶" —— 谁都能往里加一行来让检查通过。
 INTENTIONALLY_UNUSED: dict[str, str] = {
-    "/api/events":
-        "SSE 需要常驻连接，手机端一期用轮询 /api/system/info 拿索引进度；"
-        "二期做上传进度推送时启用",
     "/api/folders":
         "一期手机端只做时间线，不做目录浏览；接口已实现并测试，"
         "留给二期或桌面面板",
@@ -128,8 +125,6 @@ def main() -> int:
         where = ", ".join(sorted(set(files)))
         problems.append(f"前端调用了不存在的接口：{norm}\n    出现在：{where}")
 
-    unused = sorted(set(routes) - {_shape(n) and n for n in frontend} - set(INTENTIONALLY_UNUSED))
-    # 上面那行是刻意的复杂写法，换一种更直白的：
     called_shapes = {_shape(n) for n in frontend}
     unused = sorted(
         p for p in routes

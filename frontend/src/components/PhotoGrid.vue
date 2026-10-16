@@ -20,24 +20,57 @@ const props = defineProps<{
   hasMore: boolean;
   /** 选中的 id 集合（多选模式）。 */
   selected?: Set<number>;
+  /** 是否处于多选模式 —— 点击变成切换选中，而不是打开大图。 */
+  selectMode?: boolean;
 }>();
 
 const emit = defineEmits<{
   (e: "open", id: number): void;
   (e: "load-more"): void;
+  /** 多选模式下点了一下某个格子（切换选中）。 */
+  (e: "toggle", id: number): void;
+  /** 长按某一个格子（进入多选）。 */
+  (e: "longpress", id: number): void;
 }>();
 
 const rootEl = ref<HTMLElement | null>(null);
 const sentinel = ref<HTMLElement | null>(null);
 let io: IntersectionObserver | null = null;
 
-/** 事件委托：从事件目标往上找带 data-id 的格子。 */
+/**
+ * 事件委托：从事件目标往上找带 data-id 的格子。
+ *
+ * ★ 多选模式下**不**发 `open`：用户是在勾选，弹出全屏大图会让整个
+ *   多选流程断掉（还得先关掉查看器才能继续选）。改成发 `toggle`。
+ */
 function onClick(e: MouseEvent): void {
   const el = (e.target as HTMLElement | null)?.closest?.("[data-id]") as HTMLElement | null;
   if (!el) return;
   const id = Number(el.dataset.id);
   if (!Number.isFinite(id) || id <= 0) return;
-  emit("open", id);
+  if (props.selectMode) emit("toggle", id);
+  else emit("open", id);
+}
+
+/**
+ * 长按进入多选。
+ *
+ * `PhotoCell` 在 `touchend` 上已经 `preventDefault()` 掉了长按之后的
+ * 那次 click，所以正常路径下这里不会再收到 click。但**长按触发的那一帧
+ * 到 touchend 之间**如果用户手指抬起得极快（脚本派发的合成事件就会这样），
+ * 兼容 click 仍可能到达 —— 多选模式下它只会 `toggle` 一次（取消选中），
+ * 所以这里再兜一道：刚进入多选后的 500ms 内忽略点击。
+ */
+let suppressUntil = 0;
+
+function onLongPress(id: number): void {
+  suppressUntil = Date.now() + 500;
+  emit("longpress", id);
+}
+
+function onClickGuarded(e: MouseEvent): void {
+  if (suppressUntil && Date.now() < suppressUntil) return;
+  onClick(e);
 }
 
 function setupObserver(): void {
@@ -83,7 +116,7 @@ defineExpose({ poke, rootEl });
 </script>
 
 <template>
-  <div ref="rootEl" class="grid-root scroll" @click="onClick">
+  <div ref="rootEl" class="grid-root scroll" @click="onClickGuarded">
     <section v-for="g in props.groups" :key="g.key" class="day">
       <h2 class="day-h">
         <span>{{ g.label }}</span>
@@ -95,6 +128,8 @@ defineExpose({ poke, rootEl });
           :key="it.id"
           :item="it"
           :selected="props.selected?.has(it.id)"
+          :select-mode="props.selectMode"
+          @longpress="onLongPress"
         />
       </div>
     </section>
