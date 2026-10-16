@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from . import events as events_mod
+from . import uploads
 from .auth import auth_middleware
 from .config import Config, check_bind_safety, ensure_dirs, get as get_config, is_first_run
 from .db import Database, get_db, make_db
@@ -216,6 +217,36 @@ def _count_hint(cfg: Config) -> str:
     return f"{total}+ 个条目" if total else "数千"
 
 
+def _purge_stale_uploads(cfg: Config, st: AppState) -> int:
+    """清理上次运行留下的过期上传会话与临时文件。返回清理条数。
+
+    为什么必须放在**启动**时做：`purge_expired()` 原本只在
+    `create_session()` 里被调用 —— 也就是"用户下次发起上传时顺手做"。
+    可这个程序是常驻的，而中断是常态：
+
+      * 用户传了一半关掉手机（会话停在 open，等 TTL 到期）；
+      * 程序被强杀（断电、任务管理器结束进程、托盘强退）；
+      * 用户在别的机器上继续用，这台从此再没人发起上传。
+
+    这些情况下的 `.part` 文件躺在 `<库根>/.photobridge_tmp/` —— 那是
+    **用户的照片库目录**。它既不会被索引器扫到（在 exclude_dirs 里），
+    也不会被任何其他代码清掉，只会一直堆积。一张 4 MB 的照片传一半
+    留 2 MB，几百次就是几个 GB，而用户在资源管理器里根本看不到
+    （.photobridge_tmp 是隐藏点目录，且没有提示）。
+
+    失败绝不能挡住启动 —— 最坏情况只是临时文件多留一会儿，
+    而"程序起不来"是用户无法自助恢复的。
+    """
+    try:
+        n = uploads.purge_expired(st.db, cfg=cfg)
+    except Exception:           # noqa: BLE001
+        log.warning("启动时清理过期上传失败（不影响服务）", exc_info=True)
+        return 0
+    if n:
+        log.info("已清理 %s 个过期上传会话及其临时文件", n)
+    return n
+
+
 async def serve(cfg: Config | None = None, *,
                 on_ready: Any = None) -> None:
     """启动服务并阻塞，直到收到中断信号。
@@ -241,6 +272,15 @@ async def serve(cfg: Config | None = None, *,
 
     st = build_state(cfg)
     _, transport, st = build_app(cfg, state=st)
+
+    # ★ 启动时清理上次运行留下的过期上传。
+    # `purge_expired()` 原本只在 create_session() 里被调用 —— 即"用户下次
+    # 发起上传时顺手做"。可这个程序是常驻的：用户传了一半关掉手机、或者
+    # 程序被强杀（断电、任务管理器结束进程），那个 .part 就一直躺在
+    # **用户的照片库目录**里（<库根>/.photobridge_tmp/），既不会被扫描到
+    # （它在 exclude_dirs 里），也不会被任何人清掉，几个月后占掉几个 GB。
+    # 放在这里执行一次，代价是启动时多一条 DELETE，收益是临时区不会无限增长。
+    _purge_stale_uploads(cfg, st)
 
     st.thumbs.start()
 

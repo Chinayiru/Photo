@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import sqlite3
 import socket
 import threading
 import time
@@ -826,3 +827,161 @@ def test_transport_urls_do_not_advertise_virtual_nics():
     t2 = LocalHttpTransport(cfg, router=None, host="127.0.0.1", port=8787)
     t2._actual_port = 8787
     assert t2.urls == ["http://127.0.0.1:8787"]
+
+
+# --------------------------------------------------------------------------
+# 启动时清理过期上传（server._purge_stale_uploads）
+#
+# 背景：purge_expired() 原本只在 create_session() 里被调用 —— 也就是
+# "用户下次发起上传时顺手做"。可这个程序是常驻的，而中断是常态
+# （用户传一半关掉手机、程序被强杀、这台机器从此不再发起上传）。
+# 那些 .part 躺在 <库根>/.photobridge_tmp/ —— 用户的照片库目录里，
+# 既不会被索引器扫到（在 exclude_dirs 里），也没人清，只会一直堆积。
+# --------------------------------------------------------------------------
+
+
+def _make_stale_session(cfg, db, *, name: str = "half.jpg",
+                        age_hours: float = 48.0) -> tuple[str, Path]:
+    """造一个"已过期但还没被清理"的上传会话，并真的写一个 .part 文件。
+
+    返回 (upload_id, temp_path)。
+    """
+    from backend.app import uploads as uploads_mod
+
+    sess = uploads_mod.create_session(db, cfg, name=name, size=4096)
+    uid = sess["upload_id"]
+    temp = Path(db.scalar(
+        "SELECT temp_path FROM upload_sessions WHERE id = ?", (uid,)))
+    # 写点字节，证明清理确实删掉了文件而不只是改了数据库
+    temp.write_bytes(bytes([0xFF, 0xD8, 0xFF, 0xE0]) + b"x" * 512)
+    # 把过期时间推到过去
+    past = time.time() - age_hours * 3600.0
+    db.execute("UPDATE upload_sessions SET expires_at = ? WHERE id = ?", (past, uid))
+    return uid, temp
+
+
+def test_startup_purges_expired_uploads_and_removes_part_files(env) -> None:
+    """★ 启动清理必须同时做到：删临时文件 + 把会话标成 expired。
+
+    只删行不删文件 → 用户的照片库里留下一个永远没人管的 .part；
+    只删文件不删行 → upload_sessions 无限增长，而且那个会话看起来
+    还能继续传（再 PATCH 会报"临时文件已丢失"，用户莫名其妙）。
+    """
+    from backend.app.server import _purge_stale_uploads
+
+    uid, temp = _make_stale_session(env.cfg, env.db)
+    assert temp.is_file(), "夹具没造出临时文件"
+
+    n = _purge_stale_uploads(env.cfg, env.state)
+
+    assert n == 1, f"应清理 1 个过期会话，实际 {n}"
+    assert not temp.exists(), "临时文件没被删掉 —— 它会永远留在照片库里"
+    status = env.db.scalar("SELECT status FROM upload_sessions WHERE id = ?", (uid,))
+    assert status == "expired", f"会话状态没更新：{status}"
+
+
+def test_startup_purge_leaves_fresh_sessions_alone(env) -> None:
+    """★ 正在上传的会话绝不能被启动清理误删。
+
+    这是本功能最危险的失败模式：用户传了 1.9 GB / 2 GB，程序重启一次
+    把临时文件删了，用户从 0 重新开始 —— 而且没有任何提示指向原因。
+    """
+    from backend.app import uploads as uploads_mod
+    from backend.app.server import _purge_stale_uploads
+
+    sess = uploads_mod.create_session(env.db, env.cfg, name="fresh.jpg", size=4096)
+    temp = Path(env.db.scalar(
+        "SELECT temp_path FROM upload_sessions WHERE id = ?",
+        (sess["upload_id"],)))
+    temp.write_bytes(b"y" * 512)
+
+    n = _purge_stale_uploads(env.cfg, env.state)
+
+    assert n == 0, "把未过期的会话也清掉了"
+    assert temp.is_file(), "★ 正在上传的临时文件被删了"
+    status = env.db.scalar("SELECT status FROM upload_sessions WHERE id = ?",
+                           (sess["upload_id"],))
+    assert status == "open", f"未过期会话被改成了 {status}"
+
+
+def test_startup_purge_never_blocks_startup(env, monkeypatch) -> None:
+    """★ 清理失败绝不能挡住启动 —— 返回 0 且不抛。
+
+    最坏情况只是临时文件多留一会儿；而"程序起不来"是用户无法自助
+    恢复的（他看不到日志，只会觉得双击没反应）。
+    """
+    from backend.app import uploads as uploads_mod
+    from backend.app.server import _purge_stale_uploads
+
+    def _boom(*a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(uploads_mod, "purge_expired", _boom)
+    assert _purge_stale_uploads(env.cfg, env.state) == 0
+
+
+def test_serve_calls_startup_purge() -> None:
+    """★ 结构回归：serve() 里必须真的调了启动清理。
+
+    用 AST 而不是文本匹配 —— 本仓库已经三次栽在"注释里出现了被搜索的
+    词"（scripts/check_docs.py 把代码块里的正则当成断链、test_thumbs 的
+    注释里有 wait_for）。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from backend.app import server as server_mod
+
+    src = textwrap.dedent(inspect.getsource(server_mod.serve))
+    tree = ast.parse(src)
+    called = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Name):
+                called.add(f.id)
+            elif isinstance(f, ast.Attribute):
+                called.add(f.attr)
+    assert "_purge_stale_uploads" in called, (
+        "serve() 没有调用启动清理 —— 强杀留下的 .part 会永远堆在照片库里")
+
+
+def test_startup_purge_runs_before_transport_listens() -> None:
+    """★ 结构回归：清理必须在 transport.start() **之前**完成。
+
+    顺序反了会有一个窗口：手机已经能发请求、PATCH 打到一个正在被删的
+    会话上。启动阶段本来就不该并发，串行做完再开门。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from backend.app import server as server_mod
+
+    src = textwrap.dedent(inspect.getsource(server_mod.serve))
+    tree = ast.parse(src)
+
+    def _first_line_of(pred) -> "int | None":
+        hits = [n.lineno for n in ast.walk(tree)
+                if isinstance(n, ast.Call) and pred(n)]
+        return min(hits) if hits else None
+
+    def _is_purge(call: ast.Call) -> bool:
+        f = call.func
+        return isinstance(f, ast.Name) and f.id == "_purge_stale_uploads"
+
+    def _is_transport_start(call: ast.Call) -> bool:
+        f = call.func
+        if not (isinstance(f, ast.Attribute) and f.attr == "start"):
+            return False
+        base = f.value
+        return ((isinstance(base, ast.Name) and base.id == "transport")
+                or (isinstance(base, ast.Attribute) and base.attr == "transport"))
+
+    purge = _first_line_of(_is_purge)
+    listen = _first_line_of(_is_transport_start)
+    assert purge is not None, "serve() 里找不到启动清理"
+    assert listen is not None, "serve() 里找不到 transport.start()"
+    assert purge < listen, (
+        f"启动清理（第 {purge} 行）应在 transport.start()（第 {listen} 行）之前")
