@@ -9,7 +9,7 @@
  * 因为重试需要知道 `Content-Range` 与 offset，那是队列的状态。
  */
 
-import { ApiError, backoffMs, currentBase, sleep } from "./client";
+import { ApiError, backoffMs, currentBase, sanitizeHeaderValue, sleep } from "./client";
 import { getClientName, getToken } from "./storage";
 import type { UploadPatchResponse } from "./types";
 
@@ -96,7 +96,11 @@ export function uploadChunk(
     xhr.setRequestHeader("Content-Type", "application/octet-stream");
     xhr.setRequestHeader("Content-Range", contentRange);
     const cname = getClientName();
-    if (cname) xhr.setRequestHeader("X-PB-Client", cname);
+    // ★ 必须过一遍 sanitizeHeaderValue：`X-PB-Client` 里的非 Latin-1
+    //   字符会让 `setRequestHeader` 抛 `SyntaxError`（Chromium 报
+    //   "String contains non ISO-8859-1 code point"），整个分片发不出去。
+    //   与 client.ts 的 fetch 路径是同一个坑，两处都要挡。
+    if (cname) xhr.setRequestHeader("X-PB-Client", sanitizeHeaderValue(cname));
     // 服务端返回体是 JSON；不带这个头某些代理会改写
     xhr.setRequestHeader("Accept", "application/json");
     // 2 分钟：云带宽 5Mbps 下 2MB 分片约 3.2s，留 30 倍余量。

@@ -34,7 +34,7 @@ from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route as StarletteRoute
 
 from ..config import Config, check_bind_safety, local_ipv4_addresses
-from ..core import Ctx, Reply, iter_body, json_reply
+from ..core import Ctx, Reply, cookie_header_value, iter_body, json_reply
 from ..errors import AppError, E1006, E3001, to_app_error
 from .base import ServerTransport
 
@@ -126,15 +126,25 @@ def adapt_reply(reply: Reply) -> Response:
         # 204/304 不允许有正文。Starlette 的 Response 在 status 204 时
         # 不会自动去掉 Content-Length，这里显式清掉避免协议违规。
         headers.pop("content-length", None)
-        return Response(content=None, status_code=reply.status,
+        resp: Response = Response(content=None, status_code=reply.status,
+                                  headers=headers, media_type=media_type)
+    elif isinstance(reply.body, bytes):
+        resp = Response(content=reply.body, status_code=reply.status,
                         headers=headers, media_type=media_type)
+    else:
+        resp = StreamingResponse(_stream(reply.body), status_code=reply.status,
+                                 headers=headers, media_type=media_type)
 
-    if isinstance(reply.body, bytes):
-        return Response(content=reply.body, status_code=reply.status,
-                        headers=headers, media_type=media_type)
-
-    return StreamingResponse(_stream(reply.body), status_code=reply.status,
-                             headers=headers, media_type=media_type)
+    # ★★ Set-Cookie 必须**逐个 append**，不能放进上面的 headers 字典。
+    # 字典是"头名 → 单值"，两个 cookie 会互相覆盖；拼成逗号分隔的
+    # 单行又违反 RFC 6265，浏览器会静默丢弃整条 —— 响应 200、
+    # body 正常，只有缩略图 401，是极难定位的失败模式。
+    # `MutableHeaders.append` 会往 `_list` 追加独立一项，ASGI 层
+    # 就是两条独立的 header 行。
+    for name, value, max_age in reply.cookies:
+        resp.headers.append(
+            "set-cookie", cookie_header_value(name, value, max_age))
+    return resp
 
 
 class LocalHttpTransport(ServerTransport):

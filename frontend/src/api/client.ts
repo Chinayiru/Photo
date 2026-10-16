@@ -21,6 +21,8 @@ import {
   getClientName,
   getToken,
   clearPairing,
+  hasTokenCookie,
+  setTokenCookie,
 } from "./storage";
 import type { ApiErrorBody, ApiErrorEnvelope } from "./types";
 
@@ -177,17 +179,50 @@ export function rawUrl(id: number, download = false): string {
   return absUrl(`/api/items/${id}/raw`, download ? { download: 1 } : undefined);
 }
 
-/** 客户端标识头：电脑端用它写审计日志（`backend/app/handlers/auth.py: _client_name`）。 */
+/**
+ * 客户端标识头：电脑端用它写审计日志（`backend/app/handlers/auth.py: _client_name`）。
+ *
+ * ★★ 这个头**只能放 ASCII**。HTTP 头按 RFC 7230 是 ISO-8859-1 字节串，
+ *   浏览器在 `Headers.set()` 阶段就拒绝非 Latin-1 码点：
+ *
+ *     TypeError: Failed to execute 'set' on 'Headers':
+ *       String contains non ISO-8859-1 code point.
+ *
+ *   而 `once()` 是**所有**请求的必经之路（时间线、缩略图、上传 init…），
+ *   所以这个头一旦非法，症状是**整个 App 一个请求都发不出去**，且
+ *   报的是"无法连接到电脑，请确认手机与电脑在同一个 Wi-Fi" ——
+ *   用户会去重启路由器、检查 Wi-Fi，永远不会想到是设备名的问题。
+ *
+ *   触发条件（实测）：桌面浏览器与非 iPhone/iPad 的设备上，平台名会
+ *   落到默认分支的中文 `"浏览器"`；用户若在设置里把客户端名改成中文
+ *   （`pb.client_name`），同样会炸。
+ *
+ *   修法：出口处统一把非 ASCII 字符替换掉，而不是信任上游（`getClientName()`
+ *   来自 localStorage，用户可写任意字符串）。
+ */
+export function sanitizeHeaderValue(raw: string): string {
+  // 先去掉换行：CR/LF 会构成响应头注入（HTTP 头不能含 CR LF）
+  let s = raw.replace(/[\r\n]+/g, " ");
+  // 再把非 Latin-1 码点（> 0xFF）替换成 "?"。逐码点判断而不是
+  // 用正则区间，因为 `\u0100-\uFFFF` 之外还有代理对（emoji）。
+  let out = "";
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) ?? 0;
+    out += cp <= 0xff ? ch : "?";
+  }
+  return out.trim();
+}
+
 function clientHeader(): string {
   const custom = getClientName();
-  if (custom) return custom;
+  if (custom) return sanitizeHeaderValue(custom);
   // 不设置的话后端退化成 User-Agent 前 48 字符（一长串浏览器版本号），
   // 托盘设备列表里两行都认不出来
   const ua = navigator.userAgent;
   const ios = /iPhone|iPad|iPod/.test(ua);
   const android = /Android/.test(ua);
-  const plat = ios ? "iPhone" : android ? "Android" : "浏览器";
-  return `PhotoBridge ${plat}`;
+  const plat = ios ? "iPhone" : android ? "Android" : "Browser";
+  return sanitizeHeaderValue(`PhotoBridge ${plat}`);
 }
 
 /* ------------------------------------------------------------------ *
@@ -260,7 +295,16 @@ async function once<T>(path: string, opt: RequestOptions): Promise<T> {
 
   const headers = new Headers(opt.headers);
   const token = getToken();
-  if (token) headers.set("Authorization", `Bearer ${token}`);
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+    // ★ 自愈：token 在 localStorage 里但 cookie 没了（用户手动清了
+    // 站点数据只清了一部分、从别的浏览器导入过 localStorage、
+    // 或早期版本从未写过 cookie）。这里补一次，否则 `<img>` 缩略图
+    // 会全部 401 而 JS 请求一切正常 —— 用户看到的是"照片全是灰块"。
+    // 后端收到 Authorization 头时也会顺手回一个 Set-Cookie，
+    // 两条路互为兜底。
+    if (!hasTokenCookie()) setTokenCookie(token);
+  }
   headers.set("X-PB-Client", clientHeader());
 
   let payload: BodyInit | undefined;

@@ -148,6 +148,14 @@ class Ctx:
     started_at: float = field(default_factory=time.time)
     params: dict[str, str] = field(default_factory=dict)
     state: dict[str, Any] = field(default_factory=dict)
+    #: 本次响应要下发的 cookie：`(name, value, max_age_seconds)`。
+    #:
+    #: ★ 为什么挂在 `Ctx` 上而不是直接写 `Reply`：鉴权发生在**拿到
+    #: Reply 之前**（`auth.require_client` 在中间件里跑，处理函数才
+    #: 负责造 Reply）。`require_client` 需要"发现客户端还在用
+    #: Authorization 头就顺手补一个 cookie"来自愈老版本前端，
+    #: 而它手上根本没有 Reply 对象。让 dispatch 在收尾时统一搬运。
+    set_cookies: list[tuple[str, str, int]] = field(default_factory=list)
     #: 应用级依赖（cfg/db/thumbs/indexer 的容器，类型是 app.state.AppState）。
     #: 放在 Ctx 上而不是让处理函数 `from ..state import get_state`：
     #: 后者会让处理函数隐式依赖进程级单例，测试无法注入临时库，
@@ -219,11 +227,42 @@ class Ctx:
     def header(self, name: str, default: str | None = None) -> str | None:
         return self.headers.get(name, default)
 
+    def cookies(self) -> dict[str, str]:
+        """解析 Cookie 头。无 Cookie 或格式非法时返回空 dict。
+
+        不引入 `http.cookies`：它的 `SimpleCookie` 在遇到非法字符时会
+        **静默丢弃整条** Cookie 头（而不是丢掉那一个键值对），
+        于是一个无关的坏 cookie 就能让鉴权失败，且完全没有日志线索。
+        这里逐段解析，坏段跳过、好段保留。
+        """
+        raw = self.headers.get("cookie", "")
+        if not raw:
+            return {}
+        out: dict[str, str] = {}
+        for part in raw.split(";"):
+            name, sep, value = part.partition("=")
+            if not sep:
+                continue
+            name = name.strip()
+            if not name:
+                continue
+            out[name] = value.strip().strip('"')
+        return out
+
+    def cookie_token(self, name: str) -> str | None:
+        """从 Cookie 里取 token。"""
+        v = self.cookies().get(name, "").strip()
+        return v or None
+
     def bearer_token(self) -> str | None:
         """从 Authorization 头取 Bearer token。
 
         不用 302 重定向传 token：重定向会让 Authorization 头丢失
         （接口文档 §2.3 明确不使用 301/302）。
+
+        ★ 只认头，**不**回落到 Cookie —— 调用方（`auth.require_client`）
+        自己决定要不要接受 Cookie。把回落藏在这里会让
+        `test_core.py:489` 那种"有没有凭证"的判断出现两种口径。
         """
         raw = self.headers.get("authorization", "")
         if not raw:
@@ -303,6 +342,18 @@ class Reply:
     body: Body = None
     media_type: str | None = None
 
+    #: 待下发的 cookie：`(name, value, max_age_seconds)`。
+    #:
+    #: ★★ 为什么单独放一个列表而不是塞进 `headers`：
+    #: `headers` 是"头名 → 单值"的映射，同一个 `Set-Cookie` 写两次
+    #: 只有最后一个能活下来；而登录/续期/清除三种场景经常要同时下发
+    #: 两个 cookie。更关键的是，把两个 cookie 用逗号拼进**一个**
+    #: `Set-Cookie` 行是**非法**的 —— RFC 6265 明确要求每个
+    #: `Set-Cookie` 独立成行，浏览器会把拼接后的整串当成一个畸形
+    #: cookie 丢掉。这个失败**完全静默**：响应 200、body 正常、
+    #: 只有缩略图 401。
+    cookies: list[tuple[str, str, int]] = field(default_factory=list)
+
     # ---- 便捷设置 ----
 
     def set(self, name: str, value: str) -> "Reply":
@@ -332,6 +383,35 @@ class Reply:
     def set_length(self, n: int) -> "Reply":
         self.headers["Content-Length"] = str(n)
         return self
+
+    def set_cookie(self, name: str, value: str, *, max_age: int) -> "Reply":
+        """记录一个待下发的 cookie。
+
+        ★ 追加到 `self.cookies`（`(name, value, max_age)` 三元组），
+        **不是**写 `headers`：同名头在 `Headers` 里只能有一个值，
+        两个 cookie 会互相覆盖；而把它们用逗号拼成一行又违反
+        RFC 6265，浏览器会静默丢弃整串。
+        适配层（`transports/local_http.py: adapt_reply`）用
+        `cookie_header_value()` 把每一项还原成独立的一行 `Set-Cookie`。
+
+        `Path` 固定 `/`、`HttpOnly` 固定开启、`SameSite` 固定 `Lax`：
+          - `Secure` 在一期**必须关**：局域网是明文 HTTP，浏览器会
+            直接丢弃带 Secure 的 cookie，症状是"缩略图仍然 401"；
+          - `SameSite=Strict` 会让用户从别的 App 点分享链接进来时
+            **不携带 cookie**，表现为"点分享链接进去显示未配对"。
+        """
+        self.cookies.append((name, value, max_age))
+        return self
+
+    def clear_cookie(self, name: str) -> "Reply":
+        """下发一个立即过期的 cookie。
+
+        ⚠️ `Max-Age=0` 与"不下发"是两回事：只清 localStorage 而不清
+        cookie 时，手机在电脑上点了"移除这台设备"之后刷新页面，
+        `<img>` 仍会带着旧 cookie 拿到 200（缩略图照常显示），
+        用户会以为撤销没生效。
+        """
+        return self.set_cookie(name, "", max_age=0)
 
     @property
     def is_stream(self) -> bool:
@@ -385,6 +465,29 @@ def bytes_reply(data: bytes, media_type: str, status: int = 200) -> Reply:
     r.headers["Content-Type"] = media_type
     r.headers["Content-Length"] = str(len(data))
     return r
+
+
+def cookie_header_value(name: str, value: str, max_age: int, *,
+                        path: str = "/", http_only: bool = True) -> str:
+    """把 cookie 的语义值拼成一行 `Set-Cookie` 的值（不含头名）。
+
+    ★ 放在 core 层而不是各适配器里各写一遍：二期加云端隧道适配器时，
+    只要忘了拼 `HttpOnly` 或 `SameSite`，安全属性就**静默**降级 ——
+    没有报错、没有测试失败，只是 cookie 变得能被 JS 读到。
+
+    不引入 `http.cookies.SimpleCookie`：它输出 `Set-Cookie` 的方式
+    依赖调用方再 `.output()`，且遇到非法字符时**静默丢整条**。
+    这里的输入全部来自我们自己的常量与 `secrets.token_urlsafe()`，
+    无需转义；但仍显式拒绝 `;`/CR/LF，因为 `value` 来自数据库。
+    """
+    v = str(value)
+    if any(c in v for c in (";", "\r", "\n")):
+        raise ValueError(f"cookie 值含非法字符 name={name!r}")
+    parts = [f"{name}={v}", f"Path={path}", f"Max-Age={int(max_age)}",
+             "SameSite=Lax"]
+    if http_only:
+        parts.append("HttpOnly")
+    return "; ".join(parts)
 
 
 def empty_reply(status: int = 204) -> Reply:

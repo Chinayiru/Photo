@@ -264,6 +264,13 @@ class Router:
         if self._cors is not None:
             self._apply_cors(ctx, reply)
 
+        # 鉴权中间件（`auth.require_client`）在拿到 Reply **之前** 就跑完了，
+        # 它只能把待下发的 cookie 记在 ctx 上。这里统一搬运一次 ——
+        # 放在错误响应之后、写 X-Request-Id 之前，任何路径都不会漏掉
+        # Set-Cookie（包括"旧前端仍用 Bearer 头、顺手补一个 cookie"的自愈路径）。
+        if ctx.set_cookies:
+            reply.cookies.extend(ctx.set_cookies)
+
         reply.headers.setdefault("X-Request-Id", ctx.request_id)
         # 明确禁用 MIME 嗅探：照片库里的内容是用户提供的字节，
         # 如果浏览器把某个 .jpg 嗅探成 HTML，就变成了存储型 XSS。

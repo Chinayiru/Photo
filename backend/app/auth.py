@@ -59,6 +59,7 @@ __all__ = [
     "PAIR_LOCK_SECONDS",
     "TOKEN_TTL_DAYS",
     "TOKEN_BYTES",
+    "CLIENT_COOKIE",
     "hash_token",
     "hash_code",
     "new_token",
@@ -96,6 +97,24 @@ TOKEN_TTL_DAYS: int = 90
 
 #: token 随机字节数。32 字节 = 256 位，远超暴力破解可行范围。
 TOKEN_BYTES: int = 32
+
+#: 承载 client_token 的 cookie 名。
+#:
+#: ★★ 存在的唯一理由：浏览器原生 `<img>` 与 `EventSource` **无法发送
+#: 自定义请求头**，`Authorization: Bearer` 根本传不进去。缩略图走
+#: `<img src>`，于是全部 401（E2002），前端 `PhotoCell.onError` 把
+#: 每格标成 failed 渲染灰块 —— 表现为"照片一张都加载不出来"。
+#:
+#: 备选方案都被否决了：
+#:   - `?token=` 进 URL：token 会落进浏览器缓存键、服务器访问日志、
+#:     `Referer` 头，且与 `Vary: Authorization` 的长缓存策略冲突；
+#:   - `fetch` + `URL.createObjectURL`：摧毁 `loading="lazy"` 与
+#:     HTTP 缓存（`PhotoCell.vue` 的懒加载是硬约束）；
+#:   - Service Worker 加头：SW 是 **secure context** 专属 API，
+#:     `http://192.168.x.x` 上根本注册不了（只有 https 与 localhost 算）。
+#:
+#: Cookie 是唯一同时满足"浏览器自动携带 + 保留 HTTP 缓存与懒加载"的方案。
+CLIENT_COOKIE: str = "pb_token"
 
 #: 无需鉴权的路径（精确匹配）。
 #:
@@ -311,19 +330,35 @@ def require_client(ctx: Ctx) -> dict[str, Any]:
     if st is None:  # pragma: no cover —— 装配遗漏
         raise Unauthorized("state 未注入")
 
-    token = ctx.bearer_token()
+    via_header = ctx.bearer_token()
+    token = via_header or ctx.cookie_token(CLIENT_COOKIE)
     if not token:
-        raise Unauthorized("缺少 Authorization 头")
+        raise Unauthorized("缺少凭证：Authorization 头或 pb_token cookie")
 
     row = _lookup_device(st.db, token)
     if row is None:
+        # 失效的 cookie 必须清掉，否则浏览器会**永远**带着它：
+        # 用户重新配对拿到新 token 后，`<img>` 仍优先发旧 cookie
+        # （cookie 与 localStorage 是两个独立存储），缩略图继续 401，
+        # 而 JS 请求用的是新 Bearer 头所以一切正常 —— 症状是
+        # "时间线有照片但全是灰块"，用户无法理解也无法自助恢复。
+        ctx.set_cookies.append((CLIENT_COOKIE, "", 0))
         raise Unauthorized("token 不存在")
 
     if row["revoked"]:
+        ctx.set_cookies.append((CLIENT_COOKIE, "", 0))
         raise AppError(E2004, f"device revoked id={row['id']}")
+
+    if via_header:
+        # ★ 自愈路径：客户端还在用 Authorization 头（老版本前端、
+        # 或刚配对完还没刷新页面）。顺手补一个 cookie，让同一浏览器
+        # 里的 `<img>` / `EventSource` 立刻能用，无需用户重新配对。
+        ctx.set_cookies.append(
+            (CLIENT_COOKIE, token, TOKEN_TTL_DAYS * 86400))
 
     info = {"id": row["id"], "name": row["name"]}
     ctx.state["client"] = info
+    ctx.state["via_cookie"] = not via_header
     _touch(st, row["id"])
     return info
 

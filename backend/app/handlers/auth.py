@@ -35,7 +35,9 @@ from typing import Any, Deque
 
 from .. import audit
 from ..auth import (
+    CLIENT_COOKIE,
     PAIR_CODE_TTL,
+    TOKEN_TTL_DAYS,
     consume_pair_code,
     generate_pair_code,
     is_loopback,
@@ -136,15 +138,21 @@ async def pair(ctx: Ctx) -> Reply:
         detail={"device_name": _client_name(ctx)},
     )
 
-    return json_reply({
+    r = json_reply({
         "client_token": token,
         "client_id": client_id,
         "device_id": st.device_id,
         "device_name": st.device_name,
-        "expires_at": now + 90 * 86400,
+        "expires_at": now + TOKEN_TTL_DAYS * 86400,
         "lan_ips": st.cfg_server_ips(),
         "server_time": now,
     }, status=201)
+    # ★ 配对时同时下发 cookie：浏览器原生 `<img>` / `EventSource`
+    # 带不了 Authorization 头，缩略图只能靠 cookie 才能过鉴权。
+    # 前端仍然拿到明文 token（上面响应体里），两条通路并行：
+    # JS 请求走 Bearer 头，`<img src>` 走 cookie。
+    r.set_cookie(CLIENT_COOKIE, token, max_age=TOKEN_TTL_DAYS * 86400)
+    return r
 
 
 async def me(ctx: Ctx) -> Reply:
@@ -196,7 +204,7 @@ async def revoke_device(ctx: Ctx) -> Reply:
     指向不存在记录的悬空引用，事后追查"是谁删了这张照片"就断了线索。
     """
     st = _st(ctx)
-    require_client(ctx)
+    me = require_client(ctx)
     client_id = ctx.params["client_id"]
 
     row = st.db.query_one("SELECT id FROM devices WHERE id = ?", (client_id,))
@@ -208,7 +216,15 @@ async def revoke_device(ctx: Ctx) -> Reply:
         st.db, st.cfg, audit.ACTION_REVOKE,
         device=st.device_name, client_id=client_id,
     )
-    return empty_reply(204)
+    r = empty_reply(204)
+    if client_id == me["id"]:
+        # 手机自己撤销自己（或托盘通过手机页面撤销）：必须清 cookie。
+        # 不清的话 `<img>` 仍带着有效期的旧 cookie 请求，虽然服务端
+        # 会因 revoked=1 回 403，但浏览器会缓存失败状态直到用户
+        # 手动清站点数据 —— 重新配对后旧 cookie 依然在，缩略图
+        # 继续 403 而 JS 请求正常，症状是"照片全是灰块"。
+        r.clear_cookie(CLIENT_COOKIE)
+    return r
 
 
 # --------------------------------------------------------------------------
