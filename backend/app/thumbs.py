@@ -239,6 +239,10 @@ class ThumbEngine:
         self._sem = asyncio.Semaphore(self.workers)
         self._tasks: list[asyncio.Task[None]] = []
         self._running = False
+        #: 是否已完成回收（worker 已取消、线程池已关闭）。与 `_running` 分开：
+        #: `_running=False` 只是"不再接新活"，回收是在 stop() 里做的，
+        #: 两者之间有一个可被取消的 await —— 见 stop() 的长注释。
+        self._stopped = False
         #: 统计，供 /api/system/info 与托盘显示
         self.done = 0
         self.failed = 0
@@ -249,25 +253,80 @@ class ThumbEngine:
     def start(self) -> None:
         if self._running:
             return
+        if self._stopped:
+            # 线程池已 shutdown，再起 worker 会抛 RuntimeError 或静默不干活。
+            raise RuntimeError("ThumbEngine 已停止，不能重新启动（请新建实例）")
         self._running = True
         for i in range(self.workers):
             self._tasks.append(asyncio.create_task(self._worker(i), name=f"thumb-{i}"))
         log.info("thumb engine started: %d workers, sizes=%s", self.workers, THUMB_SIZES)
 
-    async def stop(self, *, drain: bool = False) -> None:
-        """停止引擎。
+    async def stop(self, *, drain: bool = False,
+                   drain_timeout: float | None = None) -> None:
+        """停止引擎。可重复调用；**保证 worker 与线程池一定被回收**。
 
-        drain=True 时先把手头的队列跑完 —— 关机/退出时用，避免用户看到
-        "进度 95% 然后全没了"。托盘退出走这条路，超时由调用方控制。
+        `drain=True` 时先把手头的队列跑完 —— 关机/退出时用，避免用户看到
+        "进度 95% 然后全没了"。
+
+        ★ 为什么 drain 的超时**长在函数内部**（`drain_timeout`），
+        而不是由调用方用 `asyncio.wait_for(stop(), ...)` 从外面掐：
+
+        从外面掐会 **cancel 这个协程**。若回收写在 `await queue.join()`
+        之后（早期实现），取消会让回收整段跳过 —— 而 `_running` 已经置为
+        False，于是第二次 stop() 直接 early-return，worker 与线程池
+        **永远不会被回收**。实测后果：
+
+        - 事件循环关闭时刷出 4 条 `Task was destroyed but it is pending!`
+          （`thumb-0`..`thumb-3` 卡在 `queue.get()` / `_generate_one()`）；
+        - 托盘退出看起来"卡住了"，只能去任务管理器杀进程（强杀留下 WAL）。
+
+        曾经试过用 `asyncio.shield` 保护回收段，但那只是把问题往后推：
+        `wait_for` 超时后 shield 的内层任务继续跑，而调用方已经走完
+        `_shutdown` 并让 `asyncio.run` 关闭事件循环，那个还在跑的任务
+        照样被销毁。**唯一可靠的做法是不让取消发生** —— 自己带超时，
+        超时只是停止等待，回收在同一协程里继续走完。
+
+        `finally` 保证即使 drain 抛异常也会回收。
         """
-        if not self._running:
+        if self._stopped:
             return
         self._running = False
-        if drain:
-            await self.queue.join()
+        try:
+            if drain:
+                if drain_timeout is None:
+                    await self.queue.join()
+                else:
+                    try:
+                        await asyncio.wait_for(self.queue.join(),
+                                               timeout=drain_timeout)
+                    except asyncio.TimeoutError:
+                        log.info(
+                            "缩略图队列未在 %.0f 秒内跑完（剩余 %d 个），"
+                            "剩余任务将在下次启动时补做",
+                            drain_timeout, self.queue.qsize())
+        finally:
+            await self._teardown()
+
+    async def _teardown(self) -> None:
+        """取消 worker、关线程池。幂等，且不依赖 `_running`。"""
+        if self._stopped:
+            return
+        self._stopped = True
+        # 队列里可能还有没跑完的任务（drain 超时或根本没 drain 时会）。
+        # worker 被取消后没人再调 task_done()，留着未平衡的计数会让
+        # 后续任何 queue.join() 永久挂起。
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self.queue.task_done()
         for t in self._tasks:
-            t.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+            if not t.done():
+                t.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
         self._pool.shutdown(wait=False, cancel_futures=True)
         log.info("thumb engine stopped (done=%d failed=%d skipped=%d)",

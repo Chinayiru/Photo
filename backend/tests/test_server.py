@@ -637,7 +637,7 @@ def test_missing_file_degrades_gracefully(env):
     item = env.get("/api/timeline?limit=1", token=token).json()["items"][0]
     mid = item["id"]
     row = env.db.query_one("SELECT rel_path FROM media WHERE id = ?", (mid,))
-    (env.library / row["rel_path"]).unlink()
+    _unlink_settled(env.library / row["rel_path"])
 
     r = env.get(f"/api/items/{mid}/thumb?size=320", token=token)
     assert r.status == 200, r.text
@@ -649,6 +649,35 @@ def test_missing_file_degrades_gracefully(env):
     assert r.status >= 400
 
 
+def _unlink_settled(path: Path, *, tries: int = 40, delay: float = 0.05) -> None:
+    """删除文件，容忍 Windows 上短暂的共享冲突。
+
+    ★ 为什么需要重试：`env.library` 里的文件同时被**后台缩略图线程**读取。
+    索引器刚把文件入队，worker 可能正拿着它生成缩略图（Pillow 打开文件
+    期间 Windows 不允许删除），此时 `unlink()` 抛
+    `PermissionError: [WinError 32] 另一个程序正在使用此文件`。
+
+    这是**测试自身的竞态**，不是产品缺陷：真实用户删照片时程序也在读它，
+    而 `items/delete` 走的是回收站（`send2trash`），它内部同样要处理
+    占用 —— 但那属于 `handlers` 的职责，这里只是测试夹具在模拟"文件
+    从磁盘上消失了"。
+
+    实测：不加重试时全库跑约每 8~10 次出现 1 次失败（`test_missing_file_is_flagged_after_rescan`），
+    单跑该文件 8 次全过 —— 典型的并发时序问题，不是逻辑错误。
+    """
+    last: OSError | None = None
+    for _ in range(tries):
+        try:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return                      # 已经没了，目标达成
+        except PermissionError as exc:  # noqa: PERF203
+            last = exc
+            time.sleep(delay)
+    raise AssertionError(f"文件一直被占用，无法删除：{path}（{last}）")
+
+
 def test_missing_file_is_flagged_after_rescan(env):
     """重扫之后 missing 必须为 1，前端才知道该显示"找不到了"。"""
     token = _pair(env)
@@ -656,7 +685,7 @@ def test_missing_file_is_flagged_after_rescan(env):
     item = env.get("/api/timeline?limit=1", token=token).json()["items"][0]
     mid = item["id"]
     row = env.db.query_one("SELECT rel_path FROM media WHERE id = ?", (mid,))
-    (env.library / row["rel_path"]).unlink()
+    _unlink_settled(env.library / row["rel_path"])
 
     _index(env)
     r = env.get(f"/api/items/{mid}", token=token)

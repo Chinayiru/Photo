@@ -590,3 +590,189 @@ def test_engine_stop_is_idempotent(tmp_path: Path, monkeypatch) -> None:
         await eng.stop()          # 第二次不应抛异常
 
     asyncio.run(main())
+
+
+# ---------------------------------------------------------------------------
+# 关机回收回归
+#
+# 事故经过：`server._shutdown` 曾用
+# `asyncio.wait_for(st.thumbs.stop(drain=True), timeout=20.0)` 从外面掐超时。
+# 超时会 **cancel 这个协程**，而当时的回收代码写在 `await queue.join()`
+# 之后（没有 try/finally），于是回收整段被跳过；又因为 `_running` 已置
+# False，第二次 stop() 直接 early-return —— worker 与线程池
+# **永远不会被回收**。
+#
+# 实测症状（`scripts/verify_lan_e2e.py` 跑真实库时暴露）：
+#   - 事件循环关闭刷出 4 条 `Task was destroyed but it is pending!`
+#   - 托盘退出看起来卡死，只能去任务管理器杀进程（强杀留下 WAL）
+#
+# 修法：drain 的超时长在函数内部（`drain_timeout`），超时只停止等待、
+# 不取消协程，回收在同一协程里走完；`finally` 作为第二道保险。
+#
+# 下面两条分别钉住「行为」与「结构」：行为测外部取消下不泄漏，
+# 结构测 server 不再使用那个脆弱的外部 wait_for 写法。
+# ---------------------------------------------------------------------------
+
+
+def test_engine_survives_external_cancel_without_leaking_workers(
+        tmp_path: Path, monkeypatch) -> None:
+    """★ 事故直接回归：外部 cancel 之后 worker 与线程池必须已被回收。
+
+    实测对照（本机）：
+
+    - 修复前：`workers after external cancel: 2`、`_stopped: False`、
+      `LEAKED worker tasks: 2` —— 事件循环关闭时这 2 个任务被销毁并刷警告。
+    - 修复后：`workers after external cancel: 0`、`_stopped: True`、
+      `LEAKED worker tasks: 0`。
+
+    构造方式忠实于真实场景：让 `_generate_one` 永久阻塞（等价于队列里
+    堆了 2000 张待生成缩略图、20 秒跑不完），这样 `queue.join()` 真的挂住，
+    外部 `wait_for` 才会超时并取消。
+    """
+    import pytest as _pytest
+
+    eng, _, _ = _engine_fixture(tmp_path, monkeypatch, [], workers=2)
+
+    async def never_finishes(media_id: int) -> bool:
+        await asyncio.Event().wait()          # 永久阻塞
+        return True                            # pragma: no cover
+
+    monkeypatch.setattr(eng, "_generate_one", never_finishes)
+
+    async def main() -> None:
+        eng.start()
+        assert len(eng._tasks) == 2
+        for _ in range(5):
+            eng.enqueue(999)
+        # ★ 这正是 server._shutdown 早期的写法
+        with _pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(eng.stop(drain=True), timeout=0.3)
+
+    asyncio.run(main())
+
+    leaked = [t for t in eng._tasks if not t.done()]
+    assert not leaked, f"worker 泄漏 {len(leaked)} 个: {leaked}"
+    assert eng._stopped is True, "外部取消后必须已完成回收"
+    assert eng.queue.empty(), f"队列未清空，剩余 {eng.queue.qsize()}"
+    # 线程池已 shutdown：再提交任务必须抛 RuntimeError
+    with _pytest.raises(RuntimeError):
+        eng._pool.submit(lambda: None)
+
+
+def test_server_shutdown_passes_internal_drain_timeout() -> None:
+    """结构回归：server._shutdown 必须用 drain_timeout，不能用外部 wait_for。
+
+    行为测试只能证明"外部取消时不会泄漏"，但无法阻止有人把外部
+    `wait_for` 写回去（那样每次正常关机都要依赖取消路径的鲁棒性）。
+
+    这里走 AST 而不是字符串匹配：注释里提到 `wait_for`（解释为什么
+    不能用它）是正常的，字符串匹配会误报 —— 这正是本仓库
+    `scripts/check_docs.py` 踩过的坑（代码块里的正则被当成断链）。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from backend.app import server as server_mod
+
+    src = textwrap.dedent(inspect.getsource(server_mod._shutdown))
+    tree = ast.parse(src)
+
+    # 收集所有被调用的名字，形如 asyncio.wait_for(...)
+    called: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Attribute):
+                called.add(f.attr)
+            elif isinstance(f, ast.Name):
+                called.add(f.id)
+
+    assert "wait_for" not in called, (
+        "server._shutdown 不应调用 wait_for —— 它会取消协程，"
+        "使 ThumbEngine 的 worker 与线程池回收被跳过（真实事故）"
+    )
+
+    # 必须把超时作为参数传进 stop()
+    stop_calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "stop"
+    ]
+    assert stop_calls, "server._shutdown 应调用 thumbs.stop()"
+    assert any(
+        kw.arg == "drain_timeout" for c in stop_calls for kw in c.keywords
+    ), "thumbs.stop() 必须收到 drain_timeout"
+
+
+def test_engine_stop_after_drain_timeout_does_not_hang(tmp_path: Path,
+                                                       monkeypatch) -> None:
+    """超时之后再调一次 stop() 不能挂住（幂等，且回收已完成）。"""
+    eng, _, _ = _engine_fixture(tmp_path, monkeypatch, [], workers=2)
+
+    async def main() -> None:
+        eng.start()
+        await eng.stop(drain=True, drain_timeout=0.0)
+        # 第二次必须快速返回；给它 5 秒，挂住就算失败
+        await asyncio.wait_for(eng.stop(drain=True, drain_timeout=0.0),
+                               timeout=5.0)
+
+    asyncio.run(main())
+
+
+def test_engine_drain_success_still_reports_done(tmp_path: Path,
+                                                 monkeypatch) -> None:
+    """正常路径不能被修坏：drain 足够长时必须真的把队列跑完。"""
+    src = _make_image(tmp_path / "d.jpg", (640, 480))
+    st = src.stat()
+    rows = [{"id": 1, "root_id": "library", "rel_path": "d.jpg",
+             "mtime": st.st_mtime, "size": st.st_size, "orientation": 1,
+             "thumb_state": "pending", "thumb_etag": None, "missing": 0}]
+    eng, cfg, db = _engine_fixture(tmp_path, monkeypatch, rows)
+
+    async def main() -> None:
+        eng.start()
+        eng.enqueue(1)
+        await eng.stop(drain=True, drain_timeout=30.0)
+
+    asyncio.run(main())
+    assert eng.done == 1, f"drain 应把队列跑完，done={eng.done}"
+    assert db.rows[1]["thumb_state"] == "ok"
+
+
+def test_engine_start_after_stop_is_rejected(tmp_path: Path,
+                                             monkeypatch) -> None:
+    """已回收的引擎不能重启 —— 线程池已 shutdown，重启会静默不干活。"""
+    import pytest as _pytest
+    eng, _, _ = _engine_fixture(tmp_path, monkeypatch, [])
+
+    async def main() -> None:
+        eng.start()
+        await eng.stop()
+
+    asyncio.run(main())
+    with _pytest.raises(RuntimeError, match="不能重新启动"):
+        eng.start()
+
+
+def test_engine_teardown_balances_queue_counters(tmp_path: Path,
+                                                 monkeypatch) -> None:
+    """★ 回收时必须清空队列并平衡 task_done()。
+
+    否则残留的未平衡计数会让后续任何 `queue.join()` **永久挂起** ——
+    表现是"第二次关机卡死"，而第一次看起来正常。
+    """
+    eng, _, _ = _engine_fixture(tmp_path, monkeypatch, [], workers=1)
+
+    async def main() -> None:
+        eng.start()
+        # 塞 5 个任务，但用 drain_timeout=0 让它们来不及被处理
+        for _ in range(5):
+            eng.enqueue(999)
+        await eng.stop(drain=True, drain_timeout=0.0)
+        # 队列已清空，且 join() 立刻返回（计数已平衡）
+        assert eng.queue.empty(), "队列未清空"
+        await asyncio.wait_for(eng.queue.join(), timeout=2.0)
+
+    asyncio.run(main())

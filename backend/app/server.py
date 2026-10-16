@@ -309,9 +309,14 @@ async def _shutdown(st: AppState, transport: Any) -> None:
     try:
         # drain=True：把队列里剩下的缩略图跑完，否则用户下次打开
         # 会看到一片灰图。但要有上限 —— 关机不该等几分钟。
-        await asyncio.wait_for(st.thumbs.stop(drain=True), timeout=20.0)
-    except (asyncio.TimeoutError, Exception):   # noqa: BLE001
-        log.warning("关闭缩略图引擎超时", exc_info=True)
+        #
+        # ★ 上限必须作为参数传进去（drain_timeout），不能用
+        # asyncio.wait_for 从外面掐：外部超时会 cancel 这个协程，
+        # 让 worker 与线程池的回收整段跳过（实测刷出
+        # `Task was destroyed but it is pending!`）。
+        await st.thumbs.stop(drain=True, drain_timeout=20.0)
+    except Exception:       # noqa: BLE001
+        log.warning("关闭缩略图引擎失败", exc_info=True)
 
     try:
         events_mod.get_bus().close()
