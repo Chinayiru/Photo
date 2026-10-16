@@ -388,3 +388,121 @@ def test_load_never_points_at_another_projects_data(tmp_path, monkeypatch) -> No
     assert Path(cfg.data_dir) == Path(DATA_DIR)
     assert Path(cfg.db_path) == Path(DATA_DIR) / "photobridge.db"
 
+
+# ---------------------------------------------------------------------------
+# 首次运行：`--config` 不能被丢掉
+# ---------------------------------------------------------------------------
+
+def test_is_first_run_honours_given_config(tmp_path) -> None:
+    """★ `is_first_run(cfg)` 必须看传进来的那份配置，而不是全局 CONFIG_PATH。
+
+    这是"事故 2"的**另一半**。`data_dir` 修好之后，`--config` 已经能
+    把数据库带到正确位置；但 `serve()` 里的 `is_first_run()` 仍只看
+    默认的 `data/config.json`。当默认配置不存在（或 roots 为空）时它
+    返回 True，`serve()` 随即调 `bootstrap_default_root()` 并用
+    `get_config()` **把调用方传进来的 cfg 整个丢掉** —— 用户以为在用
+    A 配置，实际跑的是自动探测出来的 B。
+
+    实测：`--config` 指向只有 1 张图的临时库，程序却去索引了自动
+    探测到的真实照片库，并在那份库上 `marked 2000 rows missing`。
+    """
+    from backend.app import config as cfgmod
+
+    cfg_path = tmp_path / "elsewhere" / "cfg.json"
+    cfg_path.parent.mkdir(parents=True)
+    cfg = Config({"roots": [{"id": "library", "path": str(tmp_path),
+                             "mode": "readwrite"}]}, path=cfg_path)
+
+    assert cfgmod.is_first_run(cfg) is False, (
+        "配置里明明有 roots，却被判成首次运行 —— "
+        "serve() 会因此丢掉这份配置"
+    )
+
+    empty = Config({}, path=cfg_path)
+    assert cfgmod.is_first_run(empty) is True, "roots 为空才算首次运行"
+
+
+def test_bootstrap_writes_to_given_config_not_default(tmp_path, monkeypatch) -> None:
+    """★ `bootstrap_default_root(cfg)` 必须写进 cfg 自己的路径并返回它。"""
+    from backend.app import config as cfgmod
+
+    cfg_path = tmp_path / "elsewhere" / "cfg.json"
+    cfg_path.parent.mkdir(parents=True)
+    cfg = Config({}, path=cfg_path)
+
+    lib = tmp_path / "相册"
+    lib.mkdir()
+    monkeypatch.setattr(cfgmod, "_guess_library_paths", lambda: [(lib, "相册")])
+
+    written: list[Path] = []
+    monkeypatch.setattr(
+        cfgmod, "_write_json",
+        lambda target, raw, **kw: written.append(Path(target)),   # noqa: ARG005
+    )
+
+    out = cfgmod.bootstrap_default_root(cfg)
+
+    assert out is cfg, "必须就地返回传进来的对象，而不是 get_config()"
+    assert written == [cfg_path], (
+        f"配置写到了 {written}，应该是调用方的 {cfg_path} —— "
+        f"写错地方等于「探测结果」和「实际运行的配置」是两份东西"
+    )
+    assert [r.id for r in out.roots] == ["library"], (
+        "改完 raw 必须让 roots 缓存失效，否则还是改之前的空列表"
+    )
+    assert str(out.roots[0].path) == str(lib)
+
+
+def test_serve_does_not_discard_passed_config() -> None:
+    """★ 结构回归：`serve()` 里不许出现 `cfg = get_config()` 覆盖入参。
+
+    行为测试要真起服务，而这条约束本质是"别把入参换掉"，
+    用 AST 直接看代码更稳（字符串匹配会被注释绊倒，
+    见 `test_server_shutdown_passes_internal_drain_timeout` 的教训）。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from backend.app import server as server_mod
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(server_mod.serve)))
+
+    # 取函数体：跳过 docstring，找到第一个真正的语句
+    fn = tree.body[0]
+    assert isinstance(fn, ast.AsyncFunctionDef), "serve 应该是 async 函数"
+    body = [n for n in fn.body
+            if not (isinstance(n, ast.Expr)
+                    and isinstance(n.value, ast.Constant))]
+
+    # 找出所有 `cfg = get_config()` 形状的赋值
+    bad: list[int] = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not (len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "cfg"):
+            continue
+        v = node.value
+        if isinstance(v, ast.Call) and (
+            (isinstance(v.func, ast.Name) and v.func.id == "get_config")
+            or (isinstance(v.func, ast.Attribute) and v.func.attr == "get_config")
+        ):
+            bad.append(node.lineno)
+
+    assert not bad, (
+        f"serve() 第 {bad} 行把 cfg 换成了 get_config() —— "
+        f"这会丢掉 --config 传进来的配置"
+    )
+
+    # 首句赋值必须是 `cfg = cfg or get_config()` 这种保底形式
+    first = body[0]
+    assert isinstance(first, ast.Assign), (
+        f"serve() 首句应是 cfg 的保底赋值，实际是 {type(first).__name__}"
+    )
+    assert isinstance(first.value, ast.BoolOp), (
+        "serve() 首句应是 `cfg = cfg or get_config()`，"
+        "而不是无条件覆盖入参"
+    )
+

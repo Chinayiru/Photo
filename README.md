@@ -72,7 +72,7 @@
 
 ## 当前状态
 
-**一期已完成**（536 条自动化测试 + 真实库端到端冒烟 35 项全绿）：
+**一期已完成**（539 条自动化测试 + 真实库端到端冒烟 35 项全绿）：
 
 | 模块 | 状态 | 关键实测数据 |
 |---|---|---|
@@ -128,9 +128,19 @@ cd Photo
 python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
+# ★ 前端要先构建，否则手机打开 / 是 404（见下方说明）
+cd frontend && npm install && npm run build && cd ..
+
 # ★ 必须显式传 --host 0.0.0.0，否则只有本机能访问
 .venv/Scripts/python.exe -m backend.app.main --host 0.0.0.0
 ```
+
+> **为什么必须自己构建前端**：`frontend/dist/` 是构建产物，**不在仓库里**。
+> 不构建的话后端会照常启动、API 也全部可用（可以用 `curl` 验证），
+> 只有手机打开 `/` 会得到 `404 {"error":{"code":"E1004",...}}`。
+> 后端日志里会有一行明确的
+> `未找到前端构建产物（…\frontend\dist），根路径不提供界面` —— 看到它就是这件事。
+> **打包好的 exe 不需要这一步**，前端已经在里面了。
 
 启动后终端会打印局域网地址（形如 `http://192.0.2.10:8787`）。手机浏览器打开它：
 
@@ -248,7 +258,7 @@ python -m backend.app.main --version
 ```bash
 .venv/Scripts/python.exe -m pip install -r requirements-dev.txt
 
-# 单元 + 集成测试（约 30 秒，536 条）
+# 单元 + 集成测试（约 30 秒，539 条）
 .venv/Scripts/python.exe -m pytest backend/tests/
 
 # 路径沙箱专项（56 条）

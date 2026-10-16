@@ -551,8 +551,27 @@ def ensure_dirs(cfg: Config | None = None) -> None:
         c.thumbs_dir(int(size)).mkdir(parents=True, exist_ok=True)
 
 
-def is_first_run() -> bool:
-    """从未完成过配置（config.json 不存在或 roots 为空）。"""
+def is_first_run(cfg: Config | None = None) -> bool:
+    """从未完成过配置（config.json 不存在或 roots 为空）。
+
+    ★ 为什么要能接受一个 `cfg`：`serve(cfg)` 拿到的可能是 `--config`
+    指定的**另一份**配置。若这里只看全局 `CONFIG_PATH`，那么用
+    `--config H:/tmp/x/cfg.json` 指向一份已写好的配置时，本函数仍会去
+    看默认的 `data/config.json`；默认配置不存在（或 roots 为空）时它
+    返回 True，`serve()` 随即调 `bootstrap_default_root()` 再用
+    `get_config()` **把调用方传进来的 cfg 整个丢掉** —— 用户以为在用
+    A 配置，实际跑的是自动探测出来的 B。
+
+    实测后果（本机）：`--config` 指向 `H:/tmp/freshclone/_lib`（1 张图），
+    程序却去索引了自动探测到的 `D:\\Photos`，并在那份库上
+    `marked 2000 rows missing`。这与"事故 2"（`--config` 不影响
+    data_dir）是同一类错误的另一半：**传进来的配置必须全程有效**。
+    """
+    if cfg is not None:
+        try:
+            return not cfg.roots
+        except ConfigError:
+            return True
     if not CONFIG_PATH.exists():
         return True
     try:
@@ -775,7 +794,7 @@ def local_ipv4_addresses() -> list[str]:
     return _usable_lan_ips(primary, others)
 
 
-def bootstrap_default_root() -> Config:
+def bootstrap_default_root(cfg: Config | None = None) -> Config:
     """首次运行时写出一份 config.json。
 
     ## 为什么不再硬编码 `D:\\Photos`
@@ -789,8 +808,15 @@ def bootstrap_default_root() -> Config:
     现在的策略：**自动探测常见位置**，探测不到就写一个空的 roots
     并留下明确提示，由用户在设置页里选目录。宁可让用户点一次
     "选择照片库"，也不要让程序去翻一个猜出来的路径。
+
+    ★ `cfg` 参数（与 `is_first_run` 同理）：调用方可能是拿
+    `--config` 传进来的配置对象。若这里用全局 `load()`，写盘会写到
+    默认的 `data/config.json`，而调用方手上那份配置对象根本没被更新 ——
+    于是"探测结果"和"实际运行的配置"变成两份不同的东西。
+    传进来时：就地改它的 `raw`、写到**它自己的路径**、并就地返回它。
     """
-    cfg = load()
+    if cfg is None:
+        cfg = load()
     if cfg.roots:
         return cfg
 
@@ -816,8 +842,10 @@ def bootstrap_default_root() -> Config:
         cfg.raw["roots"] = []
 
     cfg.save()
-    load(reload=True)
-    return get()
+    # 就地失效缓存：roots 是惰性解析并缓存的，改完 raw 必须让它重算，
+    # 否则 `cfg.roots` 还是改之前的空列表。
+    cfg._roots = None       # noqa: SLF001
+    return cfg
 
 
 #: 自动探测时的候选目录名。**精确匹配**（大小写不敏感），

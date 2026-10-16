@@ -226,11 +226,17 @@ async def serve(cfg: Config | None = None, *,
     """
     cfg = cfg or get_config()
 
-    if is_first_run():
+    # ★ 必须把 cfg 传进去，不能调用无参版本。
+    # 无参版本只看全局 CONFIG_PATH，于是 `--config` 指向另一份配置时，
+    # 它会判定"首次运行"并调 bootstrap_default_root()，而后者用
+    # get_config() 返回**默认那份**配置 —— 调用方传进来的 cfg 被整个丢掉，
+    # 用户以为在用 A 配置，实际跑的是自动探测出来的 B。
+    # 实测：`--config` 指向一个只有 1 张图的临时库，程序却去索引了
+    # 自动探测到的真实照片库，并在那份库上 `marked 2000 rows missing`。
+    if is_first_run(cfg):
         from .config import bootstrap_default_root
 
-        bootstrap_default_root()
-        cfg = get_config()
+        cfg = bootstrap_default_root(cfg)
         log.info("首次运行：已写入默认媒体根，请到设置里确认路径")
 
     st = build_state(cfg)
