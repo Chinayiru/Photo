@@ -776,3 +776,160 @@ def test_engine_teardown_balances_queue_counters(tmp_path: Path,
         await asyncio.wait_for(eng.queue.join(), timeout=2.0)
 
     asyncio.run(main())
+
+
+# --------------------------------------------------------------------------
+# HEIC / HEIF —— 一期硬需求，但此前没有任何测试真的处理过 HEIC 文件
+#
+# docs/01 把 HEIC 列为必须支持（iPhone 默认格式，白名单里有 heic/heif），
+# 而在此之前整个测试套件只断言过 `content_type_for("heic") == "image/heic"`
+# —— 那只是字符串映射，**没有任何一张 HEIC 被解码过**。
+# 一旦 pillow-heif 没装、或注册时机不对（必须在任何 Image.open 之前），
+# 表现为"iPhone 用户的照片全是灰块"，而单元测试全绿。
+# --------------------------------------------------------------------------
+
+
+def _heic_available() -> bool:
+    try:
+        import pillow_heif  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+needs_heif = pytest.mark.skipif(not _heic_available(),
+                                reason="pillow-heif 未安装")
+
+
+def _make_heic(path: Path, size: tuple[int, int], color=(10, 120, 200)) -> Path:
+    """造一张真的 HEIC。必须先注册 opener 才能 save。"""
+    from app.exif import _prepare_pillow
+
+    _prepare_pillow()
+    Image.new("RGB", size, color).save(path, "HEIF", quality=80)
+    return path
+
+
+@needs_heif
+def test_heic_thumbnail_is_generated(tmp_path: Path, monkeypatch) -> None:
+    """★ iPhone 的 HEIC 必须能生成缩略图，否则一期等于不支持 iPhone。"""
+    src = _make_heic(tmp_path / "IMG_0001.heic", (1200, 900))
+    st = src.stat()
+    rows = [{"id": 1, "root_id": "library", "rel_path": "IMG_0001.heic",
+             "mtime": st.st_mtime, "size": st.st_size, "orientation": 1,
+             "thumb_state": "pending", "thumb_etag": None, "missing": 0}]
+    eng, cfg, db = _engine_fixture(tmp_path, monkeypatch, rows)
+
+    async def main() -> None:
+        eng.start()
+        eng.enqueue(1)
+        await eng.queue.join()
+        await eng.stop()
+
+    asyncio.run(main())
+
+    assert eng.failed == 0, "HEIC 缩略图生成失败"
+    assert eng.done == 1
+    for size in THUMB_SIZES:
+        out = thumb_path(cfg, "library", "IMG_0001.heic", size)
+        assert out.is_file(), f"缺少 {size} 缩略图"
+        assert out.read_bytes()[:4] == b"RIFF", "输出不是 WebP"
+    assert db.rows[1]["thumb_state"] == "ok"
+
+
+@needs_heif
+def test_heic_generate_thumb_directly(tmp_path: Path) -> None:
+    """直接调 generate_thumb，不经过引擎 —— 隔离掉队列与 DB 的干扰。"""
+    src = _make_heic(tmp_path / "a.heic", (800, 600))
+    out = tmp_path / "a_320.webp"
+
+    w, h = generate_thumb(src, out, 320)
+    assert out.read_bytes()[:4] == b"RIFF", "输出不是 WebP"
+    # 缩略图必须真的缩小了，而不是原样拷一份
+    assert max(w, h) <= 320, f"没有缩小：{(w, h)}"
+    with Image.open(out) as im:
+        assert im.size == (w, h)
+
+
+@needs_heif
+def test_heic_exif_is_read(tmp_path: Path) -> None:
+    """HEIC 的 EXIF 拍摄时间要能读出来。
+
+    iPhone 的 HEIC 里 DateTimeOriginal 在 EXIF 子 IFD 里，与 JPEG 的
+    解析路径不完全相同。读不出来就会退回 mtime —— 用户看到的时间线
+    是按"拷贝到电脑的时间"排的，与照片内容完全脱节。
+    """
+    from app import exif as exif_mod
+
+    _make_heic(tmp_path / "b.heic", (640, 480))
+    info = exif_mod.extract_sync(tmp_path / "b.heic")
+    # 我们造的文件没有 EXIF，但**必须**能读出尺寸而不是报错
+    assert info.width == 640 and info.height == 480, f"尺寸读错：{info}"
+    assert info.error is None, f"读 HEIC 报错了：{info.error}"
+
+
+@needs_heif
+def test_portrait_heic_stays_portrait(tmp_path: Path) -> None:
+    """★ 竖拍的 HEIC 必须得到竖的缩略图（不能横着显示）。
+
+    这里必须走**真实的那条链路**：`extract_sync` 读出 orientation →
+    传给 `generate_thumb`。实测发现 pillow-heif 在**读取时就已应用**
+    Orientation 并把它归一成 1（PIL 看到的尺寸已经是转过之后的），
+    所以若手工硬传一个 6 进去，反而会**转两次**变回横的。
+
+    生产代码正是传 `extract_sync` 读出来的值，所以这里就照抄那条路径 ——
+    这条用例保护的是"exif → thumbs"这个交接点，而不是某个固定数字。
+    """
+    from app.exif import _prepare_pillow
+
+    _prepare_pillow()
+    src = tmp_path / "rot.heic"
+    im = Image.new("RGB", (1200, 600), (30, 30, 200))
+    exif = Image.Exif()
+    exif[0x0112] = 6                      # 顺时针 90°，真实手机竖拍常见值
+    im.save(src, "HEIF", exif=exif.tobytes(), quality=80)
+
+    from app import exif as exif_mod
+
+    info = exif_mod.extract_sync(src)
+
+    out_path = tmp_path / "rot_320.webp"
+    w, h = generate_thumb(src, out_path, 320, orientation=info.orientation)
+
+    assert h > w, (
+        f"竖拍 HEIC 的缩略图是横的：{(w, h)}（orientation={info.orientation}）")
+    assert max(w, h) <= 320
+    with Image.open(out_path) as out:
+        assert out.size == (w, h)
+
+
+@needs_heif
+def test_heic_orientation_is_not_applied_twice(tmp_path: Path) -> None:
+    """★ 回归：HEIC 的 orientation 不能被应用两次。
+
+    实测事实：pillow-heif 读取时就把 Orientation 应用掉并把值归一成 1，
+    PIL 看到的尺寸已经是转过之后的（1200x600 的文件读出来是 600x1200）。
+    如果哪天有人"顺手"在 thumbs 里改用 `ImageOps.exif_transpose` 或
+    把原始 EXIF 里的 6 存进数据库再传进来，竖拍照片就会被转两次 ——
+    表现是"竖着拍的照片显示成横的"，而缩略图本身完全正常，极难排查。
+    """
+    from app import exif as exif_mod
+    from app.exif import _prepare_pillow
+
+    _prepare_pillow()
+    src = tmp_path / "rot2.heic"
+    im = Image.new("RGB", (1200, 600), (30, 30, 200))
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    im.save(src, "HEIF", exif=exif.tobytes(), quality=80)
+
+    # 库读出来的方向已经是"无需再转"
+    assert exif_mod.extract_sync(src).orientation == 1, (
+        "pillow-heif 的行为变了：它以前会在读取时应用 Orientation 并归一成 1。"
+        "若确实变了，thumbs 里对 HEIC 的处理需要重新评估。")
+
+    out_path = tmp_path / "rot2_320.webp"
+    w, h = generate_thumb(src, out_path, 320,
+                          orientation=exif_mod.extract_sync(src).orientation)
+    assert h > w, f"竖拍 HEIC 被转成了横的：{(w, h)}"
