@@ -37,7 +37,7 @@ import hmac
 import logging
 import secrets
 import time
-from typing import Any
+from typing import Any, Final
 
 from .core import Ctx
 from .errors import (
@@ -58,6 +58,12 @@ __all__ = [
     "PAIR_MAX_TRIES",
     "PAIR_LOCK_SECONDS",
     "TOKEN_TTL_DAYS",
+    "TOKEN_TTL_KEY",
+    "token_ttl_days",
+    "token_expiry",
+    "cookie_max_age",
+    "cookie_max_age_for",
+    "COOKIE_MAX_AGE",
     "TOKEN_BYTES",
     "CLIENT_COOKIE",
     "hash_token",
@@ -90,10 +96,77 @@ PAIR_MAX_TRIES: int = 5
 #: 锁定加在**码**上而不是 IP 上，因为 IP 可以伪造/更换。
 PAIR_LOCK_SECONDS: float = 600.0
 
-#: client_token 有效期（天）。一期局域网场景下"永久有效"其实更贴合
-#: 使用习惯（用户不会希望每 90 天重新配对一次），但仍设 90 天：
-#: 手机丢失后即使没人去点"撤销"，令牌也会自己失效。
+#: client_token 有效期的**默认值**（天）。AC-5.10 要求 90 天，
+#: 且明写"过期策略可配置"—— 实际值由 `auth.token_ttl_days` 决定。
+#:
+#: 为什么仍然要有个过期：手机丢失后，用户很可能想不起来去电脑上点
+#: "移除这台手机"。定期失效是最后一道兜底。
 TOKEN_TTL_DAYS: int = 90
+
+#: 配置键。`0` 表示永不过期。
+TOKEN_TTL_KEY: Final = "auth.token_ttl_days"
+
+
+def token_ttl_days(cfg: Any = None) -> int:
+    """读 `auth.token_ttl_days`，非法值退回默认 90。
+
+    `cfg` 为 None 时用 `config.get()` 取当前配置 —— 这让 `require_client`
+    这类只拿得到 `ctx` 的路径也能读到配置，不必把 cfg 层层透传。
+
+    ★ 负数按 0（永不过期）处理而不是当非法值退回 90：用户显式写了
+    负数是明显想关掉过期，"退回 90"会让他以为设置没生效。
+    """
+    if cfg is None:
+        from .config import get as _get_cfg
+        try:
+            cfg = _get_cfg()
+        except Exception:       # noqa: BLE001 —— 配置未初始化时用默认值
+            return TOKEN_TTL_DAYS
+    raw = cfg.get(TOKEN_TTL_KEY, TOKEN_TTL_DAYS)
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        log.warning("auth.token_ttl_days 非法：%r，退回 %d 天",
+                    raw, TOKEN_TTL_DAYS)
+        return TOKEN_TTL_DAYS
+    return max(0, days)
+
+
+def token_expiry(now: float, cfg: Any = None) -> float | None:
+    """签发时刻 `now` 对应的绝对过期时间；永不过期返回 `None`。"""
+    days = token_ttl_days(cfg)
+    return None if days <= 0 else now + days * 86400
+
+
+#: 浏览器对 cookie `Max-Age` 的实际上限是 400 天（RFC 6265bis 建议），
+#: 超过会被夹到 400 天。用它表示"永不过期的 token"。
+COOKIE_MAX_AGE: Final = 400 * 86400
+
+
+def cookie_max_age_for(exp: float | None, now: float | None = None) -> int:
+    """按绝对过期时刻算出 cookie 该活多久（秒）。`None` = 永不过期。
+
+    刚配对完还没有设备行时用这个（`expires_at` 刚算出来，还没 INSERT）。
+    """
+    if exp is None:
+        return COOKIE_MAX_AGE
+    return max(1, int(exp - (now if now is not None else time.time())))
+
+
+def cookie_max_age(row: Any, now: float | None = None) -> int:
+    """据设备行算出 cookie 该活多久（秒）。
+
+    ★ 不能像原来那样硬编码 `90 天`。两个方向都会出错：
+
+      * token 还剩 1 天而 cookie 写 90 天 → cookie 活得比 token 长，
+        浏览器一直带着一枚服务端必然拒绝的凭证，每次都是 401 再清掉，
+        用户看到的是缩略图间歇性变灰块。
+      * token 永不过期（`expires_at is NULL`，老库升级上来的行）
+        而 cookie 只写 90 天 → 90 天后 `<img>` 突然全部灰掉。
+        JS 请求能靠 Bearer 头自愈，但用户看到的是"照片全灰了"。
+    """
+    return cookie_max_age_for(row["expires_at"] if row is not None else None, now)
+
 
 #: token 随机字节数。32 字节 = 256 位，远超暴力破解可行范围。
 TOKEN_BYTES: int = 32
@@ -257,7 +330,7 @@ def _penalize_active_codes(db: Any, now: float) -> None:
 
 
 def consume_pair_code(
-    db: Any, code: str, *, device_name: str | None = None,
+    db: Any, code: str, *, device_name: str | None = None, cfg: Any = None,
 ) -> tuple[str, str]:
     """校验并消费一个配对码，成功时返回 `(client_id, token)`。
 
@@ -314,7 +387,13 @@ def consume_pair_code(
     # --- 通过校验，签发 token ---
     client_id = secrets.token_hex(16)
     token = new_token()
-    expires_at = now + TOKEN_TTL_DAYS * 86400
+    # AC-5.10：过期时刻**必须落库**。
+    #
+    # 原来这里只把 `now + 90 天` 拼进响应体给客户端看，库里一个字段都
+    # 没有 —— 于是 token 永远有效，而客户端拿到的 `expires_at` 只是
+    # 一个装饰性的数字。用户手机丢了、又没想起来点"移除设备"，
+    # 那枚 token 就永久开门。
+    expires_at = token_expiry(now, cfg)
 
     with db.transaction(immediate=True):
         # ⚠️ 条件更新 + 检查 rowcount 是必需的，不能只 UPDATE。
@@ -329,9 +408,11 @@ def consume_pair_code(
             raise AppError(E1005, "pair code lost the race")
 
         db.execute(
-            "INSERT INTO devices(id, name, token_hash, last_seen, created_at, revoked)"
-            " VALUES (?, ?, ?, ?, ?, 0)",
-            (client_id, device_name or "未命名手机", hash_token(token), now, now),
+            "INSERT INTO devices(id, name, token_hash, last_seen, created_at,"
+            "                    revoked, expires_at)"
+            " VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (client_id, device_name or "未命名手机", hash_token(token), now, now,
+             expires_at),
         )
 
     log.info("配对成功 client_id=%s name=%s", client_id, device_name)
@@ -379,7 +460,7 @@ def purge_expired_codes(db: Any) -> int:
 def _lookup_device(db: Any, token: str) -> Any:
     """按 token 查设备行。查不到返回 None。"""
     return db.query_one(
-        "SELECT id, name, revoked, created_at, last_seen"
+        "SELECT id, name, revoked, created_at, last_seen, expires_at"
         "  FROM devices WHERE token_hash = ?",
         (hash_token(token),),
     )
@@ -420,12 +501,27 @@ def require_client(ctx: Ctx) -> dict[str, Any]:
         ctx.set_cookies.append((CLIENT_COOKIE, "", 0))
         raise AppError(E2004, f"device revoked id={row['id']}")
 
+    # AC-5.10：token 到期必须拒绝，并且**要把失效的 cookie 清掉**。
+    #
+    # 不清 cookie 的话浏览器会一直带着它重试：用户重新配对拿到新 token
+    # 后，`<img>` 仍优先发旧 cookie，缩略图永远 401，而 JS 请求用的是
+    # 新 Bearer 头所以一切正常 —— 症状是"时间线有照片但全是灰块"，
+    # 用户完全无从理解，也无法自助恢复。（与 401 E2002 那条同因。）
+    #
+    # `expires_at is None` 表示永不过期：老库升级上来的行就是这个值。
+    # 强行给它们安一个过期时刻会让所有已配对的手机在某个时刻集体
+    # 掉线 —— 那是比"永不触发过期"更糟的故障。
+    exp = row["expires_at"]
+    if exp is not None and exp <= time.time():
+        ctx.set_cookies.append((CLIENT_COOKIE, "", 0))
+        raise AppError(E2002, f"client token expired at {exp:.0f}")
+
     if via_header:
         # ★ 自愈路径：客户端还在用 Authorization 头（老版本前端、
         # 或刚配对完还没刷新页面）。顺手补一个 cookie，让同一浏览器
         # 里的 `<img>` / `EventSource` 立刻能用，无需用户重新配对。
         ctx.set_cookies.append(
-            (CLIENT_COOKIE, token, TOKEN_TTL_DAYS * 86400))
+            (CLIENT_COOKIE, token, cookie_max_age(row)))
 
     info = {"id": row["id"], "name": row["name"]}
     ctx.state["client"] = info

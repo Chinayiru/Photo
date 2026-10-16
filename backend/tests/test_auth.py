@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from backend.app.auth import (
+    CLIENT_COOKIE,
     PAIR_CODE_TTL,
     PAIR_LOCK_SECONDS,
     PAIR_MAX_TRIES,
@@ -51,17 +52,40 @@ def db(tmp_path: Path) -> Database:
 
 
 def _state(tmp_path: Path, db: Database, *, require_pairing: bool = True,
-           library: Path | None = None) -> AppState:
+           library: Path | None = None, ttl: object = None) -> AppState:
     data = tmp_path / "data"
     data.mkdir(exist_ok=True)
     lib = library or (tmp_path / "lib")
     lib.mkdir(exist_ok=True)
+    auth: dict = {"require_pairing": require_pairing}
+    if ttl is not None:
+        auth["token_ttl_days"] = ttl
     cfg = Config({
         "app": {"mode": "readwrite"},
         "roots": [{"id": "library", "path": str(lib), "mode": "readwrite"}],
-        "auth": {"require_pairing": require_pairing},
+        "auth": auth,
     }, path=data / "config.json", data_dir=data)
     return AppState(cfg=cfg, db=db)
+
+
+def _set_cookie_max_age(reply) -> int:
+    """从响应里取出 `Set-Cookie` 的 `Max-Age`（秒）。
+
+    ★ 必须解析真实的 Set-Cookie 字符串，而不是断言调用了哪个函数 ——
+    `pair()` 里那行 `max_age=cookie_max_age_for(...)` 曾经写成
+    `max(1, token_ttl_days(cfg)) * 86400`，在 `token_ttl_days = 0`
+    时算出 1 天。任何只测 `cookie_max_age_for` 自己的用例都发现不了它。
+    """
+    import re
+
+    raw = repr(reply.headers)
+    for entry in getattr(reply, "cookies", []):
+        name, _value, max_age = entry
+        if name == "pb_token":
+            return int(max_age)
+    m = re.search(r"pb_token=[^;]*; Path=/; Max-Age=(\d+)", raw)
+    assert m, f"响应里没有 pb_token 的 Set-Cookie：{raw}"
+    return int(m.group(1))
 
 
 def _router(st: AppState, *, middleware: bool = True) -> Router:
@@ -884,3 +908,221 @@ def test_pairing_does_not_leak_paths_in_error(tmp_path: Path, db: Database) -> N
     text = _body(r).decode("utf-8", "replace")
     assert str(tmp_path) not in text
     assert "Traceback" not in text
+
+
+# --------------------------------------------------------------------------
+# AC-5.10：client_token 过期
+#
+# ★ 这一组的存在理由：`expires_at` 原来只拼进**响应体**给客户端看，
+#   库里一个字段都没有 —— 于是 token 永远有效，那个数字纯属装饰。
+#   用户手机丢了、又没想起来点"移除设备"，那枚 token 就永久开门。
+#   所以断言必须落到"库里存了什么"与"过期后请求是否真的被拒"，
+#   只看响应体的 `expires_at` 是测不出这个缺陷的。
+# --------------------------------------------------------------------------
+
+def _pair_ctx(st: AppState, code: str):
+    import json as _j
+    return _ctx(st, "/api/pair", method="POST",
+                body=_j.dumps({"code": code}).encode())
+
+
+def test_pair_stores_expiry_in_db(tmp_path: Path, db: Database) -> None:
+    """签发 token 时必须把过期时刻**落库**，不能只写进响应体。"""
+    st = _state(tmp_path, db)
+    code = _make_code(db)
+    r = asyncio.run(_router(st).dispatch(_pair_ctx(st, code)))
+    assert r.status == 201
+    body = _json(r)
+
+    row = db.query_one(
+        "SELECT expires_at FROM devices WHERE id = ?", (body["client_id"],))
+    assert row["expires_at"] is not None, "过期时刻没落库，token 就永不过期"
+    assert abs(row["expires_at"] - body["expires_at"]) < 1.0
+
+
+def test_expired_token_is_rejected(tmp_path: Path, db: Database) -> None:
+    """★ 把库里那行的过期时刻改到过去，请求必须被拒。
+
+    这是 AC-5.10 的核心断言。直接改库而不是等 90 天，是为了让这条
+    回归在 CI 里 0.1 秒跑完 —— 而"等 90 天"实际上等于永远不测。
+    """
+    st = _state(tmp_path, db)
+    code = _make_code(db)
+    body = _json(asyncio.run(_router(st).dispatch(_pair_ctx(st, code))))
+    token = body["client_token"]
+
+    # 未过期时可用
+    ok = _call(st, "/api/clients/me", headers={"Authorization": f"Bearer {token}"})
+    assert ok.status == 200
+
+    db.execute("UPDATE devices SET expires_at = ? WHERE id = ?",
+               (time.time() - 1, body["client_id"]))
+
+    r = _call(st, "/api/clients/me", headers={"Authorization": f"Bearer {token}"})
+    assert r.status == 401
+    assert (CLIENT_COOKIE, "", 0) in r.cookies, (
+        "过期时没清 cookie：浏览器会一直带它重试，缩略图持续 401 变灰块")
+
+
+def test_expired_cookie_token_also_rejected(tmp_path: Path, db: Database) -> None:
+    """过期判定必须对 cookie 通路同样生效。
+
+    `<img>` 走的是 cookie，只有 Bearer 头被判过期的话，缩略图仍然
+    能拿过期令牌换到照片 —— 那正是最需要挡住的那条路。
+    """
+    st = _state(tmp_path, db)
+    code = _make_code(db)
+    body = _json(asyncio.run(_router(st).dispatch(_pair_ctx(st, code))))
+    db.execute("UPDATE devices SET expires_at = ? WHERE id = ?",
+               (time.time() - 1, body["client_id"]))
+
+    r = _call(st, "/api/clients/me",
+              headers={"Cookie": f"{CLIENT_COOKIE}={body['client_token']}"})
+    assert r.status == 401
+
+
+def test_null_expiry_never_expires(tmp_path: Path, db: Database) -> None:
+    """★ `expires_at IS NULL` 表示永不过期 —— 老库升级上来的行就是这个值。
+
+    如果给它们强行安一个过期时刻，所有**已配对**的手机会在某一天
+    集体掉线。那比"永不触发过期"更糟：用户什么都没做，手机突然要重新配对。
+    """
+    st = _state(tmp_path, db)
+    code = _make_code(db)
+    body = _json(asyncio.run(_router(st).dispatch(_pair_ctx(st, code))))
+
+    db.execute("UPDATE devices SET expires_at = NULL WHERE id = ?",
+               (body["client_id"],))
+    r = _call(st, "/api/clients/me",
+              headers={"Authorization": f"Bearer {body['client_token']}"})
+    assert r.status == 200
+
+
+def test_token_ttl_days_is_configurable(tmp_path: Path, db: Database) -> None:
+    """AC-5.10 原文要求"过期策略可配置"。"""
+    from backend.app.auth import token_expiry, token_ttl_days
+
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    lib = tmp_path / "lib"
+    lib.mkdir(exist_ok=True)
+    cfg = Config({
+        "app": {"mode": "readwrite"},
+        "roots": [{"id": "library", "path": str(lib), "mode": "readwrite"}],
+        "auth": {"require_pairing": True, "token_ttl_days": 7},
+    }, path=data / "config.json", data_dir=data)
+
+    assert token_ttl_days(cfg) == 7
+    assert token_expiry(1000.0, cfg) == 1000.0 + 7 * 86400
+
+
+def test_zero_ttl_means_never_expires(tmp_path: Path, db: Database) -> None:
+    """`token_ttl_days: 0` 是个有用的档位：用户自己承担风险时不该拦他。"""
+    from backend.app.auth import token_expiry, token_ttl_days
+
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    lib = tmp_path / "lib"
+    lib.mkdir(exist_ok=True)
+    cfg = Config({
+        "app": {"mode": "readwrite"},
+        "roots": [{"id": "library", "path": str(lib), "mode": "readwrite"}],
+        "auth": {"require_pairing": True, "token_ttl_days": 0},
+    }, path=data / "config.json", data_dir=data)
+
+    assert token_ttl_days(cfg) == 0
+    assert token_expiry(1000.0, cfg) is None
+
+
+def test_bad_ttl_falls_back_to_default(tmp_path: Path, db: Database) -> None:
+    """非法值退回默认 90，不能把服务启不起来。"""
+    from backend.app.auth import TOKEN_TTL_DAYS, token_ttl_days
+
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    lib = tmp_path / "lib"
+    lib.mkdir(exist_ok=True)
+    cfg = Config({
+        "app": {"mode": "readwrite"},
+        "roots": [{"id": "library", "path": str(lib), "mode": "readwrite"}],
+        "auth": {"require_pairing": True, "token_ttl_days": "abc"},
+    }, path=data / "config.json", data_dir=data)
+
+    assert token_ttl_days(cfg) == TOKEN_TTL_DAYS
+
+
+def test_cookie_max_age_never_outlives_token(tmp_path: Path, db: Database) -> None:
+    """★ cookie 不能活得比 token 长。
+
+    token 只剩 1 天而 cookie 写 90 天的话，浏览器会一直带着一枚
+    服务端必然拒绝的凭证 —— 症状是缩略图间歇性变灰块，用户完全
+    无法理解。反过来（cookie 短于 token）只是少一次自愈，无害。
+    """
+    from backend.app.auth import COOKIE_MAX_AGE, cookie_max_age
+
+    now = time.time()
+    assert cookie_max_age({"expires_at": now + 3600}, now) == 3600
+    # 永不过期的行 → 用浏览器上限
+    assert cookie_max_age({"expires_at": None}, now) == COOKIE_MAX_AGE
+    # 已经过期的行不能算出 0 或负数（Max-Age=0 等于删除 cookie，
+    # 而这里是在"补发"路径上，值必须为正）
+    assert cookie_max_age({"expires_at": now - 100}, now) >= 1
+
+
+def test_pair_sets_cookie_lasting_as_long_as_the_token(
+        tmp_path: Path, db: Database) -> None:
+    """★ 配对时下发的 cookie 必须和 token 活得一样久。
+
+    `token_ttl_days = 0`（永不过期）这条路径曾经被写成
+    `max(1, 0) * 86400` = **1 天** —— 于是"永不过期"的 token 配了一个
+    一天就消失的 cookie，第二天缩略图全灰而 JS 请求一切正常，
+    用户完全无从理解。这条用例直接读响应里的 `Max-Age`，
+    任何只测 `cookie_max_age_for` 自身的用例都发现不了它。
+    """
+    from backend.app.auth import COOKIE_MAX_AGE
+
+    # 默认 90 天 → cookie 就是 90 天
+    st = _state(tmp_path, db)
+    code = _make_code(db)
+    r = _call(st, "/api/pair", method="POST", body=f'{{"code":"{code}"}}'.encode())
+    assert r.status == 201
+    assert _set_cookie_max_age(r) == 90 * 86400
+
+    # 永不过期 → cookie 用浏览器上限，绝不是 1 天
+    st2 = _state(tmp_path, db, ttl=0)
+    code2 = _make_code(db)
+    r2 = _call(st2, "/api/pair", method="POST", body=f'{{"code":"{code2}"}}'.encode())
+    assert r2.status == 201
+    age = _set_cookie_max_age(r2)
+    assert age == COOKIE_MAX_AGE, f"永不过期的 token 配了 {age // 86400} 天的 cookie"
+
+    # 显式短 TTL → cookie 跟着短，不能超过 token
+    st3 = _state(tmp_path, db, ttl=1)
+    code3 = _make_code(db)
+    r3 = _call(st3, "/api/pair", method="POST", body=f'{{"code":"{code3}"}}'.encode())
+    assert r3.status == 201
+    assert _set_cookie_max_age(r3) <= 86400
+
+
+def test_panel_devices_reports_expiry(tmp_path: Path, db: Database) -> None:
+    """托盘设备列表要能看出"还有几天过期"，不能只回一个布尔。
+
+    "这台手机 3 天后掉线"和"已经掉线了"需要完全不同的用户动作。
+    """
+    st = _state(tmp_path, db)
+    code = _make_code(db)
+    r = _call(st, "/api/pair", method="POST", body=f'{{"code":"{code}"}}'.encode())
+    assert r.status == 201
+
+    r = _call(st, "/panel/devices", client_ip="127.0.0.1")
+    assert r.status == 200
+    item = _json(r)["items"][0]
+    assert item["expired"] is False
+    assert item["expires_at"] is not None
+    # 约 90 天后（允许几秒执行误差）
+    assert abs(item["expires_at"] - (time.time() + 90 * 86400)) < 60
+
+    # 手工把它改成过去 → 必须报 expired
+    db.execute("UPDATE devices SET expires_at = ?", (time.time() - 10,))
+    r = _call(st, "/panel/devices", client_ip="127.0.0.1")
+    assert _json(r)["items"][0]["expired"] is True

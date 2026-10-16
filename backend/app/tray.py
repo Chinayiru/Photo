@@ -377,7 +377,7 @@ class TrayController:
             return
         try:
             rows = st.db.query(
-                "SELECT name, revoked, last_seen FROM devices"
+                "SELECT name, revoked, last_seen, expires_at FROM devices"
                 " ORDER BY created_at DESC"
             )
         except Exception:       # noqa: BLE001
@@ -386,9 +386,18 @@ class TrayController:
         if not rows:
             self._notify("设备列表", "还没有手机配对过")
             return
+        now = time.time()
         lines = []
         for r in rows:
             mark = "（已撤销）" if r["revoked"] else ""
+            # AC-5.10：过期状态必须在托盘上看得见。手机掉了但没撤销时，
+            # token 会自己过期 —— 用户需要知道它什么时候失效。
+            exp = r["expires_at"]
+            if not mark and exp is not None:
+                if exp <= now:
+                    mark = "（已过期）"
+                elif exp - now < 7 * 86400:
+                    mark = f"（{(exp - now) / 86400:.0f} 天后过期）"
             lines.append(f"{r['name']}{mark}")
         self._notify(f"已配对 {len(rows)} 台设备", "\n".join(lines[:8]))
 

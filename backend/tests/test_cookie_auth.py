@@ -371,7 +371,7 @@ def test_pair_sets_cookie(tmp_path: Path, db: Database) -> None:
     name, value, max_age = r.cookies[0]
     assert name == CLIENT_COOKIE
     assert value == token
-    assert max_age == TOKEN_TTL_DAYS * 86400
+    assert max_age == TOKEN_TTL_DAYS * 86400  # 默认 90 天
 
 
 def test_bearer_request_refreshes_cookie(tmp_path: Path, db: Database) -> None:
@@ -385,7 +385,13 @@ def test_bearer_request_refreshes_cookie(tmp_path: Path, db: Database) -> None:
     _, token, _ = _pair(st, db)
     r = _call(st, "/api/thumb", headers={"Authorization": f"Bearer {token}"})
     assert r.status == 200
-    assert (CLIENT_COOKIE, token, TOKEN_TTL_DAYS * 86400) in r.cookies
+    # ★ 不断言精确等于 `90 * 86400`：cookie 的 Max-Age 现在取自
+    #   "该 token 还剩多久"（`cookie_max_age(row)`），而请求总在签发的
+    #   几毫秒之后发生，所以是 90 天**减去一点点**。
+    #   cookie 绝不能活得比 token 长 —— 那样浏览器会一直带一枚服务端
+    #   必然拒绝的凭证，缩略图间歇性变灰块。
+    assert _cookie(st, r, token) > 0
+    assert _cookie(st, r, token) <= TOKEN_TTL_DAYS * 86400
 
 
 def test_cookie_request_does_not_re_set(tmp_path: Path, db: Database) -> None:
@@ -474,6 +480,15 @@ def _device_of(st: AppState, token: str) -> str:
     return row["id"]
 
 
+def _cookie(st, reply, token: str) -> int:
+    """取出补发 cookie 的 Max-Age；没有这条 cookie 则断言失败。"""
+    for name, value, max_age in reply.cookies:
+        if name == CLIENT_COOKIE and value == token:
+            return int(max_age)
+    raise AssertionError(
+        f"响应里没有补发 {CLIENT_COOKIE}={token[:8]}…：{reply.cookies!r}")
+
+
 # --------------------------------------------------------------------------
 # 七、dispatch 把 ctx 上的 cookie 搬到 reply
 # --------------------------------------------------------------------------
@@ -488,7 +503,7 @@ def test_dispatch_moves_ctx_cookies_to_reply(tmp_path: Path, db: Database) -> No
     st = _state(tmp_path, db)
     _, token, _ = _pair(st, db)
     r = _call(st, "/api/thumb", headers={"Authorization": f"Bearer {token}"})
-    assert (CLIENT_COOKIE, token, TOKEN_TTL_DAYS * 86400) in r.cookies
+    assert 0 < _cookie(st, r, token) <= TOKEN_TTL_DAYS * 86400
 
 
 def test_ctx_cookie_survives_error_reply(tmp_path: Path, db: Database) -> None:

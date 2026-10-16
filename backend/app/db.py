@@ -202,8 +202,17 @@ CREATE TABLE IF NOT EXISTS devices (
   token_hash TEXT,
   last_seen  REAL,
   created_at REAL,
-  revoked    INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0,1))
+  revoked    INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0,1)),
+  -- token 的绝对过期时刻（AC-5.10）。NULL 表示"永不过期" ——
+  -- 老库升级上来的行就是 NULL，强行给它们安一个过期时间会让所有
+  -- 已配对的手机在某天突然集体掉线，那是比"永不发过期"更糟的故障。
+  expires_at REAL
 );
+
+-- ⚠️ 不能在这里建 idx_devices_expires。老库的 devices 表还没有
+-- expires_at 列，而 executescript(SCHEMA) 跑在 _migrate() **之前** ——
+-- CREATE INDEX 会抛 "no such column: expires_at"，把启动整个打断。
+-- 索引改在 _migrate() 里补完列之后建。
 
 -- ============================================================
 -- pair_codes：局域网配对码（一期）
@@ -366,6 +375,23 @@ class Database:
         SQLite 不支持修改 CHECK，只能重建表。这张表只是索引
         （主记录是 data/audit.log），所以搬数据没有丢失风险。
         """
+        # --- devices：补 expires_at 列（AC-5.10）---
+        #
+        # `CREATE TABLE IF NOT EXISTS` 对已存在的表是空操作，所以新增的
+        # 列在老库上永远不会出现。不补的话 `_lookup_device` 的 SELECT
+        # 会抛 `no such column: expires_at` —— 而那是每个已配对用户在
+        # 升级后发出的第一个请求，表现为"升级后手机全部失联"。
+        #
+        # 补出来的列值全是 NULL。NULL 在本项目里明确表示"永不过期"，
+        # 这正是升级用户的既有语义：不该因为软件更新就让他们掉线。
+        # 新配对的设备一律写入具体时刻。
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(devices)")}
+        if cols and "expires_at" not in cols:
+            log.info("迁移 devices：新增 expires_at 列")
+            conn.execute("ALTER TABLE devices ADD COLUMN expires_at REAL")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_devices_expires ON devices(expires_at)")
+
         # --- audit_log：补齐 pair/revoke/upload_reject 动作 ---
         row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='audit_log'"

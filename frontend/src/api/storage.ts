@@ -126,14 +126,28 @@ export const COOKIE_NAME = "pb_token";
  * ⚠️ 不设 `SameSite=Strict`：那会让用户从别的 App 点分享链接进来时
  * 不携带 cookie，显示未配对。`Lax` 与后端下发的值保持一致。
  */
+/**
+ * ★ 为什么 `Max-Age` 传 400 天而不是 90 天：
+ *
+ * cookie 的寿命**必须不短于**服务端 token 的寿命。两个方向都会出错：
+ *
+ *   - cookie 活得比 token 长 → 浏览器一直带着一枚服务端必然拒绝的凭证，
+ *     每次请求都是 401 再清掉，用户看到缩略图间歇性变灰块；
+ *   - cookie 短于 token → 到第 90 天 `<img>` 突然全部灰掉，而 JS 请求
+ *     靠 Bearer 头一切正常。
+ *
+ * 服务端才是真正的权威：`auth.token_ttl_days` 可配置（`0` = 永不过期），
+ * 前端**读不到**这个配置，所以这里用一个「足够长」的值，
+ * 让服务端的判定永远先于 cookie 的自然过期生效。
+ * 400 天是 RFC 6265bis 建议的浏览器上限（超过会被静默夹到 400 天），
+ * 与 `backend/app/auth.py: COOKIE_MAX_AGE` 一致。
+ */
 export function setTokenCookie(token: string): void {
   if (!token) return clearTokenCookie();
   try {
-    // Max-Age 与后端 TOKEN_TTL_DAYS=90 对齐，避免两边过期时间不一致
-    // 导致"JS 请求正常但缩略图先失效"。
     document.cookie =
       `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; ` +
-      `Max-Age=${90 * 86400}; SameSite=Lax`;
+      `Max-Age=${400 * 86400}; SameSite=Lax`;
   } catch {
     /* 禁用 cookie 时静默失败：JS 请求仍走 Authorization 头 */
   }

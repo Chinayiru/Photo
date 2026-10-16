@@ -160,6 +160,10 @@ DEFAULT_CONFIG: Final[dict[str, Any]] = {
         "allow_delete": True,       # 删除只进回收站
         "delete_to_recycle_bin": True,
         "allow_move": True,
+        # client_token 的有效期（天）。AC-5.10 原文是 90 天，且明写
+        # "过期策略可配置"。设为 0 表示永不过期（老库升级上来的行
+        # expires_at 为 NULL，语义等同 0）。
+        "token_ttl_days": 90,
     },
     "index": {
         "scan_on_start": True,

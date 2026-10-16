@@ -38,6 +38,8 @@ from ..auth import (
     CLIENT_COOKIE,
     PAIR_CODE_TTL,
     TOKEN_TTL_DAYS,
+    cookie_max_age_for,
+    token_expiry,
     consume_pair_code,
     generate_pair_code,
     is_loopback,
@@ -128,7 +130,7 @@ async def pair(ctx: Ctx) -> Reply:
         raise AppError(E1001, f"配对码格式非法 len={len(code)}")
 
     client_id, token = consume_pair_code(
-        st.db, code, device_name=_client_name(ctx),
+        st.db, code, device_name=_client_name(ctx), cfg=st.cfg,
     )
 
     now = time.time()
@@ -143,7 +145,7 @@ async def pair(ctx: Ctx) -> Reply:
         "client_id": client_id,
         "device_id": st.device_id,
         "device_name": st.device_name,
-        "expires_at": now + TOKEN_TTL_DAYS * 86400,
+        "expires_at": token_expiry(now, st.cfg),
         "lan_ips": st.cfg_server_ips(),
         "server_time": now,
     }, status=201)
@@ -151,7 +153,12 @@ async def pair(ctx: Ctx) -> Reply:
     # 带不了 Authorization 头，缩略图只能靠 cookie 才能过鉴权。
     # 前端仍然拿到明文 token（上面响应体里），两条通路并行：
     # JS 请求走 Bearer 头，`<img src>` 走 cookie。
-    r.set_cookie(CLIENT_COOKIE, token, max_age=TOKEN_TTL_DAYS * 86400)
+    # ★ 这里**不能**写 `max(1, token_ttl_days(cfg)) * 86400`：
+    # `token_ttl_days` 为 0（永不过期）时那个表达式算出来是 1 天，
+    # 于是"永不过期"的 token 配了一个一天就消失的 cookie ——
+    # 第二天缩略图全灰而 JS 请求正常。
+    r.set_cookie(CLIENT_COOKIE, token,
+                 max_age=cookie_max_age_for(token_expiry(now, st.cfg), now))
     return r
 
 
@@ -264,8 +271,9 @@ async def panel_devices(ctx: Ctx) -> Reply:
     if not is_loopback(ctx):
         raise NotFound(ctx.path)
     st = _st(ctx)
+    now = time.time()
     rows = st.db.query(
-        "SELECT id, name, created_at, last_seen, revoked FROM devices"
+        "SELECT id, name, created_at, last_seen, revoked, expires_at FROM devices"
         " ORDER BY created_at DESC"
     )
     return json_reply({
@@ -277,6 +285,13 @@ async def panel_devices(ctx: Ctx) -> Reply:
             "created_at": r["created_at"],
             "last_seen": r["last_seen"],
             "revoked": bool(r["revoked"]),
+            # AC-5.10：过期时刻要能看出来。`None` = 永不过期
+            # （老库升级上来的行，或 `auth.token_ttl_days = 0`）。
+            # 只回一个布尔"是否已过期"的话用户无法提前处理
+            # ——"这台手机 3 天后掉线"和"已经掉线了"需要完全不同的动作。
+            "expires_at": r["expires_at"],
+            "expired": bool(r["expires_at"] is not None
+                            and r["expires_at"] <= now),
         } for r in rows],
     })
 

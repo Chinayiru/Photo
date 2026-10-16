@@ -265,3 +265,181 @@ def test_indexer_without_bus_does_not_fail(tmp_path):
     stats = _run(Indexer(cfg, db).scan_all())
     assert stats[0].added == 1
     db.close()
+
+
+# --------------------------------------------------------------------------
+# AC-3.13：上传完成必须推 upload_done
+#
+# ★ 这一组的理由：`upload_done` 从 L1 起就在 `EVENT_TYPES` 白名单里，
+#   但全仓**零处** `.publish(` 发过它 —— 白名单里一行死字符串。
+#   只断言"白名单里有这个类型"是测不出这个缺陷的（`test_events.py`
+#   原来就有这样的用例，全绿）。必须走完整 handler 再验帧。
+# --------------------------------------------------------------------------
+
+def _upload_state(tmp_path, db, bus):
+    """造一个带 bus 的 AppState，并把 uploads 路由挂起来。"""
+    import asyncio as _aio
+
+    from backend.app import uploads as _up
+    from backend.app.config import Config
+    from backend.app.core import Ctx, Router, json_reply
+    from backend.app.handlers import uploads as h_up
+    from backend.app.state import AppState
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    cfg = Config({
+        "app": {"mode": "readwrite"},
+        "roots": [{"id": "library", "path": str(lib), "mode": "readwrite"}],
+        "auth": {"require_pairing": False},
+        "upload": {"subdir": "", "chunk_mb_lan": 1, "max_file_mb": 8,
+                   "session_ttl_hours": 24, "dedup": True},
+    }, path=tmp_path / "data" / "config.json", data_dir=tmp_path / "data")
+    st = AppState(cfg=cfg, db=db, bus=bus)
+
+    r = Router()
+    r.add("POST", "/api/uploads/init", h_up.init_upload)
+    r.add("PATCH", "/api/uploads/{upload_id}", h_up.patch_upload)
+    r.add("POST", "/api/uploads/{upload_id}/complete", h_up.complete_upload)
+    return st, r, lib, _up
+
+
+def _png_bytes(w: int = 8, h: int = 8) -> bytes:
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), (12, 200, 90)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_upload_done_is_published(tmp_path):
+    """★ 完整走一遍 init → PATCH → complete，总线里必须出现 upload_done。
+
+    这是 AC-3.13 的唯一有效断言方式：直接在 handler 里搜 `.publish(`
+    证明不了它真的被调用（可能在某个提前 return 后面）。
+    """
+    import asyncio as _aio
+    import json as _json
+
+    from backend.app.core import Ctx
+    from backend.app.db import Database
+
+    bus = EventBus()
+    sub = bus.subscribe()
+    db = Database(tmp_path / "t.db")
+    db.init()
+    st, router, lib, _ = _upload_state(tmp_path, db, bus)
+
+    payload = _png_bytes()
+
+    def _make_ctx(method, path, *, body=b"", headers=None):
+        async def _gen():
+            if body:
+                yield body
+
+        return Ctx(method=method, path=path, headers=headers or {},
+                   params={"upload_id": uid} if uid else {},
+                   client_ip="192.168.0.50", app=st, body=_gen())
+
+    async def _body(reply):
+        if reply.body is None:
+            return b""
+        if isinstance(reply.body, (bytes, bytearray)):
+            return bytes(reply.body)
+        out = []
+        async for c in reply.body:
+            if c:
+                out.append(c)
+        return b"".join(out)
+
+    uid = ""
+
+    async def _flow():
+        nonlocal uid
+        r = await router.dispatch(_make_ctx(
+            "POST", "/api/uploads/init",
+            body=_json.dumps({
+                "name": "新照片.png", "size": len(payload),
+                "root_id": "library",
+            }).encode()))
+        data = _json.loads((await _body(r)).decode())
+        uid = data["upload_id"]
+        assert data.get("exists") is not True
+
+        r = await router.dispatch(_make_ctx(
+            "PATCH", f"/api/uploads/{uid}", body=payload,
+            headers={"Content-Range": f"bytes 0-{len(payload) - 1}/{len(payload)}"}))
+        assert r.status == 206
+
+        r = await router.dispatch(_make_ctx(
+            "POST", f"/api/uploads/{uid}/complete", body=b""))
+        assert r.status in (200, 201)
+        return r
+
+    asyncio.run(_flow())
+
+    types = []
+    while not sub.queue.empty():
+        types.append(sub.queue.get_nowait())
+    done = [e for e in types if e["type"] == "upload_done"]
+    assert done, f"总线上没有 upload_done：{[t['type'] for t in types]}"
+    assert done[0]["upload_id"] == uid
+    db.close()
+
+
+def test_upload_done_bus_absent_does_not_fail(tmp_path):
+    """`st.bus is None` 时上传必须照常成功（脚本与单测都这么装配）。"""
+    import asyncio as _aio
+    import json as _json
+
+    from backend.app.core import Ctx
+    from backend.app.db import Database
+
+    db = Database(tmp_path / "t.db")
+    db.init()
+    st, router, lib, _ = _upload_state(tmp_path, db, None)
+    payload = _png_bytes()
+
+    async def _body(reply):
+        if reply.body is None:
+            return b""
+        if isinstance(reply.body, (bytes, bytearray)):
+            return bytes(reply.body)
+        out = []
+        async for c in reply.body:
+            if c:
+                out.append(c)
+        return b"".join(out)
+
+    state = {"uid": ""}
+
+    async def _flow():
+        r = await router.dispatch(Ctx(
+            method="POST", path="/api/uploads/init", headers={}, params={},
+            client_ip="192.168.0.50", app=st,
+            body=_gen(_json.dumps({"name": "b.png", "size": len(payload),
+                                   "root_id": "library"}).encode())))
+        state["uid"] = _json.loads((await _body(r)).decode())["upload_id"]
+        uid = state["uid"]
+        r = await router.dispatch(Ctx(
+            method="PATCH", path=f"/api/uploads/{uid}", params={"upload_id": uid},
+            headers={"Content-Range": f"bytes 0-{len(payload) - 1}/{len(payload)}"},
+            client_ip="192.168.0.50", app=st, body=_gen(payload)))
+        assert r.status == 206
+        r = await router.dispatch(Ctx(
+            method="POST", path=f"/api/uploads/{uid}/complete",
+            params={"upload_id": uid}, headers={},
+            client_ip="192.168.0.50", app=st, body=_gen(b"")))
+        assert r.status in (200, 201)
+
+    asyncio.run(_flow())
+    db.close()
+
+
+def _gen(data: bytes):
+    async def _it():
+        if data:
+            yield data
+    return _it()

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from .. import uploads
@@ -175,6 +176,35 @@ async def complete_upload(ctx: Ctx) -> Reply:
             log.debug("缩略图入队失败：media#%s", result.get("media_id"), exc_info=True)
 
     status = 200 if result.get("already_completed") else 201
+
+    # ★ AC-3.13：上传完成必须推一条 `upload_done`。
+    #
+    # 为什么在这一层发而不是在 `uploads.py` 里：`uploads.py` 是协议无关的
+    # 业务层，连 EventBus 是什么都不知道（DP-4「两条通路，一套 API」）——
+    # 二期经隧道上传时走的是另一条通路，在业务层发事件会让二期多一份。
+    #
+    # 为什么必须发：手机端传完最后一片后**自己并不知道**服务端把文件
+    # 归档到了哪里（`_place_sync` 可能改名去重，`rel_path` 未必是
+    # 客户端猜的那个）。不推的话用户看到的是"进度条满了但照片没出现在
+    # 时间线里"，只能手动下拉刷新。
+    bus = getattr(st, "bus", None)
+    if bus is not None:
+        try:
+            bus.publish({
+                "type": "upload_done",
+                "upload_id": uid,
+                "media_id": result.get("media_id"),
+                "rel_path": result.get("rel_path"),
+                # 秒传/重复完成时 media 表其实没新增行，前端要能分辨这一点。
+                "dedup": bool(result.get("dedup")),
+                "already_completed": bool(result.get("already_completed")),
+                "ts": time.time(),
+            })
+        except Exception:      # noqa: BLE001
+            # 推送失败绝不能让上传报错：文件已经安全落盘并入库，
+            # 让用户重传几百 MB 才是真正的损失。前端下次刷新就会看到。
+            log.debug("upload_done 推送失败：%s", uid, exc_info=True)
+
     return json_reply(result, status)
 
 

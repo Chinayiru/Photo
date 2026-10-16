@@ -73,7 +73,7 @@
 
 ## 当前状态
 
-**一期已完成**（819 条自动化测试 + 真实库端到端冒烟 35 项全绿）：
+**一期已完成**（836 条自动化测试 + 真实库端到端冒烟 35 项全绿）：
 
 | 模块 | 状态 | 关键实测数据 |
 |---|---|---|
@@ -260,7 +260,7 @@ python -m backend.app.main --version
 ```bash
 .venv/Scripts/python.exe -m pip install -r requirements-dev.txt
 
-# 单元 + 集成测试（约 57 秒，819 条）
+# 单元 + 集成测试（约 57 秒，836 条）
 .venv/Scripts/python.exe -m pytest backend/tests/
 
 # 路径沙箱专项（56 条）
