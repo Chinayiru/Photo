@@ -12,9 +12,14 @@
 
 import { computed } from "vue";
 import { ApiError, api, previewUrl, rawUrl, thumbUrl } from "../api/client";
-import type { DeleteResponse, MediaDetail } from "../api/types";
+import type {
+  DeleteResponse,
+  MediaDetail,
+  MoveResponse,
+  RenameResponse,
+} from "../api/types";
 import { createStore } from "./index";
-import { removeItem as removeFromTimeline } from "./timeline";
+import { patchItem as patchTimeline, removeItem as removeFromTimeline } from "./timeline";
 
 const initial = {
   open: false,
@@ -199,6 +204,84 @@ export async function deleteCurrent(): Promise<DeleteResponse> {
     else close();
   }
   return r;
+}
+
+/**
+ * 改当前这张照片的名字。
+ *
+ * 后端语义（`backend/app/handlers/browse.py: rename_item()`）：
+ *   - `new_name` **必须含扩展名**，且扩展名要还在图片白名单里
+ *     （否则能把 `.jpg` 改成 `.exe`，手机点一下就变成下载可执行文件）
+ *   - 只允许改名字，**不允许带路径**（`a/b.jpg` 会被拒；换目录走 move）
+ *   - 同名时后端幂等成功，不写审计
+ *   - ★ `taken_at` 可能变：原来时间来自文件名日期时，新名字里没日期
+ *     了就得按 EXIF → 文件名 → mtime 重算，所以要用返回值回写
+ *
+ * 失败一律抛 ApiError，由调用方决定文案 —— 这里不吞异常，因为
+ * "改成什么名字"这件事用户必须知道结果。
+ */
+export async function renameCurrent(newName: string): Promise<RenameResponse> {
+  const d = viewerStore.state.detail;
+  if (!d) throw new ApiError({ status: 0, code: "NO_ITEM", message: "没有可改名的照片" });
+
+  const r = await api.post<RenameResponse>("/api/items/rename", {
+    id: d.id,
+    new_name: newName,
+  }, { retry: 0, timeoutMs: 20_000 });
+
+  // 后端返回的是 rel_path（含目录），列表里显示的是文件名
+  const slash = r.to.lastIndexOf("/");
+  const fileName = slash >= 0 ? r.to.slice(slash + 1) : r.to;
+  const dir = slash >= 0 ? r.to.slice(0, slash) : "";
+
+  // 详情与时间线各更新一份：详情是当前看到的，时间线是返回列表后看到的，
+  // 漏掉任一个都会出现"改完名字返回列表还是旧名字"
+  viewerStore.state.detail = {
+    ...d,
+    name: fileName,
+    rel_path: r.to,
+    taken_at: r.taken_at,
+    taken_src: r.taken_src,
+  };
+  patchTimeline(d.id, {
+    name: fileName,
+    dir,
+    taken_at: r.taken_at,
+    taken_src: r.taken_src,
+  });
+  return r;
+}
+
+/**
+ * 把当前这张照片移到另一个目录。
+ *
+ * 后端语义（`backend/app/handlers/browse.py: move_items()`）：
+ *   - `target_dir` 是相对库根的路径，空串 = 库根；不存在会自动创建
+ *   - 目标目录已有同名文件时默认 `rename`（追加 `_1`），**绝不覆盖**；
+ *     所以响应里要读 `moved[0].renamed` 才知道名字变了没有
+ *   - 目标就是当前目录时记 `skipped` 而不是报错
+ *
+ * 返回 null 表示"没动"（目标就是当前目录），调用方据此给不同提示。
+ */
+export async function moveCurrent(targetDir: string): Promise<MoveResponse["moved"][number] | null> {
+  const d = viewerStore.state.detail;
+  if (!d) throw new ApiError({ status: 0, code: "NO_ITEM", message: "没有可移动的照片" });
+
+  const r = await api.post<MoveResponse>("/api/items/move", {
+    ids: [d.id],
+    target_dir: targetDir,
+  }, { retry: 0, timeoutMs: 60_000 });
+
+  const item = r.moved[0];
+  if (!item) return null;          // 目标就是当前目录 → skipped
+
+  const slash = item.to.lastIndexOf("/");
+  const fileName = slash >= 0 ? item.to.slice(slash + 1) : item.to;
+  const dir = slash >= 0 ? item.to.slice(0, slash) : "";
+
+  viewerStore.state.detail = { ...d, name: fileName, rel_path: item.to };
+  patchTimeline(d.id, { name: fileName, dir });
+  return item;
 }
 
 /** 字节数 → 人类可读。 */

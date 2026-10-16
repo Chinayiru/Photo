@@ -691,6 +691,25 @@ def test_rename_conflict_is_409_not_overwrite(tmp_path, library) -> None:
     assert (library / "2024" / "2024-05" / "a.jpg").exists()
 
 
+def test_rename_conflict_uses_target_exists_code(tmp_path, library) -> None:
+    """★ 冲突要用 E3012（"目标位置已有同名文件"），不能用 E1012。
+
+    `Conflict` 的默认 spec 是 E1012，它的 user_hint 是
+    「上传已结束，请重新开始」—— 手机端会把这句话原样显示给用户，
+    而用户刚刚只是在改名。这个断言看着琐碎，但它是唯一能挡住
+    "用默认 spec" 的地方。
+    """
+    st = _state(tmp_path, library)
+    ids = _seed(st, library)
+    r = _call(st, "POST", "/api/items/rename",
+              body=_body(id=ids["a.jpg"], new_name="b.jpg"))
+    assert r.status == 409
+    body = json.loads(r.body if isinstance(r.body, bytes) else b"{}")
+    assert body["error"]["code"] == "E3012"
+    # user_hint 不能提到上传
+    assert "上传" not in body["error"].get("user_hint", "")
+
+
 def test_rename_same_name_is_idempotent_and_not_audited(tmp_path, library) -> None:
     """改成同一个名字 → 成功但不写审计。
 

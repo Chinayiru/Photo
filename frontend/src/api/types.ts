@@ -298,6 +298,35 @@ export interface DeleteResponse {
   failed: { id: number; error: string }[];
 }
 
+/**
+ * `POST /api/items/move` → `backend/app/handlers/browse.py: move_items()`。
+ *
+ * ⚠️ 三态而不是"成功/失败"两态：`skipped` 是**有意**跳过的
+ * （目标目录就是当前目录，或 `on_conflict: "skip"`），与 `failed`
+ * 的"真的没搬成"完全不同 —— 前端提示语必须分开写。
+ */
+export interface MoveResponse {
+  moved: { id: number; from: string; to: string; renamed: boolean }[];
+  /** 有意跳过的 id 列表（不是错误）。 */
+  skipped: number[];
+  failed: { id: number; code: string; message: string }[];
+  target_dir: string;
+}
+
+/** `POST /api/items/rename` → `backend/app/handlers/browse.py: rename_item()` */
+export interface RenameResponse {
+  id: number;
+  from: string;
+  to: string;
+  /**
+   * ⚠️ 改名可能改变 `taken_at`：原来的时间来自文件名时，新名字里
+   * 没有日期了就得重算（EXIF → 文件名 → mtime）。所以前端要用
+   * 响应里的值回写时间线，而不是保留原值。
+   */
+  taken_at: number;
+  taken_src: string;
+}
+
 /** `POST /api/index/rescan` → `backend/app/handlers/browse.py: rescan()`，HTTP 202 */
 export interface RescanResponse {
   started: boolean;

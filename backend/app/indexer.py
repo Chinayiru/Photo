@@ -287,7 +287,14 @@ class Indexer:
                 seen_rels.add(rel)
 
                 prev = known.get(rel)
-                if prev is not None and not self._changed(prev, st):
+                # ★ `prev["missing"]` 必须参与判断。`_load_known` 会把
+                #   missing=1 的行也载入内存，如果只比 mtime/size，
+                #   一张"曾经被标丢失、如今又回来了"的照片会走 unchanged
+                #   分支被 continue 掉，missing 永远清不掉 —— 文件就在
+                #   磁盘上，用户却一直看到"照片已丢失"。
+                #   触发场景很常见：拔了移动硬盘再插回来、临时改名目录后
+                #   又改回去、_mark_missing 因某次根目录不可读而误标。
+                if prev is not None and not prev["missing"] and not self._changed(prev, st):
                     stats.unchanged += 1
                     # 未变但仍缺缩略图 → 补入队（上次可能没跑完）
                     if prev["thumb_state"] == "pending" and self.thumbs is not None:
@@ -374,7 +381,8 @@ class Indexer:
         "4915 次查询 + 4915 次写"降到 "1 次查询 + 约 10 次批量写"。
         """
         rows = self.db.query(
-            "SELECT id, rel_path, mtime, size, thumb_state FROM media WHERE root_id = ?",
+            "SELECT id, rel_path, mtime, size, thumb_state, missing"
+            " FROM media WHERE root_id = ?",
             (root_id,),
         )
         return {r["rel_path"]: dict(r) for r in rows}

@@ -1230,7 +1230,10 @@ async def rename_item(ctx: Ctx) -> Reply:
     src = sandbox.resolve(root, src_rel, "write", cfg=st.cfg)
 
     if dst.exists():
-        raise Conflict("同目录下已有同名文件")
+        # spec 必须显式给 E3012。Conflict 的默认 spec 是 E1012，它的
+        # user_hint 是「上传已结束，请重新开始」—— 对改名冲突完全不对，
+        # 手机端会把这句话原样显示给用户。
+        raise Conflict("同目录下已有同名文件", spec=E3012)
     if not src.exists():
         raise NotFound("文件已不在磁盘上")
 

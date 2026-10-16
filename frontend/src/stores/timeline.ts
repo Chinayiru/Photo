@@ -121,6 +121,29 @@ export function prependItem(item: MediaItem): void {
   s.items.unshift(item);
 }
 
+/**
+ * 移动 / 改名后就地更新一项。
+ *
+ * 为什么不能像删除那样 `removeItem()` 了事：移动与改名**没有改变
+ * 照片的身份**，用户刚在查看器里把照片移进「精选」，返回列表发现
+ * 它凭空消失（其实还在，只是换了目录）会以为操作把照片弄丢了。
+ *
+ * 两个字段必须一起更新：
+ *   - `dir`：列表分组/副标题显示的就是它，不改则显示旧目录
+ *   - `taken_at`：改名可能让"文件名日期"这个来源失效从而重算时间，
+ *     不改则这张照片留在旧的日期分组里，与时间线排序自相矛盾
+ *
+ * 用 `s.items[i] = { ...old, ...patch }` 整体替换而不是逐字段赋值：
+ * 后者在 Vue 3 的 reactive 数组里虽然也能触发，但整体替换能保证
+ * 任何一次改动都只触发一次更新，且不会漏掉未来新增的字段。
+ */
+export function patchItem(id: number, patch: Partial<MediaItem>): void {
+  const s = timelineStore.state;
+  const i = s.items.findIndex((x) => x.id === id);
+  if (i < 0) return;
+  s.items[i] = { ...s.items[i]!, ...patch };
+}
+
 /** 重置（退出配对、切换电脑时用）。 */
 export function clearTimeline(): void {
   timelineStore.reset();

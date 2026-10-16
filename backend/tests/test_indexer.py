@@ -364,6 +364,54 @@ def test_purge_missing(tmp_path: Path, db: Database) -> None:
     assert db.scalar("SELECT COUNT(*) FROM media") == 1
 
 
+def test_missing_cleared_even_when_file_unchanged(tmp_path: Path, db: Database) -> None:
+    """★ 文件没变（mtime/size 相同）但缺失标记为 1 → 重扫必须清掉。
+
+    上面那条 `test_missing_file_returns_to_normal` 之所以能过，是因为它
+    `os.utime()` 改了 mtime，于是走了"文件已修改"的正常分支。真正会卡住
+    的是**文件一个字节都没变**的情况：
+
+      `_load_known()` 会把 missing=1 的行也载入内存，而扫描循环原来是
+      `if prev is not None and not self._changed(prev, st): continue`
+      —— missing 不参与判断，于是这行被判为"未变"，直接跳过 upsert，
+      `missing` 永远停在 1。文件明明在磁盘上，用户却一直看到"照片已丢失"。
+
+    触发场景都是真的：移动硬盘拔了又插回来（驱动器号相同、mtime 不变）、
+    某个根目录临时不可读导致 `_mark_missing` 误标、用户手动改过数据库。
+    """
+    lib = tmp_path / "lib"
+    _img(lib / "a.jpg")
+    cfg = _cfg(tmp_path, lib)
+    _scan(cfg, db)
+    assert db.scalar("SELECT missing FROM media") == 0
+
+    # 只把标记打脏，**不动文件的 mtime/size**
+    db.execute("UPDATE media SET missing = 1")
+    assert db.scalar("SELECT missing FROM media") == 1
+
+    stats = _scan(cfg, db)
+
+    assert db.scalar("SELECT missing FROM media") == 0, "文件没变也必须清掉缺失标记"
+    assert stats.missing == 0, "本轮不该再把它标成丢失"
+
+
+def test_missing_flag_does_not_break_unchanged_counting(tmp_path: Path, db: Database) -> None:
+    """正常（missing=0）且未变的文件仍要计入 unchanged，不能每次全量重写。
+
+    这是上一条的**反向保护**：修 missing 时最容易写成"永不跳过"，
+    那会让每轮扫描都重新读 4915 张 EXIF，扫描从秒级变成分钟级。
+    """
+    lib = tmp_path / "lib"
+    for i in range(5):
+        _img(lib / f"{i}.jpg")
+    cfg = _cfg(tmp_path, lib)
+    _scan(cfg, db)
+
+    stats = _scan(cfg, db)
+    assert stats.unchanged == 5
+    assert stats.updated == 0
+
+
 def test_corrupt_file_does_not_abort_scan(tmp_path: Path, db: Database) -> None:
     """一个坏文件不能中断整轮扫描。"""
     lib = tmp_path / "lib"
