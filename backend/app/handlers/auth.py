@@ -33,6 +33,7 @@ import time
 from collections import deque
 from typing import Any, Deque
 
+from .. import audit
 from ..auth import (
     PAIR_CODE_TTL,
     consume_pair_code,
@@ -129,7 +130,11 @@ async def pair(ctx: Ctx) -> Reply:
     )
 
     now = time.time()
-    _audit(st, "pair", client_id, {"device_name": _client_name(ctx)})
+    audit.record(
+        st.db, st.cfg, audit.ACTION_PAIR,
+        device=st.device_name, client_id=client_id,
+        detail={"device_name": _client_name(ctx)},
+    )
 
     return json_reply({
         "client_token": token,
@@ -199,7 +204,10 @@ async def revoke_device(ctx: Ctx) -> Reply:
         raise NotFound(client_id)
 
     st.db.execute("UPDATE devices SET revoked = 1 WHERE id = ?", (client_id,))
-    _audit(st, "revoke", client_id, {})
+    audit.record(
+        st.db, st.cfg, audit.ACTION_REVOKE,
+        device=st.device_name, client_id=client_id,
+    )
     return empty_reply(204)
 
 
@@ -263,80 +271,14 @@ async def panel_audit(ctx: Ctx) -> Reply:
     直接读 `data/audit.log` 文件而不是 `audit_log` 表：文件是**主记录**
     （先写文件并 fsync，再写表），表只是索引。排查"照片怎么没了"
     时必须看最原始的那份，表的写入失败是刻意被容忍的。
+
+    实现已合并到 `backend/app/audit.py` —— 此前这里、`handlers/browse.py`
+    与 `uploads.py` 各有一份互不一致的写实现（其中只有一份 fsync、
+    只有一份写表），详见该模块的 docstring。
     """
     if not is_loopback(ctx):
         raise NotFound(ctx.path)
     st = _st(ctx)
     limit = ctx.q_int("limit", 100, minimum=1, maximum=1000)
-
-    path = st.cfg.audit_log_path
-    if not path.exists():
-        return json_reply({"items": [], "truncated": False})
-
-    # 从文件尾部倒着读，避免把 10MB 日志整个读进内存。
-    # 每行约 120 字节，limit 行取 400 倍字节数留足余量。
-    raw = _tail(path, max_bytes=max(8192, limit * 400))
-    lines = [ln for ln in raw.splitlines() if ln.strip()]
-    items = []
-    for line in lines[-limit:]:
-        parts = line.split("\t")
-        items.append({
-            "ts": parts[0] if len(parts) > 0 else "",
-            "action": parts[1] if len(parts) > 1 else "",
-            "device": parts[2] if len(parts) > 2 else "",
-            "path": parts[3] if len(parts) > 3 else "",
-            "detail": parts[4] if len(parts) > 4 else "",
-        })
-    items.reverse()   # 最新的在最上面
-    return json_reply({"items": items, "truncated": len(lines) > limit})
-
-
-def _tail(path: Any, *, max_bytes: int) -> str:
-    """读文件尾部若干字节，并按 UTF-8 容错解码。
-
-    ⚠️ 从中间截断可能切断一个多字节汉字，直接 decode 会抛
-    UnicodeDecodeError 让整个面板 500。用 `errors="replace"` 兜住。
-    """
-    try:
-        size = path.stat().st_size
-        with open(path, "rb") as f:
-            if size > max_bytes:
-                f.seek(size - max_bytes)
-            data = f.read()
-    except OSError as e:
-        log.warning("读取审计日志失败：%s", e)
-        return ""
-    text = data.decode("utf-8", "replace")
-    if size > max_bytes and "\n" in text:
-        text = text.split("\n", 1)[1]   # 丢掉可能残缺的首行
-    return text
-
-
-def _audit(st: Any, action: str, rel_path: str, detail: dict) -> None:
-    """写审计日志。文件是主记录，写表失败只记日志。
-
-    复用 handlers.common 的实现会引入循环导入（common 依赖 state），
-    这里的逻辑与它一致：TAB 分隔，便于 awk/grep 事后追查。
-    """
-    import json
-
-    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
-    line = (f"{ts}\t{action}\t{st.device_name}\t{rel_path}\t"
-            f"{json.dumps(detail, ensure_ascii=False)}\n")
-    try:
-        path = st.cfg.audit_log_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line)
-    except OSError as e:  # pragma: no cover
-        log.warning("写审计日志文件失败：%s", e)
-
-    try:
-        st.db.execute(
-            "INSERT INTO audit_log(ts, device_name, client_id, action, rel_path, detail)"
-            " VALUES (?, ?, NULL, ?, ?, ?)",
-            (time.time(), st.device_name, action, rel_path,
-             json.dumps(detail, ensure_ascii=False)),
-        )
-    except Exception as e:  # noqa: BLE001 —— 审计写库失败不能影响业务
-        log.debug("写审计日志表失败：%s", e)
+    items, truncated = audit.read_entries(st.cfg, limit=limit)
+    return json_reply({"items": items, "truncated": truncated})

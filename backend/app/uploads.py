@@ -39,7 +39,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Final
 
-from . import archive, sandbox
+from . import archive, audit, sandbox
 from .config import Config, RootConfig
 from .db import Database
 from .errors import (
@@ -632,7 +632,7 @@ def complete_session(
             (digest, dup["rel_path"], dup["media_id"], time.time(), upload_id),
         )
         log.info("complete 阶段去重命中：%s -> media#%d", sess["declared_name"], dup["media_id"])
-        _audit(db, cfg, "upload", dup["rel_path"], {
+        _audit(db, cfg, audit.ACTION_UPLOAD, dup["rel_path"], {
             "upload_id": upload_id, "dedup": True, "size": total,
         })
         return {
@@ -699,7 +699,7 @@ def complete_session(
     )
     _drop_lock(upload_id)
     log.info("上传完成 %s -> %s（%d 字节）", sess["declared_name"], rel_path, size)
-    _audit(db, cfg, "upload", rel_path, {
+    _audit(db, cfg, audit.ACTION_UPLOAD, rel_path, {
         "upload_id": upload_id, "dedup": False, "size": size,
         "declared_name": sess["declared_name"],
     })
@@ -812,34 +812,17 @@ def abort_session(db: Database, cfg: Config, upload_id: str) -> bool:
 # --------------------------------------------------------------------------
 
 
-def _audit(db: Database, cfg: Config, action: str, rel_path: str, detail: dict[str, Any]) -> None:
-    """写审计。文件是主记录，表只是索引（与 handlers 里的实现一致）。"""
-    import json
-    from datetime import datetime
+def _audit(db: Database, cfg: Config, action: str, rel_path: str,
+           detail: dict[str, Any]) -> None:
+    """写审计。已合并到 `backend/app/audit.py`（此前这里有第三份实现）。
 
-    line = "\t".join([
-        datetime.now().astimezone().isoformat(timespec="seconds"),
-        action,
-        "",
-        rel_path or "",
-        json.dumps(detail, ensure_ascii=False, separators=(",", ":")),
-    ]) + "\n"
-    try:
-        cfg.data_dir.mkdir(parents=True, exist_ok=True)
-        with open(cfg.audit_log_path, "a", encoding="utf-8") as fh:
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
-    except OSError:
-        log.warning("写审计日志失败", exc_info=True)
-    try:
-        db.execute(
-            "INSERT INTO audit_log(ts, device_name, client_id, action, rel_path, detail) "
-            "VALUES (?, ?, NULL, ?, ?, ?)",
-            (time.time(), "", action, rel_path or "", json.dumps(detail, ensure_ascii=False)),
-        )
-    except Exception:      # noqa: BLE001
-        log.debug("写审计表失败（不影响业务）", exc_info=True)
+    ⚠️ `upload_sessions` 表**没有**记录 client_id / device_name
+    （只有 id/root_id/target_rel/temp_path/declared_name 等），
+    所以上传这条审计线索**无法回答"哪台手机传的"**。
+    这在一期（只有用户自己的设备）影响有限，但值得记下来：
+    要补就得给 upload_sessions 加列，那是 schema 迁移。
+    """
+    audit.record(db, cfg, action, rel_path=rel_path, detail=detail)
 
 
 __all__ = [

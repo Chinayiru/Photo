@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .. import sandbox
+from .. import audit, sandbox
 from ..core import Ctx, Reply, empty_reply, file_reply, json_reply, stream_reply
 from ..core.cursor import decode_cursor, encode_cursor
 from ..errors import (
@@ -805,32 +805,12 @@ async def _trash_one(st: AppState, mid: int) -> bool:
         await loop.run_in_executor(None, send2trash, str(path))
 
     db.execute("UPDATE media SET missing = 1 WHERE id = ?", (mid,))
-    _audit(st, "delete", row["rel_path"], {"media_id": mid, "root": row["root_id"]})
+    audit.record(
+        db, st.cfg, audit.ACTION_DELETE,
+        rel_path=row["rel_path"], device=st.device_name,
+        detail={"media_id": mid, "root": row["root_id"]},
+    )
     return True
-
-
-def _audit(st: AppState, action: str, rel_path: str, detail: dict[str, Any]) -> None:
-    """写审计日志。
-
-    文件是主记录（追加写，即使进程被杀也已落盘），数据库是索引。
-    写表失败只记日志不报错 —— 为了写审计而让用户的删除操作失败是荒谬的。
-    """
-    import json
-
-    line = "\t".join([
-        time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        action,
-        str(st.device_name),
-        rel_path,
-        json.dumps(detail, ensure_ascii=False),
-    ]) + "\n"
-    try:
-        path = st.cfg.audit_log_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line)
-    except OSError:
-        log.warning("写审计日志失败 action=%s", action, exc_info=True)
 
 
 # --------------------------------------------------------------------------
@@ -862,7 +842,11 @@ async def rescan(ctx: Ctx) -> Reply:
         loop.create_task(_run_scan_root(st, root_id))
     else:
         loop.create_task(_run_scan_all(st))
-    _audit(st, "rescan", root_id or "*", {"root": root_id or "*"})
+    audit.record(
+        st.db, st.cfg, audit.ACTION_RESCAN,
+        rel_path=root_id or "*", device=st.device_name,
+        detail={"root": root_id or "*"},
+    )
 
     return json_reply({"started": True, "root": root_id or None,
                        "ts": time.time()}, status=202)
