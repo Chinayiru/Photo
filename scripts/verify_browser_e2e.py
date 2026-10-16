@@ -167,6 +167,24 @@ class Browser:
         self.send("Page.enable")
         self.send("Page.navigate", url=url)
 
+    def enable_touch(self) -> None:
+        """开启触摸模拟。
+
+        ⚠️ 不开启的话 `Input.dispatchTouchEvent` 会被静默忽略 ——
+        `document` 上不会产生任何 touchstart/touchmove/touchend，
+        手势代码一行都不执行，而脚本却"成功"跑完并全部通过。
+        这是最容易产出假绿的地方，所以下面每个手势断言都先确认
+        事件真的到达了（用 `window.__touched` 计数器）。
+        """
+        self.send("Emulation.setTouchEmulationEnabled",
+                  enabled=True, maxTouchPoints=5)
+
+    def touch(self, kind: str, points: list[tuple[float, float]]) -> None:
+        """派发一次触摸事件。kind ∈ touchStart/touchMove/touchEnd/touchCancel。"""
+        self.send("Input.dispatchTouchEvent",
+                  type=kind,
+                  touchPoints=[{"x": x, "y": y} for x, y in points])
+
     def wait_for(self, expr: str, *, budget: float = 20.0, label: str = "") -> bool:
         end = time.time() + budget
         while time.time() < end:
@@ -191,11 +209,40 @@ class Browser:
             self.proc.kill()
 
 
-def make_image(path: Path, color: tuple[int, int, int], size=(240, 180)) -> None:
+def make_image(path: Path, color: tuple[int, int, int], size=(240, 180),
+               *, gps: tuple[float, float] | None = None) -> None:
     from PIL import Image
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    Image.new("RGB", size, color).save(path, "JPEG", quality=88)
+    exif = None
+    if gps is not None:
+        # 真的写 GPS EXIF（而不是往库里塞假数据）：`viewer.ts: gpsMapUrl`
+        # 依赖后端从 EXIF 解析出的 `gps_lat/lon`。塞库只能测到"前端会渲染
+        # 一个数字"，测不到"EXIF 的度分秒被正确换算成十进制度" ——
+        # 而换算正是 AC-2.12 真正会出错的地方。
+        from PIL.ExifTags import GPS
+
+        lat, lon = gps
+
+        def dms(v: float) -> tuple[float, float, float]:
+            d = int(abs(v))
+            m = int((abs(v) - d) * 60)
+            return (float(d), float(m), round((abs(v) - d - m / 60) * 3600, 4))
+
+        exif = Image.Exif()
+        exif[0x8825] = {
+            GPS.GPSLatitudeRef: "N" if lat >= 0 else "S",
+            GPS.GPSLatitude: dms(lat),
+            GPS.GPSLongitudeRef: "E" if lon >= 0 else "W",
+            GPS.GPSLongitude: dms(lon),
+        }
+    im = Image.new("RGB", size, color)
+    # ⚠️ 不能传 `exif=None`：Pillow 的 JPEG 编码器会直接 `len(exif)`
+    # 抛 TypeError（它在判空之前就取长度了）。
+    if exif is None:
+        im.save(path, "JPEG", quality=88)
+    else:
+        im.save(path, "JPEG", quality=88, exif=exif)
 
 
 def main() -> int:
@@ -217,8 +264,9 @@ def main() -> int:
     data = tmp / "data"
     data.mkdir(parents=True)
 
-    # 造 3 张图，让时间线有内容可渲染
-    make_image(lib / "a.jpg", (200, 40, 40))
+    # 造 3 张图，让时间线有内容可渲染。
+    # a.jpg 带 GPS：AC-2.12 要求详情面板显示坐标并可跳地图
+    make_image(lib / "a.jpg", (200, 40, 40), gps=(38.800691, 93.577734))
     make_image(lib / "b.jpg", (40, 160, 60))
     make_image(lib / "sub" / "c.jpg", (40, 60, 200))
 
@@ -284,6 +332,15 @@ def main() -> int:
 
         # 注入错误收集器：任何未捕获异常都记下来
         br.send("Page.enable")
+        # 触摸事件计数器：用来证明 `Input.dispatchTouchEvent` 真的送到了页面。
+        # 没有它，一个"事件根本没派发"的环境会让所有手势断言凭空通过。
+        br.send("Page.addScriptToEvaluateOnNewDocument", source="""
+            window.__touch = {start: 0, move: 0, end: 0, cancel: 0};
+            window.addEventListener('touchstart', () => window.__touch.start++, true);
+            window.addEventListener('touchmove', () => window.__touch.move++, true);
+            window.addEventListener('touchend', () => window.__touch.end++, true);
+            window.addEventListener('touchcancel', () => window.__touch.cancel++, true);
+        """)
         br.send("Page.addScriptToEvaluateOnNewDocument", source="""
             window.__errors = [];
             window.addEventListener('error', e => {
@@ -388,6 +445,310 @@ def main() -> int:
         check(ok, "查看器打开且四个操作按钮都在（下载/改名/移动/回收站）")
 
         # ---------------------------------------------------------------
+        print("\n[4b] AC-2.12 GPS 坐标与地图链接（详情面板）")
+        # ---------------------------------------------------------------
+        # 当前打开的不一定是带 GPS 那张：三张图的 taken_at 都回落到 mtime，
+        # 排序可能变。所以**逐张翻找**，而不是假设第一张就是 a.jpg。
+        def open_info() -> bool:
+            if br.evaluate("!!document.querySelector('.sheet')"):
+                return True
+            br.evaluate("""
+              (() => {
+                const b = [...document.querySelectorAll('.v-btn')]
+                  .find(x => /信息/.test(x.getAttribute('aria-label')||''));
+                if (b) b.click();
+                return !!b;
+              })()
+            """)
+            time.sleep(0.45)
+            return bool(br.evaluate("!!document.querySelector('.sheet')"))
+
+        def close_info() -> None:
+            if br.evaluate("!!document.querySelector('.sheet')"):
+                br.evaluate("""
+                  (() => {
+                    const b = [...document.querySelectorAll('.v-btn')]
+                      .find(x => /信息/.test(x.getAttribute('aria-label')||''));
+                    if (b) b.click();
+                    return !!b;
+                  })()
+                """)
+                time.sleep(0.35)
+
+        geo = None
+        for attempt in range(3):
+            if open_info():
+                geo = br.evaluate("""
+                  (() => {
+                    const a = document.querySelector('.sheet .geo');
+                    return a ? {text: a.textContent.trim(), href: a.getAttribute('href'),
+                                target: a.getAttribute('target'), rel: a.getAttribute('rel')}
+                             : null;
+                  })()
+                """)
+                if geo:
+                    break
+                close_info()
+            br.evaluate("""
+              (() => {
+                const b = [...document.querySelectorAll('.nav')]
+                  .find(x => x.getAttribute('aria-label') === '下一张');
+                if (b) b.click(); return !!b;
+              })()
+            """)
+            time.sleep(0.6)
+
+        check(bool(geo), "★ 带 GPS 的照片在详情面板显示了坐标行")
+        if geo:
+            # 精确比对能同时验证"EXIF 度分秒 → 十进制度"的换算没错
+            check("38.800691" in geo["text"] and "93.577734" in geo["text"],
+                  f"★ 坐标数值正确（EXIF 换算无误）  got {geo['text']!r}")
+            check("openstreetmap.org" in (geo["href"] or ""),
+                  f"★ 链接指向 OpenStreetMap  got {(geo['href'] or '')[:60]}")
+            check(geo["target"] == "_blank", "地图链接新窗口打开")
+            # noopener 不是可选的：不加的话目标页能通过 window.opener
+            # 把当前页导航走（tabnabbing）
+            check("noopener" in (geo["rel"] or ""),
+                  f"地图链接带 rel=noopener  got {geo['rel']!r}")
+        # 没有 GPS 的照片**不能**显示一行空的坐标行。
+        # ⚠️ 这里不能无脑点「下一张」：如果带 GPS 那张恰好是相册最后一张，
+        # 点「下一张」是个 no-op，接着"验证下一张没有坐标"就会重新打开
+        # **同一张带 GPS 的照片**，然后断言失败 —— 那是测试自己的 bug。
+        # 所以必须确认标题真的换了，必要时改按「上一张」。
+        close_info()
+        cur_title = br.evaluate(
+            "(document.querySelector('.v-title')||{}).textContent || ''")
+        moved = False
+        for want in ("下一张", "上一张"):
+            br.evaluate("""
+              (() => {
+                const b = [...document.querySelectorAll('.nav')]
+                  .find(x => x.getAttribute('aria-label') === %s);
+                if (b) b.click(); return !!b;
+              })()
+            """ % json.dumps(want))
+            time.sleep(0.6)
+            new_title = br.evaluate(
+                "(document.querySelector('.v-title')||{}).textContent || ''")
+            if new_title and new_title != cur_title:
+                moved = True
+                break
+        check(moved, f"翻到另一张照片（标题真的换了）  got {cur_title!r}")
+        if moved and open_info():
+            empty_geo = br.evaluate("!!document.querySelector('.sheet .geo')")
+            check(not empty_geo, "★ 没有 GPS 的照片不显示空的坐标行")
+            close_info()
+
+        # ---------------------------------------------------------------
+        print("\n[4c] ★ 翻页时 <img> 节点不泄漏（DOM 无界增长回归）")
+        # ---------------------------------------------------------------
+        # 这个缺陷曾经真实存在：`.stage` 里的条件兄弟节点（缩略图占位、
+        # 加载动画、错误提示、左右翻页按钮）**没有 key**，于是 Vue 在
+        # 「nav 按钮因 hasNext 变假而消失」时按位置做 diff，把 `<img>` 的
+        # vnode 错配到别的 DOM 节点上 —— 旧 `<img>` 就永远留在 DOM 里。
+        # 每翻一页多一个已解码的 1600px 位图，手机上滑几百张就是几百个。
+        #
+        # ⚠️ 必须**跨越库尾那条边界**才复现：只在中间来回翻是看不出来的
+        # （我第一版就因此误判成"无泄漏"）。这里一路翻到尽头再翻回来。
+        n_before = br.evaluate("document.querySelectorAll('.v-img.main').length")
+        # 先到库尾（只有 3 张图，2 次足够）
+        for _ in range(2):
+            br.evaluate("""
+              (() => {
+                const b = [...document.querySelectorAll('.nav')]
+                  .find(x => x.getAttribute('aria-label') === '下一张');
+                if (b) b.click(); return !!b;
+              })()
+            """)
+            time.sleep(0.6)
+        # 再反复跨越边界
+        for i in range(6):
+            want = "上一张" if i % 2 == 0 else "下一张"
+            br.evaluate("""
+              (() => {
+                const b = [...document.querySelectorAll('.nav')]
+                  .find(x => x.getAttribute('aria-label') === %s);
+                if (b) b.click(); return !!b;
+              })()
+            """ % json.dumps(want))
+            time.sleep(0.55)
+        n_after = br.evaluate("document.querySelectorAll('.v-img.main').length")
+        check(n_after == n_before,
+              f"★ 8 次翻页（含反复跨越库尾）后 <img> 数量不变"
+              f"  got {n_before} → {n_after}")
+        check(n_after == 1,
+              f"★ 查看器里始终只有 1 张主图（不是越翻越多）  got {n_after}")
+        # 顺带确认缩略图占位也没有堆积
+        n_thumb = br.evaluate("document.querySelectorAll('.v-img.thumb').length")
+        check(n_thumb <= 1, f"缩略图占位不堆积  got {n_thumb}")
+
+        # ---------------------------------------------------------------
+        print("\n[4d] AC-2.11 手势（双指缩放 / 双击放大 / 下滑关闭）")
+        # ---------------------------------------------------------------
+        br.enable_touch()
+
+        def title() -> str:
+            return br.evaluate(
+                "(document.querySelector('.v-title')||{}).textContent || ''")
+
+        def zoom_scale() -> float:
+            """从实际生效的 CSS transform 里读出缩放倍数。
+
+            不读组件内部变量（`zoom` 在 `<script setup>` 里，外部取不到），
+            读 DOM 上的 transform 更接近"用户真的看到了什么"。
+            """
+            return float(br.evaluate("""
+              (() => {
+                const el = document.querySelector('.v-img.main');
+                if (!el) return 1;
+                const t = getComputedStyle(el).transform;
+                if (!t || t === 'none') return 1;
+                const m = t.match(/matrix\\(([^)]+)\\)/);
+                if (!m) return 1;
+                return parseFloat(m[1].split(',')[0]);
+              })()
+            """) or 1)
+
+        # --- 双指张开 → 放大 ---
+        t0 = title()
+        c = (200.0, 300.0)
+        br.touch("touchStart", [c])
+        br.touch("touchStart", [(c[0] - 30, c[1] - 30), (c[0] + 30, c[1] + 30)])
+        for step in range(1, 6):
+            d = 30 + step * 25
+            br.touch("touchMove", [(c[0] - d, c[1] - d), (c[0] + d, c[1] + d)])
+            time.sleep(0.05)
+        br.touch("touchEnd", [])
+        time.sleep(0.35)
+        z_in = zoom_scale()
+        touched = br.evaluate("window.__touch.start")
+        check(touched and touched > 0,
+              f"★ 触摸事件真的派发到了页面（不是假绿）  touchstart={touched}")
+        check(z_in > 1.2, f"★ 双指张开真的放大了图片  scale={z_in:.2f}")
+        check(title() == t0,
+              f"★ 缩放过程中没有误翻页  标题仍是 {t0!r}")
+
+        # --- 放大后单指拖动 → 平移（不应翻页）---
+        br.touch("touchStart", [c])
+        for i in range(1, 5):
+            br.touch("touchMove", [(c[0] - i * 25, c[1] - i * 20)])
+            time.sleep(0.05)
+        br.touch("touchEnd", [])
+        time.sleep(0.3)
+        check(title() == t0, f"★ 放大后拖动是平移、没有翻页  got {title()!r}")
+        check(zoom_scale() > 1.2, "放大后拖动不会把缩放重置掉")
+
+        # --- 双击 → 归位到 1x（此时已放大，双击的语义是还原）---
+        for _ in range(2):
+            br.touch("touchStart", [c])
+            br.touch("touchEnd", [])
+            time.sleep(0.08)
+        time.sleep(0.4)
+        z_dbl = zoom_scale()
+        check(z_dbl < 1.2, f"★ 双击把已放大的图还原  scale={z_dbl:.2f}")
+
+        # --- 双击（1x 时）→ 放大到 2x ---
+        for _ in range(2):
+            br.touch("touchStart", [c])
+            br.touch("touchEnd", [])
+            time.sleep(0.08)
+        time.sleep(0.4)
+        z_dbl2 = zoom_scale()
+        check(z_dbl2 > 1.5, f"★ 1x 时双击放大到约 2 倍  scale={z_dbl2:.2f}")
+
+        # 还原，免得影响后面的下滑关闭
+        for _ in range(2):
+            br.touch("touchStart", [c])
+            br.touch("touchEnd", [])
+            time.sleep(0.08)
+        time.sleep(0.4)
+
+        # --- 左右滑动翻页（单指，水平为主）---
+        # ⚠️ 先定位到**第一张**，否则左滑(=下一张)可能因为已经在库尾而
+        # 变成 no-op —— 那是测试自己站错了位置，不是手势失灵。
+        # 上一张按钮消失即表示已到第一张。
+        for _ in range(6):
+            moved = br.evaluate("""
+              (() => {
+                const b = [...document.querySelectorAll('.nav')]
+                  .find(x => x.getAttribute('aria-label') === '上一张');
+                if (b) b.click(); return !!b;
+              })()
+            """)
+            if not moved:
+                break
+            time.sleep(0.5)
+        t_before = title()
+        br.touch("touchStart", [(300.0, 400.0)])
+        for i in range(1, 7):
+            br.touch("touchMove", [(300.0 - i * 40, 400.0 + i * 3)])
+            time.sleep(0.04)
+        br.touch("touchEnd", [])
+        time.sleep(0.7)
+        check(title() != t_before,
+              f"★ 左滑翻到下一张  {t_before!r} → {title()!r}")
+
+        # 再右滑回上一张，确认方向没接反
+        t_mid = title()
+        br.touch("touchStart", [(120.0, 400.0)])
+        for i in range(1, 7):
+            br.touch("touchMove", [(120.0 + i * 40, 400.0 + i * 3)])
+            time.sleep(0.04)
+        br.touch("touchEnd", [])
+        time.sleep(0.7)
+        check(title() == t_before,
+              f"★ 右滑回到上一张（方向没接反）  {t_mid!r} → {title()!r}")
+
+        # --- 下滑关闭（单指，垂直为主）---
+        open_before = br.evaluate("!!document.querySelector('.viewer')")
+        br.touch("touchStart", [(200.0, 200.0)])
+        for i in range(1, 9):
+            br.touch("touchMove", [(200.0 + i * 2, 200.0 + i * 45)])
+            time.sleep(0.04)
+        br.touch("touchEnd", [])
+        time.sleep(0.7)
+        open_after = br.evaluate("!!document.querySelector('.viewer')")
+        check(open_before and not open_after,
+              f"★ 下滑关闭了查看器  open {open_before} → {open_after}")
+
+        # --- touchcancel 不触发翻页/关闭（来电打断）---
+        # 重新打开一张
+        br.evaluate("""
+          (() => {
+            const el = document.querySelector('[data-id]');
+            if (el) el.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+            return !!el;
+          })()
+        """)
+        time.sleep(0.8)
+        if br.evaluate("!!document.querySelector('.viewer')"):
+            t_cancel = title()
+            br.touch("touchStart", [(200.0, 200.0)])
+            for i in range(1, 9):
+                br.touch("touchMove", [(200.0 + i * 2, 200.0 + i * 45)])
+                time.sleep(0.03)
+            # 系统打断（来电/手势返回）—— 绝不能因此关闭或翻页
+            br.touch("touchCancel", [])
+            time.sleep(0.5)
+            still_open = br.evaluate("!!document.querySelector('.viewer')")
+            check(still_open,
+                  "★ touchcancel（来电打断）不会误关闭查看器")
+            check(title() == t_cancel,
+                  f"★ touchcancel 不会误翻页  got {title()!r}")
+            # 收尾：正常关闭，回到时间线
+            br.evaluate("""
+              (() => {
+                const b = [...document.querySelectorAll('.v-btn')]
+                  .find(x => x.getAttribute('aria-label') === '返回');
+                if (b) b.click(); return !!b;
+              })()
+            """)
+            time.sleep(0.5)
+
+        # 关掉信息面板，后面的步骤不依赖它
+        close_info()
+
+        # ---------------------------------------------------------------
         print("\n[5] 切 Tab（KeepAlive 缓存 + 不报错）")
         # ---------------------------------------------------------------
         for label in ("搜索", "上传", "我的", "照片"):
@@ -432,7 +793,10 @@ def main() -> int:
     if failures:
         print(f"=== {len(failures)} 项失败 ===")
         for f in failures:
-            print("  ✗", f)
+            # 这里**必须**是 ASCII：GBK 控制台下打印 U+2717 会抛
+            # UnicodeEncodeError，把真正的失败清单整个吞掉，
+            # 只留下一个与本任务无关的编码报错。
+            print("  [X]", f)
         return 1
     print("=== ALL PASS ===")
     shutil.rmtree(tmp, ignore_errors=True)

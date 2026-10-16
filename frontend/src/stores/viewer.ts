@@ -164,6 +164,44 @@ export const exifText = computed<string>(() => {
   return parts.join(" · ");
 });
 
+/**
+ * GPS 坐标文本。没有坐标时返回空串。
+ *
+ * ⚠️ 返回空串而不是 `"--"` 之类占位符：调用方用 `v-if` 决定整行是否渲染，
+ * 显示"GPS: --"会让绝大多数（没开定位的）照片都多一行废话。
+ * 模板里的 `v-if` 依赖"空串即假值"这个约定。
+ *
+ * 小数位取 6 位：约 0.11 米精度，足够定位到具体某栋楼；
+ * 再多的位数只是 EXIF 原始浮点的噪声。
+ */
+export const gpsText = computed<string>(() => {
+  const g = viewerStore.state.detail?.gps;
+  if (!g) return "";
+  // 0 是合法坐标（赤道/本初子午线），不能用 falsy 判断
+  if (typeof g.lat !== "number" || typeof g.lon !== "number") return "";
+  return `${g.lat.toFixed(6)}, ${g.lon.toFixed(6)}`;
+});
+
+/**
+ * 地图链接（OpenStreetMap）。
+ *
+ * 选 OSM 而不是高德/百度：后者需要 API key，而这是个局域网自托管工具，
+ * 不该要求用户去申请第三方密钥；且 OSM 的链接是纯 URL 参数，
+ * 在没有 JS 的旧浏览器上也能打开。
+ *
+ * ⚠️ 用 `#map=16/lat/lon` 而不是 `?mlat=..&mlon=..` 单独使用：
+ * 前者同时指定缩放级别，否则 OSM 会用一个很远的视角打开，
+ * 用户看到的是整个洲而不是他家楼下。
+ */
+export const gpsMapUrl = computed<string>(() => {
+  const g = viewerStore.state.detail?.gps;
+  if (!g) return "";
+  if (typeof g.lat !== "number" || typeof g.lon !== "number") return "";
+  const lat = g.lat.toFixed(6);
+  const lon = g.lon.toFixed(6);
+  return `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=16/${lat}/${lon}`;
+});
+
 /** 下载原图：直接触发浏览器下载（`?download=1` 让后端发 Content-Disposition）。 */
 export function downloadRaw(): void {
   const d = viewerStore.state.detail;

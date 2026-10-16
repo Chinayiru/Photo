@@ -25,6 +25,8 @@ import {
   exifText,
   goNext,
   goPrev,
+  gpsMapUrl,
+  gpsText,
   moveCurrent,
   renameCurrent,
   sizeText,
@@ -43,9 +45,70 @@ let startT = 0;
 let tracking = false;
 let locked: "h" | "v" | null = null;
 
+/**
+ * 双指缩放。
+ *
+ * ⚠️ 用 `ref` 而不是普通变量：`transform` 直接绑在模板上，
+ * 普通变量改了不会触发重渲染（`dx` 当初就踩过这个）。
+ */
+const zoom = ref(1);
+/** 双指起始间距。0 表示"本次手势不是双指"，用来区分单指/双指两条路径。 */
+let pinchStart = 0;
+/** 双指开始时的缩放倍数。缩放是**相对**的，必须记住起点。 */
+let pinchBase = 1;
+/**
+ * 缩放后单指拖动查看的偏移量。
+ *
+ * 放大到 2x 之后画面比屏幕大，用户必须能拖着看局部，
+ * 否则"放大"这个功能只能看到左上角，等于没用。
+ */
+const panX = ref(0);
+const panY = ref(0);
+
+/**
+ * 双击检测。
+ *
+ * ⚠️ 不能用 `@dblclick`：那个事件在**触屏上不可靠** ——
+ * 移动端 Safari/Chrome 对双击是否派发 `dblclick` 不一致，
+ * 而且它和"双击缩放页面"的浏览器默认行为会打架。
+ * 自己用两次 `touchend` 的时间差判断最稳。
+ */
+let lastTapAt = 0;
+let lastTapX = 0;
+let lastTapY = 0;
+/** 双击判定窗口。300ms 是移动端的经验值（也是旧版浏览器 click 延迟的来源）。 */
+const DOUBLE_TAP_MS = 300;
+/** 双击时允许的位移：手指按下去总会抖，不设阈值会把"快速两次点按"误判成双击。 */
+const DOUBLE_TAP_SLOP = 30;
+
+/** 缩放上下限。上限 4x 是因为再大就只是看马赛克了。 */
+const ZOOM_MIN = 1;
+const ZOOM_MAX = 4;
+/** 松手后离 1 多近就吸附回去。留 1.05 是因为"想放大一点点"没有意义。 */
+const ZOOM_SNAP = 1.05;
+
 /** 拖动中的水平位移（px），用于跟手动画。 */
 const dx = ref(0);
+/** 下滑关闭的垂直位移（px）。 */
+const dy = ref(0);
 const dragging = ref(false);
+/** 是否正在双指缩放（用于禁用翻页动画）。 */
+const pinching = ref(false);
+
+/** 是否处于放大状态。放大后所有翻页/关闭手势都必须让路。 */
+const zoomed = computed(() => zoom.value > ZOOM_SNAP);
+
+/** 把缩放/平移合并成一个 transform 字符串。 */
+const imageTransform = computed(() => {
+  if (pinching.value || zoomed.value) {
+    return `translate(${panX.value}px, ${panY.value}px) scale(${zoom.value})`;
+  }
+  if (dragging.value) {
+    // 下滑关闭时两个方向都要跟手（用户很少滑得笔直）
+    return `translate(${dx.value}px, ${dy.value}px)`;
+  }
+  return "";
+});
 /** 信息面板是否展开（默认收起，不挡图）。 */
 const infoOpen = ref(false);
 
@@ -225,8 +288,38 @@ watch(() => s.id, () => {
 /** 切图动画类名。 */
 const slideClass = computed(() => (s.dir === "none" ? "" : `slide-${s.dir}`));
 
+/** 两指间距。 */
+function touchDist(e: TouchEvent): number {
+  const a = e.touches[0]!;
+  const b = e.touches[1]!;
+  return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+}
+
+/**
+ * 手势总入口。
+ *
+ * 三条手势的优先级（从高到低）：
+ *   双指缩放 > 单指（放大后）拖动 > 单指（未放大）翻页 / 下滑关闭
+ *
+ * ⚠️ 这个优先级不是审美选择，是必须的：双指按下时 `touches.length` 会
+ * 从 1 变 2，如果不在 `touchstart` 里立刻切到缩放分支，
+ * 第二根手指的落点会被当成"单指拖动"的起点，于是缩放和翻页同时发生。
+ */
 function onTouchStart(e: TouchEvent): void {
-  if (e.touches.length !== 1) return;
+  if (e.touches.length >= 2) {
+    // 双指：接管本次手势。清掉单指的跟踪状态，防止松掉一根手指后
+    // 残留的 startX/startY 触发一次莫名其妙的翻页。
+    tracking = false;
+    locked = null;
+    dragging.value = false;
+    dx.value = 0;
+    dy.value = 0;
+    pinching.value = true;
+    pinchStart = touchDist(e);
+    pinchBase = zoom.value;
+    return;
+  }
+
   const t = e.touches[0]!;
   startX = t.clientX;
   startY = t.clientY;
@@ -235,51 +328,180 @@ function onTouchStart(e: TouchEvent): void {
   locked = null;
   dragging.value = false;
   dx.value = 0;
+  dy.value = 0;
 }
 
 function onTouchMove(e: TouchEvent): void {
+  // --- 双指缩放 ---
+  if (pinching.value) {
+    // ⚠️ 手指从 2 根变回 1 根时 `touchDist` 会读到 undefined 而抛错，
+    // 所以这里必须挡一道（用户松开一根手指继续滑是很常见的动作）。
+    if (e.touches.length < 2) return;
+    const d = touchDist(e);
+    if (pinchStart <= 0) return;
+    const next = pinchBase * (d / pinchStart);
+    // 夹在上下限之间：不夹的话能缩到 0.1x（图变成一个小点）或 20x
+    zoom.value = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, next));
+    return;
+  }
+
   if (!tracking || e.touches.length !== 1) return;
   const t = e.touches[0]!;
   const mx = t.clientX - startX;
   const my = t.clientY - startY;
+
+  // --- 已放大：单指拖动查看局部，不翻页、不关闭 ---
+  if (zoomed.value) {
+    panX.value += t.clientX - startX;
+    panY.value += t.clientY - startY;
+    // 起点跟着手指走，否则每帧都会重复累加同一段位移
+    startX = t.clientX;
+    startY = t.clientY;
+    return;
+  }
 
   if (!locked) {
     // 前 12px 用来判断方向：手机上手总是有点斜着滑的
     if (Math.abs(mx) < 12 && Math.abs(my) < 12) return;
     locked = Math.abs(mx) > Math.abs(my) * 1.4 ? "h" : "v";
   }
-  if (locked !== "h") return;
 
-  // 到边界了给点阻尼感，让用户知道"到头了"
-  const atEdge = (mx > 0 && !hasPrev.value) || (mx < 0 && !hasNext.value);
-  dx.value = atEdge ? mx * 0.28 : mx;
-  dragging.value = true;
+  if (locked === "h") {
+    // 到边界了给点阻尼感，让用户知道"到头了"
+    const atEdge = (mx > 0 && !hasPrev.value) || (mx < 0 && !hasNext.value);
+    dx.value = atEdge ? mx * 0.28 : mx;
+    dragging.value = true;
+    return;
+  }
+
+  // --- 垂直：下滑关闭 ---
+  // ⚠️ 只认向下（my > 0）。向上滑是很自然的"想看看图片下半部分"的动作，
+  // 若也跟手会让用户以为图片被拖走了。
+  if (my > 0) {
+    dy.value = my;
+    dragging.value = true;
+  }
 }
 
-function onTouchEnd(): void {
+function onTouchEnd(e: TouchEvent): void {
+  // --- 双指缩放收尾 ---
+  if (pinching.value) {
+    // 还有手指留在屏幕上（2→1）时不结束缩放，
+    // 否则用户松开一根手指会立刻触发一次翻页判定。
+    if (e.touches.length > 0) return;
+    pinching.value = false;
+    pinchStart = 0;
+
+    // 吸附：缩到接近 1 就回正。不吸附的话会留下一个"歪斜的缩放状态"，
+    // 用户既看不出自己在缩放，又发现翻页失灵了（因为 zoomed 仍为真）。
+    if (zoom.value <= ZOOM_SNAP) {
+      zoom.value = 1;
+      panX.value = 0;
+      panY.value = 0;
+    }
+    return;
+  }
+
   if (!tracking) return;
   tracking = false;
+
+  // --- 双击检测 ---
+  // ⚠️ 必须在翻页判定**之前**做，并且用 return 短路：
+  // 双击的第一次点按在 touchend 时位移≈0、时长≈0，会被下面的
+  // flick 判定当成"快速轻扫"（vx 很大）而误翻一页。
+  const t = e.changedTouches[0];
+  if (t && !dragging.value) {
+    const now = Date.now();
+    const nearLast =
+      Math.abs(t.clientX - lastTapX) < DOUBLE_TAP_SLOP &&
+      Math.abs(t.clientY - lastTapY) < DOUBLE_TAP_SLOP;
+    if (now - lastTapAt < DOUBLE_TAP_MS && nearLast) {
+      lastTapAt = 0; // 消费掉，避免三连击被当成两次双击
+      if (zoomed.value) {
+        zoom.value = 1;
+        panX.value = 0;
+        panY.value = 0;
+      } else {
+        // 放大到 2x。用固定的 2 而不是"上次的倍数"，
+        // 因为双击的语义是"放大看细节"，用户预期每次结果一样。
+        zoom.value = 2;
+      }
+      dx.value = 0;
+      dy.value = 0;
+      return;
+    }
+    lastTapAt = now;
+    lastTapX = t.clientX;
+    lastTapY = t.clientY;
+  }
+
   const dt = Date.now() - startT;
-  const dist = dx.value;
-  const vx = Math.abs(dist) / Math.max(dt, 1); // px/ms
+  const hDist = dx.value;
+  const vDist = dy.value;
+  const vx = Math.abs(hDist) / Math.max(dt, 1); // px/ms
+  const vy = vDist / Math.max(dt, 1);
 
   dragging.value = false;
   dx.value = 0;
+  dy.value = 0;
+
+  // --- 下滑关闭 ---
+  if (locked === "v") {
+    const h = window.innerHeight || 640;
+    // 阈值：下滑够 1/4 屏高，或者向下甩得够快
+    if (vDist > h * 0.25 || (vy > 0.5 && vDist > 60)) {
+      close();
+    }
+    return;
+  }
 
   if (locked !== "h") return;
   // 阈值：要么滑够 1/4 屏宽，要么快速轻扫（手机上"甩"一下很常见）
   const w = window.innerWidth || 360;
-  const far = Math.abs(dist) > w * 0.25;
-  const flick = vx > 0.45 && Math.abs(dist) > 28;
+  const far = Math.abs(hDist) > w * 0.25;
+  const flick = vx > 0.45 && Math.abs(hDist) > 28;
   if (!far && !flick) return;
 
   // 左滑（dist<0）= 看下一张 = 更旧 = next_id
-  if (dist < 0) {
+  if (hDist < 0) {
     if (!goNext()) toastWarn("已经是最后一张了");
   } else if (!goPrev()) {
     toastWarn("已经是第一张了");
   }
 }
+
+/**
+ * 手势被系统打断（来电、通知下拉、手势返回）。
+ *
+ * ⚠️ 不能复用 `onTouchEnd`：那里会根据位移判定"翻页/关闭"，
+ * 而 touchcancel 恰恰是**用户没做完这个动作**。用 touchend 处理的话，
+ * 用户滑到一半来电话，挂掉之后就发现照片莫名其妙换了一张。
+ * 这里只做状态复位，不触发任何动作。
+ */
+function onTouchCancel(): void {
+  tracking = false;
+  locked = null;
+  dragging.value = false;
+  pinching.value = false;
+  pinchStart = 0;
+  dx.value = 0;
+  dy.value = 0;
+  // 缩放保留（用户可能是被打断的缩放），但吸附回正
+  if (zoom.value <= ZOOM_SNAP) {
+    zoom.value = 1;
+    panX.value = 0;
+    panY.value = 0;
+  }
+}
+
+/** 缩放/平移必须随图片切换一起重置，否则下一张会带着上一张的放大状态。 */
+watch(() => s.id, () => {
+  zoom.value = 1;
+  panX.value = 0;
+  panY.value = 0;
+  pinching.value = false;
+  lastTapAt = 0;
+});
 
 function onKey(e: KeyboardEvent): void {
   if (!s.open) return;
@@ -386,11 +608,12 @@ async function doDelete(): Promise<void> {
           @touchstart.passive="onTouchStart"
           @touchmove.passive="onTouchMove"
           @touchend="onTouchEnd"
-          @touchcancel="onTouchEnd"
+          @touchcancel="onTouchCancel"
         >
           <!-- 占位：详情还没回来时先显示时间线里那张 320 缩略图，避免黑屏 -->
           <img
             v-if="!s.imageReady && currentThumbUrl"
+            key="thumb"
             class="v-img thumb"
             :src="currentThumbUrl"
             alt=""
@@ -402,7 +625,7 @@ async function doDelete(): Promise<void> {
             :key="detail.id"
             class="v-img main"
             :class="[{ drag: dragging }, slideClass]"
-            :style="dragging ? { transform: `translateX(${dx}px)` } : undefined"
+            :style="imageTransform ? { transform: imageTransform } : undefined"
             :src="currentPreviewUrl"
             :alt="detail.name"
             decoding="async"
@@ -410,11 +633,11 @@ async function doDelete(): Promise<void> {
             @error="s.error = '图片加载失败'"
           />
 
-          <div v-if="!s.imageReady && !s.error" class="v-loading">
+          <div v-if="!s.imageReady && !s.error" key="loading" class="v-loading">
             <span class="spinner big" />
           </div>
 
-          <div v-if="s.error" class="v-error">
+          <div v-if="s.error" key="error" class="v-error">
             <p>{{ s.error }}</p>
             <button class="btn ghost" type="button" @click="close">返回</button>
           </div>
@@ -422,6 +645,7 @@ async function doDelete(): Promise<void> {
           <!-- 左右切换按钮：不习惯滑动的用户（以及鼠标用户）也有路走 -->
           <button
             v-if="hasPrev"
+            key="prev"
             class="nav prev"
             type="button"
             aria-label="上一张"
@@ -429,6 +653,7 @@ async function doDelete(): Promise<void> {
           >‹</button>
           <button
             v-if="hasNext"
+            key="next"
             class="nav next"
             type="button"
             aria-label="下一张"
@@ -443,6 +668,19 @@ async function doDelete(): Promise<void> {
               <div class="row"><dt>相机</dt><dd>{{ cameraText }}</dd></div>
               <div class="row"><dt>尺寸</dt><dd>{{ sizeText }}</dd></div>
               <div v-if="exifText" class="row"><dt>参数</dt><dd>{{ exifText }}</dd></div>
+              <!-- GPS 只在真的有坐标时才出现：绝大多数照片没有定位信息，
+                   常驻一行 "GPS: --" 只是噪音（见 viewer.ts:gpsText） -->
+              <div v-if="gpsText" class="row">
+                <dt>位置</dt>
+                <dd>
+                  <a
+                    class="geo"
+                    :href="gpsMapUrl"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >{{ gpsText }}</a>
+                </dd>
+              </div>
               <div class="row"><dt>路径</dt><dd class="mono">{{ detail.rel_path }}</dd></div>
             </dl>
           </div>
@@ -740,6 +978,17 @@ async function doDelete(): Promise<void> {
 }
 
 .mono {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+
+/* GPS 坐标做成链接：点了跳 OSM 看这是哪儿。
+   颜色用链接色 + 下划线，否则用户看不出它能点（它是纯文本坐标，
+   形状上完全不像按钮）。 */
+.geo {
+  color: var(--accent, #6cf);
+  text-decoration: underline;
+  text-underline-offset: 2px;
   font-family: ui-monospace, monospace;
   font-size: 12px;
 }
