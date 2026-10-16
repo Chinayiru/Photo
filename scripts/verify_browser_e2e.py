@@ -40,6 +40,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -879,6 +880,69 @@ def main() -> int:
 
         # 把新图删掉，后面的步骤（Tab 切换、未配对）不受影响
         (lib / new_name).unlink()
+
+        # ---------------------------------------------------------------
+        print("\n[4f] AC-5.2 二维码带 device_id（静态码 + 动态 IP 的错配防护）")
+        # ---------------------------------------------------------------
+        # 二维码是用户截图存着 / 打印出来贴在机箱上的，而局域网 IP 由
+        # DHCP 分配。同一个 IP 隔几天可能已属于**另一台也跑着 PhotoBridge
+        # 的电脑** —— 只认 `?code=` 的二维码会把手机绑到别人的电脑上，
+        # 还会把对方的照片显示出来。带上 `did` 才能在配对前发现。
+        qr = urllib.request.urlopen(
+            urllib.request.Request(f"{base}/panel/pair-code", data=b"{}",
+                                   method="POST",
+                                   headers={"Content-Type": "application/json"}),
+            timeout=10).read()
+        pc2 = json.loads(qr)
+        # 托盘是在这个返回值上拼 `/?code=..&did=..` 的（`tray._new_pair_code`
+        # → `pair_qr_url`）。这里断言数据源里有 device_id —— 没有它
+        # 托盘无论怎么拼都拼不出 `did`。托盘那一侧由
+        # `backend/tests/test_tray.py` 的 AST 断言钉住。
+        check(bool(pc2.get("device_id")),
+              f"面板返回 device_id（二维码 did 的来源）  got {pc2.get('device_id')!r}")
+        ping = json.loads(urllib.request.urlopen(
+            f"{base}/api/system/ping", timeout=10).read())
+        check(pc2["device_id"] == ping["device_id"],
+              "★ 面板的 device_id 与 ping 自报的一致（否则二维码校验必然误判）")
+        did = ping["device_id"]
+
+        # 前端读到 did 后，配对**之前**会先 ping 核对。这里直接把页面导航
+        # 到一个"did 属于另一台电脑"的地址，断言它拒绝配对 —— 而且
+        # **不发出 POST /api/pair**（先配对再校验会把那一枚码用掉，
+        # 用户拿着正确的电脑也无法重试）。
+        br.evaluate("window.localStorage.clear()")
+        br.goto(f'{base}/?code={pc2["code"]}&did=deadbeefdeadbeef')
+        ok = br.wait_for(
+            "!!document.querySelector('input[placeholder*=\"192.168\"]')",
+            budget=25, label="错配页面回配对页")
+        check(ok, "扫码进错电脑时仍停在配对页（没有绑定成功）")
+        ok = br.wait_for("""
+          (() => {
+            const e = document.querySelector('.err');
+            return !!e && /另一台电脑/.test(e.textContent || '');
+          })()
+        """, budget=15, label="错配提示")
+        got_err = br.evaluate(
+            "(document.querySelector('.err')||{}).textContent || ''")
+        check(ok, f"★ 明确告诉用户'连到了另一台电脑'（不是静默失败）  got {got_err.strip()!r}")
+        still = br.evaluate("window.localStorage.getItem('pb.token')")
+        check(not still, f"错配时没有落任何 token  got {still!r}")
+
+        # 反向：did 正确时必须能正常配对，否则这个校验就是把所有人挡在外面。
+        # ★ 先清 token：否则 `wait_for(token 存在)` 会被上一轮（或更早的
+        #   `[2]` 节）留下的 token 直接满足，这个正向用例就成了空转 ——
+        #   把校验写成"永远拒绝"也照样全绿。
+        br.evaluate("window.localStorage.clear()")
+        br.goto(f'{base}/?code={pc2["code"]}&did={did}')
+        ok = br.wait_for("!!window.localStorage.getItem('pb.token')",
+                         budget=25, label="正确 did 配对成功")
+        check(ok, "did 与电脑一致时配对正常通过")
+        tok = br.evaluate("window.localStorage.getItem('pb.token')")
+        check(bool(tok), f"正向配对拿到的 token 非空  got {(tok or '')[:12]}…")
+        # 恢复成正常已配对状态，后面的 Tab 切换 / 未配对检查依赖它
+        br.goto(base + "/")
+        br.wait_for("document.querySelectorAll('[data-id]').length >= 1",
+                    budget=30, label="回到时间线")
 
         # ---------------------------------------------------------------
         print("\n[5] 切 Tab（KeepAlive 缓存 + 不报错）")

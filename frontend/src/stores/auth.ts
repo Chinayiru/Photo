@@ -132,8 +132,11 @@ export async function probe(): Promise<boolean> {
  *
  * @param base 形如 `http://192.0.2.10:8787`（会归一化）
  * @param code 6 位数字，中间的空格/连字符会被后端也清一遍，这里先清更友好
+ * @param expectedDid 二维码里带的 `device_id`（AC-5.2）。给了就先 ping
+ *   核对，**不一致直接拒绝**，一个字节的配对请求都不发。
  */
-export async function pair(base: string, code: string): Promise<PairResponse> {
+export async function pair(base: string, code: string,
+                           expectedDid = ""): Promise<PairResponse> {
   const s = authStore.state;
   const cleanBase = normalizeBase(base);
   if (!cleanBase) throw new ApiError({ status: 0, code: "E1001", message: "请填写电脑地址" });
@@ -151,6 +154,33 @@ export async function pair(base: string, code: string): Promise<PairResponse> {
   // ★ 先把 base 落到 localStorage，再发请求 —— client.ts 的 baseUrl 是
   //   每次读 localStorage 的 getter，不写进去就发到了旧地址
   saveBase(cleanBase);
+
+  // ★ 二维码校验必须在**消费配对码之前**。若先 POST /api/pair 再发现
+  //   device_id 不对，服务端已经把那一枚码用掉了（`used_at` 已写），
+  //   用户拿着正确的电脑也无法重试，只能回去重新生成一枚码 ——
+  //   而"连错电脑"恰恰是最需要能立刻改正的场景。
+  if (expectedDid) {
+    let actual = "";
+    try {
+      const ping = await api.get<PingResponse>("/api/system/ping", {
+        timeoutMs: 5000, skipAuthLost: true,
+      });
+      actual = ping.device_id;
+    } catch {
+      throw new ApiError({
+        status: 0, code: "E1001", message: "无法连接电脑",
+        userHint: "连不上这个地址。请确认手机与电脑在同一个 Wi-Fi，且电脑端程序正在运行",
+      });
+    }
+    if (actual !== expectedDid) {
+      throw new ApiError({
+        status: 0, code: "E2003", message: "这台电脑不是二维码对应的电脑",
+        userHint: "扫码连到的是另一台电脑（IP 被重新分配了）。"
+          + "请在电脑托盘里重新显示二维码再扫，或手动填写地址与配对码",
+      });
+    }
+  }
+
   s.probing = true;
   try {
     const r = await api.post<PairResponse>("/api/pair", { code: cleanCode }, {
@@ -192,7 +222,8 @@ export function unpair(): void {
  *   `http://192.0.2.10:8787/pair?c=123456&h=192.0.2.10&p=8787`
  * 也接受直接粘贴 `192.0.2.10:8787 123456` 这种"地址 + 码"。
  */
-export function parsePairInput(raw: string): { base: string; code: string } | null {
+export function parsePairInput(raw: string):
+{ base: string; code: string; did: string } | null {
   const text = raw.trim();
   if (!text) return null;
 
@@ -207,7 +238,14 @@ export function parsePairInput(raw: string): { base: string; code: string } | nu
       const host = u.searchParams.get("h") || u.hostname;
       const port = u.searchParams.get("p") || u.port || "8787";
       if (code) {
-        return { base: normalizeBase(`${host}:${port}`), code: code.replace(/[\s-]/g, "") };
+        return {
+          base: normalizeBase(`${host}:${port}`),
+          code: code.replace(/[\s-]/g, ""),
+          // 粘贴整条链接时也带上（`#/pair?code=..&did=..` 形式从 hash 里找）
+          did: (u.searchParams.get("did")
+            || new URLSearchParams(u.hash.replace(/^#\/?[^?]*\??/, "")).get("did")
+            || "").trim(),
+        };
       }
     } catch {
       /* 落到下面的文本解析 */
@@ -217,27 +255,42 @@ export function parsePairInput(raw: string): { base: string; code: string } | nu
   // ② 形如 "192.0.2.10:8787 123456" / "192.0.2.10 123456"
   const m = text.match(/(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?[\s,，]+(\d{6})/);
   if (m) {
-    return { base: normalizeBase(`${m[1]}:${m[2] || "8787"}`), code: m[3]! };
+    return { base: normalizeBase(`${m[1]}:${m[2] || "8787"}`), code: m[3]!, did: "" };
   }
 
   // ③ 只有 6 位码（地址用当前页面的 host）
   if (/^\d{6}$/.test(text.replace(/[\s-]/g, ""))) {
-    return { base: normalizeBase(window.location.host || ""), code: text.replace(/[\s-]/g, "") };
+    return {
+      base: normalizeBase(window.location.host || ""),
+      code: text.replace(/[\s-]/g, ""),
+      did: "",
+    };
   }
   return null;
 }
 
-/** 冷启动：从 URL 里看看有没有配对参数。 */
-export function pairParamsFromLocation(): { base: string; code: string } | null {
-  const search = window.location.search;
-  const hash = window.location.hash;
-  const code = new URLSearchParams(search).get("code")
-    || new URLSearchParams(hash.replace(/^#\/?[^?]*\??/, "")).get("code");
+/** 冷启动：从 URL 里看看有没有配对参数。
+ *
+ * ★ 还会读 `did`（电脑的 device_id，`tray.pair_qr_url` 带上的）。
+ * 它防的是一种很隐蔽的错配：二维码是静态的（用户截图存着、或打印出来
+ * 贴在机箱上），而局域网 IP 是 DHCP 分的。隔几天再扫，同一个 IP 可能
+ * 已经分给了另一台也跑着 PhotoBridge 的电脑 —— 于是"扫码配对"会把
+ * 手机绑到别人的电脑上，还会把对方的照片显示出来。
+ */
+export function pairParamsFromLocation():
+{ base: string; code: string; did: string } | null {
+  const search = new URLSearchParams(window.location.search);
+  const hash = new URLSearchParams(window.location.hash.replace(/^#\/?[^?]*\??/, ""));
+  const code = search.get("code") || hash.get("code");
   if (!code) return null;
   const host = window.location.hostname;
   const port = window.location.port || "8787";
   if (!host) return null;
-  return { base: normalizeBase(`${host}:${port}`), code: code.replace(/[\s-]/g, "") };
+  return {
+    base: normalizeBase(`${host}:${port}`),
+    code: code.replace(/[\s-]/g, ""),
+    did: (search.get("did") || hash.get("did") || "").trim(),
+  };
 }
 
 export const deviceLabel = computed<string>(() => {

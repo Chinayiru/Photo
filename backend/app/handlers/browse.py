@@ -990,6 +990,17 @@ async def move_items(ctx: Ctx) -> Reply:
     st = _st(ctx)
     db = st.db
 
+    # ★ `auth.allow_move` 此前是个**死配置**：`config.py` 声明了它、
+    # 默认 True，但代码里零读取 —— 于是用户关掉之后一切照旧，
+    # 界面上看不出任何区别，只会以为自己设错了。
+    #
+    # 为什么移动也要单独一个开关：移动会改变照片的目录结构，
+    # 而用户的相册目录往往与他自己的整理习惯（或同步工具、
+    # 备份脚本）绑定。删除进回收站是可撤销的，移动在某些同步盘上
+    # 会触发"删除 + 重新上传"的连锁反应。
+    if not bool(st.cfg.get("auth.allow_move", True)):
+        raise AppError(E1015, "移动功能未在电脑端开启")
+
     body = await ctx.json()
     ids = body.get("ids")
     if not isinstance(ids, list) or not ids:
@@ -1172,6 +1183,12 @@ async def rename_item(ctx: Ctx) -> Reply:
     """
     st = _st(ctx)
     db = st.db
+
+    # ★ 与 `move_items` 同一把开关。改名和移动都是"改变照片的名字/位置"，
+    # 分成两个键的话用户的心理模型对不上 —— 他只有一个
+    # "允许改动我的照片库 / 不允许"的开关。
+    if not bool(st.cfg.get("auth.allow_move", True)):
+        raise AppError(E1015, "改名功能未在电脑端开启")
 
     body = await ctx.json()
     mid = body.get("id")

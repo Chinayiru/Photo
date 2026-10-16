@@ -532,3 +532,49 @@ def test_audit_log_written_on_complete(tmp_path, library, db):
     text = cfg.audit_log_path.read_text(encoding="utf-8")
     assert "upload" in text
     assert "\t" in text          # TAB 分隔，便于 awk
+
+
+def test_chunk_size_switches_by_transport(tmp_path: Path) -> None:
+    """★ AC-6.8：分片大小必须随通路切换。
+
+    `chunk_mb_wan` 此前是死配置 —— 声明了、写进了验收标准，但代码里
+    零读取。二期接上隧道后分片会静静地仍是 8 MB，而云隧道下 RTT 高，
+    丢一片要重传 8 MB 而不是 2 MB。这条用例把"二期会忘"变成"改不动"。
+    """
+    from backend.app.uploads import _chunk_size
+
+    def _cfg(transport: str) -> Config:
+        data = tmp_path / f"d_{transport}"
+        data.mkdir(exist_ok=True)
+        lib = tmp_path / f"lib_{transport}"
+        lib.mkdir(exist_ok=True)
+        return Config({
+            "app": {"mode": "readwrite"},
+            "server": {"transport": transport},
+            "roots": [{"id": "library", "path": str(lib), "mode": "readwrite"}],
+        }, path=data / "config.json", data_dir=data)
+
+    assert _chunk_size(_cfg("local_http")) == 8 * 1024 * 1024
+    # 二期通路（名字先定成 relay，见 config.py 的注释）
+    assert _chunk_size(_cfg("relay")) == 2 * 1024 * 1024, \
+        "非局域网通路必须用 WAN 档分片"
+
+
+def test_chunk_size_floor_is_respected(tmp_path: Path) -> None:
+    """用户把分片设成 0（或负数）时不能算出 0 —— 那会让上传死循环。
+
+    分片大小 0 的实现会让 `offset += len(chunk)` 永不前进，
+    表现是"上传卡在 0%"，而且没有任何错误。
+    """
+    from backend.app.uploads import _chunk_size
+
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    lib = tmp_path / "lib"
+    lib.mkdir(exist_ok=True)
+    cfg = Config({
+        "app": {"mode": "readwrite"},
+        "roots": [{"id": "library", "path": str(lib), "mode": "readwrite"}],
+        "upload": {"chunk_mb_lan": 0},
+    }, path=data / "config.json", data_dir=data)
+    assert _chunk_size(cfg) == 256 * 1024

@@ -19,6 +19,15 @@ const code = ref("");
 const pasteText = ref("");
 const busy = ref(false);
 const error = ref("");
+/**
+ * 二维码里带的电脑 `device_id`（AC-5.2）。空串 = 手动输入，无从校验。
+ *
+ * 它防的是"静态二维码 + 动态 IP"的错配：二维码是截图/打印出来的，
+ * 而局域网 IP 由 DHCP 分配。隔几天再扫，同一个 IP 可能已经属于另一台
+ * 也跑着 PhotoBridge 的电脑 —— 不校验的话手机会绑到别人的电脑上，
+ * 还会把对方的照片显示出来。
+ */
+const expectedDid = ref("");
 
 const base = computed(() => buildBase(host.value, port.value));
 const canSubmit = computed(() =>
@@ -34,6 +43,7 @@ onMounted(() => {
       port.value = u.port || "8787";
     }
     code.value = p.code;
+    expectedDid.value = p.did;
     void submit();
   }
 });
@@ -69,7 +79,7 @@ async function submit(): Promise<void> {
   }
   busy.value = true;
   try {
-    const r = await pair(base.value, code.value);
+    const r = await pair(base.value, code.value, expectedDid.value);
     toastOk(`已连接到 ${r.device_name}`);
   } catch (e) {
     error.value = e instanceof ApiError
@@ -93,6 +103,7 @@ async function submitPaste(): Promise<void> {
     port.value = u.port || "8787";
   }
   code.value = parsed.code;
+  expectedDid.value = parsed.did;
   await submit();
 }
 

@@ -60,14 +60,16 @@ def _img(path: Path, size=(80, 60), color=(200, 100, 50),
     return path
 
 
-def _state(tmp_path: Path, library: Path, *, mode: str = "readwrite") -> AppState:
+def _state(tmp_path: Path, library: Path, *, mode: str = "readwrite",
+           allow_move: bool = True) -> AppState:
     data = tmp_path / "data"
     data.mkdir(exist_ok=True)
     cfg = Config({
         "app": {"mode": mode},
         "roots": [{"id": "library", "path": str(library), "mode": mode}],
         "thumbs": {"sizes": [320, 1600]},
-        "auth": {"allow_delete": True, "delete_to_recycle_bin": True},
+        "auth": {"allow_delete": True, "delete_to_recycle_bin": True,
+                 "allow_move": allow_move},
         "index": {"batch_size": 50},
     }, path=data / "config.json", data_dir=data)
     db = Database(cfg.db_path)
@@ -922,3 +924,67 @@ def test_move_and_rename_do_not_leak_absolute_path(tmp_path, library) -> None:
     text = r.body if isinstance(r.body, bytes) else asyncio.run(_drain(r.body))
     assert str(library).encode() not in text
     assert b"C:\\\\" not in text and b"E:\\\\" not in text
+
+
+# --------------------------------------------------------------------------
+# auth.allow_move —— 第 4 个死配置的回归
+# --------------------------------------------------------------------------
+
+def test_move_disabled_by_config(tmp_path: Path) -> None:
+    """★ `auth.allow_move = false` 必须真的挡住移动。
+
+    这个键此前只在 `config.py` 里声明、代码路径零读取 —— 用户关掉它
+    之后一切照旧，界面上没有任何区别，只能以为自己设错了。
+    """
+    library = tmp_path / "lib"
+    (library / "2024").mkdir(parents=True)
+    st = _state(tmp_path, library, allow_move=False)
+    ids = _seed(st, library)
+    mid = ids["a.jpg"]
+    before = _rel(st, mid)
+
+    r = _call(st, "POST", "/api/items/move",
+              body=_body(ids=[mid], target_dir="", on_conflict="rename"))
+    assert r.status == 403, "allow_move=false 时移动仍然成功"
+    assert _json(r)["error"]["code"] == "E1015"
+    assert _rel(st, mid) == before, "被拒绝的请求竟然改了库"
+
+
+def test_rename_disabled_by_config(tmp_path: Path) -> None:
+    """改名同样受 `auth.allow_move` 管 —— 两个动作都是"改变照片的位置/名字"。
+
+    分成两个键会让"我明明关了"变成需要读文档才知道的细节，
+    而用户的心理模型只有"允许改动我的照片库 / 不允许"。
+    """
+    library = tmp_path / "lib"
+    (library / "2024").mkdir(parents=True)
+    st = _state(tmp_path, library, allow_move=False)
+    ids = _seed(st, library)
+    mid = ids["a.jpg"]
+    before = _rel(st, mid)
+
+    r = _call(st, "POST", "/api/items/rename",
+              body=_body(id=mid, new_name="zzz.jpg"))
+    assert r.status == 403, "allow_move=false 时改名仍然成功"
+    assert _json(r)["error"]["code"] == "E1015"
+    assert _rel(st, mid) == before
+
+
+def test_move_allowed_by_default(tmp_path: Path) -> None:
+    """默认（配置里不写这个键）必须是允许 —— 与 `config.py` 的默认一致。
+
+    ★ 这条用例防的是"加了开关之后默认值接反"：`allow_delete` 是安全默认
+    False（删照片不可逆地改变用户数据），而移动是可撤销的日常操作，
+    默认 True。两者接反的话所有用户都会突然不能移动照片。
+    """
+    library = tmp_path / "lib"
+    (library / "2024").mkdir(parents=True)
+    st = _state(tmp_path, library)
+    # 把键删掉，模拟"用户配置文件里根本没这一项"（老库升级上来就是这样）
+    st.cfg.raw["auth"].pop("allow_move", None)
+    ids = _seed(st, library)
+    mid = ids["a.jpg"]
+
+    r = _call(st, "POST", "/api/items/move",
+              body=_body(ids=[mid], target_dir="2024", on_conflict="rename"))
+    assert r.status == 200, f"默认应当允许移动，却返回 {r.status}"

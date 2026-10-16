@@ -29,6 +29,7 @@ import logging
 import threading
 import time
 from typing import Any
+from urllib.parse import quote
 
 from .config import Config, local_ipv4_addresses
 
@@ -102,13 +103,23 @@ def build_icon_image(size: int = _ICON_SIZE) -> Any:
     return img
 
 
-def pair_qr_url(base_url: str, code: str) -> str:
+def pair_qr_url(base_url: str, code: str, device_id: str | None = None) -> str:
     """手机扫码后要打开的地址。
 
     `?code=` 是前端 `PairView.vue` 认的参数（`pairParamsFromLocation()`），
     扫码后配对码会自动填进输入框，用户只需点"配对"。
+
+    ★ `&did=` 带电脑的 `device_id`（AC-5.2）。它防的是一种很隐蔽的
+    错配：二维码是**静态**的（用户可能截图存着、或者打印出来贴在
+    机箱上），而局域网 IP 是 DHCP 分的。隔几天再扫，同一个 IP 可能
+    已经分给了另一台也跑着 PhotoBridge 的电脑 —— 于是"扫码配对"
+    会把用户的手机绑到别人的电脑上，还会把对方的照片显示出来。
+    带上 device_id 后前端就能发现"这个码不属于这台电脑"。
     """
-    return f"{base_url.rstrip('/')}/?code={code}"
+    url = f"{base_url.rstrip('/')}/?code={quote(code, safe='')}"
+    if device_id:
+        url += f"&did={quote(device_id, safe='')}"
+    return url
 
 
 # --------------------------------------------------------------------------
@@ -320,7 +331,7 @@ class TrayController:
         lan = self._lan_urls()
         base = lan[0] if lan else (f"http://127.0.0.1:{self._port()}")
         log.info("托盘生成配对码，%d 秒内有效", int(PAIR_CODE_TTL))
-        return code, pair_qr_url(base, code), ips
+        return code, pair_qr_url(base, code, st.device_id), ips
 
     def _port(self) -> int:
         return int(self.cfg.server.get("port", 8787))

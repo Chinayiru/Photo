@@ -408,10 +408,26 @@ def _chunk_size(cfg: Config) -> int:
     """服务端权威分片大小。
 
     局域网与远程不同：云隧道下 RTT 高，8 MB 分片丢一片要重传 8 MB，
-    2 MB 分片只重传 2 MB。一期只有局域网，但接口已经把它参数化，
-    二期接隧道时只改这一处。
+    2 MB 分片只重传 2 MB。
+
+    ★ `chunk_mb_wan` 此前是**死配置**：`config.py` 声明了它、
+    AC-6.8 也把它写进了验收标准，但代码里零读取 —— 二期接上隧道后
+    分片大小会静静地仍是 8 MB，而验收测试抓包才会发现。
+    这里按 `server.transport` 选：非局域网通路一律用 WAN 档。
+    一期只有 `local_http`，所以永远走 LAN 分支；这个分支存在的意义
+    是让二期不要忘记改这里。
+
+    为什么按 transport 而不是按"客户端声称的网络类型"：客户端不可信，
+    而且它自己往往也判断不出来（手机连着的 Wi-Fi 背后可能是 4G 中继）。
+    服务端知道自己在用哪条通路。
     """
-    mb = cfg.upload.get("chunk_mb_lan", 8)
+    transport = str(cfg.get("server.transport", "local_http") or "local_http")
+    key = "chunk_mb_lan" if transport == "local_http" else "chunk_mb_wan"
+    mb = cfg.upload.get(key)
+    if mb is None:
+        # 配置里只写了另一个档位（用户手改过配置文件）→ 用它，
+        # 总比退回硬编码的 8 更贴近用户意图。
+        mb = cfg.upload.get("chunk_mb_lan", 8)
     try:
         mb = int(mb)
     except (TypeError, ValueError):

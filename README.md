@@ -73,7 +73,7 @@
 
 ## 当前状态
 
-**一期已完成**（836 条自动化测试 + 真实库端到端冒烟 35 项全绿）：
+**一期已完成**（849 条自动化测试 + 真实库端到端冒烟 35 项全绿）：
 
 | 模块 | 状态 | 关键实测数据 |
 |---|---|---|
@@ -87,7 +87,7 @@
 | 归档（年/年-月布局 + 绝不覆盖） | ✅ | 12 线程同秒并发无丢失 |
 | 配对鉴权 + 设备撤销 + 审计日志 | ✅ | 48 条用例含并发抢码 |
 | 局域网 HTTP 服务 + 静态托管 | ✅ | 真起 uvicorn 的端到端 19 条 |
-| 手机端网页（Vue 3 + Vite + TS） | ✅ | dist 153 KB JS + 26 KB CSS（gzip 58 + 6 KB）；真实 Chrome E2E 12 节 46 断言全过 |
+| 手机端网页（Vue 3 + Vite + TS） | ✅ | dist 153 KB JS + 26 KB CSS（gzip 58 + 6 KB）；真实 Chrome E2E 13 节 53 断言全过 |
 | 打包 exe + 系统托盘 + 开机自启 | ✅ | onedir 75 MB；真产物上验证端口占用提示与数据目录位置 |
 | 实时推送（watchdog → `media_changed` → 时间线自动刷新） | ✅ | SSE 9 种事件；真实 Chrome 验证帧真的过了网络 |
 | 二期：云端中继 / 视频 / E2E | ⬜ 未开始 | 接口已留（`shared/protocol.py`） |
@@ -260,7 +260,7 @@ python -m backend.app.main --version
 ```bash
 .venv/Scripts/python.exe -m pip install -r requirements-dev.txt
 
-# 单元 + 集成测试（约 57 秒，836 条）
+# 单元 + 集成测试（约 57 秒，849 条）
 .venv/Scripts/python.exe -m pytest backend/tests/
 
 # 路径沙箱专项（56 条）
