@@ -12,15 +12,17 @@ import { computed, onActivated, onMounted } from "vue";
 import { confirmDialog, setConfirmBusy } from "../stores/confirm";
 import { ApiError } from "../api/client";
 import { getClientName, getDeviceId, getToken } from "../api/storage";
-import { authStore, currentBase, unpair } from "../stores/auth";
+import { authStore, currentBase, isPaired, unpair } from "../stores/auth";
 import {
   diskFree,
   diskTotal,
   fmtBytes,
   fmtUptime,
   indexText,
+  isScanning,
   pendingThumbs,
   photoCount,
+  progressText,
   refresh,
   rescan,
   systemStore,
@@ -62,7 +64,30 @@ const thumbCache = computed(() => {
 });
 
 const version = computed(() => app.value?.version || authStore.state.version || "—");
-const scanning = computed(() => s.scanning || info.value?.index.state === "scanning");
+
+/**
+ * 是否在扫描。
+ *
+ * ★ 优先用 SSE 推来的 `isScanning`（AC-2.16），它比
+ * `GET /api/system/info` 的快照新 —— 快照只在切到本页时拉一次，
+ * 用户点完「重新扫描」如果一直停在这一页，快照就永远停在
+ * `idle`，按钮不会变灰、也没有进度。
+ */
+const scanning = computed(
+  () => isScanning.value || info.value?.index.state === "scanning",
+);
+
+/** SSE 推来的实时进度（AC-2.16）。空串表示没有进度可显示。 */
+const liveProgress = computed(() => progressText.value);
+
+/**
+ * SSE 长连接是否活着。
+ *
+ * ★ 为什么要给用户看：断掉时界面**不会报错**，只是安静地不再更新 ——
+ * 用户以为"电脑上没新照片"，实际是推送断了。必须有个明确的信号。
+ * 未配对时（配对页）不显示，那是正常的"没连"。
+ */
+const liveOff = computed(() => isPaired() && !s.live);
 
 onMounted(() => {
   if (!s.lastLoadedAt) void refresh();
@@ -149,6 +174,26 @@ const pairing = computed(() => {
         </span>
       </div>
 
+      <!-- AC-2.16：扫描进度实时推送。快照里的 scanned 只在进页面时拉一次，
+           扫描中一直停在本页就永远是 0，所以这里显示 SSE 推来的值。 -->
+      <div v-if="liveProgress" class="scanbar">
+        <div class="scanbar-txt">{{ liveProgress }}</div>
+        <div
+          v-if="s.progress && s.progress.total"
+          class="scanbar-rail"
+          role="progressbar"
+          :aria-valuenow="s.progress.percent"
+          aria-valuemin="0"
+          aria-valuemax="100"
+        >
+          <div class="scanbar-in" :style="{ width: `${s.progress.percent}%` }" />
+        </div>
+      </div>
+
+      <!-- 扫描失败要说出来（移动硬盘没插 / 盘符变了）。
+           只让进度条消失的话，用户看到的是"点了没反应"，无从判断。 -->
+      <div v-if="s.scanError" class="err">{{ s.scanError }}</div>
+
       <div v-if="s.error" class="err">{{ s.error }}</div>
 
       <dl class="kv">
@@ -176,6 +221,12 @@ const pairing = computed(() => {
         <div class="r">
           <dt>索引</dt>
           <dd>{{ indexText }}</dd>
+        </div>
+        <div class="r">
+          <dt>实时推送</dt>
+          <dd :class="liveOff ? 'bad' : 'dim'">
+            {{ liveOff ? "已断开（下拉刷新可手动更新）" : "已连接" }}
+          </dd>
         </div>
         <div v-if="app" class="r">
           <dt>已运行</dt>
@@ -415,6 +466,32 @@ const pairing = computed(() => {
 
 .diskbar-in.warn { background: var(--warn); }
 .diskbar-in.bad { background: var(--bad); }
+
+/* AC-2.16 扫描进度 */
+.scanbar {
+  margin-top: 10px;
+}
+
+.scanbar-txt {
+  font-size: 12px;
+  color: var(--fg-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.scanbar-rail {
+  margin-top: 6px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--bg-3);
+  overflow: hidden;
+}
+
+.scanbar-in {
+  height: 100%;
+  background: var(--accent);
+  /* 进度条每批（500 个文件）跳一次，硬切会显得一顿一顿 */
+  transition: width 0.25s ease-out;
+}
 
 .sec {
   font-size: 13px;

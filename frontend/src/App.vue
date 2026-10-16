@@ -20,7 +20,9 @@ import UploadView from "./views/UploadView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import ViewerView from "./views/ViewerView.vue";
 import { onAuthLost } from "./api/client";
+import { closeEvents, connectEvents, reconnectEvents } from "./api/events";
 import { authStore, isPaired, probe } from "./stores/auth";
+import { startEvents, stopEvents } from "./stores/system";
 import { requeueInterrupted, uploadStore } from "./stores/upload";
 
 type Tab = "timeline" | "search" | "upload" | "settings";
@@ -62,7 +64,20 @@ function switchTab(k: Tab): void {
 watch(
   () => [authStore.state.conn, authStore.state.deviceMismatch] as const,
   () => {
-    paired.value = isPaired() && !authStore.state.deviceMismatch;
+    const next = isPaired() && !authStore.state.deviceMismatch;
+    const justPaired = next && !paired.value;
+    paired.value = next;
+
+    // ★ 重新配对后必须建流。onMounted 里那次连接是在"还没配对"时
+    //   调用的（直接返回），此后没有任何地方会再连 —— 用户配对成功了
+    //   却永远收不到推送，界面上也看不出区别，只会觉得"新照片不出现"。
+    if (justPaired) {
+      startEvents();
+      connectEvents();
+    } else if (!next) {
+      stopEvents();
+      closeEvents();
+    }
   },
 );
 
@@ -73,23 +88,36 @@ onMounted(() => {
   onAuthLost(() => {
     paired.value = false;
     authStore.state.conn = "UNAUTHORIZED";
+    // ★ 鉴权都没了就别再维持 SSE 长连接：服务端会一直重试推送、
+    //   浏览器会一直重连，而用户看到的是配对页，白耗电。
+    stopEvents();
+    closeEvents();
   });
 
+  // SSE 事件流（AC-2.15 新照片自动出现 / AC-2.16 扫描进度推送）。
+  // startEvents() 是幂等的，且在没有配对时 connectEvents() 会直接返回。
+  startEvents();
   if (isPaired()) {
     void probe();
     requeueInterrupted();
+    connectEvents();
   }
 
   // 切回前台探活一次：手机锁屏/切 App 回来，局域网 IP 可能已经变了
   onVisible = () => {
     if (document.visibilityState !== "visible") return;
     if (isPaired()) void probe();
+    // ★ 后台时浏览器会冻结 SSE（省电），切回来必须重连 —— 否则
+    //   用户切出去再回来，界面就再也不更新了，且没有任何提示。
+    if (isPaired()) reconnectEvents();
   };
   document.addEventListener("visibilitychange", onVisible);
 });
 
 onBeforeUnmount(() => {
   if (onVisible) document.removeEventListener("visibilitychange", onVisible);
+  stopEvents();
+  closeEvents();
 });
 </script>
 

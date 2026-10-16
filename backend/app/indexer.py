@@ -250,6 +250,7 @@ class Indexer:
         thumbs: "ThumbEngine | None" = None,
         batch_size: int = BATCH_SIZE,
         bus: EventBus | None = None,
+        total_provider: "Callable[[], int] | None" = None,
     ) -> None:
         self.cfg = cfg
         self.db = db
@@ -258,6 +259,12 @@ class Indexer:
         # 这样索引器在测试与脚本里可以完全脱离事件系统运行。
         self.bus = bus
         self.batch_size = max(1, batch_size)
+        #: 取"库里当前照片总数"的可注入钩子。
+        #:
+        #: 为什么要可注入：进度事件里的 `total` 决定百分比的分母，
+        #: 而"取总数失败时不能打断扫描"这条只有把取数过程换掉才能测到
+        #: （`Database` 用了 `__slots__`，没法直接猴补 `scalar`）。
+        self._total_provider = total_provider
         self._cancel = asyncio.Event()
         self._running = False
         self.last_stats: dict[str, ScanStats] = {}
@@ -284,6 +291,10 @@ class Indexer:
         """扫描单个根。返回统计。
 
         流程：遍历 → 逐文件 stat/EXIF → 批量 upsert → 标记 missing → 缩略图入队。
+
+        ★ 本函数在**任何**退出路径上都必须发 `scan_done`（用 `finally`）。
+        前端只靠 `scan_done` 把"扫描中"清掉；漏发一次，设置页就永远
+        停在扫描中，而用户没有任何办法自救 —— 只能刷新页面。
         """
         # 每轮扫描都从干净状态开始。上一轮的 cancel 若不清掉，之后的扫描
         # 会立刻以"用户中止"结束，表现为"点重新扫描没反应"。
@@ -291,6 +302,18 @@ class Indexer:
         stats = ScanStats(root_id=root.id)
         self._running = True
         self._cancel.clear()
+        try:
+            return await self._scan_root_inner(root, stats)
+        finally:
+            stats.finished_at = time.time()
+            self._running = False
+            self.last_stats[root.id] = stats
+            self._emit({"type": "scan_done", "root": root.id,
+                        "stats": stats.as_dict()})
+            log.info("scan finished %s", stats.summary())
+
+    async def _scan_root_inner(self, root: RootConfig, stats: ScanStats) -> ScanStats:
+        """`scan_root` 的主体。事件发射（`scan_done`）由调用方的 `finally` 负责。"""
         # 根目录本身不可读时提前退出并明确报错。
         # 不这样做的话，scandir 失败会被计入 errors 后继续跑完空栈，
         # 最终 aborted 仍是 None —— 用户看到"扫描完成，错误 1"却不知道
@@ -299,24 +322,34 @@ class Indexer:
             stats.errors += 1
             stats.aborted = f"根目录不可访问：{root.id}"
             log.error("root not accessible root=%s path=%s", root.id, root.path)
+            # ★ 这里**不发** `scan_start`。
+            #
+            # 一开始我在这里补了一条 `scan_start`（带 aborted），理由是
+            # "提前返回也要让前端知道"。但牙齿验证证明它是多余的：
+            # 调用方的 `finally` 紧接着就发 `scan_done`，而它的
+            # `stats.aborted` 里带着同一个原因。多推一条反而让设置页
+            # 先闪一下"扫描中"再消失，看起来像卡了一下。
+            # 前端据 `scan_done.stats.aborted` 显示失败原因（见 system.ts）。
             return stats
 
         log.info("scan started root=%s path=%s", root.id, root.path)
         self._emit({"type": "scan_start", "root": root.id, "ts": time.time()})
         try:
-            await self._index_files(root, _walk(root, stats), stats)
+            await self._index_files(root, _walk(root, stats), stats, progress=True)
             if not self._cancel.is_set():
                 stats.missing = self._mark_missing(root.id, stats.seen_rels)
+            # ★ 收尾必推一条最终进度。
+            #
+            # 按"每 batch_size 个推进度"的话，**比 batch_size 小的库
+            # 一条进度都发不出来**（3 张照片 / batch_size=500 → 3 < 500）。
+            # 用户点"重新扫描"，界面上除了转圈什么都没有 —— 而这一轮
+            # 恰恰是秒完的，本来最该给个明确的"扫完了"反馈。
+            # 它同时保证百分比能真的走到 100%。
+            self._emit_progress(root, stats)
         except Exception as e:  # noqa: BLE001 —— 扫描失败不能让整个服务倒下
             stats.errors += 1
             stats.aborted = str(e)
             log.exception("scan failed root=%s", root.id)
-        finally:
-            stats.finished_at = time.time()
-            self._running = False
-            self.last_stats[root.id] = stats
-            self._emit({"type": "scan_done", "root": root.id, "stats": stats.as_dict()})
-            log.info("scan finished %s", stats.summary())
         return stats
 
     # --- 索引入口（全量扫描与增量监听的共同实现）---------------------------
@@ -328,6 +361,7 @@ class Indexer:
         stats: ScanStats,
         *,
         known: dict[str, dict] | None = None,
+        progress: bool = False,
     ) -> None:
         """把一批 (相对路径, stat) 同步进 media 表。
 
@@ -340,6 +374,11 @@ class Indexer:
         调用方负责：`seen_rels` 的累积（增量时是全库已知集合）、
         `_mark_missing`、以及异常兜底。
 
+        `progress=True` 时才推 `scan_progress`（**只有全量扫描传它**）。
+        增量监听（watchdog）不推：它没有配对的 `scan_start`/`scan_done`，
+        推一条进度会让前端永远停在"扫描中"—— 因为 `scan_done` 是唯一
+        把 `progress` 清空的事件。增量有新照片时走 `media_changed`。
+
         ⚠️ 本函数**自己会过一遍 `should_index`**。全量扫描的 `_walk`
         已经过滤过一次，这里是重复的 —— 但重复是必要的：watchdog
         增量路径直接调用本函数，它拿到的是"watchdog 报上来的路径"，
@@ -350,6 +389,8 @@ class Indexer:
         if known is None:
             known = self._load_known(root.id)
         batch: list[tuple] = []
+        # 上次推进度时的 `seen`。见下方"为什么按 seen 而不是按 batch"。
+        last_emit = 0
 
         for rel, st in files:
             if self._cancel.is_set():
@@ -376,20 +417,28 @@ class Indexer:
                 if prev["thumb_state"] == "pending" and self.thumbs is not None:
                     if self.thumbs.enqueue(prev["id"]):
                         stats.thumb_queued += 1
-                continue
-
-            row = await self._build_row(root, rel, st, prev)
-            batch.append(row)
-            if prev is None:
-                stats.added += 1
             else:
-                stats.updated += 1
+                row = await self._build_row(root, rel, st, prev)
+                batch.append(row)
+                if prev is None:
+                    stats.added += 1
+                else:
+                    stats.updated += 1
 
             if len(batch) >= self.batch_size:
                 ids = self._flush(batch)
                 batch.clear()
                 if self.thumbs is not None:
                     stats.thumb_queued += self.thumbs.enqueue_many(ids)
+
+            # ★ 按 `seen` 推进度，**不按 batch**。
+            #   按 batch 的话，库里绝大多数文件都没变时（第 2 次扫描、
+            #   或用户只加了 3 张照片到 4915 张的库里）一个字节都不需要
+            #   写 → batch 永远不满 → **整轮扫描一条进度都发不出来**。
+            #   用户点了"重新扫描"，界面上只有"扫描中"在转，进度数字
+            #   纹丝不动，看起来就是卡死了。
+            if progress and stats.seen - last_emit >= self.batch_size:
+                last_emit = stats.seen
                 self._emit_progress(root, stats)
                 # 让出事件循环，否则大批量扫描会卡住 API 响应
                 await asyncio.sleep(0)
@@ -400,6 +449,16 @@ class Indexer:
                 stats.thumb_queued += self.thumbs.enqueue_many(ids)
 
     # --- 事件 -------------------------------------------------------------
+
+    def _count_photos(self) -> int:
+        """库里当前有效的照片数（`missing = 0`）。
+
+        ★ 必须排除 missing：数上丢失的行，百分比会在最后一段
+        永远到不了 100 —— 用户盯着一个停在 87% 的进度条等下去。
+        """
+        return int(self.db.scalar(
+            "SELECT COUNT(*) FROM media WHERE missing = 0 AND kind = 'image'",
+            default=0) or 0)
 
     def _emit(self, event: dict) -> None:
         """发布一条事件。**永不抛异常**。
@@ -420,7 +479,20 @@ class Indexer:
         为什么按批而不是按文件：4915 个文件会推 4915 条事件，
         手机端每秒渲染几十次进度条反而更卡；按批（500 个）推
         约 10 条，用户看到的进度仍然是连续变化的。
+
+        ★ `total` 是**必需**的：只有 `seen` 时前端只能显示
+        "已扫描 1500"，用户看不出还要等多久（20 秒的等待没有任何
+        参照物）。这里查一次库拿当前总数 —— 一次 `COUNT(*)` 走
+        `idx_media_missing`，相对每批 500 次写入可忽略。
         """
+        total = 0
+        try:
+            total = int(self._total_provider() if self._total_provider
+                        else self._count_photos())
+        except Exception:       # noqa: BLE001 —— 查不到总数不该打断扫描
+            log.debug("取总数失败", exc_info=True)
+            total = 0
+
         self._emit({
             "type": "scan_progress",
             "root": root.id,
@@ -429,7 +501,12 @@ class Indexer:
             "updated": stats.updated,
             "unchanged": stats.unchanged,
             "missing": stats.missing,
+            # ★ 前端读的是 `removed`（与 `index_info()` 的字段名一致），
+            # 这里必须同时给，否则设置页的"移除 N"永远不显示。
+            "removed": stats.missing,
+            "errors": stats.errors,
             "thumb_queued": stats.thumb_queued,
+            "total": total,
             "elapsed": stats.elapsed,
         })
 

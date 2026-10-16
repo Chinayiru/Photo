@@ -706,3 +706,292 @@ def test_stats_dict_and_summary(tmp_path: Path, db: Database) -> None:
     assert d["root_id"] == "library" and d["added"] == 1
     assert "新增 1" in stats.summary()
     assert stats.elapsed >= 0
+
+
+
+# --------------------------------------------------------------------------
+# 进度事件（AC-2.16）
+# --------------------------------------------------------------------------
+
+def _drain(sub) -> list[dict]:
+    """把订阅者队列里现有的事件取干净。不阻塞。"""
+    out: list[dict] = []
+    while True:
+        try:
+            out.append(sub.queue.get_nowait())
+        except Exception:       # noqa: BLE001 —— asyncio.QueueEmpty
+            return out
+
+
+def test_progress_event_has_total_and_errors(tmp_path: Path, db: Database) -> None:
+    """`scan_progress` 必须带 `total`，否则前端只能干说"已扫描 N"。
+
+    ★ 这条曾经是**真的缺**：事件里只有 `seen`，用户看到一个不断
+    增加的绝对数字，完全无法判断"还要等多久" —— 20 秒的等待没有
+    任何参照物，只会让人以为卡住了。
+    """
+    from app.events import EventBus
+
+    lib = tmp_path / "lib"
+    for i in range(5):
+        _img(lib / f"{i}.jpg")
+
+    bus = EventBus()
+    sub = bus.subscribe()
+    cfg = _cfg(tmp_path, lib)      # batch_size=50
+    idx = Indexer(cfg, db, bus=bus, batch_size=2)
+    asyncio.run(idx.scan_root(cfg.root_by_id("library")))
+
+    events = [e for e in _drain(sub) if e["type"] == "scan_progress"]
+    assert events, "batch_size=2 扫 5 张图必须至少推一次进度"
+    for e in events:
+        assert "total" in e, "缺 total 前端就画不出百分比"
+        assert "errors" in e
+        # ★ 字段名必须是 `removed`（与 index_info() 一致），
+        #   只给 `missing` 的话设置页的"移除 N"永远不显示。
+        assert "removed" in e
+        assert e["removed"] == e["missing"]
+
+
+def test_progress_total_reflects_library_size(tmp_path: Path, db: Database) -> None:
+    """`total` 是**库里已有**的照片数，不是本轮待扫数。
+
+    所以先扫一轮把 5 张落库，第二轮扫描时 total 就应该 ≥ 5。
+    """
+    from app.events import EventBus
+
+    lib = tmp_path / "lib"
+    for i in range(5):
+        _img(lib / f"{i}.jpg")
+
+    cfg = _cfg(tmp_path, lib)
+    asyncio.run(Indexer(cfg, db).scan_root(cfg.root_by_id("library")))
+    assert db.scalar("SELECT COUNT(*) FROM media WHERE missing = 0") == 5
+
+    bus = EventBus()
+    sub = bus.subscribe()
+    idx = Indexer(cfg, db, bus=bus, batch_size=2)
+    asyncio.run(idx.scan_root(cfg.root_by_id("library")))
+
+    totals = [e["total"] for e in _drain(sub) if e["type"] == "scan_progress"]
+    assert totals, "第二轮也要推进度"
+    assert all(t >= 5 for t in totals), f"total 不该小于库里已有数 got {totals}"
+
+
+def test_progress_event_survives_count_failure(tmp_path: Path, db: Database) -> None:
+    """取总数失败**不能**打断扫描（进度是锦上添花）。
+
+    用可注入的 `total_provider` 模拟"库被锁死/查询本身写错了" ——
+    `Database` 用了 `__slots__`，没法直接猴补 `scalar`。
+    扫描必须照常完成、照片照常落库、事件照常推（total 退 0）。
+    """
+    from app.events import EventBus
+
+    lib = tmp_path / "lib"
+    for i in range(4):
+        _img(lib / f"{i}.jpg")
+
+    def boom() -> int:
+        raise RuntimeError("模拟取总数失败")
+
+    bus = EventBus()
+    sub = bus.subscribe()
+    cfg = _cfg(tmp_path, lib)
+    idx = Indexer(cfg, db, bus=bus, batch_size=2, total_provider=boom)
+    stats = asyncio.run(idx.scan_root(cfg.root_by_id("library")))
+
+    assert db.scalar("SELECT COUNT(*) FROM media") == 4
+    assert stats.aborted is None
+    progress = [e for e in _drain(sub) if e["type"] == "scan_progress"]
+    assert progress, "取总数失败仍要推事件"
+    assert all(e["total"] == 0 for e in progress)
+
+
+def test_progress_total_excludes_missing_rows(tmp_path: Path, db: Database) -> None:
+    """`_count_photos()` 只数 `missing = 0` 的行。
+
+    数上丢失的照片，百分比就会在最后一段永远到不了 100 ——
+    用户会盯着一个停在 87% 的进度条等一整天。
+    """
+    lib = tmp_path / "lib"
+    for i in range(4):
+        _img(lib / f"{i}.jpg")
+
+    cfg = _cfg(tmp_path, lib)
+    idx = Indexer(cfg, db)
+    asyncio.run(idx.scan_root(cfg.root_by_id("library")))
+    assert idx._count_photos() == 4
+
+    # 从磁盘上删掉 2 张并重扫 → 它们被标 missing，不该再算进 total
+    (lib / "0.jpg").unlink()
+    (lib / "1.jpg").unlink()
+    asyncio.run(idx.scan_root(cfg.root_by_id("library")))
+
+    assert db.scalar("SELECT COUNT(*) FROM media WHERE missing = 1") == 2
+    assert idx._count_photos() == 2
+
+
+def test_scan_done_event_carries_removed_count(tmp_path: Path, db: Database) -> None:
+    """`scan_done` 的 stats 里要有 `missing`，设置页才能说"移除 N"。"""
+    from app.events import EventBus
+
+    lib = tmp_path / "lib"
+    _img(lib / "a.jpg")
+    _img(lib / "b.jpg")
+
+    bus = EventBus()
+    sub = bus.subscribe()
+    cfg = _cfg(tmp_path, lib)
+    idx = Indexer(cfg, db, bus=bus)
+    asyncio.run(idx.scan_root(cfg.root_by_id("library")))
+
+    (lib / "a.jpg").unlink()
+    asyncio.run(idx.scan_root(cfg.root_by_id("library")))
+
+    done = [e for e in _drain(sub) if e["type"] == "scan_done"]
+    assert done
+    assert done[-1]["stats"]["missing"] == 1
+
+
+def test_incremental_index_does_not_emit_progress(tmp_path: Path, db: Database) -> None:
+    """增量监听**不能**推 `scan_progress`。
+
+    ★ 增量没有配对的 `scan_start`/`scan_done`，而前端只靠 `scan_done`
+    清空"扫描中"。推一条进度 → 手机设置页永远停在"扫描中"、
+    进度条永远不消失，而电脑上其实什么都没在跑。
+    增量有新照片时走的是 `media_changed`（另一条路径）。
+    """
+    from app.events import EventBus
+
+    lib = tmp_path / "lib"
+    _img(lib / "a.jpg")
+
+    bus = EventBus()
+    sub = bus.subscribe()
+    cfg = _cfg(tmp_path, lib)
+    idx = Indexer(cfg, db, bus=bus, batch_size=1)
+
+    # 直接调增量入口（不传 progress），与 watcher.py 的调用方式一致
+    stats = ScanStats(root_id="library")
+    rel = "a.jpg"
+    st = os.stat(lib / rel)
+    asyncio.run(idx._index_files(cfg.root_by_id("library"),
+                                 [(rel, st)], stats, progress=False))
+
+    types = [e["type"] for e in _drain(sub)]
+    assert "scan_progress" not in types, f"增量不该推进度 got {types}"
+
+
+def test_incremental_index_still_indexes(tmp_path: Path, db: Database) -> None:
+    """不推进度**不代表不做活**：增量仍必须把文件落库。"""
+    from app.events import EventBus
+
+    lib = tmp_path / "lib"
+    _img(lib / "a.jpg")
+
+    bus = EventBus()
+    cfg = _cfg(tmp_path, lib)
+    idx = Indexer(cfg, db, bus=bus, batch_size=1)
+
+    stats = ScanStats(root_id="library")
+    st = os.stat(lib / "a.jpg")
+    asyncio.run(idx._index_files(cfg.root_by_id("library"),
+                                 [("a.jpg", st)], stats, progress=False))
+
+    assert stats.added == 1
+    assert db.scalar("SELECT COUNT(*) FROM media WHERE missing = 0") == 1
+
+
+def test_progress_emitted_even_when_nothing_changes(tmp_path: Path, db: Database) -> None:
+    """库里全部没变时**也要**推进度。
+
+    ★ 这是按 `batch` 推进度时会踩的真问题：第二次扫描 4915 张照片
+    一个字节都不用写 → batch 永远不满 → **整轮一条进度都发不出来**。
+    用户点"重新扫描"只看到"扫描中"在转、进度数字纹丝不动，
+    看起来就是卡死了。
+    """
+    from app.events import EventBus
+
+    lib = tmp_path / "lib"
+    for i in range(6):
+        _img(lib / f"{i}.jpg")
+
+    cfg = _cfg(tmp_path, lib)
+    asyncio.run(Indexer(cfg, db).scan_root(cfg.root_by_id("library")))
+
+    bus = EventBus()
+    sub = bus.subscribe()
+    idx = Indexer(cfg, db, bus=bus, batch_size=2)
+    stats = asyncio.run(idx.scan_root(cfg.root_by_id("library")))
+
+    assert stats.unchanged == 6, "这一轮应当全是未变"
+    assert stats.added == 0 and stats.updated == 0
+    progress = [e for e in _drain(sub) if e["type"] == "scan_progress"]
+    assert progress, "全未变也要有进度，否则用户看到的是卡死"
+    assert progress[-1]["seen"] == 6
+
+
+def test_progress_emitted_for_library_smaller_than_batch(tmp_path: Path, db: Database) -> None:
+    """比 `batch_size` 还小的库**也必须**推到最终进度。
+
+    ★ 真缺陷：按"每满 batch_size 个推一次"的话，3 张照片配
+    `batch_size=500` 一条进度都发不出来。用户点"重新扫描"，
+    界面上除了转圈什么反馈都没有 —— 而这一轮恰恰是秒完的，
+    本来最该明确告诉用户"扫完了"。它同时保证百分比能走到 100%。
+    """
+    from app.events import EventBus
+
+    lib = tmp_path / "lib"
+    for i in range(3):
+        _img(lib / f"{i}.jpg")
+
+    bus = EventBus()
+    sub = bus.subscribe()
+    cfg = _cfg(tmp_path, lib)
+    idx = Indexer(cfg, db, bus=bus, batch_size=500)
+    stats = asyncio.run(idx.scan_root(cfg.root_by_id("library")))
+
+    progress = [e for e in _drain(sub) if e["type"] == "scan_progress"]
+    assert progress, "小库也要有进度，否则用户只看到转圈"
+    final = progress[-1]
+    assert final["seen"] == 3
+    assert final["added"] == 3
+    # 百分比要能真的到 100%：seen == total
+    assert final["total"] == 3
+
+
+def test_progress_emitted_when_scan_aborts_early(tmp_path: Path, db: Database) -> None:
+    """根目录不可访问时也要发 `scan_done`，且**失败原因必须随帧送到前端**。
+
+    ★ 两个层次，缺一都不够：
+
+    1. 必须发 `scan_done`。前端只靠它把"扫描中"清掉；漏发一次，
+       设置页就永远停在扫描中，用户只能刷新页面自救。
+    2. `scan_done.stats.aborted` 必须带着原因。只清状态不说原因的话，
+       用户看到进度条凭空消失、照片数没变 —— "移动硬盘没插"这种
+       最常见故障，界面上一点痕迹都没有。
+
+    只断言第 1 条（我第一版就是这么写的）**测不出第 2 条被破坏**：
+    把 `aborted` 从 stats 里去掉，事件照样发。
+    """
+    from app.events import EventBus
+
+    lib = tmp_path / "lib"
+    lib.mkdir(parents=True)
+    cfg = _cfg(tmp_path, lib)
+
+    bus = EventBus()
+    sub = bus.subscribe()
+    idx = Indexer(cfg, db, bus=bus)
+
+    # 把根目录删掉 → `scan_root` 走"根目录不可访问"提前返回分支
+    lib.rmdir()
+    stats = asyncio.run(idx.scan_root(cfg.root_by_id("library")))
+
+    assert stats.aborted is not None
+    events = _drain(sub)
+    done = [e for e in events if e["type"] == "scan_done"]
+    assert done, "提前返回也必须发 scan_done，否则前端卡在扫描中"
+    # 前端读的就是这个字段（`system.ts` 的 `scanError`）
+    assert done[-1]["stats"]["aborted"], "失败原因必须随 scan_done 送到前端"
+    assert "library" in done[-1]["stats"]["aborted"]

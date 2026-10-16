@@ -8,7 +8,7 @@
  *      以为"就这些照片"）
  *   ② 切回本 Tab 时如果上次加载失败，自动重试一次
  */
-import { computed, onActivated, onMounted, ref, watch } from "vue";
+import { computed, onActivated, onDeactivated, onMounted, ref, watch } from "vue";
 import PhotoGrid from "../components/PhotoGrid.vue";
 import {
   groups,
@@ -17,6 +17,7 @@ import {
   loadMore,
   timelineStore,
 } from "../stores/timeline";
+import { systemStore } from "../stores/system";
 import { open as openViewer } from "../stores/viewer";
 
 const grid = ref<InstanceType<typeof PhotoGrid> | null>(null);
@@ -64,6 +65,56 @@ watch(() => totalRef.value, () => {
   if (totalRef.value === 0 && timelineStore.state.items.length > 0) {
     void loadMore(true);
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * AC-2.15：新照片自动出现（不需要用户下拉刷新）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 防抖句柄。
+ *
+ * ★ 必须防抖：服务端 `media_changed` 是**每个根一条**，多根同时有
+ * 变化时会连发几条；每条都触发一次全量重载的话，用户会看到时间线
+ * 连闪几次、而且每次都把滚动位置冲掉。
+ */
+let liveTimer = 0;
+
+/** 挂起中的媒体变化。Tab 被缓存（KeepAlive）时不能立刻重载。 */
+let pendingLive = false;
+
+watch(() => systemStore.state.mediaChangedAt, (v, old) => {
+  if (!v || v === old) return;
+  // 用户正在看查看器大图时重载时间线，会把他脚下的列表整个换掉；
+  // 等他关掉查看器（onActivated）再刷新。
+  if (document.visibilityState !== "visible") {
+    pendingLive = true;
+    return;
+  }
+  window.clearTimeout(liveTimer);
+  liveTimer = window.setTimeout(() => {
+    const gridEl = document.querySelector<HTMLElement>(".grid-root.scroll");
+    // ★ 只在顶部附近才自动重载。用户翻了 200 张正在看老照片时，
+    //   把列表重置回第一页等于把他刚翻到的地方弄丢了 —— 那比
+    //   "没自动出现"更让人恼火。
+    if (gridEl && gridEl.scrollTop > 240) {
+      pendingLive = true;
+      return;
+    }
+    refresh();
+  }, 400);
+});
+
+onActivated(() => {
+  // Tab 是 KeepAlive 缓存的：切走期间来的变化在这里补一次
+  if (pendingLive) {
+    pendingLive = false;
+    refresh();
+  }
+});
+
+onDeactivated(() => {
+  window.clearTimeout(liveTimer);
 });
 </script>
 

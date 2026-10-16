@@ -39,6 +39,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -349,6 +350,38 @@ def main() -> int:
             window.addEventListener('unhandledrejection', e => {
               window.__errors.push('unhandled: ' + String(e.reason));
             });
+        """)
+        # ★ SSE 观测器：包一层 `EventSource` 记录**浏览器真的收到了什么**。
+        #
+        # 为什么不查前端 store：那等于用自己的实现验证自己的实现。
+        # 这里记录的是原生 SSE 事件对象，与应用代码无关 —— 服务端到底
+        # 有没有把 `scan_progress` / `media_changed` 推过网络，一目了然。
+        # 同时记下 URL，用来证明 token 没有拼进查询串（AC 的安全要求）。
+        br.send("Page.addScriptToEvaluateOnNewDocument", source="""
+            window.__sse = {urls: [], events: []};
+            (() => {
+              const Native = window.EventSource;
+              if (!Native) return;
+              function Wrapped(url, opts) {
+                window.__sse.urls.push(String(url));
+                const es = new Native(url, opts);
+                // 命名帧必须逐类型监听：服务端用的是 `event: <type>`。
+                for (const t of ['hello','ping','scan_start','scan_progress',
+                                 'scan_done','thumb_progress','upload_done',
+                                 'media_changed','index_changed']) {
+                  es.addEventListener(t, ev => {
+                    let data = null;
+                    try { data = JSON.parse(ev.data); } catch (e) { data = null; }
+                    window.__sse.events.push({type: t, data: data,
+                                              at: Date.now()});
+                  });
+                }
+                return es;
+              }
+              Wrapped.prototype = Native.prototype;
+              Object.assign(Wrapped, {CONNECTING: 0, OPEN: 1, CLOSED: 2});
+              window.EventSource = Wrapped;
+            })();
         """)
 
         # ---------------------------------------------------------------
@@ -747,6 +780,105 @@ def main() -> int:
 
         # 关掉信息面板，后面的步骤不依赖它
         close_info()
+
+        # ---------------------------------------------------------------
+        print("\n[4e] AC-2.15/2.16 SSE 事件流（真的收到了服务端的推送）")
+        # ---------------------------------------------------------------
+        # [1] 连接建立且 URL 里不含 token
+        ok = br.wait_for("window.__sse && window.__sse.urls.length > 0",
+                         budget=15, label="EventSource 被创建")
+        urls = br.evaluate("JSON.stringify(window.__sse ? window.__sse.urls : [])")
+        url_list = json.loads(urls) if urls else []
+        check(ok and url_list, f"前端真的建了 EventSource  got {url_list}")
+        check(any("/api/events" in u for u in url_list),
+              "连的是 /api/events", f"got {url_list}")
+        # ★ token 绝不能出现在 URL 里：它会落进浏览器缓存键、服务器
+        #   访问日志、以及任何 Referer。
+        check(not any("token" in u.lower() for u in url_list),
+              "★ URL 里没有 token（鉴权走 cookie）", f"got {url_list}")
+
+        # [2] 收到 hello（证明这条流真的通了，而不是挂在那儿没数据）
+        ok = br.wait_for("""
+          (window.__sse?.events || []).some(e => e.type === 'hello')
+        """, budget=20, label="hello 帧")
+        check(ok, "收到 hello 帧（服务端确认连接）")
+
+        # [3] ★ AC-2.16：触发一次真实重扫，浏览器必须收到 scan_progress。
+        #     这是本节的**核心断言** —— 后端一直在推，但前端从来没接过
+        #     （`grep EventSource frontend/src/` 曾经零命中），所以
+        #     "设置页只有一个静止的扫描中标签"正是这个缺口的表象。
+        before = br.evaluate(
+            "(window.__sse.events.filter(e => e.type === 'scan_progress')).length")
+        # 直接对本机服务发起重扫（模拟用户在设置页点按钮；这里用 HTTP
+        # 是为了不依赖按钮的可见性/滚动位置）
+        try:
+            rq = urllib.request.Request(
+                f"{base}/api/index/rescan", data=b"{}", method="POST",
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {tok}"})
+            with urllib.request.urlopen(rq, timeout=10) as r:
+                r.read()
+        except urllib.error.HTTPError as e:
+            # 3012 = 已有扫描在进行中，也算"触发了"
+            if e.code not in (202, 400):
+                raise
+
+        ok = br.wait_for("""
+          (window.__sse?.events || []).filter(
+            e => e.type === 'scan_progress').length > %d
+        """ % before, budget=40, label="scan_progress 帧")
+        check(ok, "★ AC-2.16 浏览器收到 scan_progress（实时进度）")
+
+        # [4] 进度帧里要有 total —— 没有它前端画不出百分比，
+        #     用户只能看着一个不断增加的绝对数字干等。
+        prog = br.evaluate("""
+          JSON.stringify((window.__sse.events.filter(
+            e => e.type === 'scan_progress').slice(-1)[0] || {}).data)
+        """)
+        pdata = json.loads(prog) if prog and prog != "null" else None
+        check(bool(pdata) and "total" in pdata,
+              f"进度帧带 total（能算百分比）  got {pdata}")
+
+        # [5] 要有 scan_done，否则前端永远停在"扫描中"
+        ok = br.wait_for("""
+          (window.__sse?.events || []).some(e => e.type === 'scan_done')
+        """, budget=40, label="scan_done 帧")
+        check(ok, "收到 scan_done（进度条会消失）")
+
+        # [6] ★ AC-2.15：在电脑上往库目录拷一张图，**不做任何手动操作**，
+        #     时间线必须自己长出新照片。
+        #     这里用 shutil.copy2 模拟"用户在资源管理器里粘贴"。
+        new_name = "自动出现的新图.jpg"
+        src = tmp / "inbox" / new_name
+        make_image(src, (250, 120, 20))
+        shutil.copy2(src, lib / new_name)
+        # 前端在"时间线不在顶部"时会**故意**不自动重载（免得把用户
+        # 正翻到的地方冲掉），所以这里先滚回顶部再等。
+        br.evaluate("""
+          (() => {
+            const g = document.querySelector('.grid-root.scroll');
+            if (g) g.scrollTop = 0;
+            return !!g;
+          })()
+        """)
+        # ★ 照片文件名**不在 `innerText` 里** —— `PhotoCell.vue` 只把它放在
+        #   `aria-label` 与 `<img alt>` 上（网格格子太小，不显示文件名）。
+        #   一开始用 `document.body.innerText` 判定，新图其实已经渲染出来
+        #   了断言仍然失败 —— 那是探针的错，不是功能的错。
+        ok = br.wait_for(
+            "document.body.innerHTML.includes(%r)" % new_name,
+            budget=45, label="时间线自动出现新图")
+        check(ok, f"★ AC-2.15 新照片自动出现在时间线（无需手动刷新）  {new_name}")
+
+        # [7] 上面这条能成立，前提是前端确实收到了 media_changed
+        mc = br.evaluate("""
+          JSON.stringify((window.__sse.events.filter(
+            e => e.type === 'media_changed').slice(-1)[0] || {}).data)
+        """)
+        check(mc and mc != "null", f"收到 media_changed 事件  got {mc}")
+
+        # 把新图删掉，后面的步骤（Tab 切换、未配对）不受影响
+        (lib / new_name).unlink()
 
         # ---------------------------------------------------------------
         print("\n[5] 切 Tab（KeepAlive 缓存 + 不报错）")
