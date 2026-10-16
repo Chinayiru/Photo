@@ -257,6 +257,9 @@ python -m backend.app.main --version
 # 真实库端到端冒烟（真起 uvicorn、真发请求、真扫 4915 张，35 项）
 .venv/Scripts/python.exe scripts/smoke_real.py
 
+# 局域网通路端到端（地址广告 → 配对 → 时间线 → 缩略图 → 优雅退出）
+.venv/Scripts/python.exe scripts/verify_lan_e2e.py
+
 # 打包产物验证（端口占用提示 + 数据目录位置）
 .venv/Scripts/python.exe scripts/verify_exe.py
 
@@ -268,6 +271,8 @@ cd frontend && npm run build
 
 | 脚本 | 用途 |
 |---|---|
+| `scripts/verify_lan_e2e.py` | 局域网通路端到端（手机要走的那条路，含优雅退出检查） |
+| `scripts/verify_exe.py` | 在**真实打包产物**上验证端口占用提示与数据目录位置 |
 | `scripts/repair_index.py` | 按**磁盘事实**修复 `missing` 标记（默认演练，`--apply` 才写库；写前自动备份） |
 | `scripts/clean_dev_artifacts.py` | 清掉开发期在真实数据里留下的测试设备/配对码/临时分片（**不动 media 表**） |
 | `scripts/check_docs.py` | 文档一致性（相对链接断链、未完成标记、需求编号覆盖） |
