@@ -119,7 +119,15 @@ def build_state(cfg: Config | None = None, *, db: Database | None = None) -> App
 
     workers = int(cfg.thumbs.get("workers", 4) or 4)
     thumbs = ThumbEngine(cfg, db, workers=workers, bus=bus)
-    indexer = Indexer(cfg, db, thumbs=thumbs, bus=bus)
+    # ★ `index.batch_size` 必须真的读出来。它与 `thumbs.workers` 是同一类
+    # 配置：声明在 config.py 的默认配置里，用户改了期望生效。此前
+    # `Indexer(cfg, db, thumbs=..., bus=...)` 没传 batch_size，于是
+    # 永远用构造函数默认值 500 —— 用户把 500 改成 50 想降低单次事务
+    # 体积（机械盘、网络盘上很合理），改了什么也不会发生。
+    # 用 `_int_cfg` 而不是裸 int()：配置文件是用户可手改的 JSON，
+    # 写错类型（"batch_size": "500"、null、负数）不能让服务起不来。
+    batch_size = _int_cfg(cfg.index.get("batch_size"), 500, minimum=1)
+    indexer = Indexer(cfg, db, thumbs=thumbs, batch_size=batch_size, bus=bus)
 
     # ★ 文件系统监听（AC-2.15：往库目录拷一张图，30 秒内手机可见）。
     # 在 build_state 里构造而不是在 serve() 里，是为了让测试与脚本
@@ -224,6 +232,27 @@ def _count_hint(cfg: Config) -> str:
         except OSError:
             pass
     return f"{total}+ 个条目" if total else "数千"
+
+
+def _int_cfg(raw: Any, default: int, *, minimum: int = 0) -> int:
+    """从配置里读一个整数，坏值一律退回 `default`。
+
+    配置文件是用户可手改的 JSON，也可能来自旧版本的 `config.json`
+    （字段类型在版本间变过）。直接 `int(cfg.get(...))` 会在这些情况下
+    抛 ValueError/TypeError —— 而调用点在 `build_state()` 里，异常会
+    让**服务根本起不来**：用户看到"双击没反应"，且完全不知道是自己
+    改坏了一个数字。
+
+    `bool` 要单独挡掉：`isinstance(True, int)` 为真，而 `"batch_size": true`
+    会被静默当成 1（每批 1 条，索引慢得离谱却不报错）。
+    """
+    if isinstance(raw, bool):
+        return default
+    try:
+        v = int(raw)            # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return v if v >= minimum else default
 
 
 def _purge_stale_uploads(cfg: Config, st: AppState) -> int:

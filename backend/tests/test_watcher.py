@@ -1307,3 +1307,80 @@ def test_watch_info_reports_running(tmp_path: Path, db: Database) -> None:
     assert info["enabled"] is True
     assert info["running"] is False        # 还没 start
     assert info["debounce_sec"] == watcher_mod.DEBOUNCE_SEC
+
+
+# ==========================================================================
+# 十一、配置项真的被读取（`index.batch_size`）
+# ==========================================================================
+
+def test_build_state_passes_batch_size_to_indexer() -> None:
+    """★ `index.batch_size` 必须真的传到 `Indexer`。
+
+    它与 `thumbs.workers` 是同一类配置：声明在 `config.py` 的默认配置里，
+    用户改了期望生效。此前 `Indexer(cfg, db, thumbs=..., bus=...)` 没传
+    `batch_size`，永远用构造函数默认值 500 —— 用户把 500 改成 50 想降低
+    单次事务体积（机械盘/网络盘上很合理），改了什么也不会发生。
+
+    这类"声明但无人读"的键在本项目已经出过两次（`server.transport`、
+    `index.watch`），所以用 AST 钉住接线，而不是靠读代码时留神。
+    """
+    import ast
+
+    tree = ast.parse(_server_src())
+    fn = next(n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name == "build_state")
+    src = ast.unparse(fn)
+    assert "batch_size=batch_size" in src, "build_state 没把 batch_size 传给 Indexer"
+    # ⚠️ `ast.unparse` 会把自己的引号风格写出来（这里是单引号），
+    #    所以不能断言 `'"batch_size"'` —— 直接把两种引号都去掉再比。
+    assert "batch_size" in src.replace('"', "'"), "build_state 没从配置里读 batch_size"
+    assert "_int_cfg(" in src, "坏配置没有兜底（用户改错一个数字就起不来）"
+
+
+def test_int_cfg_rejects_bad_values() -> None:
+    """坏配置退回默认值，绝不抛异常 —— 抛了就是服务起不来。"""
+    from app.server import _int_cfg
+
+    assert _int_cfg(50, 500, minimum=1) == 50
+    assert _int_cfg("50", 500, minimum=1) == 50
+    for bad in (None, "abc", -5, 0, [], {}, "", "3.5"):
+        assert _int_cfg(bad, 500, minimum=1) == 500, f"{bad!r} 没退回默认值"
+    # ★ bool 必须单独挡：`isinstance(True, int)` 为真，
+    #   `"batch_size": true` 会被静默当成 1（每批 1 条，慢得离谱却不报错）。
+    assert _int_cfg(True, 500, minimum=1) == 500
+    assert _int_cfg(False, 500, minimum=1) == 500
+
+
+def test_indexer_batch_size_from_config_takes_effect(tmp_path: Path) -> None:
+    """★ 端到端：配置里的 batch_size 真的传到了索引器实例上。
+
+    只验 AST 接线不够 —— `batch_size=batch_size` 也可能传的是一个
+    永远等于 500 的变量。这里真调 `build_state()` 再读回
+    `st.indexer.batch_size`，是"用户在 config.json 里改的数字真的生效"
+    这条链路的完整证据。
+    """
+    import json
+
+    from app.server import build_state
+
+    for raw, want in ((50, 50), ("77", 77), (None, 500), (True, 500)):
+        data_dir = tmp_path / f"d{abs(hash((raw, want))) % 10 ** 6}"
+        data_dir.mkdir()
+        data_dir.joinpath("config.json").write_text(json.dumps({
+            "roots": [{"id": "library", "path": str(tmp_path / "lib"),
+                       "mode": "readonly", "enabled": True}],
+            "index": {"batch_size": raw},
+        }), encoding="utf-8")
+        # ⚠️ 用 `Config(..., data_dir=...)` 而不是 `get_config()`：
+        #    全局单例会指向开发机上的真实照片库（那是本项目出过的事故）。
+        from app.config import Config
+
+        cfg = Config(json.loads(data_dir.joinpath("config.json")
+                                .read_text(encoding="utf-8")),
+                     path=data_dir / "config.json", data_dir=data_dir)
+        st = build_state(cfg)
+        try:
+            assert st.indexer.batch_size == want, (
+                f"index.batch_size={raw!r} → {st.indexer.batch_size}，期望 {want}")
+        finally:
+            st.db.close()
