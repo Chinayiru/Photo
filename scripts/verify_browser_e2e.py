@@ -2120,6 +2120,122 @@ def main() -> int:
         check(not parsed, f"无未捕获异常  got {parsed[:3]}")
 
         # ---------------------------------------------------------------
+        print("\n[4n] 跨网络（4G）访问：明确提示，不静默超时（F-06）")
+        # ---------------------------------------------------------------
+        # F-06 的字面判据是"手机关 Wi-Fi 用 4G 访问"，本机没插 4G 网卡，
+        # 造不出真的跨网络。但它真正防的失效只有一个：**手机连不上时，
+        # 用户看到的是一句人话，还是一直转圈到天荒地老**。这个可以精确复现
+        # ——把手机端的地址指向一个局域网里根本不存在的主机，网络层的行为
+        # （SYN 发出去没有回应）与"4G 下访问家里 NAS 的局域网地址"完全一致。
+        #
+        # 地址取 RFC 5737 的 TEST-NET-1（192.0.2.0/24）：标准规定它
+        # **不得**出现在真实网络上，所以它永远不可达，也不会误连到
+        # 用户网络里某台真机器上。
+        br.evaluate("window.localStorage.clear()")
+        br.goto(base + "/")
+        ok = br.wait_for("!!document.querySelector('input[placeholder*=\"192.168\"]')",
+                         budget=25, label="[4n] 配对页")
+        check(ok, "★ 清掉配对状态后回到配对页（模拟一台陌生的手机）")
+
+        # 主机名填不可达地址、配对码填合法 6 位（要先过前端格式校验，
+        # 否则报的是"配对码是 6 位数字"，根本走不到网络那一步）
+        br.evaluate("""
+          (() => {
+            const set = (sel, val) => {
+              const el = document.querySelector(sel);
+              if (!el) return false;
+              el.value = val;
+              el.dispatchEvent(new Event('input', {bubbles: true}));
+              return true;
+            };
+            const hostOk = set('input[placeholder*="192.168"]', '192.0.2.1');
+            const codeOk = set('input[placeholder="······"]', '123456');
+            return JSON.stringify({hostOk, codeOk});
+          })()
+        """)
+        filled = json.loads(br.evaluate("""
+          (() => {
+            const h = document.querySelector('input[placeholder*="192.168"]');
+            const c = document.querySelector('input[placeholder="······"]');
+            return JSON.stringify({
+              host: h ? h.value : null,
+              code: c ? c.value : null
+            });
+          })()
+        """) or "{}")
+        check(filled.get("host") == "192.0.2.1" and filled.get("code") == "123456",
+              "★ 地址与配对码真的填进去了（否则下面测的是格式校验）", f"{filled}")
+
+        # 记时间：判据里要能说清"多久给出了提示"
+        t_net = time.time()
+        clicked = br.evaluate("""
+          (() => {
+            // 主按钮文案见 PairView.vue:179 —— busy 时是「正在连接…」，
+            // 空闲时是「连接电脑」（没有「开始连接」这个文案）。
+            const b = [...document.querySelectorAll('button')]
+              .find(x => (x.textContent || '').trim().includes('连接'));
+            if (b) b.click();
+            return b ? (b.textContent || '').trim() : null;
+          })()
+        """)
+        check(clicked is not None, "★ 找到并点了配对页的主按钮", f"{clicked!r}")
+
+        # 等错误出现。前端 api 的默认超时是 20s（client.ts: timeoutMs ?? 20_000），
+        # 所以这里给 40s 的预算 —— 判的不是"快不快"，而是"最终有没有人话"。
+        err_text = ""
+        for _ in range(200):
+            err_text = br.evaluate(
+                "(() => { const e = document.querySelector('.err');"
+                " return e ? (e.innerText || '').trim() : ''; })()") or ""
+            if err_text:
+                break
+            time.sleep(0.2)
+        waited = time.time() - t_net
+
+        check(bool(err_text),
+              f"★ 连不上时给出了错误提示（不是静默无反应）  等了 {waited:.1f}s",
+              f"{err_text!r}")
+        check("Wi-Fi" in err_text or "wifi" in err_text.lower(),
+              "★ 提示明确说了「同一个 Wi-Fi」（F-06 要的那句话，不是干巴巴的超时）",
+              f"{err_text!r}")
+        check("无法连接" in err_text or "超时" in err_text,
+              "★ 提示说清了是「连不上/超时」，用户知道该查什么",
+              f"{err_text!r}")
+
+        # 不白屏：配对页还在，输入框还在
+        body_len = br.evaluate("(document.body.innerText || '').trim().length")
+        still_there = br.evaluate(
+            "!!document.querySelector('input[placeholder*=\"192.168\"]')")
+        check(body_len > 0 and still_there is True,
+              "★ 连不上时**没有白屏**（配对页与输入框都还在，可以直接改地址重试）",
+              f"{body_len} 字符")
+
+        # 不无限转圈：主按钮要恢复可点（busy 回到 false）
+        spun = True
+        for _ in range(60):
+            if not br.evaluate("!!document.querySelector('.spinner')"):
+                spun = False
+                break
+            time.sleep(0.2)
+        check(not spun, "★ 没有无限转圈（spinner 在有限时间内消失）")
+        btn_ok = br.evaluate("""
+          (() => {
+            const b = [...document.querySelectorAll('button')]
+              .find(x => (x.textContent || '').trim().includes('连接'));
+            return b ? !b.disabled : false;
+          })()
+        """)
+        check(btn_ok is True,
+              "★ 按钮恢复可点（用户能改个地址立刻重试，不用刷新页面）")
+
+        # 事实核对：这也是二期云隧道存在的理由 —— 一期是真的连不上，
+        # 不是"能连但没权限"。所以错误码必须是网络层（status 0），
+        # 而不是 401/403 那种"配对有问题"。
+        check("配对" not in err_text.replace("配对码是", ""),
+              "★ 提示没有把「网络不通」误报成「配对失败」（两者修法完全不同）",
+              f"{err_text!r}")
+
+        # ---------------------------------------------------------------
         print("\n[7] 未配对时不应该泄漏已配对界面")
         # ---------------------------------------------------------------
         br.evaluate("window.localStorage.clear()")
