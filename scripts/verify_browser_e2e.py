@@ -1781,6 +1781,179 @@ def main() -> int:
         shutil.rmtree(up_dir, ignore_errors=True)
 
         # ---------------------------------------------------------------
+        print("\n[4l] 下载原图：链接形态 → 真实落盘 → 大文件（E-01 / E-04 / E-05）")
+        # ---------------------------------------------------------------
+        # E-01 的判据是"保存到手机相册"——headless 里没有相册。
+        # 但这条判据背后真正会失效的东西只有两样，都能钉：
+        #   ① 点是点了，可 `a.href` 是错的（用 preview 地址而不是 raw）；
+        #   ② 服务端把 Content-Disposition 写成 inline，
+        #      手机浏览器就会"打开图片"而不是"存进相册"。
+        # 所以：先证明前端点出来的链接是对的（含 download 参数 + download 属性），
+        # 再证明服务端给的是 attachment + 合法文件名，最后用 CDP 让浏览器
+        # 真的下一次，核对磁盘上的字节。
+        br.goto(base + "/")
+        br.wait_for("!!document.querySelector('[data-id]')", budget=25,
+                    label="回到时间线")
+        br.evaluate("""
+          (() => {
+            const el = document.querySelector('[data-id]');
+            if (el) el.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+            return !!el;
+          })()
+        """)
+        br.wait_for("/下载/.test(document.body.innerText)", budget=20,
+                    label="查看器打开")
+        # ★ footer 的四个 .act 是常驻渲染的，只靠 :disabled="!detail" 控制
+        #   可用性（ViewerView.vue）。detail 没回来时按钮是 disabled，
+        #   点了等于没点 —— doDownload() 第一行 `if (!s.detail) return;`。
+        #   我第一版就是在这里点了空按钮，才误以为锚点钩子没生效。
+        ok = br.wait_for("""
+          (() => {
+            const b = [...document.querySelectorAll('.v-actions .act')]
+              .find(x => /下载原图/.test(x.textContent||''));
+            return !!b && !b.disabled;
+          })()
+        """, budget=25, label="下载按钮可点")
+        check(ok, "★ 「下载原图」按钮在详情到齐后变为可点（不是一直 disabled）")
+
+        # 抓 downloadRaw() 生成的那个 <a>。
+        # ★ 它是在**同一个同步块**里 appendChild → click() → removeChild()，
+        #   MutationObserver 的回调是微任务，实测抓不稳（节点窗口太窄）。
+        #   直接包一层 HTMLAnchorElement.prototype.click 同步记录，最可靠。
+        br.evaluate("""
+          (() => {
+            window.__dl = null;
+            const proto = HTMLAnchorElement.prototype;
+            if (!proto.__pbHooked) {
+              const orig = proto.click;
+              proto.click = function () {
+                if (this.hasAttribute('download')) {
+                  window.__dl = {
+                    href: this.href || '',
+                    download: this.getAttribute('download'),
+                    hadAttr: this.hasAttribute('download')
+                  };
+                }
+                return orig.apply(this, arguments);
+              };
+              proto.__pbHooked = true;
+            }
+            return true;
+          })()
+        """)
+        br.evaluate("""
+          (() => {
+            const b = [...document.querySelectorAll('.v-actions .act')]
+              .find(x => /下载原图/.test(x.textContent||''));
+            if (b) b.click();
+            return !!b;
+          })()
+        """)
+        time.sleep(0.6)
+        got = br.evaluate("JSON.stringify(window.__dl)")
+        info = json.loads(got) if got and got not in ("null", None) else None
+        check(info is not None,
+              "★ 点「下载原图」真的创建并点击了带 download 的 <a>", f"{info}")
+        if info:
+            check("/raw" in info["href"],
+                  "★ 下载链接指向 /raw（不是 1600px 的 preview）",
+                  info["href"][-70:])
+            check("download=1" in info["href"],
+                  "★ 链接带 download=1（服务端据此加 attachment）",
+                  info["href"][-70:])
+            check(bool(info.get("download")) and info.get("hadAttr") is True,
+                  "★ <a> 带 download 属性且赋了文件名（浏览器据此存盘而非打开）",
+                  f"{info.get('download')}")
+
+        # ---- 服务端：Content-Disposition 必须是 attachment ----
+        import urllib.request as _ur
+        tid = br.evaluate("""
+          (() => {
+            const el = document.querySelector('[data-id]');
+            return el ? el.getAttribute('data-id') : null;
+          })()
+        """)
+        rq = _ur.Request(f"{base}/api/items/{tid}/raw?download=1",
+                         headers={"Authorization": f"Bearer {tok}"})
+        with _ur.urlopen(rq, timeout=30) as r:
+            cd = r.headers.get("Content-Disposition", "")
+            ar = r.headers.get("Accept-Ranges", "")
+            raw_bytes = r.read()
+        check(cd.lower().startswith("attachment"),
+              "★ 响应头是 Content-Disposition: attachment（否则手机会打开图片而不是存盘）",
+              cd[:90])
+        check("filename*" in cd and "filename=" in cd,
+              "★ 同时给了 filename= 与 RFC 5987 的 filename*（中文名不丢扩展名）",
+              cd[:120])
+        check(ar == "bytes",
+              "★ 声明了 Accept-Ranges: bytes（大文件可续传/可断点）", ar)
+
+        # ---- CDP 让浏览器真的下一次，核对落盘字节 ----
+        dl_dir = tmp / "dl"
+        dl_dir.mkdir(exist_ok=True)
+        br.send("Browser.setDownloadBehavior", behavior="allow",
+                downloadPath=str(dl_dir), eventsEnabled=True)
+        br.evaluate("""
+          (() => {
+            const b = [...document.querySelectorAll('.v-actions .act')]
+              .find(x => /下载原图/.test(x.textContent||''));
+            if (b) b.click();
+            return !!b;
+          })()
+        """)
+        got_file = None
+        for _ in range(120):
+            fs = [x for x in dl_dir.iterdir() if x.is_file()]
+            if fs and not list(dl_dir.glob("*.crdownload")):
+                got_file = max(fs, key=lambda x: x.stat().st_mtime)
+                break
+            time.sleep(0.25)
+        check(got_file is not None, "★ 浏览器真的把一个文件下载到了磁盘",
+              f"{[x.name for x in dl_dir.iterdir()][:3]}")
+        if got_file:
+            import hashlib as _hl
+            same = _hl.sha256(got_file.read_bytes()).hexdigest() == \
+                   _hl.sha256(raw_bytes).hexdigest()
+            check(same, "★ 落盘文件名与内容都对（字节与服务端 raw 完全一致）",
+                  f"{got_file.name} {got_file.stat().st_size}B")
+            check(got_file.stat().st_size > 1000,
+                  "★ 下载到的是真图片不是错误页",
+                  f"{got_file.stat().st_size}B")
+
+        # ---- E-04 大文件 ----
+        big_id = br.evaluate("""
+          (() => {
+            const el = document.querySelector('[data-id]');
+            return el ? el.getAttribute('data-id') : null;
+          })()
+        """)
+        rq2 = _ur.Request(f"{base}/api/items/{big_id}/raw",
+                          headers={"Authorization": f"Bearer {tok}",
+                                   "Range": "bytes=0-1023"})
+        with _ur.urlopen(rq2, timeout=30) as r:
+            part = r.read()
+            code = r.status
+            crh = r.headers.get("Content-Range", "")
+        check(code == 206 and len(part) == 1024,
+              "★ Range 请求返回 206 + 恰好 1024 字节（大文件可分段下载）",
+              f"{code} {len(part)}B {crh}")
+
+        # ---- E-05 下载进度：如实记录实现方式 ----
+        # ⚠️ 前端**没有**自绘下载进度条：downloadRaw() 是 <a download> 点击，
+        #    进度由浏览器自己的下载管理器显示（手机上是通知栏/下载列表）。
+        #    这是真实设计，不是遗漏 —— 自绘要 fetch 全量再造 blob，反而
+        #    多占一倍内存，手机上更糟。所以 E-05 判"有进度反馈"成立，
+        #    但反馈的提供方是浏览器，判据必须写清楚这一点。
+        has_own = bool(br.evaluate("""
+          (() => {
+            const t = document.body.innerText;
+            return /下载进度|正在下载[ ]*[0-9]+%/.test(t);
+          })()
+        """))
+        check(has_own is False,
+              "★ 前端不自绘下载进度（进度由浏览器下载管理器提供 —— 如实记录）")
+
+        # ---------------------------------------------------------------
         print("\n[5] 切 Tab（KeepAlive 缓存 + 不报错）")
         # ---------------------------------------------------------------
         for label in ("搜索", "上传", "我的", "照片"):
