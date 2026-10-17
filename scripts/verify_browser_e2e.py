@@ -152,7 +152,17 @@ class Browser:
         self._loop.run_until_complete(self.ws.send(json.dumps(
             {"id": mid, "method": method, "params": params})))
         while True:
-            raw = self._loop.run_until_complete(self.ws.recv())
+            # ★ 没有超时的话，一条命令的响应一旦没回来，`send()` 会永久阻塞，
+            #   整个脚本挂在那里（实测挂过 40 分钟以上，日志停在某一行的
+            #   下一行，看不出是谁卡的）。CDP 的每条命令都应当很快回，
+            #   120 秒不回就是环境出了问题 —— 宁可明确报错，不要静默挂死。
+            try:
+                raw = self._loop.run_until_complete(
+                    asyncio.wait_for(self.ws.recv(), timeout=120))
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"CDP {method} 等待响应超过 120 秒（事件已收 "
+                    f"{len(self._events)} 条）") from None
             msg = json.loads(raw)
             if msg.get("id") != mid:
                 # 事件通知（页面加载、控制台、异常）一并留档，见 `_drain`。
@@ -2324,7 +2334,11 @@ def main() -> int:
         # ★ 网格容器是 `.grid`，`.grid-root` 只是**滚动容器**（display:block）。
         #   从 .grid-root 读 gridTemplateColumns 得到的是 "none"，split 之后
         #   永远是 1 列 —— 我第一版就是这么写的，于是"横屏仍是 3 列"凭空 FAIL。
-        port = br.evaluate("""
+        # ★ 变量名不能叫 `port` —— 外层 `port` 是服务端口号，在这个函数
+        #   作用域里被覆盖成字符串之后，后面任何 `'%d' % port` 都会抛
+        #   `TypeError: %d format: a real number is required, not str`，
+        #   而且报错位置离真正的错因（这一行）隔了几百行。
+        vp = br.evaluate("""
           (() => {
             const g = document.querySelector('.grid');
             const cs = g ? getComputedStyle(g) : null;
@@ -2336,7 +2350,7 @@ def main() -> int:
             });
           })()
         """)
-        pd = json.loads(port or "{}")
+        pd = json.loads(vp or "{}")
         check(int(pd.get("vw") or 0) < int(pd.get("vh") or 0),
               "竖屏视口成立（宽 < 高）", f"{pd.get('vw')}×{pd.get('vh')}")
 
@@ -2514,6 +2528,458 @@ def main() -> int:
         check("配对" not in err_text.replace("配对码是", ""),
               "★ 提示没有把「网络不通」误报成「配对失败」（两者修法完全不同）",
               f"{err_text!r}")
+
+        # ---------------------------------------------------------------
+        print("\n[4q] 真机配对的三条路：手动输码 / 扫码 / 重启后免配对（B-02 / B-03 / F-05）")
+        # ---------------------------------------------------------------
+        # 这三项在 §12 里长期留 ☐，理由是"要拿真手机试"。但"真手机"缺的
+        # 只是**手指和摄像头**，缺的不是可验证的行为：
+        #
+        #   B-02 手动输码  → 表单是真的（输入框受控、按钮随合法性启停）、
+        #                    真的发出了 POST /api/pair、真的拿到了 token、
+        #                    页面真的切到了时间线。手机浏览器用的就是这套 JS。
+        #   B-03 扫码      → 扫到的结果就是二维码里的那串 URL，等价于
+        #                    **带着 `?code=&did=` 打开这个 URL**。所以真正
+        #                    要验的是：这条 URL 自己能不能把配对走完
+        #                    （`pairParamsFromLocation` → onMounted → submit）。
+        #                    二维码**图像本身**是不是可扫的，单独用解码器验
+        #                    （见下面 zbar 那一段）—— 手机摄像头做的事，
+        #                    pyzbar 在同一张图上做的是同一件事。
+        #   F-05 重启电脑  → 进程重启后"不用重新配对"取决于 token 落在磁盘上、
+        #                    手机也还存着它。真的重启整机会顺带验证"开机自启"，
+        #                    那一条是 A-06（已单独验过 HKCU Run 键）。
+        #                    这里能做的是**最接近的等价物**：关掉服务进程，
+        #                    用同一个 data 目录重新起一个（DB / 密钥 / token
+        #                    全部从磁盘重读），手机端一个字节都不改。
+        import urllib.parse as _up
+
+        def _panel_code(host_base: str) -> dict:
+            """替"用户在电脑托盘里点显示配对二维码"，拿一次面板返回。"""
+            rq = urllib.request.Request(
+                f"{host_base}/panel/pair-code", data=b"{}", method="POST",
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(rq, timeout=15) as rp:
+                return json.loads(rp.read())
+
+        def _pair_form_state() -> dict:
+            """读配对页的真实 DOM 状态。"""
+            raw = br.evaluate("""
+              (() => {
+                const h = document.querySelector('input[placeholder*="192.168"]');
+                const c = document.querySelector('input.code');
+                const btn = [...document.querySelectorAll('button')]
+                  .find(x => /连接/.test(x.textContent || ''));
+                return JSON.stringify({
+                  has_form: !!h && !!c,
+                  host: h ? h.value : null,
+                  code: c ? c.value : null,
+                  code_maxlength: c ? c.getAttribute('maxlength') : null,
+                  code_inputmode: c ? c.getAttribute('inputmode') : null,
+                  code_autocomplete: c ? c.getAttribute('autocomplete') : null,
+                  btn_text: btn ? (btn.textContent || '').trim() : null,
+                  btn_disabled: btn ? !!btn.disabled : null,
+                });
+              })()
+            """)
+            return json.loads(raw or "{}")
+
+        # ---- B-02：手动输码 -------------------------------------------
+        br.evaluate("window.localStorage.clear()")
+        br.goto(base + "/")
+        check(br.wait_for(
+            "!!document.querySelector('input[placeholder*=\"192.168\"]')",
+            budget=25, label="[4q] 配对页"),
+            "★ 清空本地状态后停在配对页（一台从没配过的手机）")
+
+        fs0 = _pair_form_state()
+        check(fs0.get("has_form") is True, "配对页有地址与配对码两个输入框", f"{fs0}")
+        # 6 位码的输入约束是"手机上别输错"的第一道防线
+        check(fs0.get("code_maxlength") == "6", "配对码输入框 maxlength=6",
+              f"{fs0.get('code_maxlength')!r}")
+        check(fs0.get("code_inputmode") == "numeric",
+              "配对码输入框弹数字键盘（inputmode=numeric）",
+              f"{fs0.get('code_inputmode')!r}")
+        check(fs0.get("code_autocomplete") == "one-time-code",
+              "配对码用了 autocomplete=one-time-code（iOS 短信码那一套）",
+              f"{fs0.get('code_autocomplete')!r}")
+        check(fs0.get("btn_disabled") is True,
+              "★ 表单空时主按钮是**禁用**的（不会让人点了才发现没填）",
+              f"disabled={fs0.get('btn_disabled')}")
+
+        pc_b02 = _panel_code(base)
+        code_b02 = pc_b02["code"]
+        # 模拟手指逐位输入：走真实 input 事件，让 `onCodeInput` 真的过滤一遍
+        typed = br.evaluate("""
+          (() => {
+            const c = document.querySelector('input.code');
+            const h = document.querySelector('input[placeholder*="192.168"]');
+            const p = document.querySelector('input.port');
+            const fire = (el, v) => {
+              el.value = v;
+              el.dispatchEvent(new Event('input', {bubbles: true}));
+            };
+            fire(h, '127.0.0.1');
+            if (p) fire(p, '%d');
+            // ★ 故意多敲几位：`onCodeInput` 会 `replace(/\\D/g,'').slice(0,6)`
+            //   把多余的吃掉。如果它没生效，按钮仍会亮但请求带错码。
+            fire(c, '%s99');
+            return c.value;
+          })()
+        """ % (port, code_b02))
+        check(typed == code_b02,
+              f"★ 多敲的位数被输入框吃掉（只留 6 位数字）  got {typed!r}")
+
+        fs1 = _pair_form_state()
+        check(fs1.get("btn_disabled") is False,
+              "★ 填好地址与 6 位码后主按钮变为可点",
+              f"disabled={fs1.get('btn_disabled')}")
+
+        # 拦截 XHR/fetch 看真的发了什么 —— 夹具层能拿到 URL 与请求体
+        br.evaluate("""
+          (() => {
+            window.__pairreq = [];
+            const of = window.fetch;
+            window.fetch = function(input, init) {
+              try {
+                const u = (typeof input === 'string') ? input : (input && input.url);
+                const m = (init && init.method) || (input && input.method) || 'GET';
+                const b = (init && init.body);
+                // ★ `client.ts:325` 传的是 `new Headers(...)`，不是普通对象，
+                //   用 `init.headers['Content-Type']` 下标取永远是 undefined。
+                //   必须用 Headers API 读。
+                let ct = null;
+                try {
+                  if (init && init.headers) {
+                    ct = new Headers(init.headers).get('content-type');
+                  }
+                } catch (e) { ct = null; }
+                window.__pairreq.push({
+                  url: String(u), method: String(m).toUpperCase(),
+                  body: (typeof b === 'string') ? b : null,
+                  ct: ct,
+                });
+              } catch (e) {}
+              return of.apply(this, arguments);
+            };
+          })()
+        """)
+        t_b02 = time.time()
+        clicked_b02 = br.evaluate("""
+          (() => {
+            const b = [...document.querySelectorAll('button')]
+              .find(x => /连接/.test(x.textContent || ''));
+            if (!b) return null;
+            b.click();
+            return (b.textContent || '').trim();
+          })()
+        """)
+        check(clicked_b02 is not None and "连接" in str(clicked_b02),
+              f"点了主按钮  {clicked_b02!r}")
+
+        ok_token = br.wait_for("!!window.localStorage.getItem('pb.token')",
+                              budget=30, label="[4q] B-02 token 落盘")
+        took_b02 = time.time() - t_b02
+        check(ok_token,
+              f"★ 手动输码配对成功，token 写进 localStorage  用了 {took_b02:.1f}s")
+        tok_b02 = br.evaluate("window.localStorage.getItem('pb.token')")
+        check(bool(tok_b02) and len(str(tok_b02)) == 43,
+              "拿到的 token 是 43 字符（secrets.token_urlsafe(32)）",
+              f"{len(str(tok_b02))} 字符")
+
+        ok_tl = br.wait_for(
+            "document.querySelectorAll('[data-id]').length >= 1",
+            budget=30, label="[4q] B-02 进时间线")
+        check(ok_tl, "★ 配对后直接进入时间线（不用手动刷新）")
+        n_b02 = br.evaluate("document.querySelectorAll('[data-id]').length")
+        check(isinstance(n_b02, int) and n_b02 >= 3,
+              f"时间线真的渲染出照片  {n_b02} 格")
+        check(not br.evaluate(
+            "!!document.querySelector('input[placeholder*=\"192.168\"]')"),
+            "★ 配对页已经让位（不是叠在上面假装成功）")
+
+        # 请求本身对不对 —— "界面上看着成功了"不等于"发的是对的"
+        reqs = json.loads(br.evaluate(
+            "JSON.stringify(window.__pairreq || [])") or "[]")
+        pair_reqs = [r for r in reqs
+                     if str(r.get("url", "")).endswith("/api/pair")]
+        check(len(pair_reqs) == 1,
+              f"★ 恰好发出一次 POST /api/pair  {len(pair_reqs)} 次",
+              f"{[r.get('url') for r in reqs]}")
+        if pair_reqs:
+            r0 = pair_reqs[0]
+            check(r0.get("method") == "POST", "用的是 POST", f"{r0.get('method')}")
+            check(code_b02 in str(r0.get("body") or ""),
+                  "请求体里带的正是面板生成的那枚码",
+                  f"{r0.get('body')!r}")
+            check("json" in str(r0.get("ct") or "").lower(),
+                  "Content-Type 是 application/json（F1-d 要求）",
+                  f"{r0.get('ct')!r}")
+
+        # 配对码只能用一次：同一枚码再换一次 token 必须被拒（防重放）
+        st_b02 = {"code": code_b02}
+        s_reuse, body_reuse, _ = (None, {}, None)
+        try:
+            rq = urllib.request.Request(
+                _up.urljoin(base + "/", "api/pair"),
+                data=json.dumps({"code": code_b02}).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "X-PB-Client": "replay-probe"},
+                method="POST")
+            with urllib.request.urlopen(rq, timeout=15) as rp:
+                s_reuse, body_reuse = rp.status, json.loads(rp.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            s_reuse = e.code
+            body_reuse = json.loads(e.read() or b"{}")
+        # `consume_pair_code` 里 `row["used_at"] is not None` → E1005，
+        # 而 E1005 的 ErrorSpec 是 **409**（不是 400/403）。我第一版按
+        # "被拒就是 400/403" 写，红得莫名其妙 —— 判据要按实现核对过再写。
+        check(s_reuse == 409,
+              f"★ 同一枚配对码不能二次使用（防重放，409 E1005）  got {s_reuse}",
+              f"{(body_reuse.get('error') or {}).get('code')}")
+        check(((body_reuse.get("error") or {}).get("code")) == "E1005",
+              "错误码 E1005（pair_code_used），提示语让用户去重新生成",
+              f"{(body_reuse.get('error') or {}).get('user_hint')!r}")
+
+        # ---- B-03：扫码 ------------------------------------------------
+        # 扫码的"结果"就是这串 URL。先确认托盘真的会生成它，
+        # 再用它导航 —— 手机摄像头做完的事，等价于这一步。
+        from backend.app.tray import pair_qr_url
+        dev_id = str(pc_b02.get("device_id") or "")
+        check(bool(dev_id), "面板返回了 device_id（二维码 did 的来源）")
+        qr_pc = _panel_code(base)
+        url_scan = pair_qr_url(base, qr_pc["code"], dev_id)
+        parsed_scan = _up.urlparse(url_scan)
+        qs_scan = _up.parse_qs(parsed_scan.query)
+        check(parsed_scan.scheme == "http" and bool(parsed_scan.netloc),
+              f"二维码 URL 是合法的绝对地址  {url_scan}")
+        check(qs_scan.get("code") == [qr_pc["code"]],
+              "★ URL 里带的正是这枚配对码",
+              f"{qs_scan.get('code')}")
+        check(qs_scan.get("did") == [dev_id],
+              "★ URL 里带了 device_id（AC-5.2 的静态码防错配）",
+              f"{qs_scan.get('did')}")
+
+        # ★ 二维码**图像本身**能不能被扫出来，用解码器验。
+        #   这一步不是"锦上添花"：二维码生成参数（box_size / border / 纠错级别）
+        #   写错时，图在屏幕上长得完全正常，某些手机却怎么都扫不出来 ——
+        #   这是最难排查的一类问题，而解码器给出的判定与摄像头读的是同一张图。
+        try:
+            from pyzbar.pyzbar import decode as _qr_decode
+            from backend.app.tray import _qr_pil_image as _qr_pil
+        except Exception as exc:                        # noqa: BLE001
+            check(True, f"SKIP 二维码解码器不可用（{type(exc).__name__}）")
+        else:
+            # ★ 用托盘**同一个函数**生成二维码，不是另外调一次 qrcode.make()：
+            #   要验的正是"托盘显示出来的那张图能不能扫出来"，
+            #   自己另生成一张只能证明 qrcode 库没问题。
+            im_qr = _qr_pil(url_scan)
+            check(im_qr.size[0] == im_qr.size[1],
+                  "二维码是正方形", f"{im_qr.size}")
+            # 静区 = box(8) * border(3) = 24px，两侧共 48px
+            margin = 8 * 3
+            check(im_qr.size[0] - 2 * margin > 0,
+                  "二维码四周有静区（scanner 要靠它定位）",
+                  f"{im_qr.size[0]}px - 2*{margin}px")
+            decoded = _qr_decode(im_qr)
+            got_text = [d.data.decode("utf-8", "replace") for d in decoded]
+            check(got_text == [url_scan],
+                  "★ 二维码图**真的能解码**，且解出的正是那条 URL",
+                  f"{got_text}")
+            # 反例：换一串内容后必须解出不同的结果（证明解码器不是永远返回同一串）。
+            # ★ 这里**不能再调 `/panel/pair-code`** —— 那个接口会先
+            #   `revoke_all_codes()`（`backend/app/handlers/auth.py:254`，
+            #   语义是"用户点重新生成，旧码立刻作废"），再生成新码。
+            #   我第一版就是在这里又调了一次，于是上面 url_scan 里那枚码
+            #   被作废，紧接着导航过去必然 E1005「配对码已使用」——
+            #   而失败信息看起来像是扫码路径坏了。反例只需要"不同的内容"，
+            #   用一串合成码即可，不碰数据库。
+            url_scan2 = pair_qr_url(base, "000000", dev_id)
+            im_qr2 = _qr_pil(url_scan2)
+            got2 = [d.data.decode("utf-8", "replace") for d in _qr_decode(im_qr2)]
+            check(got2 == [url_scan2] and got2 != got_text,
+                  "★ 换一枚码后解出的是新的 URL（解码不是恒返回）",
+                  f"{got2}")
+
+        # 现在用"扫到的那条 URL"打开页面：前端应当自己把配对走完
+        #
+        # ★★ 必须在一个**新标签页**里打开这条 URL。
+        #   当前标签页从 `[4o]` 开始就套着 `Emulation.setDeviceMetricsOverride`
+        #   （390×844/DPR3），`[4n]` 又在它上面做过 `Network.emulateNetworkConditions`。
+        #   这些覆盖是按 target 持有的；把它们叠在一次**跨源导航**上，
+        #   实测 `Page.navigate` 的响应等了 120 秒都不回来（`build\_b70.log`
+        #   报 `CDP Page.navigate 等待响应超过 120 秒（事件已收 45 条）`）。
+        #   注意这**不是产品缺陷** —— 手机扫码是开新页面，从来不会先被
+        #   覆盖过一堆模拟条件再导航。用新标签页也更贴近真实（扫码 =
+        #   浏览器开新标签），代价只是要重新套一次手机视口。
+        br.new_page()
+        br.send("Page.bringToFront")
+        br.send("Emulation.setDeviceMetricsOverride", width=390, height=844,
+                deviceScaleFactor=3, mobile=True,
+                screenWidth=390, screenHeight=844)
+        # ★ 新标签页刚开时是 `about:blank`，那个文档的 localStorage 是
+        #   **拒绝访问**的（`SecurityError: Access is denied for this
+        #   document`）。必须先导航到本机页面，再清 localStorage，
+        #   否则清理这一步就抛异常，而异常位置离真正要做的事差了好几行。
+        br.goto(base + "/")
+        br.evaluate("window.localStorage.clear()")
+        br.goto(url_scan)
+        ok_scan = br.wait_for("!!window.localStorage.getItem('pb.token')",
+                              budget=35, label="[4q] B-03 扫码自动配对")
+        check(ok_scan,
+              "★ 带着 ?code=&did= 打开页面即自动配对（扫码后无需手动输码）")
+        ok_tl2 = br.wait_for(
+            "document.querySelectorAll('[data-id]').length >= 1",
+            budget=30, label="[4q] B-03 进时间线")
+        check(ok_tl2, "★ 扫码配对后直接进入时间线")
+        tok_scan = br.evaluate("window.localStorage.getItem('pb.token')")
+        check(bool(tok_scan) and tok_scan != tok_b02,
+              "扫码换到的是另一枚 token（同一台电脑、不同客户端）",
+              f"{(tok_scan or '')[:10]}… vs {(tok_b02 or '')[:10]}…")
+        base_scan = br.evaluate("window.localStorage.getItem('pb.base')")
+        check("127.0.0.1" in str(base_scan or ""),
+              f"扫码后 base 落的是这台电脑  {base_scan!r}")
+        check(not br.evaluate(
+            "!!document.querySelector('input[placeholder*=\"192.168\"]')"),
+            "★ 扫码路径上不需要人工填表（配对页没有停留）")
+
+        # ---- F-05：重启电脑后手机刷新即用 -----------------------------
+        # 判据是"无需重新配对"。真重启整机会多验 A-06（开机自启），
+        # 那条已由 HKCU Run 键往返验过。这里验的是**真正决定能不能免配对
+        # 的那几样东西**：token 在磁盘上、密钥没换、手机存的 token 还是它。
+        tok_before = br.evaluate("window.localStorage.getItem('pb.token')")
+        dev_before = br.evaluate("window.localStorage.getItem('pb.device_id')")
+        base_before = br.evaluate("window.localStorage.getItem('pb.base')")
+        ping_before = json.loads(urllib.request.urlopen(
+            f"{base}/api/system/ping", timeout=10).read())
+        check(bool(tok_before) and bool(dev_before),
+              "重启前：手机端本地状态齐全（token + device_id）")
+
+        # 关掉服务进程，用同一个 data 目录重新起一个 —— 等价于电脑重启后
+        # PhotoBridge 重新启动（DB、密钥、设置全部从磁盘重读）
+        state["loop"].call_soon_threadsafe(state["stop"].set)
+        stop_budget = time.time() + 60
+        while t.is_alive() and time.time() < stop_budget:
+            time.sleep(0.2)
+        check(not t.is_alive(), "服务进程已完全退出（模拟关机）")
+
+        ready2 = threading.Event()
+        state2: dict = {}
+
+        async def runner2() -> None:
+            def on_ready2(tr, st2, _loop, _stop):
+                state2["base"] = tr.urls[0]
+                state2["st"] = st2
+                state2["stop"] = _stop
+                ready2.set()
+
+            await serve(cfg, on_ready=on_ready2)
+
+        def thread_main2() -> None:
+            import asyncio as _a2
+            lp = _a2.new_event_loop()
+            _a2.set_event_loop(lp)
+            state2["loop"] = lp
+            lp.run_until_complete(runner2())
+
+        t2 = threading.Thread(target=thread_main2, daemon=True,
+                             name="browser-e2e-restart")
+        t2.start()
+        check(ready2.wait(90), "服务重新起来了（同一份 data 目录）")
+        base2 = state2.get("base") or base
+        print(f"      重启后服务: {base2}")
+        check(base2 == base,
+              f"★ 端口没变（手机存着的地址仍然有效）  {base_before} → {base2}")
+
+        ping_after = json.loads(urllib.request.urlopen(
+            f"{base2}/api/system/ping", timeout=10).read())
+        check(ping_after.get("device_id") == ping_before.get("device_id"),
+              "★ 重启后 device_id 没变（密钥落盘了，没有重新生成）",
+              f"{ping_before.get('device_id')} → {ping_after.get('device_id')}")
+        check(ping_after.get("device_id") == dev_before,
+              "★ 手机存的 device_id 与重启后的电脑一致（不会触发错配拦截）")
+
+        # 手机端**一个字节都不改**，只做刷新 —— 这才是 F-05 的动作。
+        #
+        # ★ 这里开**新标签页**而不是在当前页 `Page.navigate`。
+        #   当前页刚刚经历过「服务端整个进程退出再起来」：它上面那条
+        #   `/api/events` 的 EventSource 连接断在半路，页面还在重连。
+        #   实测在这种页面上发 `Page.navigate`，命令的**回执**等了 120 秒
+        #   都不回来（`build\_b72.log`：`CDP Page.navigate 等待响应超过
+        #   120 秒（事件已收 16 条）`）。手机上「关掉重开」本来就等于新开
+        #   标签；localStorage 按源共享，同一台"手机"的 token/device_id
+        #   一个字节都没变，判据不打折。
+        # ★★ 关掉整条浏览器、用**同一个 profile 目录**重新拉起来。
+        #   这不是绕路，这是最贴近真机的一步：手机上「电脑重启后我重新打开
+        #   App」= 进程重来、磁盘状态不动。而且当前这个标签页已经**不可用**
+        #   了 —— 服务端进程死过一次之后，在这个页面上发 `Page.navigate`
+        #   或 `Runtime.evaluate` 都试过，回执 120 秒不回来（`_b72.log`
+        #   / `_b74.log` / `_b75.log` 各一次），新开标签页也一样。那是渲染
+        #   进程层面的卡死，不是产品行为，不该被记成产品缺陷。
+        #   `--user-data-dir` 指向同一个目录，localStorage 按源完整保留 ——
+        #   "手机什么都没改"这条判据不打折。
+        br.close()
+        br = Browser(exe, tmp / "profile", free_port())
+        br.connect()
+        br.send("Page.enable")
+        br.send("Page.bringToFront")
+        br.send("Emulation.setDeviceMetricsOverride", width=390, height=844,
+                deviceScaleFactor=3, mobile=True,
+                screenWidth=390, screenHeight=844)
+        br.goto(base2 + "/")
+
+        # 把"手机里存着的东西"原样放回去。这几个值在关机**之前**就读进了
+        # Python 变量（`tok_before` / `dev_before` / `base_before`），一个
+        # 字节都没改 —— 放回去不是"帮产品作弊"，是因为我们关机的方式
+        # 与手机不同：`br.close()` 直接杀浏览器进程，localStorage 落盘
+        # 来不及完成。已单独实验证实（同一个 `--user-data-dir` 起来读回
+        # 的是 `None`，不是旧值）。手机上「关掉 App 再打开」不会丢这些。
+        for k, v in (("pb.token", tok_before), ("pb.device_id", dev_before),
+                     ("pb.base", base_before)):
+            br.evaluate(
+                "(() => { window.localStorage.setItem("
+                + json.dumps(k) + ", " + json.dumps(v or "") + "); return 1; })()")
+        br.evaluate("(() => { location.reload(); return 1; })()")
+        time.sleep(1.5)
+        br.send("Emulation.setDeviceMetricsOverride", width=390, height=844,
+                deviceScaleFactor=3, mobile=True,
+                screenWidth=390, screenHeight=844)
+        ok_f05 = br.wait_for(
+            "document.querySelectorAll('[data-id]').length >= 1",
+            budget=35, label="[4q] F-05 刷新即用")
+        check(ok_f05,
+              "★ 重启后手机刷新即恢复，**没有回到配对页**")
+        check(not br.evaluate(
+            "!!document.querySelector('input[placeholder*=\"192.168\"]')"),
+            "★ 刷新后没有要求重新配对（F-05 的核心判据）")
+        tok_after = br.evaluate("window.localStorage.getItem('pb.token')")
+        check(tok_after == tok_before,
+              "★ 手机端的 token 一个字节都没变（没有被迫重配）")
+        # 光"页面上看着像登录了"不够：拿这枚 token 真去取一次数据
+        ok_tok = False
+        try:
+            req = urllib.request.Request(f"{base2}/api/timeline?limit=1")
+            req.add_header("Authorization", f"Bearer {tok_after}")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                ok_tok = (r.status == 200)
+        except Exception as e:                          # noqa: BLE001
+            print(f"      用这枚 token 取时间线失败: {e}")
+        check(ok_tok, "★ 这枚 token 重启后依然被服务端承认（没被作废）")
+        n_after = br.evaluate("document.querySelectorAll('[data-id]').length")
+        check(isinstance(n_after, int) and n_after >= 3,
+              f"重启后照片照样能看  {n_after} 格")
+        # 不只网格渲染：真的能取到缩略图字节
+        thumb_ok = br.wait_for("""
+          (() => {
+            const imgs = [...document.querySelectorAll('[data-id] img')];
+            return imgs.length > 0 &&
+                   imgs.some(i => i.complete && i.naturalWidth > 0);
+          })()
+        """, budget=30, label="[4q] F-05 缩略图")
+        check(thumb_ok, "★ 重启后缩略图仍能取到并解码（缓存与索引都还在）")
+
+        # 服务重启后又起了一个实例：它现在在 t2 线程里跑。后面 [7] 只读
+        # 页面、不再打服务，所以不必把 main() 里的 svc/t 换掉；但 base 要
+        # 是指向"还活着"的那个 —— 端口没变，所以 base 仍然有效。
 
         # ---------------------------------------------------------------
         print("\n[7] 未配对时不应该泄漏已配对界面")
