@@ -2097,6 +2097,286 @@ def main() -> int:
         check(ok, "★ 断网→恢复一轮之后，时间线仍能正常加载（不是废掉）")
 
         # ---------------------------------------------------------------
+        print("\n[4o] 图片三级加载与清晰度（C-05 / C-06）")
+        # ---------------------------------------------------------------
+        # C-05「缩略图清晰」与 C-06「先占位后预览再原图」原文判据都是
+        # "目视"。目视不能算证据 —— 同一张图在 320 与 1600 下"看着清楚"
+        # 因人而异。这里改成可量化的三条：
+        #   ① 网格实际加载的是 320 那档，且解码出的像素数就是 320 级别
+        #      （不是把 1600 塞进 100px 的格子 —— 那是白烧流量）；
+        #   ② 查看器先出 320 占位、再出 1600 预览（顺序可观测）；
+        #   ③ 1600 预览的长边确实到 1600（不是退回 320 冒充）。
+        # ★ 必须先切到**手机视口**再量"清不清楚"。
+        #   默认 headless 窗口是 800×600，3 列格子宽 251px，320 缩略图
+        #   只有 1.27 倍 —— 这既不是手机的尺寸，也不是用户看到的密度。
+        #   390×844 / DPR 3（iPhone 14 级别）下格子约 129px，320/129 = 2.5 倍。
+        # ★ `Emulation.setDeviceMetricsOverride` 是**按 target（标签页）**
+        #   生效的，不是浏览器全局。原来先设覆盖再 new_page()，新标签页上
+        #   根本没有这个覆盖 —— 实测格子仍是 251px（默认 800×600 窗口），
+        #   于是"320px / 251css = 1.27x"判不糊失败。必须先切标签页再设。
+        br.new_page()
+        br.send("Page.bringToFront")
+        br.send("Emulation.setDeviceMetricsOverride", width=390, height=844,
+                deviceScaleFactor=3, mobile=True,
+                screenOrientation={"type": "portraitPrimary", "angle": 0})
+        br.goto(base + "/")
+        ok = br.wait_for(
+            "(() => { const i = document.querySelector('.grid-root .cell[data-id] img');"
+            " return !!i && i.complete && i.naturalWidth > 0; })()",
+            budget=30, label="[4o] 网格缩略图解码")
+        check(ok, "★ 网格里的缩略图解码出了像素")
+
+        # 网格 <img> 的 src 必须指向 /thumb?size=320 —— 不是 /preview 也不是 /raw
+        gsrc = br.evaluate("""
+          (() => {
+            const i = document.querySelector('.grid-root .cell[data-id] img');
+            if (!i) return JSON.stringify({found: false});
+            return JSON.stringify({
+              found: true,
+              src: String(i.currentSrc || i.src || ''),
+              w: i.naturalWidth, h: i.naturalHeight,
+              cssW: Math.round(i.getBoundingClientRect().width),
+              cssH: Math.round(i.getBoundingClientRect().height)
+            });
+          })()
+        """)
+        g = json.loads(gsrc or "{}")
+        check(g.get("found") is True, "网格 <img> 存在")
+        check("/thumb" in (g.get("src") or "") and "size=320" in (g.get("src") or ""),
+              "★ 网格加载的是 320 那档缩略图（不是 1600 预览、更不是原图）",
+              f"{(g.get('src') or '')[-70:]}")
+        # 清晰度：解码尺寸必须 ≥ 格子 CSS 尺寸的 2 倍（手机 DPR 通常 2~3，
+        # 低于这个数就是糊的；高于太多是浪费）。320 缩略图配 ~120px 格子，
+        # 比值约 2.6，落在合理区间。
+        dpr_ratio = (float(g.get("w") or 0) / max(1.0, float(g.get("cssW") or 1)))
+        check(dpr_ratio >= 2.0,
+              "★ 缩略图像素密度够（解码宽 ≥ 格子的 2 倍，手机上不糊）",
+              f"{g.get('w')}px / {g.get('cssW')}css = {dpr_ratio:.2f}x")
+        check(g.get("w") == 320 or g.get("h") == 320 or
+              (g.get("w") or 0) <= 320 and (g.get("h") or 0) <= 320,
+              "★ 长边不超过 320（没有为了清晰反而塞大图）",
+              f"{g.get('w')}×{g.get('h')}")
+
+        # ---- C-06 三级顺序 ----
+        # 在打开查看器**之前**装上探针，记录 <img> 的 src 出现顺序。
+        # 只记录 /thumb、/preview、/raw 三类，其他忽略。
+        br.send("Page.addScriptToEvaluateOnNewDocument", source="""
+            window.__tier = [];
+            (() => {
+              const push = (u) => {
+                const s = String(u || '');
+                let k = null;
+                if (s.includes('/thumb')) k = 'thumb';
+                else if (s.includes('/preview')) k = 'preview';
+                else if (s.includes('/raw')) k = 'raw';
+                if (k && !window.__tier.some(x => x.k === k && x.u === s)) {
+                  window.__tier.push({k: k, u: s, at: Date.now()});
+                }
+              };
+              const desc = Object.getOwnPropertyDescriptor(
+                HTMLImageElement.prototype, 'src');
+              Object.defineProperty(HTMLImageElement.prototype, 'src', {
+                get() { return desc.get.call(this); },
+                set(v) { push(v); return desc.set.call(this, v); },
+                configurable: true
+              });
+              const Native = window.Image;
+              window.Image = function(...a) {
+                const im = new Native(...a);
+                im.addEventListener('load', () => push(im.src));
+                return im;
+              };
+              window.Image.prototype = Native.prototype;
+            })();
+        """)
+        br.goto(base + "/")
+        br.wait_for("!!document.querySelector('.grid-root .cell[data-id]')",
+                    budget=30, label="[4o] 重新进时间线")
+
+        # 点开一张：先占位（thumb）→ 再预览（preview）
+        br.evaluate("""
+          (() => {
+            const c = document.querySelector('.grid-root .cell[data-id]');
+            if (c) c.dispatchEvent(new MouseEvent('click',
+              {bubbles: true, cancelable: true}));
+            return !!c;
+          })()
+        """)
+        ok = br.wait_for("!!document.querySelector('.viewer')", budget=15,
+                         label="[4o] 打开查看器")
+        check(ok, "打开查看器")
+        # 等主图解码
+        br.wait_for("""
+          (() => {
+            const i = document.querySelector('.v-img.main');
+            return !!i && i.complete && i.naturalWidth > 0;
+          })()
+        """, budget=20, label="[4o] 主图解码")
+
+        tiers = json.loads(br.evaluate("JSON.stringify(window.__tier || [])") or "[]")
+        kinds = [d.get("k") for d in tiers]
+        check("thumb" in kinds,
+              "★ 查看器里出现了 320 占位层（详情没到齐时不黑屏）", f"{kinds}")
+        check("preview" in kinds,
+              "★ 查看器加载了 1600 预览层", f"{kinds}")
+        # 顺序：thumb 的 at 必须早于 preview 的 at
+        at = {d["k"]: d["at"] for d in tiers if d.get("k")}
+        check(at.get("thumb", 0) <= at.get("preview", 0),
+              "★ 顺序是「先占位后预览」（thumb 的请求早于 preview）",
+              f"thumb={at.get('thumb')} preview={at.get('preview')}")
+
+        # 预览长边真到 1600（不是拿 320 冒充）
+        pv = br.evaluate("""
+          (() => {
+            const i = document.querySelector('.v-img.main');
+            if (!i) return JSON.stringify({found: false});
+            return JSON.stringify({found: true, w: i.naturalWidth,
+              h: i.naturalHeight, src: String(i.currentSrc || i.src || '')});
+          })()
+        """)
+        pvd = json.loads(pv or "{}")
+        long_side = max(int(pvd.get("w") or 0), int(pvd.get("h") or 0))
+        check("/preview" in (pvd.get("src") or ""),
+              "★ 主图 src 指向 /preview（不是 /thumb）",
+              f"{(pvd.get('src') or '')[-60:]}")
+        check(long_side >= 1000,
+              "★ 预览图长边真的接近 1600（C-05「点开看得清」的量化判据）",
+              f"{pvd.get('w')}×{pvd.get('h')}")
+        # 不允许在这一步就拉 /raw（§5.4.3 约束③：放大到 1.5× 才用原图）
+        check("raw" not in kinds,
+              "★ 没放大时不请求原图（省流量与内存）", f"{kinds}")
+
+        br.evaluate("window.history.back()")
+        # ★ 关掉查看器后必须**重新确认网格回来了**再测滚动。
+        #   原来紧接 history.back() 就测，那次 evaluate 落在一个还没有
+        #   `.grid-root` 的文档上，Promise 直接 resolve 成 {}，症状是
+        #   "滚动测量跑起来了"凭空 FAIL 且 why 为空。
+        ok = br.wait_for("!!document.querySelector('.grid-root')", budget=20,
+                         label="[4o] 关闭查看器后回到网格")
+        check(ok, "关闭查看器后网格回来了（滚动测量的前提）")
+        time.sleep(0.5)
+
+        # ---- C-09 滚动流畅 ----
+        # "无卡顿"没法直接读，但可以量：连续滚动的**帧间隔分布**。
+        # 判据落在 p95 帧间隔上 —— 均值会被几个流畅帧骗过去，p95 不会。
+        # 60fps 是 16.7ms；这里给 50ms（约 20fps）作为"可感知卡顿"的界线，
+        # 因为 headless + 软件渲染比真机慢，卡到 50ms 以上连真机也救不回来。
+        # ★ 必须先把标签页提到前台：rAF 在**后台标签页**会被降到约 0fps，
+        #   一个回调都不触发，Promise 永不 resolve，evaluate 返回 None。
+        #   症状是"滚动测量跑起来了"凭空 FAIL 且 extra 为空 —— 因为连
+        #   `ok:false` 那条分支都没走到（Promise 根本没结束）。
+        br.send("Page.bringToFront")
+        time.sleep(0.3)
+        smooth = br.evaluate("""
+          (() => new Promise(resolve => {
+            const el = document.querySelector('.grid-root');
+            if (!el) { resolve(JSON.stringify({ok: false, why: 'no grid'})); return; }
+            // 保险丝：万一 rAF 仍被节流，4 秒后用明确的 why 结束，
+            // 而不是让 evaluate 挂成 None（None 无法区分"没跑"与"抛了"）。
+            const fuse = setTimeout(() => resolve(JSON.stringify({
+              ok: false, why: 'rAF 被节流，只收到 ' + frames.length + ' 帧'
+            })), 4000);
+            const frames = [];
+            let last = performance.now();
+            let steps = 0;
+            function tick() {
+              const now = performance.now();
+              frames.push(now - last);
+              last = now;
+              el.scrollTop += 40;
+              steps += 1;
+              if (steps < 60) requestAnimationFrame(tick);
+              else {
+                clearTimeout(fuse);
+                frames.sort((a, b) => a - b);
+                const pick = (p) => frames[Math.min(frames.length - 1,
+                  Math.floor(frames.length * p))] || 0;
+                resolve(JSON.stringify({
+                  ok: true, n: frames.length,
+                  median: pick(0.5), p95: pick(0.95), max: frames[frames.length-1],
+                  scrolled: el.scrollTop
+                }));
+              }
+            }
+            requestAnimationFrame(tick);
+          }))()
+        """)
+        sm = json.loads(smooth or "{}")
+        check(sm.get("ok") is True, "滚动测量跑起来了", f"{sm.get('why') or ''}")
+        if sm.get("ok"):
+            check(float(sm.get("p95") or 999) < 50.0,
+                  "★ 连续滚动 60 帧的 p95 帧间隔 < 50ms（不卡顿）",
+                  f"median={sm.get('median'):.1f}ms p95={sm.get('p95'):.1f}ms "
+                  f"max={sm.get('max'):.1f}ms")
+            check(float(sm.get("scrolled") or 0) > 0,
+                  "★ 滚动真的发生了（不是内容太少滚不动）",
+                  f"scrollTop={sm.get('scrolled')}")
+
+        # ---------------------------------------------------------------
+        print("\n[4p] 横屏布局（I-08）")
+        # ---------------------------------------------------------------
+        # 「旋转屏幕」在 headless 里就是改视口尺寸 + 换朝向。判据落在
+        # **布局真的重排了**上：横屏比竖屏宽、网格还是 3 列、没有横向溢出。
+        br.send("Emulation.setDeviceMetricsOverride", width=390, height=844,
+                deviceScaleFactor=3, mobile=True,
+                screenOrientation={"type": "portraitPrimary", "angle": 0})
+        time.sleep(0.8)
+        # ★ 网格容器是 `.grid`，`.grid-root` 只是**滚动容器**（display:block）。
+        #   从 .grid-root 读 gridTemplateColumns 得到的是 "none"，split 之后
+        #   永远是 1 列 —— 我第一版就是这么写的，于是"横屏仍是 3 列"凭空 FAIL。
+        port = br.evaluate("""
+          (() => {
+            const g = document.querySelector('.grid');
+            const cs = g ? getComputedStyle(g) : null;
+            return JSON.stringify({
+              vw: window.innerWidth, vh: window.innerHeight,
+              cols: cs ? cs.gridTemplateColumns.split(' ').length : 0,
+              scrollW: document.documentElement.scrollWidth,
+              clientW: document.documentElement.clientWidth
+            });
+          })()
+        """)
+        pd = json.loads(port or "{}")
+        check(int(pd.get("vw") or 0) < int(pd.get("vh") or 0),
+              "竖屏视口成立（宽 < 高）", f"{pd.get('vw')}×{pd.get('vh')}")
+
+        br.send("Emulation.setDeviceMetricsOverride", width=844, height=390,
+                deviceScaleFactor=3, mobile=True,
+                screenOrientation={"type": "landscapePrimary", "angle": 90})
+        time.sleep(1.0)
+        land = br.evaluate("""
+          (() => {
+            const g = document.querySelector('.grid');
+            const cs = g ? getComputedStyle(g) : null;
+            return JSON.stringify({
+              vw: window.innerWidth, vh: window.innerHeight,
+              cols: cs ? cs.gridTemplateColumns.split(' ').length : 0,
+              scrollW: document.documentElement.scrollWidth,
+              clientW: document.documentElement.clientWidth,
+              cells: document.querySelectorAll('.grid-root .cell[data-id]').length
+            });
+          })()
+        """)
+        ld = json.loads(land or "{}")
+        check(int(ld.get("vw") or 0) > int(ld.get("vh") or 0),
+              "★ 转成横屏后视口真的变了（宽 > 高）",
+              f"{pd.get('vw')}×{pd.get('vh')} → {ld.get('vw')}×{ld.get('vh')}")
+        check(int(ld.get("cols") or 0) == 3,
+              "★ 横屏仍是 3 列网格（布局自适应没散架）", f"{ld.get('cols')} 列")
+        check(int(ld.get("cells") or 0) > 0,
+              "★ 横屏下照片还在（没被裁掉/没白屏）", f"{ld.get('cells')} 格")
+        # 不许横向溢出：scrollWidth 不能超过 clientWidth
+        check(int(ld.get("scrollW") or 0) <= int(ld.get("clientW") or 0) + 1,
+              "★ 横屏没有横向溢出（页面不用左右拖）",
+              f"scrollW={ld.get('scrollW')} clientW={ld.get('clientW')}")
+
+        # 还原成竖屏，后面的节仍按手机竖屏跑
+        br.send("Emulation.setDeviceMetricsOverride", width=390, height=844,
+                deviceScaleFactor=3, mobile=True,
+                screenOrientation={"type": "portraitPrimary", "angle": 0})
+        time.sleep(0.6)
+
+        # ---------------------------------------------------------------
         print("\n[5] 切 Tab（KeepAlive 缓存 + 不报错）")
         # ---------------------------------------------------------------
         for label in ("搜索", "上传", "我的", "照片"):
