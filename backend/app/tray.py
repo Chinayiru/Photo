@@ -201,6 +201,18 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str]) -> None:
             y = (root.winfo_screenheight() - h) // 3
             root.geometry(f"+{max(0, x)}+{max(0, y)}")
 
+            # ★ 显式"显示并提到最前"。
+            # 实测过窗口被创建出来、尺寸内容都对，但 `IsWindowVisible()`
+            # 返回 False 的情形 —— 用户看到的是"托盘就绪了，但没有窗口"。
+            # `-topmost` 只管 z 序，不管窗口是否处于 withdrawn 状态；
+            # 这三行把"显示 → 提到最前 → 抢焦点"补齐，代价为零。
+            try:
+                root.deiconify()
+                root.lift()
+                root.focus_force()
+            except Exception:       # noqa: BLE001
+                pass
+
             root.mainloop()
         except Exception:       # noqa: BLE001
             log.exception("二维码窗口异常")
