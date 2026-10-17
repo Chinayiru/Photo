@@ -77,7 +77,7 @@
 
 | 模块 | 状态 | 关键实测数据 |
 |---|---|---|
-| 路径沙箱（七步校验 + junction 防护） | ✅ | 56 条专项用例全过 |
+| 路径沙箱（七步校验 + junction 防护） | ✅ | 96 条文档化用例（`test_sandbox.py`）+ 41 条手工演练全过 |
 | 配置系统 | ✅ | 首次运行自动生成 `data/config.json`；`--config` 会连数据目录一起跟着走 |
 | EXIF 提取 + 文件名日期回退 | ✅ | 真实库 4915 张：exif 4366 / filename 312 / mtime 237 |
 | 索引器（手写栈式遍历 + 批量 upsert） | ✅ | **4915 张 17.6 秒**（验收要求 ≤10 分钟）；重扫幂等 0.1 秒 |
@@ -263,7 +263,7 @@ python -m backend.app.main --version
 # 单元 + 集成测试（约 57 秒，853 条）
 .venv/Scripts/python.exe -m pytest backend/tests/
 
-# 路径沙箱专项（56 条）
+# 路径沙箱专项（41 条手工演练；pytest 侧 96 条见 backend/tests/test_sandbox.py）
 .venv/Scripts/python.exe scripts/check_sandbox.py
 
 # 真实库端到端冒烟（真起 uvicorn、真发请求、真扫 4915 张，35 项）

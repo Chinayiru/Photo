@@ -1179,3 +1179,100 @@ def test_delete_is_idempotent_and_still_counts(tmp_path, library) -> None:
                          body=_json_body({"ids": [mid]})))
     assert first == {"deleted": 1, "failed": []}
     assert second == {"deleted": 1, "failed": []}
+
+
+# ---------------------------------------------------------------------------
+# HTTP 层路径穿越（docs/07 §7.1 的 TC-SANDBOX-SEC-081~090）
+# ---------------------------------------------------------------------------
+
+
+def _traversal_urls() -> list[tuple[str, str, str]]:
+    """(编号, URL, 期望状态)。"""
+    return [
+        ("SEC-081", "/api/items/..%2f..%2fsecret.txt/thumb", "400"),
+        ("SEC-082", "/api/items/%2e%2e%2fsecret.txt/thumb", "400"),
+        ("SEC-083", "/api/items/a.jpg%00.png/thumb", "400"),
+        ("SEC-084", "/api/items/....//....//secret.txt/thumb", "404"),
+        ("SEC-085", "/api/items/%252e%252e%252fsecret.txt/thumb", "400"),
+        ("SEC-086", "/api/items/C:\\Windows\\win.ini/thumb", "400"),
+        ("SEC-087", "/api/items/\\\\?\\C:\\Windows/thumb", "400"),
+        ("SEC-088", "/api/items/CON/thumb", "400"),
+        ("SEC-089", "/api/items/a.jpg:ads/thumb", "400"),
+        ("SEC-090", "/api/items/./a.jpg/thumb", "404"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "case_id,url,expected",
+    _traversal_urls(),
+    ids=[c[0] for c in _traversal_urls()],
+)
+def test_http_layer_traversal_cannot_reach_outside_files(
+    tmp_path, library, case_id: str, url: str, expected: str
+) -> None:
+    """docs/07 §7.1 SEC-081~090：这些 URL 一律**不能**返回库外文件。
+
+    ## 它们实际挡在哪一层（与文档的差异）
+
+    文档写的是"沙箱拦住这些 URL"。实测不是：这些 URL 里的 `media_id`
+    段**根本不是整数**，所以它们在 `ctx.param_int()` 就被
+    `400 E1001 路径参数 media_id 必须是整数` 拒掉，**走不到沙箱**。
+
+    这是**分层正确**的结果，不是缺陷：
+    * `/api/items/{media_id}` 的 media_id 是数据库主键，不是路径 ——
+      用整数解析拒绝一切非数字形态，比让它们进沙箱再判要早一层；
+    * SEC-084 / SEC-090 拿到的是 **404** 而不是 400，因为它们的
+      `media_id` 段是 `....` 与 `.`：路径段数与路由模式对不上，
+      直接落到 fallback 404。两种情况都**没有触到文件系统**，
+      这才是本组真正要钉的性质。
+
+    文档判据写"`400` 或 `404`"，正是承认了这个不确定性 —— 本用例把
+    各自的实际值钉住（实现变了就会红），同时断言响应体里不出现库外
+    路径，那一条才是安全性的实质。
+    """
+    st = _state(tmp_path, library)
+    _seed_three(st, library)
+
+    r = _call(st, "GET", url)
+    assert str(r.status) == expected, f"{case_id} 期望 {expected}，实际 {r.status}"
+
+    body = _body(r)
+    assert b"secret" not in body
+    assert b"win.ini" not in body
+    # 响应体绝不能回显解析出的绝对路径
+    assert str(library).encode() not in body
+
+
+def test_http_layer_traversal_never_opens_a_file_outside(tmp_path, library) -> None:
+    """同一组用例的**行为**断言：库外放一个陷阱文件，确认它从没被读到。
+
+    URL 层面的状态码可能随路由实现变化，但"库外的字节有没有被读出来"
+    是稳定的安全性质。陷阱文件内容足够独特，只要响应体里出现它就说明
+    真的越界了 —— 这比断言 400/404 更接近我们真正关心的事。
+    """
+    st = _state(tmp_path, library)
+    _seed_three(st, library)
+
+    marker = b"OUTSIDE-MARKER-7f3a9c"
+    (tmp_path / "secret.txt").write_bytes(marker)
+    (library.parent / "secret.txt").write_bytes(marker)
+
+    for case_id, url, _expected in _traversal_urls():
+        r = _call(st, "GET", url)
+        assert marker not in _body(r), f"{case_id} 把库外内容读出来了：{url}"
+
+
+@pytest.mark.parametrize("suffix", ["", "/thumb", "/preview", "/raw"])
+def test_every_item_endpoint_rejects_non_integer_media_id(
+    tmp_path, library, suffix: str
+) -> None:
+    """`item` / `thumb` / `preview` / `raw` 四个端点都必须拒绝非整数 id。
+
+    只测 thumb 会漏掉"某天有人给 raw 单独写了个解析函数"。四个端点共用
+    `ctx.param_int()`，这条把它们钉在一起。
+    """
+    st = _state(tmp_path, library)
+    _seed_three(st, library)
+    r = _call(st, "GET", f"/api/items/..%2f..%2fsecret.txt{suffix}")
+    assert r.status == 400
+    assert _json(r)["error"]["code"] == "E1001"
