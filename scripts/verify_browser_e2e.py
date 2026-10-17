@@ -58,6 +58,9 @@ CHROME_CANDIDATES = (
 )
 
 failures: list[str] = []
+# 本次运行所用浏览器的版本（CDP `Browser.getVersion` 报的）。
+# 收尾时打出来，给 I-01「Chrome 正常」留一份可核对的环境证据。
+browser_version = ""
 
 
 def check(ok: bool, label: str, extra: str = "") -> None:
@@ -361,6 +364,40 @@ def main() -> int:
     port = free_port()
     data = tmp / "data"
     data.mkdir(parents=True)
+
+    # **I-01「Chrome 正常」的证据必须带版本号**。只写"跑过了"没有意义：
+    # 换一台机器、换一个 Chrome 大版本，结论就可能不同，而读的人无从判断
+    # 这份结论是在哪个浏览器上得出的。用 CDP 自己报的 `Browser.getVersion`
+    # 取，比解析 exe 的 VersionInfo 可信（那只是安装包版本）。
+    _ver = ""
+    try:
+        _vp = free_port()
+        _vproc = subprocess.Popen(
+            [exe, "--headless=new", "--disable-gpu", "--no-first-run",
+             f"--remote-debugging-port={_vp}",
+             f"--user-data-dir={tmp / 'vprobe'}", "about:blank"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            _end = time.time() + 30
+            while time.time() < _end:
+                try:
+                    with urllib.request.urlopen(
+                            f"http://127.0.0.1:{_vp}/json/version", timeout=2) as r:
+                        _ver = json.loads(r.read()).get("Browser", "")
+                    break
+                except Exception:                       # noqa: BLE001
+                    time.sleep(0.25)
+        finally:
+            _vproc.terminate()
+            try:
+                _vproc.wait(timeout=10)
+            except Exception:                           # noqa: BLE001
+                _vproc.kill()
+    except Exception as e:                              # noqa: BLE001
+        print(f"      取浏览器版本失败（不影响用例）: {e}")
+    print(f"浏览器版本: {_ver}")
+    global browser_version
+    browser_version = _ver
 
     # 造 3 张图，让时间线有内容可渲染。
     # a.jpg 带 GPS：AC-2.12 要求详情面板显示坐标并可跳地图
@@ -3008,7 +3045,7 @@ def main() -> int:
             # 只留下一个与本任务无关的编码报错。
             print("  [X]", f)
         return 1
-    print("=== ALL PASS ===")
+    print(f"=== ALL PASS ===  浏览器 {browser_version}".rstrip())
     shutil.rmtree(tmp, ignore_errors=True)
     return 0
 
