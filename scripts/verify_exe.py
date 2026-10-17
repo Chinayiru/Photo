@@ -89,7 +89,10 @@ def _write_cfg(work: Path, port: int, lib: Path) -> Path:
     cfg = d / "config.json"
     cfg.write_text(json.dumps({
         "app": {"tray": False},
-        "server": {"host": "127.0.0.1", "port": port},
+        # panel_http 默认是关的（审计 F1-b：/panel 只靠回环 IP 挡不住本机浏览器
+        # 发起的攻击）。本脚本恰恰是"用 HTTP 调面板接口拿配对码"的正当调用方，
+        # 所以必须显式打开 —— 与 backend/tests/test_server.py 的 fixture 同理。
+        "server": {"host": "127.0.0.1", "port": port, "panel_http": True},
         "roots": [{"id": "library", "path": str(lib), "mode": "readwrite"}],
         "cloud": {"enabled": False},
     }, ensure_ascii=False), encoding="utf-8")

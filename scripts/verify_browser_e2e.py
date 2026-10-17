@@ -359,7 +359,12 @@ def main() -> int:
     make_image(lib / "sub" / "c.jpg", (40, 60, 200))
 
     cfg_raw = {
-        "server": {"port": port, "transport": "local_http", "bind": "0.0.0.0"},
+        # panel_http 默认是关的（审计 F1-b：/panel 只靠回环 IP 挡不住本机浏览器
+        # 发起的攻击）。本脚本要用 HTTP 调 /panel/pair-code 拿配对码，属于
+        # 正当的本机调用方，所以显式打开 —— 与 backend/tests/test_server.py 的
+        # fixture、scripts/verify_exe.py 同理。
+        "server": {"port": port, "transport": "local_http", "bind": "0.0.0.0",
+                   "panel_http": True},
         "roots": [{"id": "library", "path": str(lib), "mode": "readwrite",
                    "enabled": True}],
     }
