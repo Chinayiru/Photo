@@ -30,6 +30,10 @@
     # 后台挂机并把报告写文件
     .venv\\Scripts\\python.exe scripts\\soak_test.py --hours 24 --report build\\soak.json
 
+**中断也能看进度**：带 `--report` 时每 30 轮会原子写一次检查点
+（`"status": "running"`，只记事实不做判定），跑一半被杀掉也能看到
+"跑到第几轮、失败哪些"。收尾时才写完整报告（`"status"` 不含，字段见下）。
+
 退出码：0 = 通过；1 = 有指标越界；2 = 环境问题（库不存在等）。
 """
 from __future__ import annotations
@@ -98,6 +102,52 @@ def _net_growth(series: list[float], *, frac: float = WARMUP_FRACTION):
     second = statistics.mean(usable[half:])
     rel = (second - first) / first if first else None
     return second - first, rel, first
+
+
+def _write_checkpoint(
+    path: Path | None,
+    *,
+    hours: float,
+    rounds: int,
+    rounds_ok: int,
+    rounds_bad: int,
+    samples: list[dict[str, Any]],
+    failures: list[str],
+    total_hours: float,
+) -> None:
+    """把"到目前为止"的进度落盘，供中断后查看。
+
+    ★ 与最终报告的差别：这里**不做判定**。判据（丢掉前 1/4 暖机后比较前后
+    半程均值）在样本不足时毫无意义，提前算出来只会误导。所以检查点只写
+    原始事实：跑了多久、多少轮、失败哪些、采样序列是什么。
+
+    写失败一律吞掉 —— 挂机不该因为磁盘满/文件被占用而中断。
+    """
+    if path is None:
+        return
+    payload = {
+        "status": "running",
+        "hours": round(hours, 3),
+        "total_hours": total_hours,
+        "progress": f"{hours / total_hours:.1%}" if total_hours else "n/a",
+        "rounds": rounds,
+        "rounds_ok": rounds_ok,
+        "rounds_bad": rounds_bad,
+        "failures": failures[-50:],          # 只留最近 50 条，避免无限膨胀
+        "samples": samples,
+        "written_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8", newline="",
+        )
+        # 原子替换：否则进程正好在写到一半时被杀，留下半截 JSON，
+        # 之后"看一眼进度"反而会 JSONDecodeError。
+        os.replace(tmp_path, path)
+    except Exception:       # noqa: BLE001
+        pass
 
 
 def _rss_bytes() -> int | None:
@@ -418,6 +468,19 @@ def main() -> int:
     total_sec = max(1.0, args.hours * 3600.0)
     interval = max(1.0, args.interval)
 
+    # ★ 报告路径必须**在循环开始前**就解析好。
+    # 原实现只在收尾处写一次，于是挂机跑 24 小时、中途被任何原因打断
+    # （外部进程 git reset、用户关机、断电、任务管理器结束进程），
+    # 已经跑出来的数据**一行都不会留下** —— 实测踩过：跑了 8.00 小时
+    # / 481 轮，进程被杀掉，`build\soak_24h.json` 根本不存在，
+    # 只剩一份日志要人肉反推。检查点让"跑了多久"随时可查。
+    report_path: Path | None = None
+    if args.report:
+        report_path = Path(args.report)
+        if not report_path.is_absolute():
+            report_path = REPO / report_path
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+
     cfg, tmp = _build_config(args)
     print("=" * 66)
     print("PhotoBridge 稳定性挂机")
@@ -490,6 +553,17 @@ def main() -> int:
             failures.append(f"第 {n_rounds} 轮请求失败：{res['detail']}")
 
         s = sample("tick")
+
+        # ★ 每 30 轮（默认 30 分钟）落一次检查点。
+        # 不每轮都写：轮间隔 60 秒时每轮写一次也是可以的，但挂机时长
+        # 可能是 0.03 小时（压测模式，间隔 1 秒），那样写盘会盖过被测逻辑。
+        if n_rounds % 30 == 0:
+            _write_checkpoint(
+                report_path,
+                hours=elapsed / 3600, rounds=n_rounds,
+                rounds_ok=rounds_ok, rounds_bad=rounds_bad,
+                samples=samples, failures=failures, total_hours=args.hours,
+            )
 
         # 每 10 轮打一行，避免日志刷屏（挂机 24 小时 = 1440 轮）
         if n_rounds % 10 == 1 or not res["ok"]:
@@ -633,17 +707,13 @@ def main() -> int:
         "samples": samples,
     }
 
-    if args.report:
-        rp = Path(args.report)
-        if not rp.is_absolute():
-            rp = REPO / rp
-        rp.parent.mkdir(parents=True, exist_ok=True)
-        rp.write_text(
+    if report_path is not None:
+        report_path.write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
             encoding="utf-8",
             newline="",
         )
-        print(f"\n报告已写入 {rp}")
+        print(f"\n报告已写入 {report_path}")
 
     print()
     if failures:
