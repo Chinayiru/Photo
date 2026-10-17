@@ -506,3 +506,135 @@ def test_serve_does_not_discard_passed_config() -> None:
         "而不是无条件覆盖入参"
     )
 
+
+# ---------------------------------------------------------------------------
+# 配置默认值不可被单份配置污染
+# ---------------------------------------------------------------------------
+
+
+def test_merge_deep_copies_so_defaults_are_never_mutated() -> None:
+    """★ `_merge` 必须深拷贝 `DEFAULT_CONFIG`，否则"改配置"会改到默认值上。
+
+    `_merge` 原先是 `out = dict(base)` —— 只复制第一层，嵌套 dict 仍与
+    模块级 `DEFAULT_CONFIG` 共享对象。于是一份**没写 server 节**的配置，
+    它的 `raw["server"]` 就是 `DEFAULT_CONFIG["server"]` 本身，任何
+    `cfg.raw["server"]["host"] = x` 都在改写全进程的默认值。
+
+    实测表现：先跑一条"首启写 0.0.0.0"的用例，之后每一条用例新建的
+    Config 都带着 0.0.0.0 出生 —— 连"关掉 require_pairing 就该拒绝监听"
+    这条安全用例都被带跑偏（它拿到了状态污染后的默认值，于是"通过"了，
+    而实际上闸门根本没生效）。
+
+    这条断言刻意直接盯 `DEFAULT_CONFIG` 本身，而不只是比对新旧 Config 的
+    值：只有这样才能区分"深拷贝生效"和"恰好两次得到相同结果"。
+    """
+    import copy
+
+    from backend.app import config as cfgmod
+
+    baseline = copy.deepcopy(cfgmod.DEFAULT_CONFIG)
+
+    a = Config({})                       # 完全空配置：所有节都走默认
+    a.raw["server"]["host"] = "0.0.0.0"
+    a.raw["auth"]["require_pairing"] = False
+
+    assert cfgmod.DEFAULT_CONFIG == baseline, (
+        "改一份新配置的 raw 竟然改到了 DEFAULT_CONFIG —— "
+        "后续所有 Config 都会从被污染的默认值起步"
+    )
+
+    b = Config({})
+    assert b.server.get("host") == baseline["server"]["host"], (
+        f"新建的 Config 拿到了被污染的 host={b.server.get('host')!r}"
+    )
+    assert b.raw["auth"]["require_pairing"] is True, (
+        "新建的 Config 拿到了被污染的 require_pairing=False —— "
+        "这会让'无鉴权暴露照片库'看起来是可接受的默认值"
+    )
+    assert b.raw["server"] is not cfgmod.DEFAULT_CONFIG["server"], (
+        "嵌套 dict 仍是同一个对象，deepcopy 没生效"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 首次运行向导要真的打开局域网
+# ---------------------------------------------------------------------------
+
+
+def _boot_case(tmp_path, monkeypatch, raw, found):
+    """跑一次 `bootstrap_default_root`，返回 (cfg, host)。"""
+    from backend.app import config as cfgmod
+
+    cfg_path = tmp_path / "data" / "config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg = Config(raw, path=cfg_path)
+
+    lib = tmp_path / "相册"
+    lib.mkdir(exist_ok=True)
+    monkeypatch.setattr(
+        cfgmod, "_guess_library_paths",
+        lambda: ([(lib, "相册")] if found else []),
+    )
+    out = cfgmod.bootstrap_default_root(cfg)
+    return out, out.server.get("host")
+
+
+def test_bootstrap_opens_lan_on_first_run(tmp_path, monkeypatch) -> None:
+    """★ 首启探测到照片库时，必须把 host 从回环改成 0.0.0.0。
+
+    这是那个"手机连不上"的根因：`DEFAULT_CONFIG` 的注释承诺过
+    "首次运行向导会把这一项改成 0.0.0.0"，而 `bootstrap_default_root`
+    只写 roots、从不碰 `server.host`。默认 `127.0.0.1` 意味着托盘打印出
+    `http://192.168.x.x:8787`、手机打开却是"目标计算机积极拒绝"，
+    而电脑端一切正常 —— 用户完全无从判断该改哪里。
+    """
+    cfg, host = _boot_case(tmp_path, monkeypatch, {}, found=True)
+
+    assert host == "0.0.0.0", (
+        f"首启探测到照片库后 host 仍是 {host!r}，手机连不上；"
+        f"这个 bug 之前在真实 exe 上实测踩到过"
+    )
+    assert cfg.raw["auth"]["require_pairing"] is True, (
+        "开了局域网监听却没有 require_pairing，等于无鉴权暴露整个照片库"
+    )
+
+
+def test_bootstrap_does_not_open_lan_without_library(tmp_path, monkeypatch) -> None:
+    """没探测到照片库时不许开监听 —— 开了也只能回 404，纯增暴露面。"""
+    _, host = _boot_case(tmp_path, monkeypatch, {}, found=False)
+    assert host != "0.0.0.0", (
+        "roots 为空却开了局域网监听：既无用，又扩大了攻击面"
+    )
+
+
+def test_bootstrap_respects_explicit_host(tmp_path, monkeypatch) -> None:
+    """用户手写的 host 绝不能被首启向导覆盖 —— 只在它还是默认值时才动。"""
+    _, host = _boot_case(
+        tmp_path, monkeypatch, {"server": {"host": "192.168.1.5"}}, found=True,
+    )
+    assert host == "192.168.1.5", "覆盖了用户显式配置的 host"
+
+
+def test_bootstrap_refuses_lan_when_pairing_off(tmp_path, monkeypatch) -> None:
+    """★ 安全闸门：`require_pairing=false` 时**绝不能**开 0.0.0.0。
+
+    这条是 `test_merge_deep_copies_so_defaults_are_never_mutated` 的行为
+    对偶：默认值一旦被污染，这条会"通过"一个本不该通过的场景。
+    """
+    _, host = _boot_case(
+        tmp_path, monkeypatch, {"auth": {"require_pairing": False}}, found=True,
+    )
+    assert host != "0.0.0.0", (
+        "require_pairing=false 时开了局域网监听 —— 手机不用配对就能"
+        "拉走整库照片"
+    )
+
+
+def test_bootstrap_refuses_lan_when_allow_lan_off(tmp_path, monkeypatch) -> None:
+    """用户明确关掉局域网时，首启向导不许自作主张打开。"""
+    _, host = _boot_case(
+        tmp_path, monkeypatch, {"server": {"allow_lan": False}}, found=True,
+    )
+    assert host != "0.0.0.0", (
+        "allow_lan=false 时开了局域网监听，违背用户明确设置"
+    )

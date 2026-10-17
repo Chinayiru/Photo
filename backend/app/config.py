@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tempfile
@@ -463,8 +464,20 @@ def _merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, An
     为什么用深合并而不是整体替换：用户手写的 config.json 通常只写关心的几项
     （如只有 roots 和 port）。整体替换会让新增的默认键在升级后消失，
     导致 KeyError 或行为回退。
+
+    ★ 为什么必须 deepcopy，而不是 `dict(base)`：`dict()` 只复制**第一层**，
+    嵌套的 dict 仍然指向原对象。而 `base` 是模块级的 `DEFAULT_CONFIG`，
+    于是任何一份「没写 server 节」的配置，它的 `cfg.raw["server"]` 就是
+    `DEFAULT_CONFIG["server"]` 本身 —— 之后 `cfg.raw["server"]["host"] = x`
+    改的不是这份配置，而是**全进程的默认值**，下一个新建的 Config 会带着
+    上一次写进去的值出生。
+
+    这不是理论问题：`main.py` 的 `--host` 参数与首启向导的 host 写入都走
+    这条路，实测中表现为「先跑一条把 host 写成 0.0.0.0 的用例，后面每条
+    用例都带着 0.0.0.0 出生」，连「关掉 require_pairing 就该拒绝监听」这条
+    安全用例都被污染成通过。嵌套只有两三层的量级，拷贝成本可以忽略。
     """
-    out: dict[str, Any] = dict(base)
+    out: dict[str, Any] = copy.deepcopy(dict(base))
     for k, v in override.items():
         if isinstance(v, Mapping) and isinstance(out.get(k), Mapping):
             out[k] = _merge(out[k], v)  # type: ignore[arg-type]
@@ -845,10 +858,39 @@ def bootstrap_default_root(cfg: Config | None = None) -> Config:
         )
         cfg.raw["roots"] = []
 
-    cfg.save()
     # 就地失效缓存：roots 是惰性解析并缓存的，改完 raw 必须让它重算，
-    # 否则 `cfg.roots` 还是改之前的空列表。
+    # 否则 `cfg.roots` 还是改之前的空列表，下面 check_bind_safety 会
+    # 因为「没有媒体根目录」而拒绝 —— 明明刚写进去。
     cfg._roots = None       # noqa: SLF001
+
+    # ★ 首次运行向导的**另一半**。
+    #
+    # DEFAULT_CONFIG 的注释里承诺过「首次运行向导会把这一项改成 0.0.0.0
+    # 并同时开启 require_pairing」，但这段代码从来没兑现 —— 它只写 roots，
+    # 从不碰 server.host。后果是**全新安装默认绑回环**：托盘已经打印出
+    # `http://192.168.x.x:8787`，手机打开却是「目标计算机积极拒绝」，而
+    # 电脑端一切正常，用户完全无从判断该改哪里（实测踩到）。
+    #
+    # 只在两个条件同时成立时改：
+    #   ① 真的探测到了照片库 —— 没库就没必要开监听，开了也只能回 404；
+    #   ② `check_bind_safety("0.0.0.0", cfg)` 放行 —— 复用同一套三道门
+    #      （allow_lan / roots 非空 / require_pairing），保证**不会**出现
+    #      「无鉴权暴露整个照片库」。把判断交给它而不是在这里重写一遍
+    #      条件，是为了将来加门时两处不会走偏。
+    #
+    # 用户显式写过的 host 一律尊重：只在它还是默认值时才动。
+    if found and cfg.server.get("host") == DEFAULT_CONFIG["server"]["host"]:
+        ok, why = check_bind_safety("0.0.0.0", cfg)
+        if ok:
+            cfg.raw.setdefault("server", {})["host"] = "0.0.0.0"
+            log.info("首次运行：已开启局域网直连（%s），手机访问上面的地址即可", why)
+        else:
+            log.warning(
+                "首次运行：未开启局域网直连（%s），手机将连不上；可在设置里打开",
+                why,
+            )
+
+    cfg.save()
     return cfg
 
 

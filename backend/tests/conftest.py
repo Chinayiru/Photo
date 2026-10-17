@@ -88,3 +88,59 @@ def _isolate_global_state():
     _reset_global_state()
     yield
     _reset_global_state()
+
+
+# ---------------------------------------------------------------------------
+# 真实 data/config.json 守卫
+# ---------------------------------------------------------------------------
+
+def _real_config_path() -> Path:
+    """生产路径上的 `data/config.json`（不是任何临时库的那份）。"""
+    from backend.app.config import CONFIG_PATH
+
+    return Path(CONFIG_PATH)
+
+
+@pytest.fixture(autouse=True)
+def _protect_real_config():
+    """★ 禁止任何用例写坏开发机上真实的 `data/config.json`。
+
+    ## 为什么需要（真实事故）
+
+    `Config.__init__` 的 `path` 参数**有默认值** `CONFIG_PATH`，也就是生产
+    那份配置。写用例时很容易顺手写 `Config({})` 而忘了传
+    `path=tmp_path/...`；此时 `bootstrap_default_root(cfg)` 里的
+    `cfg.save()` 会**真的写到开发机的配置文件上**。
+
+    实测后果：跑一轮新写的用例，把开发机上那份 `data/config.json` 的
+    `roots` 换成了 pytest 临时目录、`host` 改成了别的值，且**没有任何
+    报错** —— 测试全绿，程序下次启动却索引不到照片。这类损坏极难归因：
+    配置文件看着是"正常"的 JSON，只是内容被换掉了。
+
+    ## 做法
+
+    用例前后比对真实配置的字节内容；发现被改动就**还原并让该用例失败**，
+    把"哪个用例干的"直接摆在面前。还原比只报错重要：否则第一个用例污染
+    之后，所有用例都在脏数据上跑，失败会互相掩盖。
+
+    只在文件**原本存在**时守卫。测试环境里若本来没有这份配置，
+    `bootstrap_default_root` 写出一份是正当行为，不该拦截。
+    """
+    real = _real_config_path()
+    existed = real.exists()
+    before = real.read_bytes() if existed else None
+
+    yield
+
+    if not existed:
+        return
+    try:
+        after = real.read_bytes()
+    except FileNotFoundError:
+        after = None
+    if after != before:
+        real.write_bytes(before or b"")
+        pytest.fail(
+            f"用例把真实的 {real} 改了（已还原）。"
+            "多半是构造 Config 时忘了传 path=tmp_path/'config.json'。"
+        )

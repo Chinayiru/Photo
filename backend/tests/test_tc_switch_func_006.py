@@ -356,7 +356,13 @@ _IGNORED = {"x-request-id", "date", "server", "connection", "keep-alive",
 #:   `Content-Length` 跟着差 1 字节。
 #: * `server_time` —— 时间线/搜索响应的服务端时间（前端用它校正本地钟）。
 #:   它是**顶层**字段，与 `ts` 是两个不同的名字，只写一个会漏。
-_VOLATILE_JSON = {"ts", "request_id", "uptime_sec", "server_time"}
+#: * `disk_free` —— `/api/system/info` 的每个 root 都带它，读的是**实时**
+#:   剩余磁盘空间（`state.py` 的 `_disk_usage`）。这条用例自己会在两条通路
+#:   之间写缩略图与数据库行，几百毫秒里剩余空间真的会变 —— 实测偶发
+#:   漂几十 KB，导致整条用例失败（约每 4 次全量跑复现一次）。
+#:   **`disk_total` 不在此列**：分区总容量不会因为写几个文件而变，它必须
+#:   两边严格相等；抹掉它会把"适配层算错了磁盘总量"这种真 bug 一起放过。
+_VOLATILE_JSON = {"ts", "request_id", "uptime_sec", "server_time", "disk_free"}
 
 
 def _normalize(obj):
