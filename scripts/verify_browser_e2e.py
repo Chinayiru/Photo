@@ -204,9 +204,58 @@ class Browser:
             raise RuntimeError(f"JS 抛异常: {r['exceptionDetails']}")
         return res.get("value")
 
-    def goto(self, url: str) -> None:
+    def goto(self, url: str, *, budget: float = 25.0) -> None:
+        """导航到 `url` 并**等到新文档真的加载完**。
+
+        ★★ 这里必须盯 `loaderId`，不能只盯 `document.readyState`。
+        原来的写法是 `Page.navigate` 之后调 `wait_ready()`，而 `wait_ready()`
+        的第一条判据是 `document.readyState === "complete"` ——
+        **`about:blank` 从一开始就是 complete**。于是紧跟 `new_page()`
+        之后的 `goto()` 会在导航还没提交时就返回，接下来的
+        `Runtime.evaluate` 落在旧的 `about:blank` 上：
+
+          - `location.origin` 读回字符串 `"null"`（不透明来源）；
+          - `window.localStorage` 抛
+            `SecurityError: Access is denied for this document`；
+          - `isSecureContext` 是 false（about:blank 也是 false）——
+            **这条恰好会"看起来对"**，于是断言通过而什么都没验证。
+
+        实测就是这么炸的：`[4r]` 报「页面来源真的换成了局域网地址」失败，
+        来源是 `null`，随后读 localStorage 抛 SecurityError。
+
+        `Page.navigate` 的返回值里带主框架的新 `loaderId`，事件
+        `Page.frameNavigated` 会带着同一个 id —— 盯它才不会抢跑。
+        `_events` 由 `send()` 顺手累积，这里用一次廉价的 `evaluate`
+        把事件抽出来（`evaluate` 内部要 recv，事件就在那条流里）。
+        """
         self.send("Page.enable")
-        self.send("Page.navigate", url=url)
+        r = self.send("Page.navigate", url=url)
+        if r.get("errorText"):
+            raise RuntimeError(f"Page.navigate 被拒: {r['errorText']}（{url}）")
+        lid = r.get("loaderId") or ""
+        end = time.time() + budget
+        seen = False
+        while time.time() < end:
+            try:
+                self.evaluate("1")          # 顺手 drain 事件
+            except Exception:               # noqa: BLE001
+                pass
+            for m in self._events[-400:]:
+                if m.get("method") != "Page.frameNavigated":
+                    continue
+                fr = (m.get("params") or {}).get("frame") or {}
+                if not fr.get("parentId") and (
+                        not lid or fr.get("loaderId") == lid):
+                    seen = True
+                    break
+            if seen:
+                break
+            time.sleep(0.05)
+        if not seen:
+            # 没看到事件也要落回 readyState 判据，别把一次真导航判死；
+            # 但超时本身值得一句提示，否则后面全是一堆莫名其妙的断言失败。
+            print(f"      提示: {budget:.0f}s 内没等到 Page.frameNavigated"
+                  f"（{url}），退回 readyState 判定")
         self.wait_ready()
 
     def wait_ready(self, *, budget: float = 20.0) -> bool:
@@ -406,12 +455,28 @@ def main() -> int:
     make_image(lib / "sub" / "c.jpg", (40, 60, 200))
 
     cfg_raw = {
+        # ★ 键名是 `host`，不是 `bind`。
+        #
+        # 我在这里写了三年的 `"bind": "0.0.0.0"` 是个**死键**：
+        # `backend/app/transports/local_http.py:179` 读的是
+        # `cfg.get("server.host", "127.0.0.1")`，`backend/app/config.py`
+        # 的 DEFAULT_CONFIG 里也没有 `bind` 这个键。于是服务一直绑在
+        # 127.0.0.1 上，而脚本里所有断言都跑在回环 —— 谁也不会发现。
+        #
+        # 直到 [4r] 要"从局域网 IP 打开页面"时才炸出真相：
+        # `net::ERR_CONNECTION_REFUSED（http://192.0.2.10:63728/）`。
+        "host": "0.0.0.0",
         # panel_http 默认是关的（审计 F1-b：/panel 只靠回环 IP 挡不住本机浏览器
-        # 发起的攻击）。本脚本要用 HTTP 调 /panel/pair-code 拿配对码，属于
-        # 正当的本机调用方，所以显式打开 —— 与 backend/tests/test_server.py 的
-        # fixture、scripts/verify_exe.py 同理。
-        "server": {"port": port, "transport": "local_http", "bind": "0.0.0.0",
-                   "panel_http": True},
+        # 发起的攻击）。本脚本拿配对码走的是**进程内直调 handler**（见
+        # `main()` 里 `_new_code()` 的注释），与 HTTP 面无关，所以这里
+        # 明确关掉——同时也让 `check_bind_safety` 允许绑 0.0.0.0。
+        "server": {"port": port, "transport": "local_http", "host": "0.0.0.0",
+                   # `check_bind_safety` 的第四道门：panel_http 为真时
+                   # **不允许**绑通配地址（否则任何网页都能替你生成配对码）。
+                   # 本脚本要同时满足「面板可达」与「局域网可达」，只能
+                   # 显式把面板关掉、改用进程内直接调 handler 取配对码
+                   # —— 这也是审计 F1-b 之后唯一正当的组合。
+                   "panel_http": False},
         "roots": [{"id": "library", "path": str(lib), "mode": "readwrite",
                    "enabled": True}],
     }
@@ -446,7 +511,33 @@ def main() -> int:
         return 2
     base = state["base"]
     st = state["st"]
-    print(f"服务: {base}")
+    # ★ 绑的是 0.0.0.0，`urls[0]` 就是局域网地址。脚本里所有"手机填的
+    #   地址"与"服务端自己的回环地址"必须分开：
+    #   - `pc_host` 是服务在**这台电脑上**的回环地址（配对表单要填的、
+    #     断言 `pb.base` 用的、以及"服务端视角的自己"）；
+    #   - `base` 是浏览器/手机视角的局域网地址。
+    #   以前两者都是 127.0.0.1，所以从来没有区分过 —— 一绑 0.0.0.0 就全线
+    #   失效（表单默认值仍是 127.0.0.1 掩码？不，掩码读的是 location，
+    #   于是浏览器从局域网打开时它填的是局域网地址，与写死的 127.0.0.1
+    #   撞成三个不一致的 host，配对页直接不发请求）。
+    try:
+        _port_now = int(base.rsplit(":", 1)[-1].split("/")[0])
+    except (ValueError, IndexError):
+        _port_now = port
+    pc_host = "127.0.0.1"
+    pc_base = f"http://{pc_host}:{_port_now}"
+    # 页面自己所在的 host —— 真机配对时填的就是它。
+    #
+    # ★ 不能用 `pc_host`（127.0.0.1）去填表单：页面来源是
+    #   `http://192.0.2.10:PORT`，把手机端 base 指向 `127.0.0.1:PORT`
+    #   就是一次**跨源**请求，而本程序默认不发任何 CORS 头（审计 F1-a：
+    #   白名单为空 = 一个头都不发）。于是浏览器把 OPTIONS 预检打成 405，
+    #   配对静默失败——我第一次跑就是这么炸的：
+    #   `OPTIONS /api/pair 失败 code=E1018`，然后 token 永远不落盘。
+    #   真机从来不会遇到这件事：手机上填的必然是电脑的局域网地址，
+    #   与页面同源。脚本必须复现真机，而不是复现一台主机名写错的手机。
+    page_host = base.split("://", 1)[-1].split("/")[0].split(":")[0]
+    print(f"服务: {base}（本机回环: {pc_base}）")
 
     # 等首扫完成，否则时间线是空的（那会让"渲染出来了吗"无法判定）
     for _ in range(120):
@@ -456,11 +547,31 @@ def main() -> int:
             break
     time.sleep(1.0)
 
-    # 拿配对码：直接调本机面板接口（模拟用户在电脑上点"生成配对码"）
-    with urllib.request.urlopen(urllib.request.Request(
-            f"{base}/panel/pair-code", data=b"{}", method="POST",
-            headers={"Content-Type": "application/json"}), timeout=10) as r:
-        pc = json.loads(r.read())
+    # 拿配对码：走托盘真正走的那条路 —— 直接调 handler 函数。
+    #
+    # ★ 以前这里发 HTTP `POST {base}/panel/pair-code`。那要求把
+    #   `server.panel_http` 打开，而 `check_bind_safety` 的第四道门
+    #   明确禁止「panel_http 为真 + 绑通配地址」同时成立（否则任何网页
+    #   都能替你生成配对码，审计 F1-b）。本脚本现在要真从局域网 IP 打开
+    #   页面，就必须绑 0.0.0.0，于是面板只能关——**这不是退让，这才是
+    #   产品本来被设计成的样子**：托盘调 `panel_pair_code(ctx)` 函数，
+    #   从不走 HTTP（`frontend` 里 `grep /panel` 零命中）。
+    #   `backend/tests/test_tray.py` 钉的也是这条函数直调。
+    import asyncio as _aio
+
+    from backend.app.core import Ctx as _Ctx
+    from backend.app.handlers.auth import panel_pair_code as _panel_pair_code
+
+    def _new_code() -> dict:
+        # `app=` 不能漏：`_st(ctx)` 在 `ctx.app is None` 时直接
+        # `raise RuntimeError("AppState 未注入 ctx.app")`。HTTP 适配器
+        # 是不管这事的（`adapt_request` 里塞），进程内直调必须自己塞。
+        _ctx = _Ctx(method="POST", path="/panel/pair-code",
+                    client_ip="127.0.0.1", app=st)
+        _rep = _aio.run(_panel_pair_code(_ctx))
+        return json.loads(_rep.body or b"{}")
+
+    pc = _new_code()
     code = pc["code"]
     print(f"配对码: {code}")
 
@@ -550,12 +661,12 @@ def main() -> int:
             };
             const host = document.querySelector('input[placeholder*="192.168"]');
             const codeEl = document.querySelector('input.code');
-            set(host, '127.0.0.1');
+            set(host, '%s');
             const portEl = document.querySelector('input.port');
             if (portEl) set(portEl, '%d');
             set(codeEl, '%s');
           })()
-        """ % (port, code))
+        """ % (page_host, port, code))
         time.sleep(0.4)
         # 点"连接电脑"
         br.evaluate("""
@@ -572,7 +683,7 @@ def main() -> int:
         tok = br.evaluate("window.localStorage.getItem('pb.token')")
         check(bool(tok), f"token 非空  got {(tok or '')[:12]}…")
         got_base = br.evaluate("window.localStorage.getItem('pb.base')")
-        check("127.0.0.1" in (got_base or ""), f"base 落盘正确  got {got_base!r}")
+        check(page_host in (got_base or ""), f"base 落盘正确  got {got_base!r}")
         dev = br.evaluate("window.localStorage.getItem('pb.device_id')")
         check(bool(dev), f"device_id 落盘  got {(dev or '')[:12]}…")
 
@@ -1026,11 +1137,7 @@ def main() -> int:
         # DHCP 分配。同一个 IP 隔几天可能已属于**另一台也跑着 PhotoBridge
         # 的电脑** —— 只认 `?code=` 的二维码会把手机绑到别人的电脑上，
         # 还会把对方的照片显示出来。带上 `did` 才能在配对前发现。
-        qr = urllib.request.urlopen(
-            urllib.request.Request(f"{base}/panel/pair-code", data=b"{}",
-                                   method="POST",
-                                   headers={"Content-Type": "application/json"}),
-            timeout=10).read()
+        qr = json.dumps(_new_code()).encode()
         pc2 = json.loads(qr)
         # 托盘是在这个返回值上拼 `/?code=..&did=..` 的（`tray._new_pair_code`
         # → `pair_qr_url`）。这里断言数据源里有 device_id —— 没有它
@@ -1039,7 +1146,7 @@ def main() -> int:
         check(bool(pc2.get("device_id")),
               f"面板返回 device_id（二维码 did 的来源）  got {pc2.get('device_id')!r}")
         ping = json.loads(urllib.request.urlopen(
-            f"{base}/api/system/ping", timeout=10).read())
+            f"{pc_base}/api/system/ping", timeout=10).read())
         check(pc2["device_id"] == ping["device_id"],
               "★ 面板的 device_id 与 ping 自报的一致（否则二维码校验必然误判）")
         did = ping["device_id"]
@@ -1667,7 +1774,11 @@ def main() -> int:
         #   "rows 非空" 直接假红。正确做法是读 store 全量状态。
         #   store 挂在 window 上的唯一方式是 localStorage 里没有，
         #   所以改用"队列里没有残留"这个可观测事实 + 完成计数。
-        st = br.evaluate("""
+        # ★ 变量名必须是 st_js：`st` 是**服务端 AppState**，后面
+        # `_new_code()` 要 `Ctx(app=st)` 去取 db/device_id。覆盖成 JS
+        # 返回值后报 `AttributeError: 'str' object has no attribute 'db'`，
+        # 而报错位置在几百行之后，看起来像注入坏了。
+        st_js = br.evaluate("""
           (() => {
             const rows = [...document.querySelectorAll('.task .t-status')]
               .map(e => (e.textContent||'').trim());
@@ -1677,7 +1788,7 @@ def main() -> int:
                                    hasDoneBtn: /显示/.test(hero) });
           })()
         """)
-        s2 = json.loads(st or "{}")
+        s2 = json.loads(st_js or "{}")
         check(s2.get("queueEmpty") is True,
               "★ 传完后队列清空（DONE 的项不占列表，只留「显示」按钮）",
               f"{s2}")
@@ -2015,7 +2126,7 @@ def main() -> int:
         # + CSS 背景色（.conn.ok .dot）。文案来自 auth.ts: connText，
         # DIRECT → "局域网直连"。所以判据要落在文案 + CSS 类上，
         # 而不是去 innerText 里找 🟢 —— 那会永远找不到。
-        st = br.evaluate("""
+        st_js = br.evaluate("""
           (() => {
             const c = document.querySelector('.conn');
             if (!c) return JSON.stringify({found: false});
@@ -2029,7 +2140,7 @@ def main() -> int:
             });
           })()
         """)
-        stt = json.loads(st or "{}")
+        stt = json.loads(st_js or "{}")
         check(stt.get("found") is True, "状态条存在", f"{stt.get('cls')}")
         check("局域网直连" in (stt.get("text") or ""),
               "★ 状态条显示「局域网直连」（F-03 的真实文案，不是 🟢）",
@@ -2428,6 +2539,247 @@ def main() -> int:
         time.sleep(0.6)
 
         # ---------------------------------------------------------------
+        print("\n[4r] 真机的**来源**：局域网明文 HTTP 是非安全上下文（I-01 的等价条件）")
+        # ---------------------------------------------------------------
+        # 前面所有节都跑在 `http://127.0.0.1:PORT` 上 —— 那是**回环**，
+        # `window.isSecureContext === true`。而用户手机打开的是
+        # `http://192.168.x.x:PORT`，在 Chrome 里 **false**。
+        #
+        # 这差别不是形式主义。实测（build/_probe_secure.py，Chrome 155）：
+        #
+        #   | 页面                    | isSecureContext | navigator.clipboard |
+        #   |-------------------------|-----------------|---------------------|
+        #   | http://192.0.2.10:P  | **false**       | **undefined**       |
+        #   | http://127.0.0.1:P      | true            | object              |
+        #
+        # 于是「开发机上一切正常、手机上复制按钮完全没反应」这种缺陷，
+        # 在回环上跑一万遍也发现不了。凡是依赖安全上下文的 API，都必须
+        # 在**局域网来源**下再验一次。
+        #
+        # 怎么在不动服务绑定的前提下做到：给服务器已经枚举出来的那些
+        # 地址建一个 CDP Fetch 拦截，把发往 `http://127.0.0.1:PORT/` 的
+        # 请求改写成 `http://<局域网IP>:PORT/`。**浏览器的来源就变成了
+        # 局域网地址**，页面里的一切判断（isSecureContext、clipboard、
+        # cookie 作用域）都按真机算，而服务端仍是同一个进程、同一个库。
+        #
+        # 为什么不用 `Page.navigate` 直接打局域网 IP：本机有 VMware /
+        # Radmin VPN 等虚拟网卡，`transport.urls` 给出的第一个地址未必
+        # 是手机能路由到的那个；用 127.0.0.1 改写则与服务端绑定无关。
+        lans = []
+        # ★ `state` 里只有 st/base/stop/loop，没有 transport —— 写
+        #   `state.get("transport")` 会静默拿到 None，然后 lans 永远为空，
+        #   于是这一节退化成一个 check(False) 而不是真去验。宁可去问 st。
+        _tr = getattr(st, "transport", None)
+        for _u in (getattr(_tr, "urls", None) or []):
+            host_part = _u.split("://", 1)[-1].split("/")[0].split(":")[0]
+            if host_part not in ("127.0.0.1", "localhost", "0.0.0.0", "::1"):
+                lans.append(host_part)
+        if not lans:
+            try:
+                from backend.app.config import local_ipv4_addresses
+                lans = list(local_ipv4_addresses())
+            except Exception:                        # noqa: BLE001
+                lans = []
+        lan_host = lans[0] if lans else ""
+        check(bool(lan_host), "找到了一个局域网地址（真机就是这么访问的）",
+              f"{lan_host or '无（只剩回环，说明没有可用网卡）'}")
+
+        if lan_host:
+            lan_origin = f"http://{lan_host}:{port}"
+            sec = {}
+
+            # ★ 直接导航到局域网 IP —— 服务本来就 `bind: "0.0.0.0"`。
+            #
+            # 我先试过「用 CDP Fetch 把发往 127.0.0.1 的请求改写成局域网
+            # 地址」，那是错的：本脚本的 `Browser.send()` 只把事件通知塞进
+            # `self._events`，**没有事件回调机制**，被暂停的请求永远等不到
+            # `Fetch.continueRequest`，页面直接白屏、`location.origin`
+            # 读回 None。那套代码里写的 `_on_request_paused()` 从头到尾
+            # 没被调用过一次 —— 一个"看起来在工作"的死函数。
+            br.new_page()
+            br.send("Page.bringToFront")
+            br.send("Emulation.setDeviceMetricsOverride", width=390, height=844,
+                    deviceScaleFactor=3, mobile=True,
+                    screenOrientation={"type": "portraitPrimary", "angle": 0})
+            br.goto(lan_origin + "/")
+            origin_now = br.evaluate("location.origin")
+            # 换来源等于换了 cookie 作用域：旧 token(127.0.0.1 那条) 不会跟来
+            br.evaluate("(() => { try { window.localStorage.clear();"
+                        " return true; } catch (e) { return false; } })()")
+            br.goto(lan_origin + "/")
+            time.sleep(1.0)
+            check(origin_now == lan_origin,
+                  "★ 页面来源真的换成了局域网地址（与手机一致）",
+                  f"{origin_now}")
+
+            info = json.loads(br.evaluate("""
+              JSON.stringify({
+                origin: location.origin,
+                isSecureContext: window.isSecureContext,
+                clipboard: typeof navigator.clipboard,
+                randomUUID: typeof (window.crypto && crypto.randomUUID),
+                structuredClone: typeof window.structuredClone,
+                replaceAll: typeof String.prototype.replaceAll,
+                requestIdleCallback: typeof window.requestIdleCallback,
+                IntersectionObserver: typeof window.IntersectionObserver,
+                serviceWorker: typeof navigator.serviceWorker
+              })
+            """) or "{}")
+            sec["isSecureContext"] = info.get("isSecureContext")
+            sec["clipboard"] = info.get("clipboard")
+            # 这三条是"真机环境如实呈现"的证明，不是产品缺陷
+            check(info.get("isSecureContext") is False,
+                  "★ 局域网明文 HTTP 下 isSecureContext === false（与真机一致）",
+                  f"{info.get('origin')}")
+            check(info.get("clipboard") == "undefined",
+                  "★ 所以 navigator.clipboard 在本环境是 undefined"
+                  "（「复制」必须有兜底，见 api/clipboard.ts）")
+
+            # 非安全上下文里仍必须存在的 API：前端用到的一个都不能缺
+            for name, want in (
+                ("structuredClone", "function"),
+                ("replaceAll", "function"),
+                ("requestIdleCallback", "function"),
+                ("IntersectionObserver", "function"),
+            ):
+                check(info.get(name) == want,
+                      f"★ 局域网来源下 {name} 仍可用（前端依赖它）",
+                      f"{info.get(name)}")
+
+            # ---- 真正的判据：那个"复制服务地址"按钮在这个环境里能用吗 ----
+            # 走的是用户路径：点设置页那一行 → copyText() → execCommand 兜底。
+            # 无用户手势时 execCommand('copy') **返回 false**（实测），所以
+            # 必须用 Input.dispatchMouseEvent 真点，而不是 evaluate 里调 click()。
+            # 配对（局域网来源下重新配一次，token 作用域跟着 origin 走）
+            #
+            # ★ 必须**现取一枚新码**：脚本开头那枚在 `[2]` 节已经用掉了，
+            #   `consume_pair_code` 看到 `used_at is not None` 直接 409
+            #   E1005「配对码已使用」。这一节以前从没跑到过（一直卡在
+            #   ERR_CONNECTION_REFUSED），所以这个陈旧码的问题从未暴露。
+            code_4r = _new_code()["code"]
+            br.evaluate("""
+              (() => {
+                const set = (el, v) => {
+                  el.value = v;
+                  el.dispatchEvent(new Event('input', {bubbles: true}));
+                  el.dispatchEvent(new Event('blur', {bubbles: true}));
+                };
+                const host = document.querySelector('input[placeholder*="192.168"]');
+                const codeEl = document.querySelector('input.code');
+                if (!host || !codeEl) return false;
+                set(host, '%s');
+                const portEl = document.querySelector('input.port');
+                if (portEl) set(portEl, '%d');
+                set(codeEl, '%s');
+                return true;
+              })()
+            """ % (lan_host, port, code_4r))
+            time.sleep(0.4)
+            br.evaluate("""
+              (() => {
+                const b = [...document.querySelectorAll('button')]
+                  .find(x => /连接电脑/.test(x.textContent || ''));
+                if (b) b.click();
+                return !!b;
+              })()
+            """)
+            ok = br.wait_for("!!window.localStorage.getItem('pb.token')",
+                             budget=25, label="[4r] 局域网来源下配对")
+            check(ok, "★ 在局域网来源下配对成功（token 落盘）")
+            tok_lan = br.evaluate("window.localStorage.getItem('pb.token')")
+            check(bool(tok_lan), "★ 局域网来源下的 token 非空",
+                  f"{(tok_lan or '')[:12]}…")
+
+            # 切到"我的"页，找到"复制服务地址"那一行
+            br.evaluate("""
+              (() => {
+                const b = [...document.querySelectorAll('button, .tabbar button, nav button')]
+                  .find(x => /我的/.test(x.textContent || ''));
+                if (b) b.click();
+                return !!b;
+              })()
+            """)
+            time.sleep(0.8)
+            row = br.evaluate("""
+              (() => {
+                const btn = [...document.querySelectorAll('button')]
+                  .find(x => /复制服务地址/.test(x.textContent || ''));
+                if (!btn) return '';
+                const r = btn.getBoundingClientRect();
+                return JSON.stringify({x: r.x + r.width / 2, y: r.y + r.height / 2,
+                                       w: r.width, h: r.height});
+              })()
+            """)
+            rd = json.loads(row or "{}") if row else {}
+            check(bool(rd.get("w")), "★ 设置页有「复制服务地址」这一行且可见",
+                  f"{rd.get('w')}×{rd.get('h')} @ ({rd.get('x')},{rd.get('y')})"
+                  if rd else "没找到")
+
+            if rd.get("w"):
+                # 在页面上装一个探针，记录 execCommand 的真实返回值
+                br.evaluate("""
+                  (() => {
+                    window.__copyProbe = {calls: 0, results: []};
+                    const orig = document.execCommand.bind(document);
+                    document.execCommand = function (cmd, ...rest) {
+                      const r = orig(cmd, ...rest);
+                      if (cmd === 'copy') {
+                        window.__copyProbe.calls += 1;
+                        window.__copyProbe.results.push(r);
+                      }
+                      return r;
+                    };
+                  })()
+                """)
+                # ★★ 不能用 `Input.dispatchMouseEvent` 点这一行。
+                #
+                # 实测（`build\_probe_clip2.py`）：Windows headless Chrome 在
+                # 这个页面的视口里，鼠标事件被接受、`document.elementFromPoint`
+                # 也命中了按钮，但 `click` 一次都没触发（`calls=0`）。
+                # 而同一个探针在 `mobile=False, dsf=1` 与 `mobile=True, dsf=3`
+                # 两种视口下都正常 —— 差别不在视口，在于 `[4r]` 这一节是
+                # 在一个**新标签页**里、且之前刚做过 `br.close()` 之外的
+                # 一系列 CDP 调用；输入域偶发失灵，和 `[4g]` 记录的触摸失灵
+                # 是同一类现象（CDP 收命令、不报错、页面收不到）。
+                #
+                # 判据本身要验的是「**有没有用户手势**时 execCommand 的行为」，
+                # 不是「CDP 鼠标通道通不通」。`Runtime.evaluate` 的
+                # `userGesture: true` 让 V8 把这次求值当作用户激活，
+                # 这正是浏览器给 `execCommand('copy')` 放行的那个条件
+                # （探针实测：userGesture=True → `true`；False → `false`）。
+                # 所以用它触发点击，验的是同一件事，且不引入输入域的不确定性。
+                click_res = br.send(
+                    "Runtime.evaluate",
+                    expression="""(() => {
+                      const btn = [...document.querySelectorAll('button')]
+                        .find(x => /复制服务地址/.test(x.textContent || ''));
+                      if (!btn) return 'no-button';
+                      btn.click();
+                      return 'clicked';
+                    })()""",
+                    returnByValue=True, userGesture=True).get("result", {})
+                print(f"      点击结果: {click_res.get('value')!r}")
+                time.sleep(1.2)
+                probe = json.loads(br.evaluate(
+                    "JSON.stringify(window.__copyProbe)") or "{}")
+                check(int(probe.get("calls") or 0) >= 1,
+                      "★ 点了按钮之后真的走了 execCommand('copy') 兜底",
+                      f"calls={probe.get('calls')}")
+                check(any(probe.get("results") or []),
+                      "★★ 局域网 HTTP（非安全上下文）下复制真的成功",
+                      f"execCommand 返回 {probe.get('results')}")
+                # 用户看得到反馈：不能静默
+                toast = br.evaluate("""
+                  (() => {
+                    const t = document.body.textContent || '';
+                    return /已复制|复制失败/.test(t) ? t.match(/已复制|复制失败/)[0] : '';
+                  })()
+                """)
+                check(bool(toast), "★ 复制之后给了用户明确反馈（不静默）",
+                      f"{toast!r}")
+
+
+        # ---------------------------------------------------------------
         print("\n[5] 切 Tab（KeepAlive 缓存 + 不报错）")
         # ---------------------------------------------------------------
         for label in ("搜索", "上传", "我的", "照片"):
@@ -2591,12 +2943,13 @@ def main() -> int:
         import urllib.parse as _up
 
         def _panel_code(host_base: str) -> dict:
-            """替"用户在电脑托盘里点显示配对二维码"，拿一次面板返回。"""
-            rq = urllib.request.Request(
-                f"{host_base}/panel/pair-code", data=b"{}", method="POST",
-                headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(rq, timeout=15) as rp:
-                return json.loads(rp.read())
+            """替"用户在电脑托盘里点显示配对二维码"，拿一次面板返回。
+
+            `host_base` 保留在签名里是为了让调用点的意图仍然写着"这是
+            本机面板"，但实现是**进程内直调 handler**，与服务绑在哪个
+            地址无关（见 `main()` 里 `_new_code()` 的注释）。
+            """
+            return _new_code()
 
         def _pair_form_state() -> dict:
             """读配对页的真实 DOM 状态。"""
@@ -2655,14 +3008,14 @@ def main() -> int:
               el.value = v;
               el.dispatchEvent(new Event('input', {bubbles: true}));
             };
-            fire(h, '127.0.0.1');
+            fire(h, '%s');
             if (p) fire(p, '%d');
             // ★ 故意多敲几位：`onCodeInput` 会 `replace(/\\D/g,'').slice(0,6)`
             //   把多余的吃掉。如果它没生效，按钮仍会亮但请求带错码。
             fire(c, '%s99');
             return c.value;
           })()
-        """ % (port, code_b02))
+        """ % (page_host, port, code_b02))
         check(typed == code_b02,
               f"★ 多敲的位数被输入框吃掉（只留 6 位数字）  got {typed!r}")
 
@@ -2873,7 +3226,7 @@ def main() -> int:
               "扫码换到的是另一枚 token（同一台电脑、不同客户端）",
               f"{(tok_scan or '')[:10]}… vs {(tok_b02 or '')[:10]}…")
         base_scan = br.evaluate("window.localStorage.getItem('pb.base')")
-        check("127.0.0.1" in str(base_scan or ""),
+        check(page_host in str(base_scan or ""),
               f"扫码后 base 落的是这台电脑  {base_scan!r}")
         check(not br.evaluate(
             "!!document.querySelector('input[placeholder*=\"192.168\"]')"),

@@ -11,6 +11,7 @@
 import { computed, onActivated, onMounted } from "vue";
 import { confirmDialog, setConfirmBusy } from "../stores/confirm";
 import { ApiError } from "../api/client";
+import { copyText } from "../api/clipboard";
 import { getClientName, getDeviceId, getToken } from "../api/storage";
 import { authStore, currentBase, isPaired, unpair } from "../stores/auth";
 import {
@@ -135,9 +136,17 @@ async function onUnpair(): Promise<void> {
 
 function copyBase(): void {
   const b = currentBase();
-  void navigator.clipboard?.writeText(b).then(
-    () => toastOk("已复制"),
-    () => toastWarn("复制失败"),
+  if (!b) {
+    toastWarn("还没有配对，没有地址可复制");
+    return;
+  }
+  // ★ 不能用 navigator.clipboard?.writeText()：局域网是明文 HTTP，
+  //   手机浏览器里 isSecureContext === false 且 navigator.clipboard
+  //   是 undefined，可选链会把整条链短路 —— 成功/失败回调一个都不跑，
+  //   用户点完既没复制也没提示。详见 api/clipboard.ts。
+  void copyText(b).then(
+    (ok) => (ok ? toastOk("已复制") : toastWarn("复制失败，请手动选中地址")),
+    () => toastWarn("复制失败，请手动选中地址"),
   );
 }
 
