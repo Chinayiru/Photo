@@ -571,6 +571,59 @@ def test_thumb_placeholder_when_generation_fails(tmp_path, library) -> None:
     assert _json(r)["error"]["code"] == "E3004"
 
 
+def test_thumb_of_missing_row_is_placeholder_no_store(tmp_path, library) -> None:
+    """已删除的照片：缩略图必须给占位图 + `no-store`，不能给真图 + 一年 immutable。
+
+    审计 F5。删除只把行标成 `missing=1`，**缩略图缓存文件留在磁盘上**
+    （`thumb_path` 全仓没有 unlink）。早先这里只判 `not dst.exists()`，
+    于是判定"不需要生成"之后直接落到 `_file_thumb_reply()`，把那张
+    已经删掉的照片的缩略图连 `max-age=31536000, immutable` 一起端出去 ——
+    手机缓存一年且**不再发请求**：用户删了照片以为没了，那台手机一年内
+    仍然拿得出来；删错了想恢复，客户端也不会重新问。
+
+    对照 `get_raw`（`browse.py:484`）对同一行数据是 404，两个接口
+    不能对"这张照片还在不在"给出相反答案。
+    """
+    from app.thumbs import generate_thumb, placeholder_webp
+
+    st = _state(tmp_path, library)
+    ids = _seed(st, library)
+    mid = ids[0]
+    row = st.db.query_one("SELECT rel_path FROM media WHERE id=?", (mid,))
+    rel = row["rel_path"]
+
+    # 先把真缩略图生成出来并写进磁盘缓存 —— 复现"删除后缓存文件仍在"。
+    dst = thumb_path(st.cfg, "library", rel, 320)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src = library / rel
+    generate_thumb(str(src), dst, 320, orientation=1)
+    assert dst.exists()
+
+    # 走真实的删除路径：文件移入回收站 + 行标 missing=1。
+    r = _call(st, "POST", "/api/items/delete", body=_json_body({"ids": [mid]}))
+    assert r.status == 200
+    assert not src.exists(), "删除后源文件应已移入回收站"
+    assert st.db.query_one("SELECT missing FROM media WHERE id=?", (mid,))["missing"] == 1
+    assert dst.exists(), "缩略图缓存文件**不**随删除清理（这正是 F5 的前提）"
+
+    r = _call(st, "GET", f"/api/items/{mid}/thumb",
+              query={"size": "320"}, params={"media_id": str(mid)})
+    assert r.status == 200
+    assert _body(r) == placeholder_webp(320), (
+        "已删除的照片必须给占位图，不能把缓存里的真图端出去")
+    cache = r.headers.get("Cache-Control", "")
+    assert "immutable" not in cache, f"占位图绝不能带 immutable（拿到 {cache!r}）"
+    assert "no-store" in cache, f"占位图必须 no-store（拿到 {cache!r}）"
+
+    # 反向对照：删掉**源文件仍在库**的那张，缓存行为不能被一起改坏。
+    live = ids[1]
+    r2 = _call(st, "GET", f"/api/items/{live}/thumb",
+               query={"size": "320"}, params={"media_id": str(live)})
+    assert r2.status == 200
+    assert "immutable" in r2.headers.get("Cache-Control", ""), (
+        "正常照片的缩略图仍应走一年 immutable 缓存（URL 带 v= 版本参数）")
+
+
 def test_preview_uses_largest_configured_size(tmp_path, library) -> None:
     st = _state(tmp_path, library)
     ids = _seed(st, library)

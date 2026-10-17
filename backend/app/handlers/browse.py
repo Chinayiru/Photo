@@ -317,12 +317,15 @@ async def _serve_thumb(st: AppState, ctx: Ctx, mid: int) -> Reply:
         # 列表，一年之内它仍然能把这批"已删除"的缩略图从缓存里拿出来；
         # 反过来，如果用户删错了想恢复，客户端也不会重新请求，
         # 因为他手上那份看起来完全正常。
-        # 占位图只缓存 60 秒，真实内容一恢复就能马上看到。
+        # 占位图**整个不缓存**（审计 F5 的原文建议是 `Cache-Control: no-store`）。
+        # 60 秒对一个"删除 → 撤销删除"的动作仍然太长：用户删错了、马上撤销，
+        # 界面在接下来一分钟里还是灰图，而 `no-store` 一刷新就恢复。
+        # 占位图只有几百字节，重算一次的成本远低于"让用户怀疑照片没救回来"。
         data = placeholder_webp(size or PLACEHOLDER_SIZE)
         r = Reply(status=200, body=data, media_type="image/webp")
         r.headers["Content-Type"] = "image/webp"
         r.headers["Content-Length"] = str(len(data))
-        r.set_cache(60, private=True)      # 占位图只缓存 1 分钟，别把真的挡住
+        r.headers["Cache-Control"] = "no-store"
         r.set("Vary", "Authorization")
         return r
 
