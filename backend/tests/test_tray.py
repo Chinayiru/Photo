@@ -86,3 +86,62 @@ class TestTrayWiring:
         assert "pair_qr_url(base, code, st.device_id)" in src, (
             "托盘生成二维码时必须把 device_id 传进去，否则 AC-5.2 是空头的"
         )
+
+
+class TestPairCodeIsDiscoverable:
+    """首启时配对码必须自己出现，不能只藏在托盘右键菜单里。
+
+    ## 这个测试防的是什么（用户实际反馈："配对码是隐藏的"）
+
+    原实现里配对窗口**唯一**入口是托盘右键菜单「显示配对二维码」。
+    而本程序没有主窗口（托盘常驻），Windows 又把新出现的托盘图标默认
+    收进折叠区 —— 用户双击 exe 后看到的是"什么都没发生"，根本不知道
+    要去哪里找那 6 位数字。首次使用就此卡死在第一步。
+
+    所以这里断言的不是"窗口长什么样"，而是**启动流程里有没有一个
+    主动弹出配对码的动作**，以及它是否只在首次（无已配对设备）时触发。
+    """
+
+    def test_on_ready_actually_calls_the_auto_show(self) -> None:
+        import inspect
+
+        from backend.app import tray as tray_mod
+
+        src = inspect.getsource(tray_mod.TrayController.on_ready)
+        assert "self._maybe_show_qr_on_start()" in src, (
+            "on_ready 必须主动调用 _maybe_show_qr_on_start()，否则配对码"
+            "只能从托盘右键菜单里找 —— 而用户根本看不见那个图标"
+        )
+
+    def test_auto_show_is_gated_on_having_no_device(self) -> None:
+        import inspect
+
+        from backend.app import tray as tray_mod
+
+        src = inspect.getsource(tray_mod.TrayController._maybe_show_qr_on_start)
+        assert "_has_paired_device()" in src, (
+            "自动弹窗必须跳过已配对过的用户，否则每次重启都被窗口挡住"
+        )
+
+    def test_has_paired_device_ignores_revoked(self) -> None:
+        import inspect
+
+        from backend.app import tray as tray_mod
+
+        src = inspect.getsource(tray_mod.TrayController._has_paired_device)
+        # 被撤销的设备不算"配对过"：用户可能正是撤销了旧手机、要重新配。
+        assert "revoked = 0" in src, (
+            "查询已配对设备时必须过滤 revoked = 0，否则撤销后无法重新配对"
+        )
+
+    def test_auto_show_never_raises_into_on_ready(self) -> None:
+        """弹窗失败绝不能把服务带崩。"""
+        import inspect
+
+        from backend.app import tray as tray_mod
+
+        src = inspect.getsource(tray_mod.TrayController._maybe_show_qr_on_start)
+        assert "except Exception:" in src
+        assert "daemon=True" in src, (
+            "必须用 daemon 线程 —— 否则关程序时会被这个线程挂住"
+        )

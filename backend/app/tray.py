@@ -295,6 +295,11 @@ class TrayController:
 
         log.info("系统托盘已就绪（%s）", tip)
 
+        # ★ 首次运行时主动把配对码摆到用户眼前。
+        # 没有这一步，用户双击 exe 后看到的是"什么都没发生" —— 程序没有
+        # 主窗口，托盘图标又被 Windows 收进折叠区，配对码完全无从发现。
+        self._maybe_show_qr_on_start()
+
     def _run_icon(self) -> None:
         try:
             self._icon.run()
@@ -343,6 +348,61 @@ class TrayController:
             return
         code, url, ips = got
         _show_qr_window("PhotoBridge 配对", url, code, ips)
+
+    def _has_paired_device(self) -> bool:
+        """是否已经有手机配对过（未撤销的）。"""
+        st = self._state
+        if st is None:
+            return True         # 状态还没就绪时不要弹窗，宁可不动
+        try:
+            return bool(
+                st.db.scalar(
+                    "SELECT 1 FROM devices WHERE revoked = 0 LIMIT 1",
+                    default=None,
+                )
+            )
+        except Exception:       # noqa: BLE001
+            log.exception("查询已配对设备失败")
+            return True         # 查不到就当"已配对"，避免多余弹窗打扰
+
+    def _maybe_show_qr_on_start(self) -> None:
+        """★ 首次运行主动弹出配对窗口 —— 否则用户根本找不到配对码。
+
+        ## 问题（用户实际反馈："配对码是隐藏的"）
+
+        配对窗口原先**只能**通过托盘右键菜单「显示配对二维码」打开，启动时
+        完全不出现。而 Windows 默认把新出现的托盘图标收进折叠区（那个 `^`
+        小箭头里），用户双击 exe 之后看到的是"什么都没有发生"：
+
+          * 没有主窗口（本程序是托盘常驻的，本来就没有窗口）；
+          * 托盘图标藏在折叠区里，看不见；
+          * 于是"配对码在哪"完全无解 —— 只能去翻文档。
+
+        这不是界面风格问题，是**首次使用被卡死在第一步**。
+
+        ## 做法
+
+        仅在「一台手机都没配对过」时自动弹一次。已有配对设备就不再打扰 ——
+        那种场景用户是重启程序，弹窗只会碍事。
+
+        在独立线程里延迟几秒再弹：`on_ready` 是在服务刚监听成功时调用的，
+        此刻托盘图标本身还在初始化，抢着开第二个 Tk 窗口容易互相干扰。
+        延迟也让"先看到托盘图标出现、再看到配对窗口"的顺序更自然。
+        失败一律吞掉 —— 弹不出窗口不该影响服务本身。
+        """
+        if self._has_paired_device():
+            return
+
+        def _later() -> None:
+            time.sleep(2.0)
+            try:
+                self._on_show_qr()
+            except Exception:       # noqa: BLE001
+                log.exception("首次运行自动弹出配对窗口失败（不影响服务）")
+
+        threading.Thread(
+            target=_later, name="photobridge-first-pair", daemon=True,
+        ).start()
 
     def _on_copy_url(self, *_: Any) -> None:
         lan = self._lan_urls()
