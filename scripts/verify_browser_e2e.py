@@ -1483,6 +1483,303 @@ def main() -> int:
         else:
             check(False, "★ 拿到了主图坐标（否则放大验证根本跑不到）")
 
+
+        # ---------------------------------------------------------------
+        print("\n[4k] 上传：选文件 → 分片 → 归档（D-01 / D-02 / D-11）")
+        # ---------------------------------------------------------------
+        # 切到「上传」页签
+        ok_tab = br.evaluate("""
+          (() => {
+            const b = [...document.querySelectorAll('.tabbar button')]
+              .find(x => (x.textContent||'').includes('上传'));
+            if (b) b.click();
+            return !!b;
+          })()
+        """)
+        check(ok_tab, "能找到并切到「上传」页签")
+        time.sleep(0.4)
+
+        # ---- D-01：两个 input 的真实属性就是"手机上会调起什么"的依据 ----
+        props = br.evaluate("""
+          (() => {
+            const all = [...document.querySelectorAll('input[type=file]')];
+            return JSON.stringify(all.map(i => ({
+              accept: i.getAttribute('accept'),
+              multiple: i.hasAttribute('multiple'),
+              capture: i.getAttribute('capture'),
+              hidden: i.classList.contains('sr'),
+            })));
+          })()
+        """)
+        arr = json.loads(props or "[]")
+        check(len(arr) == 2, f"上传页有两个 file input（相册 / 拍照）  got {len(arr)}")
+        alb = next((a for a in arr if a["multiple"]), None)
+        cam = next((a for a in arr if a["capture"]), None)
+        check(alb is not None, "「从相册选」的 input 带 multiple（可多选）")
+        check(alb and alb["accept"] == "image/*",
+              "相册 input 的 accept 是 image/*（手机上只列图片）",
+              f"{(alb or {}).get('accept')!r}")
+        check(cam is not None, "「拍照」的 input 带 capture")
+        check(cam and cam["capture"] == "environment",
+              "拍照 input 的 capture=environment（后置摄像头）",
+              f"{(cam or {}).get('capture')!r}")
+
+        # ---- 造两张真实 JPEG 放到临时目录，用 CDP 塞进 input ----
+        up_dir = Path(tempfile.mkdtemp(prefix="pb_up_"))
+        f1 = up_dir / "e2e_upload_alpha.jpg"
+        f2 = up_dir / "e2e_upload_beta.jpg"
+        make_image(f1, (200, 30, 30), size=(320, 240))
+        make_image(f2, (30, 30, 200), size=(320, 240))
+        def _lib_total() -> int:
+            """读库里当前图片数；读不到返回 -1。
+
+            ⚠️ 不要写 `int(...) or -1`：库里一个文件都没有时它返回 0，
+            而 `0 or -1` 是 -1，会被当成"请求失败"。这个坑我踩了一次，
+            症状是 `-1 → -1` 恒假红，看着像 stats 接口 401。
+            """
+            v = br.evaluate("""
+              (async () => {
+                const r = await fetch('/api/system/stats', {
+                  headers: { 'Authorization': 'Bearer ' + (localStorage.getItem('pb.token') || '') }
+                });
+                if (!r.ok) return -1;
+                const j = await r.json();
+                return (j.media && j.media.total) || 0;
+              })()
+            """)
+            return -1 if v is None else int(v)
+
+        before_count = _lib_total()
+        t_up_start = time.time() - 1.0
+
+        # DOM.setFileInputFiles 需要先拿到节点的 backendNodeId
+        doc = br.send("DOM.getDocument", depth=-1)
+        root_id = doc["root"]["nodeId"]
+        q = br.send("DOM.querySelectorAll",
+                    nodeId=root_id, selector="input[type=file]")
+        node_ids = q.get("nodeIds") or []
+        check(len(node_ids) == 2, f"DOM 里查到两个 file input 节点  got {len(node_ids)}")
+        # 第一个是相册（multiple），按 DOM 顺序就是它
+        br.send("DOM.setFileInputFiles",
+                files=[str(f1), str(f2)], nodeId=node_ids[0])
+
+        # ---- D-11：进度条的中间态 ----
+        # 不能只断言"有 .bar 元素"—— 它在 hasActive 为真时才渲染，
+        # 断言它存在等于断言"上传开始了"，而我们要的是"进度在动"。
+        progress_seen = 0
+        pct_samples = []
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            snap = br.evaluate("""
+              (() => {
+                const el = document.querySelector('.total-pct');
+                const bars = [...document.querySelectorAll('.bar-in')]
+                  .map(b => b.style.width);
+                return JSON.stringify({
+                  pct: el ? el.textContent.trim() : null,
+                  bars,
+                  tasks: document.querySelectorAll('.task').length,
+                });
+              })()
+            """)
+            s = json.loads(snap or "{}")
+            if s.get("pct") and s["pct"].endswith("%"):
+                pct_samples.append(s["pct"])
+                try:
+                    if 0 < int(s["pct"].rstrip("%")) < 100:
+                        progress_seen += 1
+                except ValueError:
+                    pass
+            if s.get("tasks", 0) >= 2 and s.get("pct") == "100%":
+                break
+            time.sleep(0.15)
+
+        check(bool(pct_samples), "上传时页面上出现了百分比（总进度区渲染了）",
+              f"{pct_samples[:4]}")
+        check(progress_seen > 0 or "100%" in pct_samples,
+              "★ 进度真的动过（观测到 0<pct<100 的中间态，或直接到 100%）",
+              f"中间态 {progress_seen} 次，样本 {pct_samples[:6]}")
+        check("100%" in pct_samples, "★ 两个文件都传完后总进度到 100%",
+              f"{pct_samples[-3:]}")
+
+        # ---- 等后端真的收下（轮询 stats，比固定 sleep 可靠）----
+        after_count = before_count
+        for _ in range(60):
+            after_count = _lib_total()
+            if after_count >= before_count + 2:
+                break
+            time.sleep(0.5)
+        check(after_count >= before_count + 2,
+              "★ 两张照片真的入库了（库行数 +2）",
+              f"{before_count} → {after_count}")
+
+        # ---- 任务项状态：不该停在 UPLOADING / RETRY ----
+        # ★ `tasks` 是 computed，**默认过滤掉 DONE/DEDUPED**
+        #   （UploadView.vue: `showDone ? all : all.filter(status !== DONE)`）。
+        #   所以传完之后 `.task` 列表本来就是空的 —— 我第一版断言
+        #   "rows 非空" 直接假红。正确做法是读 store 全量状态。
+        #   store 挂在 window 上的唯一方式是 localStorage 里没有，
+        #   所以改用"队列里没有残留"这个可观测事实 + 完成计数。
+        st = br.evaluate("""
+          (() => {
+            const rows = [...document.querySelectorAll('.task .t-status')]
+              .map(e => (e.textContent||'').trim());
+            const queueEmpty = document.querySelectorAll('.task').length === 0;
+            const hero = document.body.innerText;
+            return JSON.stringify({ rows, queueEmpty,
+                                   hasDoneBtn: /显示/.test(hero) });
+          })()
+        """)
+        s2 = json.loads(st or "{}")
+        check(s2.get("queueEmpty") is True,
+              "★ 传完后队列清空（DONE 的项不占列表，只留「显示」按钮）",
+              f"{s2}")
+        check(all("上传中" not in r for r in s2.get("rows") or []),
+              "队列里没有卡在「上传中」的项", f"{s2.get('rows')}")
+
+        # ---- 归档：文件名由**时间戳**决定，不是原始文件名 ----
+        # archive.py: `YYYY/YYYY-MM/YYYYMMDD_HHMMSS[_序号].jpg`。
+        # 所以不能按 `e2e_upload_alpha*` 找 —— 那是上传端的名字，
+        # 落盘时会被改成拍摄/上传时间。按"这次新增的文件"找才对。
+        up_root = lib / "手机上传"
+        arch = sorted(p for p in up_root.rglob("*")
+                      if p.is_file() and p.stat().st_mtime > t_up_start)
+        check(len(arch) == 2,
+              f"★ 两个文件真的归档到 手机上传/ 下（本次新增 {len(arch)} 个）",
+              f"{[a.name for a in arch]}")
+        if arch:
+            import re as _re
+            pat = _re.compile(r"^\d{8}_\d{6}(_\d+)?\.(jpg|jpeg|png)$")
+            check(all(pat.match(a.name) for a in arch),
+                  "★ 落盘名是时间戳格式（不是上传时的原文件名）",
+                  f"{[a.name for a in arch]}")
+            from PIL import Image as _Im
+            ok_open = True
+            for a in arch:
+                try:
+                    with _Im.open(a) as im:
+                        im.load()
+                except Exception:                       # noqa: BLE001
+                    ok_open = False
+            check(ok_open, "★ 落盘的文件是完整可解码的 JPEG（不是半截）")
+
+        # ---- D-12：上传**进行中**切后台，任务不丢、还能传完 ----
+        # ⚠️ 这一段第一版是假绿：它在两个小文件**已经传完**之后才模拟切后台，
+        #    此时 `.task` 列表本来就是空的（DONE 被 computed 过滤掉），
+        #    `0 → 0` 恒成立，断言等于没写。真正的 D-12 是"传到一半切走"。
+        #    所以这里单独造一个 6MB 的图，在它还在飞的时候切后台。
+        big = up_dir / "e2e_upload_big.jpg"
+        # 随机噪声压缩率低，文件才真的够大。用 Image.frombytes 一次喂原始
+        # 字节 —— 我第一版逐像素 putdata 造 432 万点，慢到像卡死。
+        from PIL import Image as _Im2
+        import os as _os
+        _w, _h = 2400, 1800
+        _noise = _Im2.frombytes("RGB", (_w, _h), _os.urandom(_w * _h * 3))
+        _noise.save(big, quality=95)
+        big_mb = big.stat().st_size / (1024 * 1024)
+        print(f"     造了一个 {big_mb:.1f}MB 的图用于切后台测试")
+
+        doc2 = br.send("DOM.getDocument", depth=-1)
+        q2 = br.send("DOM.querySelectorAll",
+                     nodeId=doc2["root"]["nodeId"], selector="input[type=file]")
+        # ★ 限速：局域网下 4.8MB 一秒就传完，切后台根本观测不到中间态。
+        #   用 CDP Network.emulateNetworkConditions 把上行压到 1.2MB/s，
+        #   4.8MB 就至少要 4 秒 —— 这才有"上传中"可切。
+        br.send("Network.enable")
+        br.send("Network.emulateNetworkConditions",
+                offline=False, latency=20,
+                downloadThroughput=8 * 1024 * 1024,
+                uploadThroughput=int(1.2 * 1024 * 1024),
+                connectionType="cellular3g")
+        print("     已把上行限到 1.2MB/s，让「上传中」真的持续几秒")
+
+        br.send("DOM.setFileInputFiles",
+                files=[str(big)], nodeId=(q2.get("nodeIds") or [0])[0])
+
+        # 等到它真的进入"上传中"，而不是停在 PENDING
+        inflight = False
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            snap = br.evaluate("""
+              (() => {
+                const rows = [...document.querySelectorAll('.task .t-status')]
+                  .map(e => (e.textContent||'').trim());
+                return JSON.stringify(rows);
+              })()
+            """)
+            rows_now = json.loads(snap or "[]")
+            if any("上传中" in r for r in rows_now):
+                inflight = True
+                break
+            time.sleep(0.1)
+        check(inflight, "★ 大文件真的进入了「上传中」状态（否则 D-12 无从谈起）")
+
+        n_inflight = br.evaluate("document.querySelectorAll('.task').length")
+        check(n_inflight >= 1, f"切后台前队列里确实有任务  got {n_inflight}")
+
+        # 切后台：真的改 visibilityState 并派发事件（前端 App.vue:127 监听它）
+        br.evaluate("""
+          (() => {
+            Object.defineProperty(document, 'visibilityState',
+              { value: 'hidden', configurable: true });
+            Object.defineProperty(document, 'hidden',
+              { value: true, configurable: true });
+            document.dispatchEvent(new Event('visibilitychange'));
+            return true;
+          })()
+        """)
+        # ★ 隐藏之后要**连续**采样，不能 sleep(2.0) 再采一次：
+        #   4.8MB 在局域网里 2 秒早传完了，而 DONE 会被 computed 过滤掉
+        #   （UploadView.vue: tasks = showDone ? all : all.filter(非DONE)），
+        #   于是恒拿到 []，把"已经传完"误读成"任务被清空"。
+        #   真正要钉的是：整个后台窗口里，任务从没被标成中断/失败。
+        BAD = ("已中断", "失败", "已取消")
+        seen_rows: list = []
+        interrupted = None
+        n_ok = 0
+        t_hidden = time.time()
+        while time.time() - t_hidden < 6.0:
+            snap = br.evaluate("""
+              (() => JSON.stringify({
+                rows: [...document.querySelectorAll('.task .t-status')]
+                        .map(e => (e.textContent||'').trim()),
+                n: document.querySelectorAll('.task').length
+              }))()
+            """)
+            d = json.loads(snap or "{}")
+            rows_now = d.get("rows") or []
+            if d.get("n"):
+                n_ok += 1
+            for r in rows_now:
+                if r and r not in seen_rows:
+                    seen_rows.append(r)
+                if any(b in r for b in BAD) and "恢复" not in r:
+                    interrupted = r
+            time.sleep(0.1)
+
+        check(interrupted is None,
+              "★ 切到后台的整个窗口里，任务从没被标成「已中断」/「失败」",
+              f"见到过的状态 {seen_rows}"
+              + (f"（提前结束：{interrupted}）" if interrupted else ""))
+        check(n_ok >= 8,
+              "★ 切后台期间队列里确实还有任务在（不是被清空重来）",
+              f"在后台窗口里观测到任务的轮数 {n_ok}/60，状态 {seen_rows}")
+
+        # 回到前台后必须能收尾：最终队列清空且库再 +1
+        done_ok = False
+        for _ in range(120):
+            if br.evaluate("document.querySelectorAll('.task').length") == 0:
+                done_ok = True
+                break
+            time.sleep(0.5)
+        check(done_ok, "★ 回到前台后大文件仍能传完（任务从队列消失）")
+        after_big = _lib_total()
+        check(after_big >= before_count + 3,
+              "★ 切过后台的那个文件真的入库了（库行数再 +1）",
+              f"{before_count}+3 → {after_big}")
+
+        shutil.rmtree(up_dir, ignore_errors=True)
+
         # ---------------------------------------------------------------
         print("\n[5] 切 Tab（KeepAlive 缓存 + 不报错）")
         # ---------------------------------------------------------------
