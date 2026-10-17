@@ -332,6 +332,16 @@ def _rule_1(ctx: Ctx) -> list[Finding]:
 _TEMPISH = re.compile(
     r"(tmp|temp|part|probe|stale|half|scratch|cache|\.pb[a-z]*)", re.IGNORECASE)
 
+#: 像容器的接收者名字 —— `list.remove(x)` / `set.discard` 之类与文件无关。
+#: 只用于规则 2 的 `.remove()` 消歧义，不影响 `os.remove(p)`。
+_CONTAINERISH = re.compile(
+    r"conns?|_conn|items|rows|threads?|tasks?|workers?|pool|queue|stack|"
+    r"cache|mapping|handlers|listeners|subs|subscribers|tokens|ids|names|"
+    r"keys|values|entries|nodes|children|parents|seen|pending|done|active",
+    re.I,
+)
+
+
 #: 已核实过语义的"合法真删"位置：函数名或其职责说明它删的不是用户数据。
 #: 每一条都必须能讲清楚为什么安全，否则不许加进来。
 _DELETE_ALLOWED = re.compile(
@@ -417,6 +427,17 @@ def _rule_2(ctx: Ctx) -> list[Finding]:
             # 取接收者表达式文本（`tmp.unlink()` 的 `tmp`）
             recv = call.func.value if isinstance(call.func, ast.Attribute) else None
             recv_txt = ast.unparse(recv) if recv is not None else ""
+            # ★ `.remove()` 有**两个毫不相干的含义**：删文件（`Path.remove`
+            #   不存在，实际是 `os.remove`）与从 list/set/dict 里摘一个元素
+            #   （`self._conns.remove(conn)`）。后者根本不碰文件系统。
+            #   判据是"接收者表达式的名字像不像容器"，而不是"方法叫 remove"：
+            #   `os.remove(p)` 是模块调用（func.value 是 Name `os`），
+            #   `self._conns.remove(c)` 的接收者是属性访问且名字是复数/容器词。
+            if tail == "remove" and recv is not None:
+                if isinstance(recv, ast.Attribute) and _CONTAINERISH.search(recv.attr):
+                    continue
+                if isinstance(recv, ast.Name) and _CONTAINERISH.search(recv.id):
+                    continue
             first = ast.unparse(call.args[0]) if call.args else ""
             fn = _enclosing(tree, call.lineno)
             hay = f"{fn} {recv_txt} {first}"

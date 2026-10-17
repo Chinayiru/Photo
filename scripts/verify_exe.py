@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -118,6 +119,28 @@ def main() -> int:
     _make_lib(lib)
 
     failures: list[str] = []
+
+    # ── 0. 无控制台黑框（A-01 的「无黑框」判据）─────────────────
+    # 判据不靠肉眼看窗口：**PE 头的 Subsystem 字段**才是真相。
+    #   2 = IMAGE_SUBSYSTEM_WINDOWS_GUI → 双击不弹控制台
+    #   3 = IMAGE_SUBSYSTEM_WINDOWS_CUI → 双击先弹一个黑框
+    # 只看 `packaging/photobridge.spec` 里写了 `console=False` 不够：
+    # spec 是输入，PE 头是产物，中间可能被别的构建步骤覆盖。
+    print("[0] 读 PE 头的 Subsystem（判「双击不弹黑框」）")
+    _b = EXE.read_bytes()
+    if _b[:2] != b"MZ":
+        failures.append("exe 不是 PE 文件（缺 MZ 头）")
+    else:
+        _pe = struct.unpack_from("<I", _b, 0x3C)[0]
+        if _b[_pe:_pe + 4] != b"PE\0\0":
+            failures.append("exe 不是 PE 文件（缺 PE\\0\\0 签名）")
+        else:
+            _sub = struct.unpack_from("<H", _b, _pe + 4 + 20 + 68)[0]
+            print(f"    Subsystem = {_sub}（2=GUI 无黑框 / 3=CUI 有黑框）")
+            if _sub != 2:
+                failures.append(
+                    f"Subsystem={_sub}，不是 IMAGE_SUBSYSTEM_WINDOWS_GUI(2)；"
+                    "双击会先弹一个控制台黑框")
 
     # ── 1. 端口被占 ────────────────────────────────────────────
     holder = socket.socket()

@@ -293,13 +293,18 @@ class Database:
     而连接池引入的借还逻辑和失效检测是净负担。
     """
 
-    __slots__ = ("path", "_local", "_write_lock", "_initialized")
+    __slots__ = ("path", "_local", "_write_lock", "_initialized", "_conns")
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self._local = threading.local()
         self._write_lock = threading.RLock()
         self._initialized = False
+        # 所有线程建过的连接。**必须记着**：SQLite 只在"最后一个连接关闭"
+        # 时才 checkpoint 并删除 -wal / -shm。只关当前线程那条的话，
+        # 缩略图 worker、watchdog 线程留下的连接会一直挂着，
+        # 进程退出后 data/ 里就留着 photobridge.db-wal（实测 1.5 MB）。
+        self._conns: list[sqlite3.Connection] = []
 
     # --- 连接 -------------------------------------------------------------
 
@@ -319,6 +324,8 @@ class Database:
         conn.row_factory = sqlite3.Row
         self._apply_pragmas(conn)
         self._local.conn = conn
+        with self._write_lock:
+            self._conns.append(conn)
         return conn
 
     def _apply_pragmas(self, conn: sqlite3.Connection) -> None:
@@ -338,10 +345,61 @@ class Database:
         cur.close()
 
     def close(self) -> None:
+        """关闭**本线程**的连接（可重复调用）。"""
         conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
         if conn is not None:
             conn.close()
             self._local.conn = None
+            with self._write_lock:
+                try:
+                    self._conns.remove(conn)
+                except ValueError:
+                    pass
+
+    def close_all(self) -> int:
+        """关闭所有线程建过的连接，返回关闭条数。**退出时调用。**
+
+        ## 为什么必须有个 close_all
+
+        `close()` 只关当前线程那条，这是对的 —— 线程本地连接本来就
+        该由各自线程管。但进程退出时没有人替缩略图 worker、watchdog
+        线程收尾，它们的连接会跟着解释器一起被回收，而 SQLite 的
+        "最后连接关闭 → checkpoint → 删 -wal/-shm" 这一步**不会执行**。
+
+        实测症状：托盘"退出"后 `data/` 里留着
+        `photobridge.db-wal`（1.5 MB 量级）与 `photobridge.db-shm`。
+        下次启动 SQLite 会把 WAL 合回去（数据不丢），但：
+
+        * A-11 验收项（"退出后无 WAL/SHM 残留"）永远不可能通过；
+        * 用户在"退出后能不能直接拷走 data/ 备份"时会被 -wal 误导；
+        * 单文件数据库看起来像多文件，与文档承诺不符。
+
+        关完再 `PRAGMA wal_checkpoint(TRUNCATE)` 一次，把 WAL 内容
+        落回主库并 truncate 到 0 字节（此时已经没别的连接持有 WAL）。
+        """
+        with self._write_lock:
+            conns, self._conns = self._conns, []
+        closed = 0
+        for conn in conns:
+            try:
+                conn.close()
+                closed += 1
+            except Exception:      # noqa: BLE001
+                pass
+        # 本线程那条如果没被 close() 过，也一并清掉引用
+        self._local.conn = None
+        try:
+            # 用一个临时连接做一次 TRUNCATE checkpoint（此时已无其他连接）
+            tmp = sqlite3.connect(str(self.path), timeout=5.0,
+                                  isolation_level=None)
+            try:
+                tmp.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                tmp.close()
+        except Exception:          # noqa: BLE001
+            # 库被别的进程占着、文件被删了……都不该让退出失败
+            pass
+        return closed
 
     # --- 初始化 -----------------------------------------------------------
 

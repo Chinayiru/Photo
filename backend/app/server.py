@@ -455,8 +455,12 @@ async def _shutdown(st: AppState, transport: Any) -> None:
     except Exception:       # noqa: BLE001
         pass
 
+    # ★ close_all() 而不是 close()：线程本地连接只能关掉当前线程那条，
+    # 缩略图 worker 与 watchdog 线程的连接没人收尾
+    # → SQLite 不会执行"最后一个连接关闭"的 checkpoint，
+    # 退出后 data/ 里就留着 -wal/-shm（实测 1.5 MB）。
     try:
-        st.db.close()
+        st.db.close_all()
     except Exception:       # noqa: BLE001
         log.warning("关闭数据库失败", exc_info=True)
 
