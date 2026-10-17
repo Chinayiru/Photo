@@ -198,7 +198,8 @@ class Svc:
 
         async def runner() -> None:
             def on_ready(transport, st, loop, stop):
-                self.state.update(base=transport.urls[0], st=st, loop=loop, stop=stop)
+                self.state.update(base=transport.urls[0], st=st, loop=loop,
+                                  stop=stop, transport=transport)
                 self.ready.set()
             await serve(self.cfg, on_ready=on_ready)
 
@@ -219,6 +220,11 @@ class Svc:
     @property
     def st(self):
         return self.state["st"]
+
+    @property
+    def transport(self):
+        """传输层对象（`transport.urls` / `transport.port_actual`）。"""
+        return self.state["transport"]
 
     def stop(self, timeout: float = 45.0) -> bool:
         self.state["loop"].call_soon_threadsafe(self.state["stop"].set)
@@ -1182,6 +1188,150 @@ def main() -> int:
           f"{lan}")
     for bogus in ("26.26.192.40", "192.168.226.1", "192.168.64.1", "192.168.32.1"):
         check(bogus not in lan, f"未公布虚拟网卡 {bogus}")
+
+    # =====================================================================
+    print("\n[F-02] 托盘公布的 URL 真的能打开（手机走的就是这条路）")
+    # 手机没法自动化，但"托盘 URL"就是 transport.urls 给的那串地址，可以
+    # 拿真实网卡 IP 去 HTTP 请求 —— 同一 IP、同一端口、同一 router、同一套
+    # Host 校验与鉴权，手机走的就是这条代码路径。
+    #
+    # ⚠️ 主服务绑的是 127.0.0.1（验收跑在本机最省事），局域网 IP 当然连不上。
+    #    那不是产品缺陷，是测试环境的绑定方式决定的。所以要另起一个
+    #    host=0.0.0.0 的实例。**绝不要 svc.stop()** —— 后面的节全指着它。
+    from backend.app.config import local_ipv4_addresses
+    ips = local_ipv4_addresses()
+    check(bool(ips), "本机至少有一个可用的局域网地址", f"{ips}")
+
+    cfg_lan = Config({
+        "app": {"mode": "readwrite"},
+        "server": {"host": "0.0.0.0", "port": 0, "allow_lan": True,
+                   "panel_http": False},
+        "roots": [{"id": "library", "path": str(lib), "mode": "readwrite",
+                   "enabled": True, "recursive": True}],
+        "upload": {"subdir": "手机上传", "chunk_mb_lan": 1, "max_file_mb": 64},
+        "auth": {"allow_delete": True, "delete_to_recycle_bin": True,
+                 "allow_move": True, "require_pairing": True},
+        "index": {"scan_on_start": False, "watch": False, "batch_size": 50},
+        "thumbs": {"sizes": [320, 1600], "workers": 4},
+    }, path=data / "config_lan.json", data_dir=data)
+    cfg_lan.save()
+    svc_lan = Svc(cfg_lan)
+    svc_lan.start()
+    try:
+        urls = list(getattr(svc_lan.transport, "urls", []) or [])
+        check(bool(urls), "transport.urls 给了可访问地址", f"{urls}")
+        # ★ urls 里绝不能出现 0.0.0.0 / 127.0.0.1：前者手机连不上，
+        #   后者只对自己有效。这是 F-01 判据在"真的绑了所有网卡"时的补强。
+        check(all("0.0.0.0" not in u for u in urls),
+              "★ urls 里没有 0.0.0.0（绑定地址不是可访问地址）", f"{urls}")
+        check(all("127.0.0.1" not in u for u in urls),
+              "★ urls 里没有 127.0.0.1（手机连不上回环）", f"{urls}")
+        lan_ips_in_urls = [u for u in urls
+                           if any(f"//{ip}" in u for ip in ips)]
+        check(len(lan_ips_in_urls) == len(urls),
+              "★ urls 里每一条都用了真实网卡 IP",
+              f"{urls} vs ips={ips}")
+
+        for u in urls:
+            try:
+                with urllib.request.urlopen(u + "/", timeout=15) as rp:
+                    html = rp.read()
+                    code = rp.status
+                    ctype = rp.headers.get("Content-Type", "")
+            except Exception as exc:                    # noqa: BLE001
+                check(False, f"★ {u}/ 能打开", f"{type(exc).__name__}: {exc}")
+                continue
+            check(code == 200, f"★ {u}/ 返回 200（手机能打开）", f"got {code}")
+            check(ctype.startswith("text/html"),
+                  f"★ {u}/ 回 HTML 而不是 JSON 错误", ctype)
+            check(b'id="app"' in html or b"id=app" in html,
+                  f"★ {u}/ 是前端入口页（有 #app 挂载点）", f"{len(html)}B")
+
+            # 同一地址上 API 也要通：Host 校验必须放行这台机器的真实 IP
+            # （netguard.check_host 的 DEFAULT_TRUSTED_HOSTS 只列回环，
+            #   真实 IP 靠机器名现算进来的 —— 这条就是在钉那个逻辑）
+            try:
+                with urllib.request.urlopen(
+                        urllib.request.Request(
+                            u + "/api/system/ping",
+                            headers={"Authorization": f"Bearer {token}"}),
+                        timeout=15) as rp2:
+                    ping = json.loads(rp2.read())
+                # ★ 响应键是 **pong** 不是 ok —— 我第一版按惯例猜 ok，白跑一轮
+                check(ping.get("pong") is True,
+                      f"★ {u} 上 /api/system/ping 也通（Host 校验放行真实 IP）",
+                      f"{ping}")
+            except Exception as exc:                    # noqa: BLE001
+                check(False, f"★ {u} 上 API 也通",
+                      f"{type(exc).__name__}: {exc}")
+
+    finally:
+        svc_lan.stop()
+
+    # 主服务必须还活着 —— 往长验收脚本里插节最容易犯的错就是把它弄挂，
+    # 然后后面 30 多节连锁失败，看起来像"整个产品坏了"。
+    s_alive, _, _ = call(base, "/api/system/ping", token=token)
+    check(s_alive == 200, "★ 插播局域网服务之后，主服务仍然活着",
+          f"got {s_alive}")
+
+    # =====================================================================
+    print("\n[F-07] 同一 Wi-Fi 下第二台手机也能配对，两台各自独立、可分别撤销")
+    tok_a = pair(base, st, "f07-phone-A")
+    tok_b = pair(base, st, "f07-phone-B")
+    check(tok_a != tok_b, "★ 两台设备拿到的是不同 token",
+          f"{tok_a[:8]}… vs {tok_b[:8]}…")
+    # ★ 响应键是 client_name（不是 name，也不是 id）—— 见 handlers/auth.py:176
+    _, me_a, _ = call(base, "/api/clients/me", token=tok_a)
+    _, me_b, _ = call(base, "/api/clients/me", token=tok_b)
+    check(me_a.get("client_name") == "f07-phone-A",
+          "★ 手机 A 的 /api/clients/me 认得自己", f"{me_a.get('client_name')!r}")
+    check(me_b.get("client_name") == "f07-phone-B",
+          "★ 手机 B 的 /api/clients/me 认得自己", f"{me_b.get('client_name')!r}")
+    check(me_a.get("client_id") and me_b.get("client_id")
+          and me_a["client_id"] != me_b["client_id"],
+          "★ 两台设备是不同的设备记录",
+          f"{me_a.get('client_id')} vs {me_b.get('client_id')}")
+    check(me_a.get("device_id") == me_b.get("device_id"),
+          "同一台电脑上配对的两台手机，device_id 必然相同",
+          f"{me_a.get('device_id')}")
+
+    # 两台都在设备列表里
+    _, devs, _ = call(base, "/api/devices", token=tok_a)
+    items = devs.get("items") or []
+    names = [d.get("name") for d in items]
+    check("f07-phone-A" in names and "f07-phone-B" in names,
+          "★ 两台都在设备列表里", f"{names}")
+    check(all(not d.get("revoked") for d in items
+              if d.get("name") in ("f07-phone-A", "f07-phone-B")),
+          "两台撤销位都是 0", f"{[d.get('revoked') for d in items]}")
+
+    # 撤销 A，B 不受影响
+    cid_a = me_a["client_id"]
+    s_rev, _, _ = call(base, f"/api/devices/{cid_a}", method="DELETE",
+                       token=tok_b)
+    # ★ 撤销是 DELETE /api/devices/{client_id}，成功 204
+    check(s_rev == 204, "撤销 A 返回 204", f"got {s_rev}")
+    s_a, err_a, _ = call(base, "/api/clients/me", token=tok_a)
+    check(s_a == 403, "★ A 被撤销后自己立刻失效（403 E2004）", f"got {s_a}")
+    check((err_a.get("error") or {}).get("code") == "E2004",
+          "A 的错误码是 E2004（「该设备已被移除」）",
+          f"got {(err_a.get('error') or {}).get('code')}")
+    s_b, me_b2, _ = call(base, "/api/clients/me", token=tok_b)
+    check(s_b == 200,
+          "★ B 完全不受影响（撤销 A 不会连带踢掉 B）", f"got {s_b}")
+    check(me_b2.get("client_name") == "f07-phone-B", "B 的身份没变",
+          f"{me_b2.get('client_name')!r}")
+
+    # 撤回列表里 A 标 revoked、B 没标
+    _, devs2, _ = call(base, "/api/devices", token=tok_b)
+    by_name = {d.get("name"): d for d in (devs2.get("items") or [])}
+    check(by_name.get("f07-phone-A", {}).get("revoked") is True,
+          "★ 列表里 A 已标记 revoked", f"{by_name.get('f07-phone-A')}")
+    check(by_name.get("f07-phone-B", {}).get("revoked") is False,
+          "★ 列表里 B 仍是有效设备", f"{by_name.get('f07-phone-B')}")
+
+    # 撤销 B 收尾，不留垃圾设备（用 A 的 token 已经失效，只能就地操作）
+    call(base, f"/api/devices/{me_b['client_id']}", method="DELETE", token=tok_b)
 
     # =====================================================================
     print("\n[F-09] SSE 能推送")

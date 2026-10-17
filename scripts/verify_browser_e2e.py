@@ -1954,6 +1954,149 @@ def main() -> int:
               "★ 前端不自绘下载进度（进度由浏览器下载管理器提供 —— 如实记录）")
 
         # ---------------------------------------------------------------
+        print("\n[4m] 网络状态：直连态 / 断网提示 / 恢复（F-03 / F-04 / F-08）")
+        # ---------------------------------------------------------------
+        # 原文判据是"拔网线 / 关 Wi-Fi"，字面没法自动化。但它真正防的
+        # 失效是"连不上时白屏或无限转圈"，这个可以在真浏览器里精确复现：
+        # 用 CDP 把网络整个断掉，看页面给不给中文提示。
+        br.goto(base + "/")
+        br.wait_for("!!document.querySelector('[data-id]')", budget=25,
+                    label="回到时间线")
+
+        # ---- F-03 状态条显示「局域网直连」----
+        # 注意源码里没有 🟢 这个 emoji：StatusBar.vue 用的是 `<span class="dot">`
+        # + CSS 背景色（.conn.ok .dot）。文案来自 auth.ts: connText，
+        # DIRECT → "局域网直连"。所以判据要落在文案 + CSS 类上，
+        # 而不是去 innerText 里找 🟢 —— 那会永远找不到。
+        st = br.evaluate("""
+          (() => {
+            const c = document.querySelector('.conn');
+            if (!c) return JSON.stringify({found: false});
+            const dot = c.querySelector('.dot');
+            return JSON.stringify({
+              found: true,
+              text: (c.innerText || '').trim(),
+              cls: c.className,
+              dotBg: dot ? getComputedStyle(dot).backgroundColor : '',
+              aria: c.getAttribute('aria-label') || ''
+            });
+          })()
+        """)
+        stt = json.loads(st or "{}")
+        check(stt.get("found") is True, "状态条存在", f"{stt.get('cls')}")
+        check("局域网直连" in (stt.get("text") or ""),
+              "★ 状态条显示「局域网直连」（F-03 的真实文案，不是 🟢）",
+              f"{stt.get('text')!r}")
+        check("ok" in (stt.get("cls") or "").split(),
+              "★ 状态条带 ok 类（绿灯靠 CSS 背景色，源码里没有 🟢 emoji）",
+              f"{stt.get('cls')!r} dot={stt.get('dotBg')}")
+        # 绿点真的绿：解析 rgb() 看 G 通道
+        try:
+            nums = [int(x) for x in
+                    (stt.get("dotBg") or "").replace("rgb(", "")
+                    .replace("rgba(", "").replace(")", "").split(",")[:3]]
+            greenish = len(nums) == 3 and nums[1] > nums[0] and nums[1] > nums[2]
+        except Exception:                                   # noqa: BLE001
+            nums, greenish = [], False
+        check(greenish, "★ 那个点是绿的（G 通道最大，不是灰/红）",
+              f"{stt.get('dotBg')}")
+        check("局域网直连" in (stt.get("aria") or ""),
+              "★ aria-label 也说了「局域网直连」（读屏用户能听到）",
+              f"{stt.get('aria')!r}")
+
+        # ---- F-04 断网时给明确中文提示，不白屏不空转 ----
+        br.send("Network.enable")
+        br.send("Network.emulateNetworkConditions",
+                offline=True, latency=0,
+                downloadThroughput=0, uploadThroughput=0)
+        # 触发一次探活（状态条本身就是按钮，点它重新探测）
+        br.evaluate("""
+          (() => {
+            const c = document.querySelector('.conn');
+            if (c) c.click();
+            return !!c;
+          })()
+        """)
+        off = None
+        for _ in range(60):
+            s2 = br.evaluate("""
+              (() => {
+                const c = document.querySelector('.conn');
+                if (!c) return JSON.stringify({found: false});
+                return JSON.stringify({
+                  found: true,
+                  text: (c.innerText || '').trim(),
+                  cls: c.className
+                });
+              })()
+            """)
+            d2 = json.loads(s2 or "{}")
+            if d2.get("found") and ("离线" in (d2.get("text") or "")
+                                    or "连接" in (d2.get("text") or "")):
+                off = d2
+                break
+            time.sleep(0.2)
+        check(off is not None,
+              "★ 断网后状态条变成「电脑离线」/「正在连接…」（不是一直绿灯）",
+              f"{off}")
+        if off:
+            check("bad" in (off.get("cls") or "").split()
+                  or "busy" in (off.get("cls") or "").split(),
+                  "★ 断网后状态条换成 bad/busy 类（视觉上真的变了）",
+                  f"{off.get('cls')!r}")
+
+        # 白屏判据：页面还得有内容，而且不能是空白
+        body_len = br.evaluate("(document.body.innerText || '').trim().length")
+        check(body_len > 0,
+              "★ 断网时页面**没有白屏**（DOM 里仍有内容）", f"{body_len} 字符")
+        # 不能无限转圈：转圈元素要么不存在，要么 10 秒内消失
+        spun = True
+        for _ in range(50):
+            if not br.evaluate("!!document.querySelector('.spinner')"):
+                spun = False
+                break
+            time.sleep(0.2)
+        check(not spun,
+              "★ 断网时没有无限转圈（spinner 在有限时间内消失或有明确错误）")
+
+        # ---- F-08 网络恢复后仍可访问（模拟"长时间空闲后"） ----
+        br.send("Network.emulateNetworkConditions",
+                offline=False, latency=0,
+                downloadThroughput=-1, uploadThroughput=-1)
+        br.evaluate("""
+          (() => {
+            const c = document.querySelector('.conn');
+            if (c) c.click();
+            return !!c;
+          })()
+        """)
+        back = None
+        for _ in range(80):
+            s3 = br.evaluate("""
+              (() => {
+                const c = document.querySelector('.conn');
+                if (!c) return JSON.stringify({found: false});
+                return JSON.stringify({
+                  found: true, text: (c.innerText || '').trim(),
+                  cls: c.className
+                });
+              })()
+            """)
+            d3 = json.loads(s3 or "{}")
+            if d3.get("found") and "局域网直连" in (d3.get("text") or ""):
+                back = d3
+                break
+            time.sleep(0.25)
+        check(back is not None,
+              "★ 网络恢复后自动回到「局域网直连」，无需刷新页面", f"{back}")
+
+        # 页面还是要能用：再打开一次查看器
+        br.goto(base + "/")
+        ok = br.wait_for("!!document.querySelector('[data-id]')", budget=25,
+                         label="恢复后时间线仍可用")
+        check(ok, "★ 断网→恢复一轮之后，时间线仍能正常加载（不是废掉）")
+
+        # ---------------------------------------------------------------
         print("\n[5] 切 Tab（KeepAlive 缓存 + 不报错）")
         # ---------------------------------------------------------------
         for label in ("搜索", "上传", "我的", "照片"):
