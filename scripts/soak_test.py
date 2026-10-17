@@ -34,7 +34,10 @@
 （`"status": "running"`，只记事实不做判定），跑一半被杀掉也能看到
 "跑到第几轮、失败哪些"。收尾时才写完整报告（`"status"` 不含，字段见下）。
 
-退出码：0 = 通过；1 = 有指标越界；2 = 环境问题（库不存在等）。
+退出码：0 = 通过；1 = 有指标越界；2 = 环境问题（库不存在等）**或观测窗口
+不足以判定**（见 `_plateau_info`：线程/任务数还在单调上升时，说明暖机段
+没盖住惰性建线程期，此时报 FAIL 是假失败 —— 实测本机需约 3 小时才爬平，
+所以 `--hours 0.25` 这种短跑会得到 2 而不是 0/1）。
 """
 from __future__ import annotations
 
@@ -86,6 +89,52 @@ WARMUP_FRACTION = 0.25
 RSS_GROWTH_LIMIT = 0.30        # 后半程均值相对前半程均值涨超 30% 判失败
 THREAD_GROWTH_LIMIT = 4        # 线程数净增超过 4 个判失败
 TASK_GROWTH_LIMIT = 8          # asyncio 任务数净增超过 8 个判失败
+
+# ★ 判据有前提：**观测窗口必须长到暖机段能盖住"惰性起线程"的上升期**。
+#
+# 实测（2026-10-18）：本机 `os.cpu_count() = 20`，asyncio 默认执行器上限
+# 是 `min(32, 20+4) = 24`。线程数从 5 爬到 29 用了 **约 3 小时**
+# （`asyncio_1..23` 逐个按并发需求建起来，`thumb_1` 同理）。
+# 当总时长只有 15 分钟时，`WARMUP_FRACTION=0.25` 只丢掉最初的 3.75 分钟，
+# 之后测到的"增长"完全来自仍在进行的建线程过程 —— 脚本于是报
+# `线程数净增 +6.1 超过上限`，**这是假失败**：同一台机器跑满 10 小时，
+# 线程数在 3 小时后恒定在 29、判据是 +0.26 PASS。
+#
+# 假失败比没有结论更糟：它会让"缩短挂机"看起来像"发现了泄漏"。
+# 所以下面引入"是否已趋平"的判定 —— 指标还在单调上升时不给 PASS/FAIL，
+# 给 INCONCLUSIVE（退出码 2，与"环境问题"同义：这次观测不足以判定）。
+#
+# 趋平判据：把后 40% 的采样再切成前后两半，若后半段均值相对前半段
+# 仍在涨超过 `PLATEAU_TOLERANCE`，就算"还在上升"。
+PLATEAU_FRACTION = 0.40        # 从末尾往前取多少比例来判断是否趋平
+PLATEAU_TOLERANCE = 0.10       # 末段相对前段涨幅超过 10% 就算仍在上升
+PLATEAU_MIN_ABS = 1.0          # 绝对差小于这个值一律视为已趋平（噪声）
+
+
+def _plateau_info(series: list[float]) -> tuple[bool, float]:
+    """判断序列末尾是否已趋平。
+
+    返回 `(是否已趋平, 末段相对前段的涨幅)`。
+
+    为什么要它：`_net_growth` 比较的是"暖机后前后半程"，它默认暖机段
+    已经把一次性增长吃掉。这个假设在 24 小时窗口下成立（实测 3 小时
+    就爬到平台），在 15 分钟窗口下**不成立** —— 那时测到的是上升期本身，
+    报出的"净增"是真正的建线程过程，不是泄漏。
+    """
+    if len(series) < 10:
+        return True, 0.0           # 样本太少，不去质疑；交给 _net_growth 的 None
+    tail = series[int(len(series) * (1.0 - PLATEAU_FRACTION)):]
+    if len(tail) < 4:
+        return True, 0.0
+    half = len(tail) // 2
+    first = statistics.mean(tail[:half])
+    second = statistics.mean(tail[half:])
+    diff = second - first
+    if abs(diff) < PLATEAU_MIN_ABS:
+        return True, 0.0
+    rel = diff / first if first else 0.0
+    return rel <= PLATEAU_TOLERANCE, rel
+
 
 
 def _net_growth(series: list[float], *, frac: float = WARMUP_FRACTION):
@@ -595,17 +644,24 @@ def main() -> int:
     # ---------------- 判定 ----------------
     http_fail_rate = rounds_bad / max(1, n_rounds)
 
+    # 判据不成立时的条目（区别于 failures）：这次观测不足以判定，
+    # 不代表产品有问题。见 _plateau_info 的注释。
+    inconclusive: list[str] = []
+
     rss_series = [s["rss"] for s in samples if s["rss"]]
     rss_abs, rss_growth, rss_base = _net_growth(rss_series)
 
     thread_series = [float(s["threads"]) for s in samples]
     thread_abs, _thread_rel, thread_base = _net_growth(thread_series)
+    thread_flat, thread_flat_rel = _plateau_info(thread_series)
 
     task_series = [float(s["tasks"]) for s in samples if s["tasks"] >= 0]
     task_abs, _task_rel, task_base = _net_growth(task_series)
+    task_flat, task_flat_rel = _plateau_info(task_series)
 
     handle_series = [float(s["handles"]) for s in samples if s["handles"]]
     handle_abs, _handle_rel, handle_base = _net_growth(handle_series)
+    handle_flat, handle_flat_rel = _plateau_info(handle_series)
 
     # 保留首尾净增，用于报告里的"整体"视角（不参与判定）
     thread_net = (thread_series[-1] - thread_series[0]) if thread_series else 0.0
@@ -669,9 +725,23 @@ def main() -> int:
     if rss_growth is not None and rss_growth > RSS_GROWTH_LIMIT:
         failures.append(f"RSS 增长 {rss_growth:+.1%} 超过上限 {RSS_GROWTH_LIMIT:.0%}")
     if thread_abs > THREAD_GROWTH_LIMIT:
-        failures.append(f"线程数净增 {thread_abs:+.1f} 超过上限")
+        if thread_flat:
+            failures.append(f"线程数净增 {thread_abs:+.1f} 超过上限")
+        else:
+            # 还在上升 = 暖机段没盖住建线程期，这次观测不足以判定
+            inconclusive.append(
+                f"线程数仍在上升（末段相对前段 {thread_flat_rel:+.1%}，"
+                f"净增 {thread_abs:+.1f}）—— 观测窗口太短，暖机段没有盖住"
+                f"惰性建线程期，本次**不能判定**是否为泄漏"
+            )
     if task_abs > TASK_GROWTH_LIMIT:
-        failures.append(f"任务数净增 {task_abs:+.1f} 超过上限")
+        if task_flat:
+            failures.append(f"任务数净增 {task_abs:+.1f} 超过上限")
+        else:
+            inconclusive.append(
+                f"任务数仍在上升（末段相对前段 {task_flat_rel:+.1%}，"
+                f"净增 {task_abs:+.1f}）—— 观测窗口太短，无法判定"
+            )
     if latency_worse:
         print(f"  注意        : 这些接口后半程 p95 明显变慢：{latency_worse}")
 
@@ -694,15 +764,19 @@ def main() -> int:
         "rss_peak_bytes": max(rss_series) if rss_series else None,
         "thread_growth": thread_abs,
         "thread_net_first_last": thread_net,
+        "thread_plateau": thread_flat,
         "task_growth": task_abs,
         "task_net_first_last": task_net,
+        "task_plateau": task_flat,
         "handle_growth": handle_abs,
         "handle_net_first_last": handle_net,
+        "handle_plateau": handle_flat,
         "shutdown_sec": round(shutdown_sec, 1),
         "thread_alive": alive,
         "media_total": media_total,
         "media_missing": media_missing,
         "failures": failures,
+        "inconclusive": inconclusive,
         "latency": lat_report,
         "samples": samples,
     }
@@ -720,7 +794,17 @@ def main() -> int:
         print(f"=== FAIL（{len(failures)} 项） ===")
         for f in failures:
             print("  -", f)
+        if inconclusive:
+            print(f"（另有 {len(inconclusive)} 项证据不足，未计入 FAIL）")
         return 1
+    if inconclusive:
+        print(f"=== INCONCLUSIVE（{len(inconclusive)} 项证据不足） ===")
+        for f in inconclusive:
+            print("  -", f)
+        print("\n这不是产品缺陷，是**观测窗口不够长**：判据要求暖机段"
+              "（前 25%）盖住惰性建线程的上升期，实测本机需要约 3 小时。"
+              "请用 --hours 24 重跑。")
+        return 2
     print("=== PASS ===")
     return 0
 

@@ -167,3 +167,86 @@ class TestReportPathResolvedBeforeLoop:
         assert "% 30" in src, (
             "检查点不是按轮次周期落的：每轮都写会盖过被测逻辑"
         )
+
+
+class TestPlateauGuard:
+    """「还在上升」时必须拒绝判定，而不是报 FAIL。
+
+    ## 这条是怎么来的
+
+    2026-10-18 为了"快点看到结果"，用 `--hours 0.25 --interval 5` 跑了
+    174 轮。脚本报 `=== FAIL（1 项） === 线程数净增 +6.1 超过上限`。
+    但同一台机器跑满 10 小时的数据是 `+0.26 PASS`。
+
+    查下去：本机 `os.cpu_count() = 20`，asyncio 默认执行器上限
+    `min(32, 20+4) = 24`，线程数从 5 爬到 29 **用了约 3 小时**。
+    15 分钟窗口里 `WARMUP_FRACTION=0.25` 只丢掉最初 3.75 分钟，
+    后面测到的全是"正在建线程"，于是"净增"当然超限。
+
+    **假失败比没有结论更糟**：它会让"缩短挂机"看起来像"发现了泄漏"，
+    而泄漏本应只在长窗口里显形。所以判据必须带一个前提检查：
+    指标在窗口末段还在单调上升 → 不判 PASS/FAIL，判 INCONCLUSIVE。
+    """
+
+    def test_rising_series_is_not_flat(self, soak) -> None:
+        """持续上升的序列必须被判为"未趋平"。"""
+        series = [5.0 + i * 0.5 for i in range(100)]
+        flat, rel = soak._plateau_info(series)
+        assert flat is False, "仍在上升却没被识别出来 —— 会报假 FAIL"
+        assert rel > 0
+
+    def test_flat_series_is_flat(self, soak) -> None:
+        """爬到平台后不动的序列必须被判为"已趋平"。"""
+        # 前 20 个爬升，之后恒定 —— 模拟真实的惰性建线程后稳定
+        series = [5.0 + min(i, 20) * 0.5 for i in range(100)]
+        flat, _rel = soak._plateau_info(series)
+        assert flat is True, "已经趋平却判成仍在上升 —— 会把 PASS 降级成 N/A"
+
+    def test_ten_hour_shape_passes_the_guard(self, soak) -> None:
+        """复现 10 小时那份数据的形状（3h 爬平，之后恒定 6.5h）。
+
+        这段必须"已趋平"，否则真实的长挂机会被误降级。
+        """
+        series = ([5.0 + i * 24 / 60 for i in range(60)]      # 0→3h 爬到 29
+                  + [29.0] * 140)                              # 3→10h 恒定
+        flat, _rel = soak._plateau_info(series)
+        assert flat is True
+
+    def test_fifteen_minute_shape_fails_the_guard(self, soak) -> None:
+        """复现 15 分钟那份数据的形状（全程仍在爬升）。
+
+        这段必须"未趋平"，否则假 FAIL 会重新出现。
+        """
+        series = [5.0 + i * 15 / 176 for i in range(176)]
+        flat, _rel = soak._plateau_info(series)
+        assert flat is False
+
+    def test_short_series_is_not_flagged(self, soak) -> None:
+        """样本太少时不去质疑 —— 交给 `_net_growth` 返回 None。"""
+        flat, rel = soak._plateau_info([1.0, 2.0, 3.0])
+        assert flat is True
+        assert rel == 0.0
+
+    def test_noise_below_absolute_threshold_is_flat(self, soak) -> None:
+        """抖动小于 `PLATEAU_MIN_ABS` 的一律视为已趋平。
+
+        线程数是整数，末端抖动 1 个线程不该把判定翻成 N/A。
+        """
+        series = [29.0] * 90 + [30.0] * 10     # 末段 +1，绝对差 1.0 不超阈值
+        flat, _rel = soak._plateau_info(series)
+        assert flat is True
+
+    def test_inconclusive_lists_are_separate_from_failures(self, soak) -> None:
+        """`inconclusive` 与 `failures` 必须是两个独立概念。
+
+        合并它们就等于把"证据不足"当成"产品坏了"（或反过来）。
+        这里钉住源码里两者是分开收集、分开输出的。
+        """
+        import inspect
+
+        src = inspect.getsource(soak.main)
+        assert "inconclusive: list[str] = []" in src
+        assert '=== INCONCLUSIVE' in src
+        # 证据不足时退出码是 2（与"环境问题"同义），不是 1（越界）
+        assert "return 2" in src
+

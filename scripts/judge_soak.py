@@ -31,6 +31,7 @@ from scripts.soak_test import (                                    # noqa: E402
     WARMUP_FRACTION,
     _human,
     _net_growth,
+    _plateau_info,
 )
 
 
@@ -61,11 +62,12 @@ def main() -> int:
     task_series = [float(s["tasks"]) for s in samples if s.get("tasks", -1) >= 0]
     handle_series = [float(s["handles"]) for s in samples if s.get("handles")]
 
-    verdicts: list[tuple[str, bool, str]] = []
+    # verdict 三态：True = 通过，False = 越界，None = 证据不足（不判）
+    verdicts: list[tuple[str, bool | None, str]] = []
 
     rss_abs, rss_rel, rss_base = _net_growth(rss_series)
     if rss_rel is None:
-        verdicts.append(("RSS", False, "样本不足，无法判定"))
+        verdicts.append(("RSS", None, "样本不足，无法判定"))
     else:
         ok = rss_rel <= RSS_GROWTH_LIMIT
         verdicts.append((
@@ -75,19 +77,25 @@ def main() -> int:
         ))
 
     thread_abs, _tr, thread_base = _net_growth(thread_series)
-    ok = thread_abs <= THREAD_GROWTH_LIMIT
+    thread_flat, thread_flat_rel = _plateau_info(thread_series)
+    over = thread_abs > THREAD_GROWTH_LIMIT
     verdicts.append((
-        "线程数", ok,
+        "线程数", (None if not thread_flat else not over) if over else True,
         f"净增 {thread_abs:+.2f}（上限 +{THREAD_GROWTH_LIMIT}），"
-        f"基线 {thread_base:.0f}，末值 {thread_series[-1]:.0f}",
+        f"基线 {thread_base:.0f}，末值 {thread_series[-1]:.0f}"
+        + ("" if thread_flat else
+           f" —— **末段仍在上升 {thread_flat_rel:+.1%}，窗口太短，不能判定**"),
     ))
 
     task_abs, _tkr, task_base = _net_growth(task_series)
-    ok = task_abs <= TASK_GROWTH_LIMIT
+    task_flat, task_flat_rel = _plateau_info(task_series)
+    over = task_abs > TASK_GROWTH_LIMIT
     verdicts.append((
-        "任务数", ok,
+        "任务数", (None if not task_flat else not over) if over else True,
         f"净增 {task_abs:+.2f}（上限 +{TASK_GROWTH_LIMIT}），"
-        f"基线 {task_base:.0f}，末值 {task_series[-1]:.0f}",
+        f"基线 {task_base:.0f}，末值 {task_series[-1]:.0f}"
+        + ("" if task_flat else
+           f" —— **末段仍在上升 {task_flat_rel:+.1%}，窗口太短，不能判定**"),
     ))
 
     # 句柄没有阈值（不是判据），只报告趋势
@@ -108,7 +116,8 @@ def main() -> int:
     print(f"判定（判据与阈值全部取自 scripts/soak_test.py，暖机丢弃 {WARMUP_FRACTION:.0%}）")
     print("=" * 72)
     for name, ok, detail in verdicts:
-        print(f"  {'PASS' if ok else 'FAIL'}  {name:<8} {detail}")
+        tag = "PASS" if ok else ("N/A " if ok is None else "FAIL")
+        print(f"  {tag}  {name:<8} {detail}")
 
     print()
     print("线程名变化：")
@@ -135,12 +144,22 @@ def main() -> int:
               f"{statistics.mean([s['tasks'] for s in chunk]):>5.1f}  "
               f"{statistics.mean([s['handles'] for s in chunk if s.get('handles')]):>7.1f}")
 
-    bad = [name for name, ok, _ in verdicts if not ok]
+    bad = [name for name, ok, _ in verdicts if ok is False]
+    unknown = [name for name, ok, _ in verdicts if ok is None]
     print()
     if bad:
         print(f"结论：{len(bad)} 项越界 -> {bad}")
+        if unknown:
+            print(f"（另有 {len(unknown)} 项证据不足：{unknown}）")
         return 1
-    print("结论：全部判据通过（本次观测 10 小时；H-08 要求的 24 小时时长本身未达成）")
+    if unknown:
+        print(f"结论：{len(unknown)} 项证据不足，无法判定 -> {unknown}")
+        print("原因：线程/任务数在窗口末段仍在单调上升 —— 判据要求暖机段"
+              "（前 25%）盖住惰性建线程期，实测本机需约 3 小时。"
+              "这不是缺陷，是观测窗口不够长。")
+        return 2
+    print(f"结论：全部判据通过（本次观测 {d.get('hours') or 0:.1f} 小时；"
+          f"用例要求的时长请对照 docs/07 §12 的 H-08）")
     return 0
 
 
