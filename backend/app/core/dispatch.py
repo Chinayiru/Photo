@@ -34,7 +34,11 @@ from .ctx import Ctx, Reply, json_reply, new_request_id
 
 log = logging.getLogger(__name__)
 
-__all__ = ["Route", "Router", "Handler", "Middleware", "NotFoundRoute"]
+__all__ = ["Route", "Router", "Handler", "Middleware", "NotFoundRoute", "ECHO_ORIGIN"]
+
+#: `enable_cors(allow_origin=...)` 的特殊值：**回显请求自己的 Origin**。
+#: 用它当默认值，而不是 `"*"` —— 见 `enable_cors` 的文档。
+ECHO_ORIGIN: str = "echo"
 
 #: 处理函数签名：接收 Ctx，返回 Reply。
 Handler = Callable[[Ctx], Awaitable[Reply]]
@@ -174,7 +178,7 @@ class Router:
         self._middleware.append(mw)
         return mw
 
-    def enable_cors(self, *, allow_origin: str = "*",
+    def enable_cors(self, *, allow_origin: str = ECHO_ORIGIN,
                     allow_headers: str = "Authorization, Content-Type, Content-Range, X-Request-Id",
                     expose_headers: str = "ETag, Content-Range, Content-Length, X-Request-Id",
                     max_age: int = 86400) -> None:
@@ -184,6 +188,31 @@ class Router:
         但二期云端隧道下页面来自 https://域名，API 也走同域，同样同源。
         真正需要它的是开发期：Vite dev server 在 5173，API 在 8787，
         不同端口就是跨源，不加这个连不上。
+
+        ★ `allow_origin` 的默认值是 `ECHO_ORIGIN`（`"echo"`），不是 `"*"`：
+
+          `"echo"`（默认）：请求带 `Origin` → 回显该源；不带 → **不发**
+              `Access-Control-Allow-Origin`。这是唯一同时满足"开发期跨源
+              能用"与"响应里绝不出现通配符"的取值。
+
+          `"*"`：字面通配符，**必须显式传**。本服务的鉴权走 `Authorization`
+              头与 cookie，且从不发 `Access-Control-Allow-Credentials`，
+              所以通配符在语义上并不比回显更宽松；但它会让"允许任何源"
+              这句话出现在响应头里，审计与渗透测试都会标成问题 —— 不当默认。
+
+          其他字符串：固定值，只放行那一个源（二期云端域名可走这里）。
+
+        ## 回显为什么安全
+
+        回显本身不授予任何权限："这个源能否读到响应"由浏览器按自己的源
+        比对决定，回显只对发起请求的那个源有效。第三方站点想借受害者
+        浏览器读走数据，需要 `Access-Control-Allow-Credentials: true`
+        —— 我们从不发这个头（全仓库仅在 `frontend/src/api/events.ts` 的
+        注释里提到）。没有凭据时攻击者本来就无需 CORS 即可发请求，
+        回显不增加任何攻击面。
+
+        规则 15（`docs/06-安全设计文档.md` §10）的要求因此落在两点：
+        默认值不写 `*`，且无 `Origin` 时干脆不发这个头。
         """
         self._cors = {
             "origin": allow_origin,
@@ -346,17 +375,36 @@ class Router:
         return reply
 
     def _apply_cors(self, ctx: Ctx, reply: Reply) -> None:
+        """把 CORS 头写进响应。
+
+        `allow_origin` 有三种语义（见 `enable_cors`）：
+
+        * `ECHO_ORIGIN`：有 Origin 就回显，没有就**一个都不发**；
+        * `"*"`：显式通配符，原样发；
+        * 其他固定值：原样发，并声明 `Vary: Origin`，因为同一个 URL
+          对不同源给出的是不同结果。
+        """
         assert self._cors is not None
+        configured = self._cors["origin"]
         origin = ctx.headers.get("origin")
-        reply.headers["Access-Control-Allow-Origin"] = self._cors["origin"]
+
+        if configured == ECHO_ORIGIN:
+            if not origin:
+                # 没有 Origin 的请求（curl、<img>、顶层导航）不参与 CORS，
+                # 发任何 Allow-Origin 都没有意义，发 "*" 更是白白广播。
+                return
+            reply.headers["Access-Control-Allow-Origin"] = origin
+            reply.headers["Vary"] = "Origin"
+        else:
+            reply.headers["Access-Control-Allow-Origin"] = configured
+            if configured != "*":
+                # 固定白名单值时响应对所有请求都一样，本来不必 Vary；
+                # 但一旦以后改成按 Origin 分支就会漏掉，加上更稳妥。
+                reply.headers["Vary"] = "Origin"
+
         reply.headers["Access-Control-Allow-Headers"] = self._cors["headers"]
         reply.headers["Access-Control-Expose-Headers"] = self._cors["expose"]
         reply.headers["Access-Control-Max-Age"] = self._cors["max_age"]
-        if origin:
-            # 带凭据的请求不能用 "*"，必须回显来源。
-            reply.headers["Access-Control-Allow-Origin"] = (
-                self._cors["origin"] if self._cors["origin"] != "*" else origin)
-            reply.headers["Vary"] = "Origin"
 
     # ------------------------------------------------------------------
     # 自省

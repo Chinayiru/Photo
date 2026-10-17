@@ -638,3 +638,127 @@ def test_bootstrap_refuses_lan_when_allow_lan_off(tmp_path, monkeypatch) -> None
     assert host != "0.0.0.0", (
         "allow_lan=false 时开了局域网监听，违背用户明确设置"
     )
+
+# ---------------------------------------------------------------------------
+# 规则 13：数据目录绝不能当媒体根
+# ---------------------------------------------------------------------------
+
+
+def _root_cfg(tmp_path, root_path, *, data_dir, exclude_dirs=None):
+    """造一份"根目录 = root_path、数据目录 = data_dir"的配置。"""
+    root = {
+        "id": "library",
+        "path": str(root_path),
+        "mode": "readwrite",
+    }
+    if exclude_dirs is not None:
+        root["exclude_dirs"] = exclude_dirs
+    return Config(
+        {"roots": [root]},
+        path=tmp_path / "data" / "config.json",
+        data_dir=data_dir,
+    )
+
+
+def test_root_may_not_be_the_data_dir(tmp_path) -> None:
+    """★ 根目录就是 data 目录 → 必须拒绝。
+
+    这是规则 13 的核心场景：一旦放行，`/api/timeline` 会把
+    `thumbs/**/*.webp` 当照片收进库，`/api/items/<id>/raw` 再把
+    `audit.log`、`photobridge.db` 以照片身份吐给手机。
+    """
+    from backend.app.config import ConfigError
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "audit.log").write_text("secret\n", encoding="utf-8")
+
+    cfg = _root_cfg(tmp_path, data, data_dir=data)
+    with pytest.raises(ConfigError) as ei:
+        _ = cfg.roots
+    assert "数据目录" in str(ei.value)
+
+
+def test_root_may_not_be_inside_the_data_dir(tmp_path) -> None:
+    """根是 data 的子目录，同样是"在数据目录内部"。"""
+    from backend.app.config import ConfigError
+
+    data = tmp_path / "data"
+    inner = data / "sub"
+    inner.mkdir(parents=True)
+
+    cfg = _root_cfg(tmp_path, inner, data_dir=data)
+    with pytest.raises(ConfigError):
+        _ = cfg.roots
+
+
+def test_root_containing_data_dir_is_rejected_when_not_excluded(tmp_path) -> None:
+    """数据目录在根内部、且目录名不在排除表里 → 拒绝。
+
+    用户把程序装在照片盘根上时就是这个形状：索引器 `rglob("*")`
+    会一头走进 `data/`。
+    """
+    from backend.app.config import ConfigError
+
+    lib = tmp_path / "lib"
+    data = lib / "runtime"
+    data.mkdir(parents=True)
+
+    cfg = _root_cfg(tmp_path, lib, data_dir=data,
+                    exclude_dirs=["@eaDir", ".photobridge_tmp"])
+    with pytest.raises(ConfigError) as ei:
+        _ = cfg.roots
+    assert "排除表" in str(ei.value)
+
+
+def test_root_containing_excluded_data_dir_is_allowed(tmp_path) -> None:
+    """数据目录在根内部**但已被排除表覆盖** → 放行。
+
+    这是常见且合理的布局（程序装在照片盘上）。硬拒它会把正常用法
+    判死，而用户没有自助修复手段；排除表已经保证了索引不越界。
+    """
+    from backend.app.config import check_root_safety
+
+    lib = tmp_path / "lib"
+    data = lib / "data"
+    data.mkdir(parents=True)
+
+    cfg = _root_cfg(tmp_path, lib, data_dir=data)
+    r = cfg.roots[0]
+    ok, why = check_root_safety(r, cfg)
+    assert ok, why
+    assert "跳过" in why
+
+
+def test_default_exclude_dirs_covers_data() -> None:
+    """`data` 必须默认就在扫描排除表里 —— 否则上面那条放行就是漏洞。"""
+    from backend.app.config import DEFAULT_EXCLUDE_DIRS
+
+    assert "data" in {d.lower() for d in DEFAULT_EXCLUDE_DIRS}
+
+
+def test_bootstrap_refuses_probed_root_that_is_the_data_dir(
+    tmp_path, monkeypatch,
+) -> None:
+    """自动探测是无人复核的：它若选中数据目录，必须自己拒掉。
+
+    不做这一步的话，`bootstrap_default_root` 会把一个刚被
+    `check_root_safety` 判死的 path 写进 config.json，
+    下一次启动直接 ConfigError —— 用户完全不知道发生了什么。
+    """
+    from backend.app import config as cfgmod
+
+    cfg_path = tmp_path / "data" / "config.json"
+    cfg_path.parent.mkdir(parents=True)
+    cfg = Config({}, path=cfg_path)
+
+    # 探测结果就是数据目录本身
+    monkeypatch.setattr(
+        cfgmod, "_guess_library_paths", lambda: [(cfg.data_dir, "data")],
+    )
+    monkeypatch.setattr(cfgmod, "_write_json", lambda *a, **k: None)  # noqa: ARG005
+
+    out = cfgmod.bootstrap_default_root(cfg)
+    assert out.roots == [], (
+        "把数据目录当成了照片库写进配置 —— 下次启动会直接起不来"
+    )

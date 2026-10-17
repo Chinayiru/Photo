@@ -88,6 +88,7 @@ DEFAULT_EXCLUDE_DIRS: Final[tuple[str, ...]] = (
     "#recycle",                     # Synology 回收站
     ".Trash", ".Trashes",           # macOS / U 盘
     ".photobridge_tmp",             # ★ 本程序的上传临时区
+    "data",                         # ★ 本程序的运行数据目录（规则 13 的第二道防线）
     "lost+found",
     ".Spotlight-V100", ".fseventsd",
 )
@@ -331,6 +332,14 @@ class Config:
     def roots(self) -> list[RootConfig]:
         if self._roots is None:
             self._roots = [_root_from_dict(d, self._raw["app"]["mode"]) for d in self._raw["roots"]]
+            # ★ 规则 13：在这里**硬拦截**，而不是启动时只打个警告。
+            # 配置错到"根目录就是 data 目录"这一步时，程序继续跑等于
+            # 主动把审计日志与数据库当照片提供服务；用户看到的是"照片
+            # 能打开"，没有任何可感知的异常。宁可起不来，也不能悄悄泄漏。
+            for r in self._roots:
+                ok, why = check_root_safety(r, self)
+                if not ok:
+                    raise ConfigError(f"{why}。请修改 config.json 的 roots")
         return self._roots
 
     @property
@@ -456,6 +465,82 @@ def _root_from_dict(d: Mapping[str, Any], app_mode: str) -> RootConfig:
             str(x).lower() for x in (d.get("exclude_files") or DEFAULT_EXCLUDE_FILES)
         ),
     )
+
+
+#: 允许作为媒体根的比较基准：**必须落在数据目录之外**。
+#: 规则 13（`docs/06-安全设计文档.md` §10）要求「绝不通过 API 暴露审计日志与
+#: 配置」。该规则原本只被理解为"不要加一条读 data/ 的路由"——那是**消极**
+#: 的实现：真正的风险在于用户（或被改写的 config.json）把根目录设成
+#: `<程序目录>\data`，从此时间线、搜索、缩略图原图下载**全部会把审计日志
+#: 与 photobridge.db 当照片吐出去**（`/api/items/<id>/raw`、`/api/search`
+#: 都会命中）。沙箱是按"根目录内"判定的，它无法区分"这是用户照片"还是
+#: "这是我们自己的运行数据"。
+#:
+#: 因此这一层必须由配置侧拦住，而不是靠路由白名单。
+#: 判据函数是 `check_root_safety()`。
+
+
+def _is_inside(child: Path, parent: Path) -> bool:
+    """`child` 是否等于 `parent` 或位于其下。两边都先 resolve（消 symlink/..）。"""
+    try:
+        c = child.resolve()
+        p = parent.resolve()
+    except (OSError, RuntimeError):
+        return False
+    return c == p or p in c.parents
+
+
+def check_root_safety(root: RootConfig, cfg: Config) -> tuple[bool, str]:
+    """判断某个媒体根是否安全。返回 `(ok, 说明)`，**只判断不抛异常**。
+
+    规则 13（`docs/06-安全设计文档.md` §10）要求「绝不通过 API 暴露审计日志
+    与配置」。只做到"别加一条读 data/ 的路由"是**消极**实现 —— 真正的风险
+    在配置侧：一旦媒体根被设成数据目录（或它的父目录），全流程就都把运行
+    数据当照片处理了，而沙箱只判断"在根目录内"，它无法区分用户照片与我们
+    自己的运行文件：
+
+      * `/api/timeline`、`/api/search` 会收录 `thumbs/**/*.webp`；
+      * `/api/items/<id>/raw` 会把它们以照片身份吐出去；
+      * `audit.log`、`photobridge.db`、`secrets.json` 同在一个目录里。
+
+    ## 三种情形，两种处理
+
+    1. **根目录就是数据目录，或在它内部** → 硬拒绝。
+       此时数据目录里的每个文件都在根的覆盖范围内，没有任何缓冲。
+
+    2. **数据目录在根目录内部，且数据目录的目录名不在扫描排除表里**
+       → 硬拒绝。索引器会 `rglob("*")` 走进它。
+
+    3. **数据目录在根目录内部，但目录名已被 `DEFAULT_EXCLUDE_DIRS` 排除**
+       → 放行，但在说明里点出来。这是**常见且合理**的布局
+       （用户把程序装在照片盘上，或测试用临时目录既当库又当数据目录），
+       排除表已经保证了索引不越界。硬拒它会把正常用法判死，
+       而用户没有任何自助修复手段。
+
+    判定用**目录名**而不是全路径比较，因为 `data` 的位置随安装方式变化
+    （开发期是 `仓库/data`，PyInstaller 下是 `dist/PhotoBridge/data`）。
+
+    返回说明文本，供日志与托盘提示使用 —— 与 `check_bind_safety` 一致。
+    """
+    data_dir = cfg.data_dir
+    excluded = {str(x).lower() for x in root.exclude_dirs}
+
+    if _is_inside(root.path, data_dir):
+        return False, (
+            f"根目录 {root.id!r} 指向数据目录 {data_dir}（或其内部），"
+            "会把审计日志与数据库当照片暴露出去"
+        )
+
+    if _is_inside(data_dir, root.path):
+        if data_dir.name.lower() not in excluded:
+            return False, (
+                f"根目录 {root.id!r} 包含了数据目录 {data_dir}，"
+                f"而 {data_dir.name!r} 不在扫描排除表里，"
+                "索引会把缩略图缓存当照片收进来"
+            )
+        return True, f"ok（索引会跳过其中的 {data_dir.name}/）"
+
+    return True, "ok"
 
 
 def _merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -838,6 +923,17 @@ def bootstrap_default_root(cfg: Config | None = None) -> Config:
         return cfg
 
     found = _guess_library_paths()
+    # ★ 探测结果必须先过规则 13：自动探测是**无人复核**的路径，
+    # 若它恰好选中了数据目录（或数据目录的父目录），后面所有
+    # "根目录内即可访问"的判定都会把运行数据当照片放出去。
+    if found:
+        cand, label = found[0]
+        probe = RootConfig(id="library", path=cand, label=label, mode="readwrite")
+        safe, why = check_root_safety(probe, cfg)
+        if not safe:
+            log.warning("首次运行：自动探测到 %s 但不能用 —— %s", cand, why)
+            found = []
+
     if found:
         path, label = found[0]
         log.info("首次运行：自动发现照片库 %s", path)

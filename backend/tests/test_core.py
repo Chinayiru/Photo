@@ -510,10 +510,45 @@ def test_cors_echoes_origin_when_present(router: Router) -> None:
     assert r.headers["Vary"] == "Origin"
 
 
+def test_cors_never_emits_wildcard_by_default(router: Router) -> None:
+    """★ 默认配置下，响应里**任何情况下**都不该出现 `*`。
+
+    规则 15（docs/06 §10）要求 CORS 绝不用 `*`。默认值曾是字面量 `*`，
+    于是**不带 Origin 的请求**（curl / `<img>` / 顶层导航）拿到的正是
+    `Access-Control-Allow-Origin: *` —— 一个谁都能读的广播。
+    改成回显语义后，这类请求干脆不发这个头。
+    """
+    router.enable_cors()
+    plain = run(router.dispatch(Ctx("GET", "/api/system/ping")))
+    assert plain.headers.get("Access-Control-Allow-Origin") is None, \
+        "无 Origin 的请求不该拿到 Access-Control-Allow-Origin"
+
+    with_origin = run(router.dispatch(Ctx("GET", "/api/system/ping",
+                                          headers={"Origin": "http://x.y"})))
+    assert with_origin.headers["Access-Control-Allow-Origin"] == "http://x.y"
+    assert with_origin.headers["Access-Control-Allow-Origin"] != "*"
+
+
+def test_cors_wildcard_still_available_explicitly(router: Router) -> None:
+    """显式要 `*` 时仍然给 —— 不把能力删掉，只把默认值改对。"""
+    router.enable_cors(allow_origin="*")
+    r = run(router.dispatch(Ctx("GET", "/api/system/ping")))
+    assert r.headers["Access-Control-Allow-Origin"] == "*"
+
+
+def test_cors_fixed_origin_is_honoured(router: Router) -> None:
+    """二期云端域名会走这条：只放行那一个源，不随请求变。"""
+    router.enable_cors(allow_origin="https://photo.example.com")
+    r = run(router.dispatch(Ctx("GET", "/api/system/ping",
+                                headers={"Origin": "http://evil.example"})))
+    assert r.headers["Access-Control-Allow-Origin"] == "https://photo.example.com"
+
+
 def test_cors_exposes_etag_for_conditional_requests(router: Router) -> None:
     """不 expose ETag 的话，浏览器拿不到它，条件请求永远不生效。"""
     router.enable_cors()
-    r = run(router.dispatch(Ctx("GET", "/api/system/ping")))
+    r = run(router.dispatch(Ctx("GET", "/api/system/ping",
+                                headers={"Origin": "http://localhost:5173"})))
     assert "ETag" in r.headers["Access-Control-Expose-Headers"]
 
 
