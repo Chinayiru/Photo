@@ -1119,6 +1119,52 @@ def _seed_three(st, library) -> None:
 # --------------------------------------------------------------------------
 
 
+def test_rescan_unknown_root_is_400_not_202(tmp_path, library) -> None:
+    """未知的根必须 400，**绝不能** 202 + 静默降级成全库重扫。
+
+    审计 F12 的核心危害就在这里：`{"root_id":"nope"}` 早先因为名字不被
+    识别而走 "else: 扫全部" 分支，返回 202 `{"started":true,"root":null}`。
+    调用方以为"只扫了 nope 那个根"，实际是全库重扫（真实库约 20 秒、
+    4915 个文件的目录遍历与 stat）。这种"请求被接受了、但做的是另一件事"
+    比直接报错危险得多，因为没有任何迹象提示用户去检查拼写。
+    """
+    fake = _FakeIndexer()
+    st = _state(tmp_path, library, indexer=fake)
+
+    for raw in (b'{"root_id":"nope"}', b'{"root":"nope"}'):
+        r = _call(st, "POST", "/api/index/rescan", body=raw)
+        assert r.status == 400, f"{raw!r} → {r.status} {_json(r)}"
+        assert _json(r)["error"]["code"] == "E1001"
+        assert "nope" in _json(r)["error"]["detail"]
+
+    asyncio.run(asyncio.sleep(0))
+    assert fake.calls == [], f"未知的根却真的触发了扫描：{fake.calls}"
+
+
+def test_rescan_root_ids_are_consistent(tmp_path, library) -> None:
+    """`root_id` 这个拼写在所有接口里都被真正识别（不只是不报错）。
+
+    单看"返回 202"不足以证明别名生效 —— 静默降级的分支同样返回 202。
+    所以这里断言的是**扫描真的发生在那个根上**（`fake.calls`），
+    以及响应体里的 `root` 字段回填了它。
+    """
+    fake = _FakeIndexer()
+    st = _state(tmp_path, library, indexer=fake)
+    r = _call(st, "POST", "/api/index/rescan", body=b'{"root_id":"library"}')
+    assert r.status == 202, _json(r)
+    assert _json(r)["root"] == "library"
+    asyncio.run(asyncio.sleep(0))
+    assert fake.calls == ["library"]
+
+    # 不给任何根 = 全库重扫，此时 fake 记的是 scan_all（"all"，不是某个根的 id）。
+    fake.calls.clear()
+    r = _call(st, "POST", "/api/index/rescan", body=b"{}")
+    assert r.status == 202, _json(r)
+    assert _json(r)["root"] is None
+    asyncio.run(asyncio.sleep(0))
+    assert fake.calls == ["all"], f"不给根时应对所有根扫一遍：{fake.calls}"
+
+
 def test_rescan_accepts_root_id_alias(tmp_path, library) -> None:
     fake = _FakeIndexer()
     st = _state(tmp_path, library, indexer=fake)
