@@ -12,7 +12,16 @@
 用法：
     .venv\\Scripts\\python.exe scripts\\judge_soak.py build\\soak_24h_aborted_10h.json
 
-不传参数时读 `build\\soak_24h.json`。退出码：0 = 全部通过，1 = 有判据越界。
+    # 判定通过时，顺手打印可以直接贴进 docs/07 §8.6 的 Markdown 表格
+    .venv\\Scripts\\python.exe scripts\\judge_soak.py build\\soak_24h.json --emit-docs
+
+不传参数时读 `build\\soak_24h.json`。退出码：0 = 全部通过，1 = 有判据越界，
+2 = 证据不足（观测窗口太短，见 `soak_test._plateau_info`）。
+
+**为什么要 `--emit-docs`**：判定通过之后要人工把 5 个数字抄进 docs/07 §8.6
+的表格。抄错一个数字，文档就从"证据"变成"说法" —— 而这份文档存在的意义
+恰恰是每个 ✅ 后面都能指到一份可复跑的原始数据。让输出格式由脚本生成，
+人只负责粘贴，抄错的可能性就没了。
 """
 from __future__ import annotations
 
@@ -35,9 +44,52 @@ from scripts.soak_test import (                                    # noqa: E402
 )
 
 
+def _emit_docs(path: Path, d: dict, verdicts: list[tuple[str, bool | None, str]],
+               rss_rel: float | None, rss_base: float, rss_abs: float,
+               rss_peak: float, thread_abs: float, thread_base: float,
+               thread_last: float, task_abs: float, task_base: float,
+               task_last: float, handle_abs: float, handle_base: float,
+               handle_last: float) -> None:
+    """打印可直接贴进 docs/07 §8.6 的 Markdown 表格 + 证据块。
+
+    ★ 只打印，不写文件。文档是人工编辑的（它有自己的换行符约定与上下文），
+    脚本越权去改它，一次换行符事故就够毁掉一整个提交 —— 这个仓库已经被
+    CRLF/LF 坑过一次（见 docs/10 §6.2.1）。所以这里只生成文本，粘贴与否
+    由人决定。
+    """
+    hours = d.get("hours") or 0.0
+    print()
+    print("=" * 72)
+    print("以下内容可直接贴进 docs/07 §8.6（--emit-docs）")
+    print("=" * 72)
+    print()
+    print("| 判据 | 实测 | 阈值 | 结论 |")
+    print("|---|---|---|---|")
+    print(f"| RSS 增长 | **{rss_rel:+.1%}**（基线 {_human(rss_base)}，"
+          f"净增 {_human(rss_abs)}，峰值 {_human(rss_peak)}） | "
+          f"≤ +{RSS_GROWTH_LIMIT:.0%} | ✅ |")
+    print(f"| 线程数净增 | **{thread_abs:+.2f}**（基线 {thread_base:.0f}，"
+          f"末值 {thread_last:.0f}） | ≤ +{THREAD_GROWTH_LIMIT} | ✅ |")
+    print(f"| 任务数净增 | **{task_abs:+.2f}**（基线 {task_base:.0f}，"
+          f"末值 {task_last:.0f}） | ≤ +{TASK_GROWTH_LIMIT} | ✅ |")
+    print(f"| 句柄数净增 | {handle_abs:+.2f}（基线 {handle_base:.0f}，"
+          f"末值 {handle_last:.0f}） | 无阈值，仅观测 | — |")
+    print(f"| 请求成功率 | {d.get('rounds_bad') or 0} 失败 / "
+          f"{d.get('rounds')} 轮 | 100% | ✅ |")
+    print()
+    print(f"观测时长 **{hours:.1f} 小时**、{d.get('rounds')} 轮、"
+          f"{len(d.get('samples') or [])} 个样本、"
+          f"暖机丢弃 {WARMUP_FRACTION:.0%}；原始数据 `{path}`。")
+    print()
+    print("> ⚠️ 上面这句「可直接贴」仅指**表格本身**：H-08 的 ✅ 还要求时长"
+          "达到 24 小时，请先确认 `hours` 已经是 24 再据此打勾。")
+
+
 def main() -> int:
-    path = Path(sys.argv[1] if len(sys.argv) > 1 else
-                REPO / "build" / "soak_24h.json")
+    argv = sys.argv[1:]
+    emit_docs = "--emit-docs" in argv
+    argv = [a for a in argv if a != "--emit-docs"]
+    path = Path(argv[0] if argv else REPO / "build" / "soak_24h.json")
     if not path.exists():
         print(f"找不到报告：{path}", file=sys.stderr)
         print("挂机时用 --report 指定路径；中断后残留的检查点同样可以直接判定。",
@@ -160,6 +212,14 @@ def main() -> int:
         return 2
     print(f"结论：全部判据通过（本次观测 {d.get('hours') or 0:.1f} 小时；"
           f"用例要求的时长请对照 docs/07 §12 的 H-08）")
+    if emit_docs:
+        _emit_docs(
+            path, d, verdicts, rss_rel, rss_base, rss_abs,
+            max(rss_series) if rss_series else 0.0,
+            thread_abs, thread_base, thread_series[-1] if thread_series else 0.0,
+            task_abs, task_base, task_series[-1] if task_series else 0.0,
+            handle_abs, handle_base, handle_series[-1] if handle_series else 0.0,
+        )
     return 0
 
 

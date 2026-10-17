@@ -250,3 +250,113 @@ class TestPlateauGuard:
         # 证据不足时退出码是 2（与"环境问题"同义），不是 1（越界）
         assert "return 2" in src
 
+
+class TestJudgeEmitDocs:
+    """判定通过后，§8.6 的表格由脚本生成，人只负责粘贴。
+
+    ## 为什么值得测
+
+    打勾之前要把 5 个数字抄进 `docs/07` §8.6。抄错一个数字，文档就从
+    "证据"退化成"说法" —— 而这份文档存在的全部意义，是每个 ✅ 后面都能
+    指到一份可复跑的原始数据。所以生成这一步必须可验证：喂一份**已知的**
+    报告进去，输出的表格必须与文档里现存的五行逐字一致。
+
+    这里用真实的历史数据 `build/soak_24h_aborted_10h.json` 做基准 ——
+    它已经在 docs/07 §8.6 里躺了一版人工抄写的表格。如果生成器与它不一致，
+    要么生成器错了，要么当初抄错了，两种都该拦下来。
+    """
+
+    JUDGE = REPO / "scripts" / "judge_soak.py"
+    TEN_H = REPO / "build" / "soak_24h_aborted_10h.json"
+
+    def _load_judge(self):
+        assert self.JUDGE.is_file(), f"找不到判定脚本 {self.JUDGE}"
+        spec = importlib.util.spec_from_file_location("_pb_judge_soak", self.JUDGE)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_emit_docs_is_opt_in(self) -> None:
+        """不带 `--emit-docs` 不该多打印任何东西。
+
+        默认输出是给人扫一眼判定结论用的；夹带一大段 Markdown 会让
+        "本次到底过没过"淹没在噪声里。
+        """
+        src = self.JUDGE.read_text(encoding="utf-8")
+        assert '"--emit-docs" in argv' in src
+        assert src.count("_emit_docs(") == 2, "应当是 1 处定义 + 1 处调用"
+
+    def test_docs_emitter_only_prints_never_writes(self) -> None:
+        """生成器绝不自己改文档。
+
+        `docs/07` 有它自己的换行符约定，脚本越权去写它，一次 CRLF 事故
+        就够毁掉整个提交 —— 这个仓库已经被坑过一次（docs/10 §6.2.1）。
+        """
+        src = self.JUDGE.read_text(encoding="utf-8")
+        start = src.index("def _emit_docs(")
+        body = src[start:src.index("def main()")]
+        for forbidden in ("write_text", "write_bytes", "open(", "os.replace"):
+            assert forbidden not in body, (
+                f"_emit_docs 里出现了 {forbidden} —— 它必须是纯打印"
+            )
+
+    def test_emitted_table_matches_the_documented_one(self, capsys) -> None:
+        """与本仓库已入库的那版表格逐字对齐。
+
+        跳过条件：`build/` 是 gitignore 的产物目录，换个 checkout 就没有
+        这份原始数据。没有它就无法做这个比对 —— 但**不能因此静默通过**，
+        所以要显式 skip 并说明原因。
+        """
+        if not self.TEN_H.is_file():
+            pytest.skip(f"缺少历史原始数据 {self.TEN_H}（build/ 不入库）")
+
+        judge = self._load_judge()
+
+        import sys as _sys
+        saved = _sys.argv
+        _sys.argv = ["judge_soak.py", str(self.TEN_H), "--emit-docs"]
+        try:
+            rc = judge.main()
+        finally:
+            _sys.argv = saved
+
+        assert rc == 0, "10 小时那份数据必须仍然判定通过（回归）"
+        out = capsys.readouterr().out
+
+        # 这五行是 docs/07 §8.6 里人工抄的那版，逐字比对
+        for expected in (
+            "| RSS 增长 | **-8.7%**（基线 40.8MB，净增 -3.6MB，峰值 64.5MB） | ≤ +30% | ✅ |",
+            "| 线程数净增 | **+0.26**（基线 29，末值 29） | ≤ +4 | ✅ |",
+            "| 任务数净增 | **+0.00**（基线 3，末值 3） | ≤ +8 | ✅ |",
+            "| 句柄数净增 | +1.36（基线 401，末值 403） | 无阈值，仅观测 | — |",
+            "| 请求成功率 | 0 失败 / 600 轮 | 100% | ✅ |",
+        ):
+            assert expected in out, f"生成的表格与文档不一致：\n{expected}"
+
+    def test_emitted_block_warns_when_shorter_than_24h(self, capsys) -> None:
+        """10 小时的观测**不许**被当成 H-08 打勾的依据。
+
+        生成器会照实打出表格（趋势是真的），但必须附带一句"时长还没到"，
+        否则下一个人看到 ✅ 就顺手打勾了 —— 这正是"半自动化的项仍算 ☐"
+        这条判定原则要防的事。
+        """
+        if not self.TEN_H.is_file():
+            pytest.skip(f"缺少历史原始数据 {self.TEN_H}（build/ 不入库）")
+
+        judge = self._load_judge()
+
+        import sys as _sys
+        saved = _sys.argv
+        _sys.argv = ["judge_soak.py", str(self.TEN_H), "--emit-docs"]
+        try:
+            judge.main()
+        finally:
+            _sys.argv = saved
+
+        out = capsys.readouterr().out
+        assert "还要要求时长达到 24 小时" in out or "H-08 的 ✅ 还要求时长" in out, (
+            "少于 24 小时的观测必须带时长警告"
+        )
+        assert "观测时长 **10.0 小时**" in out
+
