@@ -988,3 +988,214 @@ def test_move_allowed_by_default(tmp_path: Path) -> None:
     r = _call(st, "POST", "/api/items/move",
               body=_body(ids=[mid], target_dir="2024", on_conflict="rename"))
     assert r.status == 200, f"默认应当允许移动，却返回 {r.status}"
+
+
+# --------------------------------------------------------------------------
+# 墓碑行占路径（审计 F4）
+# --------------------------------------------------------------------------
+#
+# `_trash_one()` 只把行标成 `missing = 1`，行**留在表里继续占用**
+# `UNIQUE(root_id, rel_path)`。而 `media` 表的唯一约束是表级的、
+# 不带 `WHERE missing = 0` —— 于是"移动到一个曾经删除过同名文件的
+# 目录"会撞唯一键：文件已经搬完了，`UPDATE` 抛 IntegrityError，
+# 接口 500，磁盘与数据库就此分叉。
+#
+# 更刺眼的是同一份代码里对"墓碑算不算占位"给出过两个相反答案：
+# `_pick_free_name` 的调用方查候选名时写了 `AND missing = 0`（不算占位），
+# 而唯一索引认为它占位。现在统一成"不算占位"。
+
+def test_move_into_dir_with_tombstone_of_same_name(tmp_path, library) -> None:
+    """★ 移动目标目录里有一条同名的**已删除**记录时，必须成功。
+
+    复现路径（审计报告 §5.2 的实测序列）：
+      1. A 照片移动到 dir，再删除 → 磁盘上没有文件，但库里留着
+         `missing=1` 的同名行（墓碑）；
+      2. 另一张**同名**照片从别处移动进 dir → 撞墓碑的唯一键。
+
+    期望：移动成功，墓碑行被清掉，B 的 rel_path 指向真实文件。
+    """
+    st = _state(tmp_path, library)
+    ids = _seed(st, library)
+    old = ids["a.jpg"]
+
+    # 1. 把 A 移到 2024/精选，再删除 —— 留一条墓碑在 2024/精选/a.jpg
+    b1 = _json(_call(st, "POST", "/api/items/move",
+                     body=_body(ids=[old], target_dir="2024/精选")))
+    assert b1["failed"] == [], b1
+    from app.handlers import browse as _b
+    assert asyncio.run(_b._trash_one(st, old)) is True
+    tomb = st.db.query_one("SELECT id, rel_path, missing FROM media WHERE id=?",
+                           (old,))
+    assert tomb["missing"] == 1
+    assert tomb["rel_path"] == "2024/精选/a.jpg"
+    assert not (library / "2024" / "精选" / "a.jpg").exists()
+
+    # 2. 再造一张**同名**的照片在别的目录，索引进来
+    _img(library / "phone" / "a.jpg")
+    from app.indexer import Indexer
+    asyncio.run(Indexer(st.cfg, st.db).scan_root(st.cfg.root_by_id("library")))
+    new = int(st.db.scalar("SELECT id FROM media WHERE rel_path='phone/a.jpg'"))
+    assert new != old
+
+    # 3. 把它移进 2024/精选 —— 文件名 a.jpg 与墓碑完全同路，必撞唯一键
+    r = _call(st, "POST", "/api/items/move",
+              body=_body(ids=[new], target_dir="2024/精选"))
+    body = _json(r)
+    assert r.status == 200, f"撞上墓碑应当成功，实际 {r.status}: {body}"
+    assert body["failed"] == [], f"移动失败：{body}"
+
+    # 墓碑必须已被清掉，否则它会继续占坑、还会被下次扫描"复活"成重复行
+    assert st.db.query_one("SELECT 1 FROM media WHERE id=?", (old,)) is None
+    # 新行的库里路径必须指向真实存在的文件
+    rel = _rel(st, new)
+    assert rel == "2024/精选/a.jpg", rel
+    assert (library / rel).exists(), "库里指向的路径必须真的在磁盘上"
+    # 磁盘上与库里都不能有重名
+    names = [r2["file_name"] for r2 in st.db.query(
+        "SELECT file_name FROM media WHERE missing = 0")]
+    assert names.count("a.jpg") == 1
+
+
+def test_rename_onto_tombstone_in_same_dir(tmp_path, library) -> None:
+    """同目录改名撞墓碑：同样必须成功，且不留下两条指向同一个名字的行。"""
+    st = _state(tmp_path, library)
+    ids = _seed(st, library)
+    old = ids["a.jpg"]
+    new = ids["b.jpg"]
+
+    from app.handlers import browse as _b
+    assert asyncio.run(_b._trash_one(st, old)) is True
+    assert st.db.scalar("SELECT missing FROM media WHERE id=?", (old,)) == 1
+
+    r = _call(st, "POST", "/api/items/rename",
+              body=_body(id=new, new_name="a.jpg"))
+    assert r.status == 200, f"改名撞墓碑应当成功，实际 {r.status}: {_json(r)}"
+    assert _rel(st, new) == "2024/2024-05/a.jpg"
+    assert (library / "2024" / "2024-05" / "a.jpg").exists()
+    # b.jpg 已经不在磁盘上，库里也不该还留着它的活行
+    assert st.db.scalar(
+        "SELECT COUNT(*) FROM media WHERE file_name='b.jpg' AND missing=0") == 0
+
+
+def test_move_conflict_with_live_row_still_fails_and_rolls_back(
+        tmp_path, library) -> None:
+    """★ 撞上**活行**（不是墓碑）时必须失败，并且把文件搬回原处。
+
+    这是上两条的反向保护：清理墓碑的逻辑绝不能退化成"冲突就删别人的行"。
+    活行意味着那个路径上真的有一张照片，删掉它的元数据等于让用户
+    在自己的库里丢一张照片。
+    """
+    st = _state(tmp_path, library)
+    ids = _seed(st, library)
+    mid = ids["a.jpg"]
+    src = library / "2024" / "2024-05" / "a.jpg"
+    src_before = src.read_bytes()
+
+    # 手工造一条**活行**占住目标路径，**但磁盘上没有对应文件**。
+    #
+    # 这个组合是关键：`dst.exists()` 为 False，所以挑选名字/冲突检查那一层
+    # 看不到任何冲突；文件被搬过去之后，`UPDATE` 才撞上唯一键。
+    # 这正是"库里有行、磁盘还没跟上"的真实窗口期（扫描未跑到、或文件刚
+    # 被外部程序移走）。用来验证 `_update_rel_path()` 的**回滚**分支。
+    st.db.execute(
+        "INSERT INTO media (root_id, rel_path, file_name, ext, kind, size,"
+        " mtime, taken_at, taken_src, thumb_state, missing, indexed_at)"
+        " VALUES ('library','2024/精选/a.jpg','a.jpg','jpg','image',10,"
+        " 1.0, 1.0, 'mtime', 'pending', 0, 1.0)")
+    (library / "2024" / "精选").mkdir(parents=True, exist_ok=True)
+    assert not (library / "2024" / "精选" / "a.jpg").exists()
+
+    r = _call(st, "POST", "/api/items/move",
+              body=_body(ids=[mid], target_dir="2024/精选", on_conflict="fail"))
+    body = _json(r)
+
+    # 撞活行 → 该条记 failed，不能 500
+    assert r.status == 200, f"单项失败不该让整批 500：{r.status} {body}"
+    assert [f["id"] for f in body["failed"]] == [mid], body
+    assert body["failed"][0]["code"] == "E3012"
+    assert body["moved"] == []
+
+    # ★ 核心断言：文件必须被搬回原位，磁盘与数据库保持一致
+    assert src.exists(), "写库失败后文件必须搬回原处"
+    assert src.read_bytes() == src_before, "回滚不能损坏文件"
+    assert not (library / "2024" / "精选" / "a.jpg").exists(), "副本不该留下"
+    assert _rel(st, mid) == "2024/2024-05/a.jpg"
+    # 活行不能被误删：它的路径上（理论上）还有一张别人的照片
+    assert st.db.scalar(
+        "SELECT COUNT(*) FROM media WHERE rel_path='2024/精选/a.jpg'") == 1
+
+
+# --------------------------------------------------------------------------
+# 双向控制字符（审计 F10）
+#
+# 这类字符在 Windows 上是**合法文件名**，`open()` 能建、资源管理器能显示，
+# 所以前面所有字符校验都会放行。但它们的唯一作用是让渲染顺序与真实字符
+# 顺序不同 —— 用户看到的文件名与实际不是同一个。对一个"帮用户找回照片"
+# 的程序来说，这就是欺骗。
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [
+    "x\u202Eegap.png",      # RLO：经典的"伪装扩展名"手法
+    "x\u202Degap.png",      # LRO
+    "x\u2066egap.png",      # LRI
+    "x\u2069egap.png",      # PDI
+    "x\u200Eegap.png",      # LRM，不可见
+    "a\u202Eb.png",
+])
+def test_rename_rejects_bidi_controls(tmp_path, library, bad) -> None:
+    """改名必须拒绝双向控制字符，且**不能真的把文件建出来**。"""
+    st = _state(tmp_path, library)
+    ids = _seed(st, library)
+    mid = ids["a.jpg"]
+    before = _rel(st, mid)
+
+    r = _call(st, "POST", "/api/items/rename",
+              body=_body(id=mid, new_name=bad))
+    assert r.status == 400, f"{bad!r} 应当被拒，实际 {r.status}: {_json(r)}"
+    assert _json(r)["error"]["code"] == "E1009"
+    # ★ 最关键的断言：磁盘上不能多出一个奇怪名字的文件。
+    # 只断言状态码是不够的 —— 早先的实现会先搬文件再改库，
+    # 请求失败但文件已经改了名，那才是最糟的形态。
+    assert _rel(st, mid) == before, "被拒绝的改名不能改动记录"
+    names = [p.name for p in (library / "2024" / "2024-05").iterdir()]
+    assert not any("\u202e" in n.lower() or "\u202d" in n.lower() for n in names)
+
+
+def test_rename_error_detail_names_the_codepoint(tmp_path, library) -> None:
+    """错误详情要能说清是哪个字符 —— 否则用户对着输入框不知所措。
+
+    `repr()` 出来是一串不可见字符，日志里看着像空字符串。
+    """
+    st = _state(tmp_path, library)
+    ids = _seed(st, library)
+    r = _call(st, "POST", "/api/items/rename",
+              body=_body(id=ids["a.jpg"], new_name="x\u202Eegap.png"))
+    assert r.status == 400
+    detail = _json(r)["error"].get("detail") or ""
+    assert "U+202E" in detail, detail
+    assert "RLO" in detail, detail
+
+
+def test_rename_still_accepts_normal_unicode_names(tmp_path, library) -> None:
+    """别矫枉过正：中文、空格、括号、emoji 都该正常通过。
+
+    这条不是凑数 —— 零宽字符（U+200B–U+200D）与 BOM（U+FEFF）在中文
+    和阿拉伯文排版里是正常的组合字符，把它们也禁掉会误伤真实文件名。
+    """
+    st = _state(tmp_path, library)
+    ids = _seed(st, library)
+    for good in ("春天 的 照片(1).jpg", "photo 2024.jpg", "照片🖼.jpg"):
+        r = _call(st, "POST", "/api/items/rename",
+                  body=_body(id=ids["a.jpg"], new_name=good))
+        assert r.status == 200, f"{good!r} 应当被接受：{_json(r)}"
+        assert _rel(st, ids["a.jpg"]).endswith(good)
+
+
+def test_zero_width_joiner_is_still_allowed(tmp_path, library) -> None:
+    """U+200D（零宽连接符）在 emoji 组合与阿拉伯文里合法，必须放行。"""
+    st = _state(tmp_path, library)
+    ids = _seed(st, library)
+    r = _call(st, "POST", "/api/items/rename",
+              body=_body(id=ids["a.jpg"], new_name="fam\u200Dily.jpg"))
+    assert r.status == 200, _json(r)

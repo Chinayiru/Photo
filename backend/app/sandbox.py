@@ -37,6 +37,41 @@ Need = Literal["read", "write", "delete"]
 #: Windows 文件名非法字符。':' 单独在步 2 处理（NTFS 数据流语义更具体）。
 ILLEGAL_CHARS: Final[frozenset[str]] = frozenset('<>"|?*') | frozenset(chr(c) for c in range(0x20))
 
+#: 双向文本控制字符 —— "显示出来的顺序与真实字符顺序不同"的那一批。
+#:
+#: 为什么要单独列：这些字符**在 Windows 上是合法文件名**，`open()` 能建、
+#: 资源管理器能显示，所以步 2/步 3 的字符校验全都会放行。但它们的唯一
+#: 作用就是翻转渲染方向：
+#:
+#:   U+202E RIGHT-TO-LEFT OVERRIDE 之后的字符按从右到左渲染
+#:
+#: 于是 `x\u202Eegap.png` 显示出来的后缀与真实后缀完全不同 —— 经典的
+#: "RLO 伪装扩展名"手法，能让 `evil\u202Egnp.exe` 看着像 png。
+#:
+#: 对 PhotoBridge 这不止是"看着别扭"：照片库的全部价值就是让用户按
+#: 文件名/缩略图找到自己的照片。一个显示成别的名字的文件放进库里，
+#: 用户点开时看到的东西与他以为的不是同一张 —— 这正是 docs/06 §10
+#: 规则 6（魔术字节校验）想防的那类欺骗，只是发生在名字层而不是内容层。
+#:
+#: 实测（审计报告 F10）：`POST /api/items/rename {"new_name":
+#: "x\u202Eegap.png"}` 返回 200 并真的在磁盘上建出了文件；而同一接口
+#: 对 `CON.png` 和含 NUL 的名字都正确返回 400 E1009 —— 校验链是通的，
+#: 只是没覆盖这一档。
+#:
+#: 范围取 U+202A–U+202E（LRE/RLE/PDF/LRO/RLO）、U+2066–U+2069
+#: （LRI/RLI/FSI/PDI），外加 U+200E/U+200F（LRM/RLM，不可见单向标记）。
+#: **不含** U+200B–U+200D（零宽空格/连接符）—— 那些在中文与阿拉伯文
+#: 排版里是正常的组合字符，禁掉会误伤真实文件名；也不含 U+FEFF（BOM），
+#: 它更可能是复制粘贴的残留，剥掉比拒绝友好（见 `strip_bidi`）。
+BIDI_CONTROLS: Final[frozenset[str]] = frozenset(
+    [
+        *(chr(c) for c in range(0x202A, 0x202F)),   # LRE RLE PDF LRO RLO
+        *(chr(c) for c in range(0x2066, 0x206A)),   # LRI RLI FSI PDI
+        "\u200e",                                    # LRM
+        "\u200f",                                    # RLM
+    ]
+)
+
 #: Windows 保留设备名。带扩展名的形式（`CON.txt`）同样保留。
 RESERVED_NAMES: Final[frozenset[str]] = frozenset(
     {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
@@ -160,11 +195,49 @@ def _steps_1_to_3(rel_path: str) -> tuple[str, list[str]]:
         bad = ILLEGAL_CHARS.intersection(seg)
         if bad:
             raise _Reject("illegal_chars", "".join(sorted(bad)))
+        # 双向控制字符：**拒绝**而不是剥掉。剥掉会静默改掉用户给的名字，
+        # 而拒绝能让调用方明确告诉用户"这个名字不能用" —— 用户此刻正
+        # 在改名的输入框前，他改一个字比事后发现名字变了要好得多。
+        bidi = BIDI_CONTROLS.intersection(seg)
+        if bidi:
+            raise _Reject("bidi_control", _describe_bidi(bidi))
     joined = "/".join(parts)
     if len(joined) > MAX_RELPATH:
         raise _Reject("path_too_long", str(len(joined)))
 
     return joined, parts
+
+
+def _describe_bidi(chars: frozenset[str] | set[str]) -> str:
+    """把命中的控制字符渲染成 `U+202E(RLO)` 形式，方便用户与日志定位。
+
+    直接 `repr()` 出来是一串不可见字符，日志里看着像空字符串 ——
+    运维和用户都不知道该改哪儿。
+    """
+    names = {
+        0x202A: "LRE", 0x202B: "RLE", 0x202C: "PDF", 0x202D: "LRO", 0x202E: "RLO",
+        0x2066: "LRI", 0x2067: "RLI", 0x2068: "FSI", 0x2069: "PDI",
+        0x200E: "LRM", 0x200F: "RLM",
+    }
+    return "、".join(
+        f"U+{ord(c):04X}({names.get(ord(c), '?')})" for c in sorted(chars)
+    )
+
+
+def strip_bidi(text: str) -> str:
+    """剥掉双向控制字符（用于**只做展示**的字符串，不做安全校验）。
+
+    与 `resolve()` 里的拒绝策略不冲突：那边处理的是"用户主动起的名字"，
+    该不该用由用户决定；这边处理的是"从别处读来的已有数据"，比如
+    扫描时拿到的文件名（用户可能是从别的系统拷进来的遗产文件）。
+    对后者，剥掉比拒绝好 —— 拒绝会让整个目录索引失败，
+    而那张照片本身完全正常，只是名字里夹了个不可见字符。
+    """
+    if not text:
+        return text
+    if BIDI_CONTROLS.isdisjoint(text):
+        return text
+    return "".join(c for c in text if c not in BIDI_CONTROLS)
 
 
 def _strip_win_prefix(path: str) -> str:

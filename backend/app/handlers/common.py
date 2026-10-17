@@ -37,6 +37,8 @@ __all__ = [
     "parse_ts",
     "parse_size",
     "etag_matches",
+    "root_id_param",
+    "root_id_payload",
 ]
 
 #: 时间线轻量项需要的列。
@@ -410,6 +412,63 @@ def parse_size(value: str | None, allowed: tuple[int, ...], *, name: str = "size
     if n not in allowed:
         raise AppError(E1001, f"不支持的 {name}={n}，可选：{', '.join(map(str, allowed))}")
     return n
+
+
+#: 根目录参数的两个合法拼写。**顺序有意**：`root` 是接口文档用的名字，
+#: `root_id` 是数据库列名，两者都收，但报错信息里统一说 `root`。
+ROOT_PARAM_NAMES: tuple[str, ...] = ("root", "root_id")
+
+
+def root_id_param(ctx: Any) -> str | None:
+    """从 query 里读根目录 id，`root` 与 `root_id` 都认。
+
+    ★ 为什么"两个都认"而不是"只留一个并把另一个判 400"：
+    接口文档（docs/04）写的是 `root`，但上传接口一直写的是 `root_id`，
+    手机端第二期已经按 `root_id` 发请求了。突然把 `root_id` 判成错误
+    会让已配对设备上的上传全部失败 —— 客户端没法在不重新发布的前提下
+    改回来。所以这里做**宽松接受 + 冲突报错**：只给一个就用那个，
+    给两个且不一致才 400（那种情况客户端一定自己写错了）。
+    """
+    values = []
+    for name in ROOT_PARAM_NAMES:
+        raw = ctx.q(name)
+        if raw is not None and raw != "":
+            values.append((name, raw))
+    return _pick_root(values, where="查询参数")
+
+
+def root_id_payload(body: Any, ctx: Any) -> str | None:
+    """从 JSON body 里读根目录 id，body 优先于 query。"""
+    values = []
+    for name in ROOT_PARAM_NAMES:
+        raw = body.get(name) if isinstance(body, dict) else None
+        if raw is not None and raw != "":
+            values.append((f"body.{name}", raw))
+            continue
+        raw = ctx.q(name)
+        if raw is not None and raw != "":
+            values.append((name, raw))
+    return _pick_root(values, where="请求参数")
+
+
+def _pick_root(values: list[tuple[str, Any]], *, where: str) -> str | None:
+    if not values:
+        return None
+    first_name, first = values[0]
+    for name, val in values[1:]:
+        if str(val) != str(first):
+            from ..errors import E1001, AppError
+
+            raise AppError(
+                E1001,
+                f"{where} {first_name}={first!r} 与 {name}={val!r} 不一致，"
+                f"请只传一个（推荐 root）",
+            )
+    if not isinstance(first, str):
+        from ..errors import E1001, AppError
+
+        raise AppError(E1001, f"{where} {first_name} 必须是字符串")
+    return first
 
 
 def etag_matches(if_none_match: str | None, etag: str) -> bool:

@@ -69,6 +69,23 @@ log = logging.getLogger(__name__)
 #: 家用上行；再多只会让每个都变慢，且电脑端要同时维持多个临时文件。
 MAX_OPEN_SESSIONS: Final[int] = 3
 
+#: "只 init 过、一个字节都没收到"的会话，超过这么久就直接回收。
+#:
+#: 这类会话的价值是**零**：临时文件是空的，客户端重来一遍的代价是零。
+#: 而它占掉的名额是实打实的 —— `MAX_OPEN_SESSIONS` 只有 3，三个废弃的
+#: init 就能让全站上传被 429 拒掉。默认 10 分钟：正常客户端 init 完
+#: 立刻开始发分片，中间隔 10 分钟只可能是用户暂停或 app 被切走。
+STALE_INIT_SECONDS: Final[float] = 600.0
+
+#: 已经传了一部分、但临时文件超过这么久没被写过，也视为放弃。
+#:
+#: 判据用**临时文件的 mtime** 而不是 DB 里的某个时间戳：`received` 列
+#: 只在成功写入后更新，不记录"什么时候更新的"，而每次 `append_chunk`
+#: 都真的会写这个文件。mtime 是"最后一次有进展"的忠实记录。
+#: 窗口给到 2 小时：手机切后台、锁屏、走到没信号的地方，用户回来还想
+#: 续传是正常需求，不能因为等了一小时就把他的 500MB 判死。
+IDLE_RECLAIM_SECONDS: Final[float] = 2 * 3600.0
+
 #: 读文件算 sha256 的分块大小。
 HASH_CHUNK: Final[int] = 1024 * 1024
 
@@ -138,6 +155,73 @@ def open_session_count(db: Database) -> int:
     return int(row["n"]) if row else 0
 
 
+def reclaim_stale(db: Database, *, now: float | None = None) -> int:
+    """回收"客户端已经不管了"的会话，把额度还给真正在传的人。
+
+    为什么需要它（审计 F6）：`MAX_OPEN_SESSIONS` 只有 3，而
+    `open_session_count()` 数的是所有 `status='open'` 的行。
+    只要有一条**永远不会有进展**的会话留在 open，它就永久占掉 1/3 的
+    上传名额；三条就把全站上传锁死，用户看到的是
+    `429 E4002 同时上传的任务太多` —— 而实际上一个都没在传。
+
+    三种会话会被回收，判据都是"确实没有在传"：
+
+    1. **一次 PATCH 都没收到**（`received = 0`）且 created_at 超过
+       `STALE_INIT_SECONDS`：临时文件还是 0 字节，客户端重来一遍不亏。
+    2. **临时文件已经不存在**：客户端或系统清理把 .part 删了，
+       这个会话永远 complete 不了，留着只能占额度。
+    3. **临时文件 2 小时没被写过**（`IDLE_RECLAIM_SECONDS`）：
+       用户真的走开了。注意这里**不删临时文件** —— 他回来续传时
+       走 `_reconcile_offset` 还能接着传，只是这期间不占名额。
+
+    与 `purge_expired()` 的分工：那个按 `expires_at`（24 小时）清，
+    是"会话过期"；这个按"没有进展"清，是"客户端跑了"。两者都必要 ——
+    前者管磁盘空间，后者管并发额度。
+
+    返回回收的会话数。**任何一条出问题都不能影响别人**，所以逐条 try。
+    """
+    now = time.time() if now is None else now
+    rows = db.query(
+        "SELECT id, temp_path, received, created_at FROM upload_sessions "
+        "WHERE status = 'open' AND expires_at > ?",
+        (now,),
+    )
+    reclaimed = 0
+    for r in rows:
+        temp = r["temp_path"]
+        received = int(r["received"] or 0)
+        created = float(r["created_at"] or 0)
+        idle = False
+        try:
+            if not temp or not Path(temp).is_file():
+                # 临时文件没了 → 这个会话**永远** complete 不了（complete 要
+                # 读它算 sha256），留着只能占额度。不需要额外的宽限期：
+                # `create_session()` 是先 `os.open` 建文件、再 INSERT 行，
+                # 所以"有行没有文件"本身就已经是异常状态。
+                idle = True
+            elif received == 0 and now - created > STALE_INIT_SECONDS:
+                idle = True
+            elif now - Path(temp).stat().st_mtime > IDLE_RECLAIM_SECONDS:
+                idle = True
+        except OSError:
+            # 读不到 mtime（权限/被独占）→ 不敢判死，留着。
+            continue
+        if not idle:
+            continue
+        try:
+            db.execute(
+                "UPDATE upload_sessions SET status = 'expired' WHERE id = ? AND status = 'open'",
+                (r["id"],),
+            )
+            _drop_lock(r["id"])
+            reclaimed += 1
+        except Exception:      # noqa: BLE001
+            log.debug("回收废弃会话失败：%s", r["id"], exc_info=True)
+    if reclaimed:
+        log.info("回收无进展的上传会话 %d 个", reclaimed)
+    return reclaimed
+
+
 def purge_expired(db: Database, *, cfg: Config | None = None) -> int:
     """清理过期会话及其临时文件。
 
@@ -181,6 +265,27 @@ def _unlink_temp(temp_path: str | None) -> None:
             p.unlink()
     except OSError:
         log.debug("清理临时文件失败：%s", temp_path, exc_info=True)
+
+
+def _abort_session_quietly(db: Database, upload_id: str) -> None:
+    """把会话置成 aborted，**绝不抛异常**。
+
+    用于"已经出错、正在往上抛"的路径：这里再抛一个异常会把真正的原因
+    盖掉，用户看到的错误就完全对不上了。置成 aborted 而不是删除行，
+    是为了让 `GET /api/uploads/{id}` 还能查到"这个会话被中止了"。
+    """
+    try:
+        db.execute(
+            "UPDATE upload_sessions SET status = 'aborted', completed_at = ? "
+            "WHERE id = ? AND status = 'open'",
+            (time.time(), upload_id),
+        )
+    except Exception:      # noqa: BLE001
+        log.debug("会话置 aborted 失败：%s", upload_id, exc_info=True)
+    try:
+        _drop_lock(upload_id)
+    except Exception:      # noqa: BLE001
+        log.debug("释放上传锁失败：%s", upload_id, exc_info=True)
 
 
 # --------------------------------------------------------------------------
@@ -435,10 +540,16 @@ def create_session(
         }
 
     # --- 3) 并发上限 ---
+    # ★ 顺序很重要：**先清理再计数**（审计 F6）。
+    # 早先是 `if open_session_count(db) >= MAX_OPEN_SESSIONS: raise` 之后
+    # 才 `purge_expired(db)`，等于"过期会话要等下一次 init 才能被清掉，
+    # 而那一次 init 已经先被它们自己拒了"。表现就是过期会话明明已经
+    # 过了 expires_at，用户仍然一直收到 429，直到 24 小时后别的路径
+    # 触发清理 —— 自锁一天。
+    purge_expired(db)
+    reclaim_stale(db)
     if open_session_count(db) >= MAX_OPEN_SESSIONS:
         raise AppError(E4002, "同时上传的任务太多，请等前面的传完")
-
-    purge_expired(db)
 
     upload_id = uuid.uuid4().hex
     temp = sandbox.tmp_path(root, upload_id)
@@ -785,9 +896,29 @@ def complete_session(
             when = os.path.getmtime(temp)
         except OSError:
             when = time.time()
+    # ★ 最后一道夹取：上面三个来源都可能给出脏值（客户端 1e300、
+    # EXIF 里被写坏的 9999:99:99、mtime 落在 1601 年）。归档目录与
+    # 文件名都靠这个时间戳算，越界会在 `datetime.fromtimestamp` 抛
+    # `OverflowError` —— 不在 EXC_MAP 里 → 500，且抛在归档之前/之中，
+    # 会话留在 open 状态。见审计 F2 / docs/11 ISSUE-018。
+    when = archive.safe_timestamp(when)
     try:
         rel_path, dst = _place_sync(temp, root, cfg, when, sess["declared_name"], sess["target_rel"])
     except ArchiveError as exc:
+        # 归档失败（磁盘满、跨卷、目标被占）：临时文件还在，客户端**可以**
+        # 重试 complete，所以会话必须留在 open —— 不能置 aborted。
+        # 但额度是有限的（MAX_OPEN_SESSIONS=3），若这里每次都留一条
+        # open 记录，客户端连试三次不同文件就把全站上传锁死了。
+        # 折中：只把**同一个**会话继续留着（重试同一张图仍可成功），
+        # 并记一条审计，让运维能从日志看出"是磁盘问题不是用户问题"。
+        _audit(db, cfg, audit.ACTION_UPLOAD_REJECT, sess["declared_name"], {
+            "upload_id": upload_id,
+            "declared_name": sess["declared_name"],
+            "size": total,
+            "reason": "archive_failed",
+            "detail": type(exc).__name__,
+        })
+        log.error("归档失败（会话保留，可重试）：%s（%s）", sess["declared_name"], exc)
         raise AppError(E3010, str(exc)) from exc
 
     size = dst.stat().st_size
@@ -817,12 +948,27 @@ def complete_session(
         except Exception:      # noqa: BLE001
             log.debug("回写 sha256 失败：%s", rel_path, exc_info=True)
 
-    db.execute(
-        "UPDATE upload_sessions SET status = 'completed', received = total_size, "
-        "sha256 = ?, final_rel = ?, media_id = ?, dedup = 0, completed_at = ? "
-        "WHERE id = ?",
-        (digest, rel_path, media_id, time.time(), upload_id),
-    )
+    # ★ 到这里照片已经安全落盘、也已经进库。下面的 DB 更新若失败，
+    # 文件还在（下次扫描会收录），但**会话会卡在 open**：
+    # `open_session_count()` 数的是 status='open' 的行，卡满
+    # `MAX_OPEN_SESSIONS` 之后所有新上传都被 429 拒掉，
+    # 而 `purge_expired()` 只清 24 小时过期的会话 —— 用户要等一天。
+    # 所以这里失败必须把会话置成 aborted 把额度放出来。
+    # 见审计 F2 / docs/11 ISSUE-018。
+    try:
+        db.execute(
+            "UPDATE upload_sessions SET status = 'completed', received = total_size, "
+            "sha256 = ?, final_rel = ?, media_id = ?, dedup = 0, completed_at = ? "
+            "WHERE id = ?",
+            (digest, rel_path, media_id, time.time(), upload_id),
+        )
+    except Exception as exc:      # noqa: BLE001
+        log.exception("上传完成但会话状态写入失败：%s", rel_path)
+        _abort_session_quietly(db, upload_id)
+        raise AppError(
+            E3006,
+            f"照片已保存到 {rel_path}，但会话记录更新失败，请重新开始上传",
+        ) from exc
     _drop_lock(upload_id)
     log.info("上传完成 %s -> %s（%d 字节）", sess["declared_name"], rel_path, size)
     _audit(db, cfg, audit.ACTION_UPLOAD, rel_path, {

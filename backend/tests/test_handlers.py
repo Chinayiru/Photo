@@ -1038,3 +1038,144 @@ def test_no_handler_leaks_absolute_path(tmp_path, library) -> None:
             assert "E:\\\\" not in text or marker not in text
             assert "Traceback" not in text
             assert "File \"" not in text
+
+
+def _json_body(obj) -> bytes:
+    import json as _j
+
+    return _j.dumps(obj).encode("utf-8")
+
+
+def _seed_three(st, library) -> None:
+    """造 3 张照片并索引（`_seed`/`_scan` 是本文件既有夹具的等价物）。"""
+    from app.indexer import Indexer
+
+    _img(library / "a.jpg")
+    _img(library / "b.jpg")
+    _img(library / "c.jpg")
+    asyncio.run(Indexer(st.cfg, st.db).scan_root(st.cfg.root_by_id("library")))
+
+
+# --------------------------------------------------------------------------
+# root 参数名：`root` 与 `root_id` 都认，冲突才报错（审计 F12）
+#
+# 早先同一件事在不同接口用不同名字且互不认：timeline/folders/search/rescan
+# 只认 `root`，uploads 认 `root`+`root_id`。传错名字不会报错，而是被
+# 当成"没指定根" —— rescan 于是退化成**全库重扫**（真实库约 20 秒），
+# 用户以为自己只扫了一个目录。静默降级比报错危险得多。
+# --------------------------------------------------------------------------
+
+
+def test_rescan_accepts_root_id_alias(tmp_path, library) -> None:
+    fake = _FakeIndexer()
+    st = _state(tmp_path, library, indexer=fake)
+    r = _call(st, "POST", "/api/index/rescan", body=b'{"root_id":"library"}')
+    assert r.status == 202, _json(r)
+    assert _json(r)["root"] == "library"
+    asyncio.run(asyncio.sleep(0))
+    assert fake.calls == ["library"], f"root_id 被忽略了，退化成了：{fake.calls}"
+
+
+def test_rescan_root_query_string_is_honoured(tmp_path, library) -> None:
+    fake = _FakeIndexer()
+    st = _state(tmp_path, library, indexer=fake)
+    r = _call(st, "POST", "/api/index/rescan", query={"root_id": "library"},
+              body=b"{}")
+    assert r.status == 202, _json(r)
+    asyncio.run(asyncio.sleep(0))
+    assert fake.calls == ["library"]
+
+
+def test_rescan_conflicting_root_names_is_400(tmp_path, library) -> None:
+    """两个名字给了不同的值 —— 一定是客户端写错了，必须报错而不是挑一个。
+
+    挑一个的问题：挑哪个都不对，而且用户永远不知道另一个被忽略了。
+    """
+    st = _state(tmp_path, library, indexer=_FakeIndexer())
+    r = _call(st, "POST", "/api/index/rescan",
+              body=b'{"root":"library","root_id":"other"}')
+    assert r.status == 400, _json(r)
+    assert _json(r)["error"]["code"] == "E1001"
+
+
+def test_timeline_accepts_root_id_alias(tmp_path, library) -> None:
+    st = _state(tmp_path, library)
+    r = _call(st, "GET", "/api/timeline", query={"root_id": "library"})
+    assert r.status == 200, _json(r)
+
+
+def test_folders_accepts_root_id_alias(tmp_path, library) -> None:
+    st = _state(tmp_path, library)
+    r = _call(st, "GET", "/api/folders", query={"root_id": "library"})
+    assert r.status == 200, _json(r)
+    assert _json(r)["root"] == "library"
+
+
+def test_search_accepts_root_id_alias(tmp_path, library) -> None:
+    st = _state(tmp_path, library)
+    r = _call(st, "GET", "/api/search", query={"root_id": "library", "q": "a"})
+    assert r.status == 200, _json(r)
+
+
+# --------------------------------------------------------------------------
+# 删除响应形状（审计 F9）
+#
+# 实现在 2026-10-17 的审计里被判"与 docs/04 不一致"，结论是改文档：
+# `deleted` 是**计数**不是 ID 数组，且行保留（missing=1）而不是删行。
+# 这里把形状钉住，免得下一个人又照着旧文档改回去。
+# --------------------------------------------------------------------------
+
+
+def test_delete_response_is_count_not_id_list(tmp_path, library) -> None:
+    st = _state(tmp_path, library)
+    _seed_three(st, library)
+    mid = st.db.scalar("SELECT id FROM media ORDER BY id LIMIT 1")
+
+    r = _call(st, "POST", "/api/items/delete", body=_json_body({"ids": [mid]}))
+    assert r.status == 200, _json(r)
+    body = _json(r)
+    assert body == {"deleted": 1, "failed": []}, body
+    # 明确断言"不是数组" —— 旧文档承诺的是 array<integer>
+    assert isinstance(body["deleted"], int)
+
+
+def test_delete_keeps_row_and_marks_missing(tmp_path, library) -> None:
+    """行必须留着。"最近删除"全靠它，删行等于把这个功能的依据抹掉。"""
+    st = _state(tmp_path, library)
+    _seed_three(st, library)
+    mid = st.db.scalar("SELECT id FROM media ORDER BY id LIMIT 1")
+    r = _call(st, "POST", "/api/items/delete", body=_json_body({"ids": [mid]}))
+    assert r.status == 200
+
+    row = st.db.query_one("SELECT missing, rel_path FROM media WHERE id = ?", (mid,))
+    assert row is not None, "删除后行不能消失"
+    assert row["missing"] == 1
+    assert st.db.scalar("SELECT COUNT(*) FROM media") == 3
+
+
+def test_delete_unknown_id_goes_to_failed_not_4xx(tmp_path, library) -> None:
+    """批量删除里一项无效不该让整批失败。"""
+    st = _state(tmp_path, library)
+    _seed_three(st, library)
+    mid = st.db.scalar("SELECT id FROM media ORDER BY id LIMIT 1")
+
+    r = _call(st, "POST", "/api/items/delete",
+              body=_json_body({"ids": [mid, 999999]}))
+    assert r.status == 200, _json(r)
+    body = _json(r)
+    assert body["deleted"] == 1
+    assert body["failed"] == [{"id": 999999, "error": "not_found"}]
+
+
+def test_delete_is_idempotent_and_still_counts(tmp_path, library) -> None:
+    """重复删除：文件已不在，仍算成功（行已是 missing=1）。"""
+    st = _state(tmp_path, library)
+    _seed_three(st, library)
+    mid = st.db.scalar("SELECT id FROM media ORDER BY id LIMIT 1")
+
+    first = _json(_call(st, "POST", "/api/items/delete",
+                        body=_json_body({"ids": [mid]})))
+    second = _json(_call(st, "POST", "/api/items/delete",
+                         body=_json_body({"ids": [mid]})))
+    assert first == {"deleted": 1, "failed": []}
+    assert second == {"deleted": 1, "failed": []}

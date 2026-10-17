@@ -18,10 +18,12 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any
 
-from .. import uploads
+from .. import archive, uploads
+from . import common
 from ..core import Ctx, Reply, json_reply
 from ..errors import AppError, BadRequest, E1001, E1010, E1012, NotFound
 from ..transports.base import parse_range, RangeNotSatisfiable
@@ -68,7 +70,7 @@ async def init_upload(ctx: Ctx) -> Reply:
         st.cfg,
         name=name,
         size=size,
-        root_id=_opt_str(body.get("root") or body.get("root_id")),
+        root_id=common.root_id_payload(body, ctx),
         sha256=_opt_str(body.get("sha256")),
         mtime=_opt_float(body.get("mtime")),
         target_dir=_opt_str(body.get("target_dir")),
@@ -231,18 +233,38 @@ def _opt_str(value: Any) -> str | None:
 
 
 def _opt_float(value: Any) -> float | None:
+    """取可选的时间戳参数。
+
+    ★ 必须挡住 `inf`/`nan`/超界值（审计 F2）。早先这里只判"能不能转成
+    float"，于是 `declared_taken_at=1e300` 一路穿过校验，在
+    `archive.archive_dir()` 的 `datetime.fromtimestamp()` 处抛
+    `OverflowError`；`OverflowError` 不在 `errors.EXC_MAP` 里 → 500，
+    而且它抛在 `complete_session` 归档之后，会话永远停在 `status='open'`
+    —— 攒满 `MAX_OPEN_SESSIONS`(3) 之后**全站上传被拒一天**。
+
+    合法区间与 `archive.MIN_ARCHIVE_TS` / `MAX_ARCHIVE_TS` 一致。
+    超界值直接 400 而不是静默夹取：客户端显式声明了一个 3000 年后的
+    拍摄时间，多半是它自己的 bug，静默改成"现在"会把照片归到错误
+    的年份目录里，用户几个月后才会发现。
+    """
     if value is None or value == "":
         return None
     if isinstance(value, bool):
         raise BadRequest("参数类型不正确")
     if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
+        ts = float(value)
+    elif isinstance(value, str):
         try:
-            return float(value)
+            ts = float(value)
         except ValueError:
             raise BadRequest("时间戳格式不正确") from None
-    raise BadRequest("时间戳格式不正确")
+    else:
+        raise BadRequest("时间戳格式不正确")
+    if not math.isfinite(ts):
+        raise BadRequest("时间戳格式不正确")
+    if ts < archive.MIN_ARCHIVE_TS or ts > archive.MAX_ARCHIVE_TS:
+        raise BadRequest("时间戳超出合理范围（1980 年至 3000 年之间）")
+    return ts
 
 
 def _parse_upload_range(raw: str) -> tuple[int, int, int]:

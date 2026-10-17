@@ -496,57 +496,66 @@ def test_middleware_can_short_circuit(router: Router) -> None:
                                    headers={"Authorization": "Bearer t"}))).status == 200
 
 
-def test_cors_disabled_by_default(router: Router) -> None:
-    r = run(router.dispatch(Ctx("GET", "/api/system/ping")))
+def test_cors_is_off_by_default(router: Router) -> None:
+    """★ 默认**完全不启用** CORS（审计 F1-a）。
+
+    这里断言的是"不调用 `enable_cors()` 时一个 `Access-Control-*` 头都
+    不会出现"。它同时钉住了 `server.py` 必须显式传白名单这件事的语义：
+    `enable_cors()` 无参调用现在等价于"关掉"，而不是"回显谁问谁"。
+    """
+    r = run(router.dispatch(Ctx("GET", "/api/system/ping",
+                                headers={"Origin": "http://localhost:5173"})))
     assert r.headers.get("access-control-allow-origin") is None
 
 
-def test_cors_echoes_origin_when_present(router: Router) -> None:
-    """带凭据的请求不能用 "*"，必须回显来源。"""
-    router.enable_cors()
+def test_cors_allowlist_rejects_unknown_origin(router: Router) -> None:
+    """★ F1 的关键断言：**非白名单来源拿不到任何 CORS 头**。
+
+    旧的 `test_cors_echoes_origin_when_present` 断言的正是被审计判为
+    缺陷的行为（"谁来就回显谁"），所以 888 条测试全绿却漏掉了整条
+    攻击链。这条用例反向钉住：攻击者域名 + 本机回环 IP 的组合下，
+    响应里不能有 `Access-Control-Allow-Origin`。
+
+    注意 `Origin: http://127.0.0.1:9999` 这一项 —— 它是攻击者最会用的
+    取值（"看起来像本机"），而白名单比对是精确字符串，不会因为它
+    长得像就放过。
+    """
+    router.enable_cors(allow_origins=["http://localhost:5173"])
+    for evil in ("https://evil.example.com", "null",
+                 "http://127.0.0.1:9999", "http://localhost:5174"):
+        r = run(router.dispatch(Ctx("GET", "/api/system/ping",
+                                    headers={"Origin": evil})))
+        assert r.headers.get("Access-Control-Allow-Origin") is None, \
+            f"{evil} 不该拿到 Access-Control-Allow-Origin"
+
+
+def test_cors_allowlist_accepts_listed_origin(router: Router) -> None:
+    """白名单内的源正常放行，并带 `Vary: Origin`（响应随 Origin 变）。"""
+    router.enable_cors(allow_origins=["http://localhost:5173"])
     r = run(router.dispatch(Ctx("GET", "/api/system/ping",
                                 headers={"Origin": "http://localhost:5173"})))
     assert r.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
     assert r.headers["Vary"] == "Origin"
 
 
-def test_cors_never_emits_wildcard_by_default(router: Router) -> None:
-    """★ 默认配置下，响应里**任何情况下**都不该出现 `*`。
-
-    规则 15（docs/06 §10）要求 CORS 绝不用 `*`。默认值曾是字面量 `*`，
-    于是**不带 Origin 的请求**（curl / `<img>` / 顶层导航）拿到的正是
-    `Access-Control-Allow-Origin: *` —— 一个谁都能读的广播。
-    改成回显语义后，这类请求干脆不发这个头。
-    """
-    router.enable_cors()
-    plain = run(router.dispatch(Ctx("GET", "/api/system/ping")))
-    assert plain.headers.get("Access-Control-Allow-Origin") is None, \
-        "无 Origin 的请求不该拿到 Access-Control-Allow-Origin"
-
-    with_origin = run(router.dispatch(Ctx("GET", "/api/system/ping",
-                                          headers={"Origin": "http://x.y"})))
-    assert with_origin.headers["Access-Control-Allow-Origin"] == "http://x.y"
-    assert with_origin.headers["Access-Control-Allow-Origin"] != "*"
+def test_cors_no_origin_gets_no_headers(router: Router) -> None:
+    """没有 Origin 的请求（curl / `<img>` / 顶层导航）不参与 CORS。"""
+    router.enable_cors(allow_origins=["http://localhost:5173"])
+    r = run(router.dispatch(Ctx("GET", "/api/system/ping")))
+    assert r.headers.get("Access-Control-Allow-Origin") is None
+    assert r.headers.get("Access-Control-Expose-Headers") is None
 
 
-def test_cors_wildcard_still_available_explicitly(router: Router) -> None:
-    """显式要 `*` 时仍然给 —— 不把能力删掉，只把默认值改对。"""
-    router.enable_cors(allow_origin="*")
+def test_cors_wildcard_must_be_explicit(router: Router) -> None:
+    """显式要 `*` 时仍然给 —— 能力没被删掉，只是不再当默认值。"""
+    router.enable_cors(allow_origins="*")
     r = run(router.dispatch(Ctx("GET", "/api/system/ping")))
     assert r.headers["Access-Control-Allow-Origin"] == "*"
 
 
-def test_cors_fixed_origin_is_honoured(router: Router) -> None:
-    """二期云端域名会走这条：只放行那一个源，不随请求变。"""
-    router.enable_cors(allow_origin="https://photo.example.com")
-    r = run(router.dispatch(Ctx("GET", "/api/system/ping",
-                                headers={"Origin": "http://evil.example"})))
-    assert r.headers["Access-Control-Allow-Origin"] == "https://photo.example.com"
-
-
 def test_cors_exposes_etag_for_conditional_requests(router: Router) -> None:
     """不 expose ETag 的话，浏览器拿不到它，条件请求永远不生效。"""
-    router.enable_cors()
+    router.enable_cors(allow_origins=["http://localhost:5173"])
     r = run(router.dispatch(Ctx("GET", "/api/system/ping",
                                 headers={"Origin": "http://localhost:5173"})))
     assert "ETag" in r.headers["Access-Control-Expose-Headers"]
@@ -566,3 +575,55 @@ def test_route_pattern_escaping() -> None:
     # 未转义时 "a.b" 会匹配 "axb"
     with pytest.raises(Exception):
         r.match("GET", "/api/axb")
+
+
+# --------------------------------------------------------------------------
+# 路径参数必须是 int64（审计 F8）
+#
+# SQLite 的 INTEGER 只有 64 位。`int()` 能解析任意大的十进制串，于是
+# `/api/items/99999999999999999999/raw` 会一路走到 sqlite3 绑定参数，
+# 抛 `OverflowError: Python int too large to convert to SQLite INTEGER`
+# —— 它不在 errors.EXC_MAP 里，归一成 E3001/500。
+#
+# ★ 为什么不能用"捕获 OverflowError 再转 400"来解决：那样只是把
+# 一个已经发生的越界值事后补救，而越界值在此之前可能已经参与了
+# 比较、拼进了 SQL。在入口处卡住才是正确位置。
+# --------------------------------------------------------------------------
+
+
+def test_param_int_accepts_int64_boundaries() -> None:
+    ctx = Ctx("GET", "/x", params={"id": "9223372036854775807"})
+    assert ctx.param_int("id") == 2 ** 63 - 1
+    ctx = Ctx("GET", "/x", params={"id": "-9223372036854775808"})
+    assert ctx.param_int("id") == -(2 ** 63)
+
+
+@pytest.mark.parametrize("raw", [
+    "9223372036854775808",       # int64 max + 1
+    "-9223372036854775809",      # int64 min - 1
+    "9" * 30,
+    "1" + "0" * 100,
+])
+def test_param_int_rejects_out_of_int64_range(raw: str) -> None:
+    """超界必须是 400，不能落到 500。
+
+    断言 status 而不是只断言抛 BadRequest —— `Internal` 也继承 AppError，
+    只判异常类型会把"500 被当成正常错误"放过去。
+    """
+    ctx = Ctx("GET", "/x", params={"id": raw})
+    with pytest.raises(BadRequest) as ei:
+        ctx.param_int("id")
+    assert ei.value.status == 400
+    assert ei.value.spec.code == "E1001"
+
+
+def test_param_int_supports_custom_bounds() -> None:
+    """有的参数（比如 limit）需要更窄的范围，边界必须可配。"""
+    ctx = Ctx("GET", "/x", params={"n": "500"})
+    assert ctx.param_int("n", maximum=500) == 500
+    with pytest.raises(BadRequest):
+        ctx.param_int("n", maximum=499)
+    ctx = Ctx("GET", "/x", params={"n": "1"})
+    assert ctx.param_int("n", minimum=1) == 1
+    with pytest.raises(BadRequest):
+        ctx.param_int("n", minimum=2)

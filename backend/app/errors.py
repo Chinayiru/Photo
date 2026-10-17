@@ -277,6 +277,16 @@ def to_app_error(exc: BaseException) -> AppError:
     """把任意异常归一成 AppError。未匹配的一律 E3001，且**不携带异常文本**。"""
     if isinstance(exc, AppError):
         return exc
+    # ★ UnknownRootError 是请求参数错误，必须 400（审计 F7）。
+    # 在 EXC_MAP 之前判，因为它在概念上不属于"运行时故障"那一张表；
+    # 也因为它继承 ConfigError（普通 Exception），落不到任何 OSError 分支。
+    # 惰性 import 避免 config ↔ errors 的循环导入（config 不 import errors）。
+    try:
+        from .config import UnknownRootError
+    except Exception:  # noqa: BLE001 —— 配置模块缺失时退化为原行为
+        UnknownRootError = ()  # type: ignore[assignment,misc]
+    if isinstance(exc, UnknownRootError):
+        return BadRequest("媒体根目录不存在")
     for typ, spec in EXC_MAP:
         if isinstance(exc, typ):
             # 注意：这里传 detail=None 而不是 str(exc)。str(OSError) 在 Windows 上

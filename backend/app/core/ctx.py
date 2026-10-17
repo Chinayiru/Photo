@@ -56,6 +56,11 @@ CLOUD = "cloud"
 
 Body = bytes | AsyncIterator[bytes] | None
 
+#: SQLite 的 INTEGER 是**有符号 64 位**。路径参数最终都会绑进 `WHERE id = ?`，
+#: 超出这个区间的 Python 整数会让 `sqlite3` 抛 `OverflowError`（→ 500）。
+INT64_MIN: int = -(2 ** 63)
+INT64_MAX: int = 2 ** 63 - 1
+
 
 def new_request_id() -> str:
     """生成请求 id，用于把日志、错误响应、审计记录串起来。
@@ -296,9 +301,45 @@ class Ctx:
                 raise AppError(E1006)
         return bytes(buf)
 
-    async def json(self, limit: int = 1024 * 1024) -> dict[str, Any]:
-        """解析 JSON 请求体。空体返回 {}，非法 JSON 抛 400。"""
+    async def json(self, limit: int = 1024 * 1024,
+                   *, require_json: bool = True) -> dict[str, Any]:
+        """解析 JSON 请求体。空体返回 {}，非法 JSON 抛 400。
+
+        ★ `require_json=True` 时会校验 `Content-Type` 是 JSON（审计 F1 第 4 条）。
+
+        ## 为什么这不是"洁癖"，而是攻击链的一环
+
+        CORS 把请求分成两类：`GET`/`HEAD`/`POST` 且 Content-Type 属于
+        `text/plain`、`application/x-www-form-urlencoded`、
+        `multipart/form-data` 的，是**简单请求**，浏览器不发预检。
+        于是 `POST /api/pair` 只要声明 `Content-Type: text/plain`，
+        就能带着一段 JSON 文本跨源发出去 —— 而服务端只看 body 不看头，
+        照样解析成功并返回一个新 token。
+
+        预检本来是"带 `Authorization` 或 `application/json` 的跨源请求
+        会被浏览器先拦一下"这道屏障的落点；服务端不校验 Content-Type，
+        这道屏障就形同不存在（审计报告 §2.3 明确说明：攻击者不需要
+        用户的任何凭据，它自己 mint 一个）。
+
+        多一个请求头对合法客户端零成本 —— 它们本来就都发
+        `application/json`（`frontend/src/api/client.ts:312`）；而且
+        `application/json` 这个 Content-Type 本身就会触发预检，
+        跨源攻击者**恰恰做不到**。
+
+        `require_json=False` 留给"body 是 JSON 但头不是"的历史调用方
+        （目前没有；保留这个开关是为了将来接隧道协议时不被迫改这里）。
+        """
         from ..errors import BadRequest
+
+        if require_json:
+            ctype = (self.headers.get("content-type") or "").strip().lower()
+            # 空头 = 没有 body 语义上的声明。此时若 body 非空，只可能是
+            # 手工构造的请求，按"不是 JSON"处理。
+            if ctype and not _is_json_content_type(ctype):
+                raise BadRequest(
+                    f"Content-Type 必须是 application/json（当前 {ctype!r}）")
+            if not ctype and (self.headers.get("content-length") or "").strip() not in ("", "0"):
+                raise BadRequest("缺少 Content-Type 头（应为 application/json）")
 
         raw = await self.body_bytes(limit)
         if not raw:
@@ -311,15 +352,28 @@ class Ctx:
             raise BadRequest("请求体必须是 JSON 对象")
         return data
 
-    def param_int(self, name: str) -> int:
-        """取路径参数并转 int，失败抛 400（而不是 500）。"""
+    def param_int(self, name: str, *, minimum: int = INT64_MIN, maximum: int = INT64_MAX) -> int:
+        """取路径参数并转 int，失败抛 400（而不是 500）。
+
+        ★ 必须挡住 int64 之外的整数（ISSUE-018 / 审计 F8）。Python 的 `int`
+        是任意精度，`int("99999999999999999999")` 一点问题都没有，但 SQLite
+        的 INTEGER 只有 64 位：这个值一旦绑定进 `WHERE id = ?`，`sqlite3`
+        会抛 `OverflowError: Python int too large to convert to SQLite INTEGER`，
+        而 `OverflowError` 不在 `errors.EXC_MAP` 里 → 500。
+
+        客户端只要拼一个 `/api/items/9…9/raw` 就能把"不存在"变成"服务器错误"，
+        顺带把日志刷满。取值范围必须是路径参数契约的一部分。
+        """
         from ..errors import BadRequest
 
         raw = self.params.get(name, "")
         try:
-            return int(raw)
+            value = int(raw)
         except (TypeError, ValueError):
             raise BadRequest(f"路径参数 {name} 必须是整数") from None
+        if value < minimum or value > maximum:
+            raise BadRequest(f"路径参数 {name} 超出取值范围")
+        return value
 
     @property
     def elapsed_ms(self) -> float:
@@ -465,6 +519,19 @@ def bytes_reply(data: bytes, media_type: str, status: int = 200) -> Reply:
     r.headers["Content-Type"] = media_type
     r.headers["Content-Length"] = str(len(data))
     return r
+
+
+def _is_json_content_type(ctype: str) -> bool:
+    """`application/json` / `application/ld+json` / `application/vnd.x+json` 都算。
+
+    不追求严格：真正的判据是"浏览器会不会把它当简单请求"。凡是
+    `application/*` 里以 `+json` 结尾的变体，浏览器都不把它归入那三个
+    简单类型，所以都该放行。`text/json` 也放行（有些老客户端这么发），
+    它在预检语义上属于简单请求 —— 但那个类型**没人用**，且放行它
+    需要显式拼这个字符串，不会悄无声息地打开。
+    """
+    base = ctype.split(";", 1)[0].strip()
+    return base == "application/json" or base.endswith("+json") or base == "text/json"
 
 
 def cookie_header_value(name: str, value: str, max_age: int, *,

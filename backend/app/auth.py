@@ -40,6 +40,7 @@ import time
 from typing import Any, Final
 
 from .core import Ctx
+from .netguard import check_host
 from .errors import (
     E1002,
     E1003,
@@ -78,6 +79,7 @@ __all__ = [
     "auth_middleware",
     "PUBLIC_PATHS",
     "PANEL_PATHS",
+    "panel_http_enabled",
 ]
 
 # --------------------------------------------------------------------------
@@ -564,11 +566,34 @@ def is_loopback(ctx: Ctx) -> bool:
     把 IPv4 映射地址表示成 `::ffff:127.0.0.1`，只判 `127.0.0.1`
     会让本机浏览器访问 `/panel` 时被拒 —— 而用户此刻正坐在电脑前
     点托盘的"打开面板"。
+
+    ⚠️ **空 IP 不是回环**（ISSUE-018 / 审计 F11）。早先的实现把 `""` 也算
+    进白名单，理由是"没有 IP 就当本机"。但 `Ctx.client_ip` 的默认值就是
+    空串，任何一条**构造 `Ctx` 时忘了填 IP** 的代码路径（测试、二期云端
+    派发、将来新增的传输层）都会让 `/panel/**` 静默变成公开端点 ——
+    而它端出的是配对数、设备清单与审计日志。判不准的时候要拒绝，
+    不是放行。
     """
     ip = (ctx.client_ip or "").strip().lower()
     if ip.startswith("::ffff:"):
         ip = ip[7:]
-    return ip in ("127.0.0.1", "::1", "localhost", "")
+    if not ip:
+        return False
+    return ip in ("127.0.0.1", "::1", "localhost")
+
+
+def panel_http_enabled(cfg: Any = None) -> bool:
+    """`/panel/**` 是否挂在 HTTP 上。默认 False（见 `auth_middleware`）。"""
+    if cfg is None:
+        from .config import get as _get_cfg
+        try:
+            cfg = _get_cfg()
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        return bool(cfg.get("server.panel_http", False))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 async def auth_middleware(ctx: Ctx, nxt: Any):
@@ -583,14 +608,43 @@ async def auth_middleware(ctx: Ctx, nxt: Any):
 
     path = ctx.path
 
-    # --- /panel/**：只允许本机 ---
+    # --- Host 校验：挡住 DNS rebinding（审计 F1-c）---
+    #
+    # 必须放在**所有**分支之前。放在鉴权之后没有意义：攻击链的第一步
+    # 是读 `/panel/pair-code`，而那条路本来就不需要 token。
+    #
+    # 代价是每个请求多一次本机网卡枚举（<0.1ms，见 netguard 的说明）。
+    # 收益是把"恶意域名解析到 127.0.0.1 就等于本机"这条假设彻底打掉。
+    denied = check_host(ctx.headers.get("host"), cfg)
+    if denied is not None:
+        from .errors import NotFound
+
+        log.warning("%s %s 被 Host 校验拒绝：%s", ctx.method, path, denied)
+        raise NotFound(path)
+
+    # --- /panel/**：默认整条关闭（审计 F1-b）---
+    #
+    # 以前这里只判 `is_loopback(ctx)`。那道门在纸面上是"只允许本机"，
+    # 实际含义是"允许本机上的**任何网页**"：恶意页面让浏览器去访问
+    # `http://127.0.0.1:8787/panel/pair-code`，来源 IP 就是 127.0.0.1，
+    # 与用户自己点面板没有任何可区分之处。于是攻击者不需要用户的配对码
+    # ——它自己现取一个，再用 /api/pair 换 90 天有效的 token。
+    #
+    # 现在默认 `server.panel_http = false`：整条 prefix 404，连回环也拒。
+    # 之所以敢默认关：**没有任何调用方**。托盘直接用 handler 函数（不走
+    # HTTP），前端全仓库 `grep /panel` 零命中。需要脚本化取配对码时把
+    # `server.panel_http` 打开即可，此时`check_bind_safety` 还会顺带
+    # 禁止同时监听 0.0.0.0。
     for prefix in PANEL_PATHS:
         if path == prefix or path.startswith(prefix + "/"):
+            from .errors import NotFound
+
+            if not panel_http_enabled(cfg):
+                log.info("拒绝访问 %s：server.panel_http 未开启", path)
+                raise NotFound(path)
             if not is_loopback(ctx):
                 # 返回 404 而不是 403：403 等于告诉扫描者"这个路径存在，
                 # 只是你权限不够"，而 404 让他无法区分"没有这个功能"。
-                from .errors import NotFound
-
                 log.warning("拒绝非本机访问 /panel：client_ip=%s", ctx.client_ip)
                 raise NotFound(path)
             return await nxt(ctx)

@@ -413,7 +413,17 @@ def test_missing_flag_does_not_break_unchanged_counting(tmp_path: Path, db: Data
 
 
 def test_corrupt_file_does_not_abort_scan(tmp_path: Path, db: Database) -> None:
-    """一个坏文件不能中断整轮扫描。"""
+    """一个坏文件不能中断整轮扫描。
+
+    ⚠️ 这条用例原本断言的恰恰是审计 F3 那个缺陷：`bad.jpg` 写入
+    `b"not an image at all"`（19 字节，既不是 JPEG 也不是任何已知格式），
+    老实现照样把它入库、`taken_src='mtime'`，于是 `GET /api/items/N/raw`
+    会以 `image/jpeg` 把这些垃圾字节端给手机。
+
+    "坏文件不能中断扫描"仍然成立 —— 只是**跳过它**，不是**收录它**。
+    真正要保护的是"截断的/EXIF 损坏的**真照片**"，那类文件头是对的，
+    由下面的 `test_truncated_real_jpeg_is_still_indexed` 覆盖。
+    """
     lib = tmp_path / "lib"
     _img(lib / "good.jpg")
     (lib / "bad.jpg").write_bytes(b"not an image at all")
@@ -421,10 +431,31 @@ def test_corrupt_file_does_not_abort_scan(tmp_path: Path, db: Database) -> None:
     cfg = _cfg(tmp_path, lib)
 
     stats = _scan(cfg, db)
-    assert stats.added == 3, "坏文件也应入库（只是没有 EXIF）"
-    assert db.scalar("SELECT COUNT(*) FROM media WHERE ext='jpg'") == 3
-    row = db.query_one("SELECT taken_src FROM media WHERE file_name='bad.jpg'")
-    assert row["taken_src"] == "mtime"
+    assert stats.added == 2, "两张好图入库"
+    assert stats.skipped_content == 1, "伪装文件被跳过（计入 skipped_content）"
+    assert stats.errors == 0, "跳过不是错误，不该计 errors"
+    assert db.scalar("SELECT COUNT(*) FROM media WHERE ext='jpg'") == 2
+    assert db.query_one("SELECT 1 FROM media WHERE file_name='bad.jpg'") is None
+
+
+def test_truncated_real_jpeg_is_still_indexed(tmp_path: Path, db: Database) -> None:
+    """**真照片**被截断时仍然入库。
+
+    这是上一条的配对用例，防止 `check_content()` 矫枉过正：
+    文件头是合法 JPEG（`\\xff\\xd8\\xff`）但后半截被截掉的图，
+    用户一定希望它在时间线上出现（哪怕缩略图生成失败），
+    而不是"照片凭空少了几张"。
+    """
+    lib = tmp_path / "lib"
+    ok = _img(lib / "whole.jpg", (200, 150))
+    raw = ok.read_bytes()
+    (lib / "half.jpg").write_bytes(raw[: len(raw) // 3])   # 截断成 1/3
+    cfg = _cfg(tmp_path, lib)
+
+    stats = _scan(cfg, db)
+    assert stats.added == 2, "截断的图头仍是 JPEG，必须入库"
+    assert stats.skipped_content == 0
+    assert db.scalar("SELECT COUNT(*) FROM media") == 2
 
 
 def test_batch_flush_across_boundaries(tmp_path: Path, db: Database) -> None:
@@ -995,3 +1026,38 @@ def test_progress_emitted_when_scan_aborts_early(tmp_path: Path, db: Database) -
     # 前端读的就是这个字段（`system.ts` 的 `scanError`）
     assert done[-1]["stats"]["aborted"], "失败原因必须随 scan_done 送到前端"
     assert "library" in done[-1]["stats"]["aborted"]
+
+
+# --------------------------------------------------------------------------
+# 文件名含双向控制字符（审计 F10）
+#
+# `sandbox.resolve()` 对"用户主动起名"是拒绝的，但索引器处理的是
+# **已经在磁盘上**的文件（U 盘拷进来、别的系统遗产、本程序改名功能
+# 修好之前建出来的）。对这类文件必须"不收进库"，而不是让它在时间线上
+# 以一个骗人的名字出现。
+# --------------------------------------------------------------------------
+
+
+def test_bidi_control_filename_is_not_indexed(tmp_path: Path, db: Database) -> None:
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    _img(lib / "ok.jpg")
+    # RLO：资源管理器里显示成另一个名字
+    (lib / "x\u202Eegap.jpg").write_bytes((lib / "ok.jpg").read_bytes())
+
+    cfg = _cfg(tmp_path, lib)
+    stats = _scan(cfg, db)
+    assert stats.added == 1, stats.summary()
+    assert stats.skipped_name == 1, stats.summary()
+    rows = db.query("SELECT file_name FROM media")
+    assert [r["file_name"] for r in rows] == ["ok.jpg"]
+
+
+def test_bidi_is_included_in_summary_and_as_dict() -> None:
+    """统计字段必须进日志与 API —— 否则"为什么这张照片不见了"没人答得上。"""
+    from app.indexer import ScanStats
+
+    s = ScanStats(root_id="library")
+    s.skipped_name = 3
+    assert "文件名 3" in s.summary()
+    assert s.as_dict()["skipped_name"] == 3

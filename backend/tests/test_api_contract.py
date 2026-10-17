@@ -258,7 +258,11 @@ def srv(tmp_path: Path):
     data = tmp_path / "data"
     cfg = Config(
         {
-            "server": {"host": "127.0.0.1", "port": 0, "allow_lan": False},
+            # `panel_http: True` —— 本文件要遍历全部接口做契约校验，
+            # `_token()` 必须能通过 HTTP 取到配对码。生产默认 False
+            # （审计 F1-b：本机浏览器与用户本人无从区分）。
+            "server": {"host": "127.0.0.1", "port": 0, "allow_lan": False,
+                       "panel_http": True},
             "roots": [{
                 "id": "library", "path": str(lib), "label": "库",
                 "mode": "readwrite", "enabled": True, "recursive": True,

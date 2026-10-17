@@ -218,12 +218,47 @@ async function runTask(task: UploadTask): Promise<void> {
       const err = e instanceof ApiError ? e : null;
       task.status = "FAILED";
       task.error = err?.friendly ?? (e instanceof Error ? e.message : "上传失败");
+      // ★ 失败后把服务端的会话还回去（审计 F6）。
+      //
+      // 服务端 `MAX_OPEN_SESSIONS = 3`，数的是 `status='open'` 的行。
+      // 早先这里只在本地标 FAILED，会话继续留在服务端 open ——
+      // 连失败三次（格式不支持、磁盘满、任何服务端拒绝）之后，用户再也
+      // 传不上任何东西，而且看到的是"同时上传的任务太多，请等前面的传完"，
+      // 可实际上一个都没在传。用户唯一的出路是等 24 小时会话过期。
+      //
+      // 什么时候**不**还：`retryable` 的错误（断网、5xx 抖动、限流）。
+      // 那类失败会话还是好的，用户点重试应该**接着传**而不是从 0 开始 ——
+      // 一个 500MB 的视频传到 90% 断网，重来一遍是不可接受的。
+      // 这类会话交给服务端 `reclaim_stale()` 按"没有进展"回收。
+      //
+      // 为什么不用 `await`：这已经是 catch 分支的最后一步，
+      // 让它阻塞 `finally` 里的 `s.active -= 1` 只会白等一个网络往返。
+      if (!(err?.retryable ?? false)) void releaseSession(task);
     }
     task.rate = 0;
   } finally {
     controllers.delete(task.id);
     s.active = Math.max(0, s.active - 1);
     schedule();
+  }
+}
+
+/**
+ * 把一个失败任务的会话还给服务端（`DELETE /api/uploads/{id}`）。
+ *
+ * **绝不抛异常、绝不改任务状态**：调用方已经把它标成 FAILED 了，
+ * 这里再动一次状态会让用户看到的消息突然变成"已取消"。
+ * 会话 id 清空是必须的 —— 留着它，用户下次点重试会去问一个已经
+ * 被服务端置成 aborted 的会话，拿到的错误与真实原因无关。
+ */
+async function releaseSession(task: UploadTask): Promise<void> {
+  const id = task.uploadId;
+  if (!id) return;                       // init 都没成功，服务端没有会话
+  task.uploadId = null;
+  try {
+    await api.del<UploadAbortResponse>(`/api/uploads/${id}`, { timeoutMs: 10_000 });
+  } catch {
+    // 会话可能已经过期/完成，取消失败不影响任何本地状态
   }
 }
 
@@ -405,6 +440,16 @@ export function resumeAll(): void {
 /** 清掉已完成/已取消/已去重的条目（失败的不清，用户还要重试）。 */
 export function clearFinished(): void {
   const s = uploadStore.state;
+  // 失败/取消的任务若还挂着服务端会话（比如 retryable 的失败没还），
+  // 用户点"清除"就是想放弃它了 —— 顺手把会话还掉，别占额度。
+  for (const t of s.tasks) {
+    if (
+      (t.status === "CANCELED" || t.status === "FAILED")
+      && t.uploadId
+    ) {
+      void releaseSession(t);
+    }
+  }
   s.tasks = s.tasks.filter(
     (t) => t.status !== "DONE" && t.status !== "DEDUPED" && t.status !== "CANCELED",
   );
@@ -412,7 +457,13 @@ export function clearFinished(): void {
 
 /** 退出配对时清空整个队列。 */
 export function clearAll(): void {
-  for (const t of uploadStore.state.tasks) controllers.get(t.id)?.abort();
+  for (const t of uploadStore.state.tasks) {
+    controllers.get(t.id)?.abort();
+    // 退出配对就把所有会话还掉：这些任务再也不会被继续了。
+    if (t.uploadId && t.status !== "DONE" && t.status !== "DEDUPED") {
+      void releaseSession(t);
+    }
+  }
   controllers.clear();
   uploadStore.reset();
 }

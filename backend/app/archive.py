@@ -32,8 +32,10 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +46,52 @@ from .errors import AppError, ArchiveError, E1001, SandboxError
 from . import sandbox
 
 log = logging.getLogger(__name__)
+
+#: 归档时间戳的合法下界：1980-01-01（与 `exif.MIN_VALID_TS` 同源）。
+#: 早于它的 EXIF 一定是相机没设时间，没有任何整理价值。
+MIN_ARCHIVE_TS: float = 315532800.0
+
+#: 归档时间戳的合法上界：3000-01-01。
+#: `datetime.fromtimestamp` 在 Windows 上超过 3001 年抛 `OSError`，
+#: 在 Linux 上到 9999 年。取 3000 留足余量 —— 用户手机拍到 2200 年
+#: 也还在范围内。
+#: ★ 这个上界真正要挡的不是"未来照片"，而是 **`1e300` 这类非法输入**：
+#: 它一路穿过 JSON 校验，在 `datetime.fromtimestamp` 处抛 `OverflowError`，
+#: 而 `OverflowError` 不在 `errors.EXC_MAP` 里 → 500；更糟的是它抛在
+#: 归档链路上，`complete_session` 没有兜底，会话会永远卡在
+#: `status='open'`，攒满 `MAX_OPEN_SESSIONS` 后全站上传被拒。
+#: 见 docs/11 ISSUE-018 与审计报告 F2。
+MAX_ARCHIVE_TS: float = 32503680000.0  # 3000-01-01T00:00:00Z
+
+
+def _clamp_ts(ts: float) -> float:
+    """把时间戳夹进合法区间。非有限值/超界一律取当前时间。"""
+    if not math.isfinite(ts) or ts < MIN_ARCHIVE_TS or ts > MAX_ARCHIVE_TS:
+        now = time.time()
+        if now < MIN_ARCHIVE_TS:
+            return MIN_ARCHIVE_TS
+        return min(now, MAX_ARCHIVE_TS)
+    return ts
+
+
+def safe_timestamp(value: float | int | None, *, fallback: float | None = None) -> float:
+    """把任意来源的时间戳夹到 `[MIN_ARCHIVE_TS, MAX_ARCHIVE_TS]`。
+
+    非法输入（`None`/`inf`/`nan`/超界）回退到 `fallback`，再不行就是"现在"。
+    **绝不抛异常** —— 归档链路上任何一个时间戳异常都不该让用户的照片
+    传不上来；退化成"按当前时间归档"是完全可用的降级。
+    """
+    try:
+        ts = float(value) if value is not None else math.nan
+    except (TypeError, ValueError):
+        ts = math.nan
+    if not math.isfinite(ts) or ts < MIN_ARCHIVE_TS or ts > MAX_ARCHIVE_TS:
+        try:
+            alt = float(fallback) if fallback is not None else math.nan
+        except (TypeError, ValueError):
+            alt = math.nan
+        ts = alt if math.isfinite(alt) else math.nan
+    return _clamp_ts(ts)
 
 #: 同一秒内的第 2 张开始追加 `_1`、`_2`……第一张不带序号。
 #: 这样绝大多数文件名是干净的 `20240512_183000.jpg`。
@@ -71,7 +119,7 @@ _ALLOWED_EXT_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
 
 def archive_dir(taken_at: float) -> str:
     """`YYYY/YYYY-MM`，按**本地时区**。"""
-    dt = datetime.fromtimestamp(taken_at)
+    dt = datetime.fromtimestamp(safe_timestamp(taken_at))
     return f"{dt.year:04d}/{dt.year:04d}-{dt.month:02d}"
 
 
@@ -80,7 +128,7 @@ def archive_name(taken_at: float, ext: str, seq: int = 0, *, ms: int | None = No
 
     seq=0 表示第一个候选（不带序号）。ms 非 None 时改用毫秒消歧。
     """
-    dt = datetime.fromtimestamp(taken_at)
+    dt = datetime.fromtimestamp(safe_timestamp(taken_at))
     stem = f"{dt:%Y%m%d_%H%M%S}"
     if ms is not None:
         stem = f"{stem}_{ms:03d}"
@@ -117,7 +165,7 @@ def candidate_names(
             return
         yield archive_name(taken_at, ext, seq)
     # 同一秒超过 999 张（现实中不可能，但代码路径必须存在且会终止）
-    dt = datetime.fromtimestamp(taken_at)
+    dt = datetime.fromtimestamp(safe_timestamp(taken_at))
     for ms in range(1000):
         for seq in range(0, 3):
             if SEQ_MAX + 1 + ms * 3 + seq > limit:

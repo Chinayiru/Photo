@@ -1139,11 +1139,33 @@ def _rule_14(ctx: Ctx) -> list[Finding]:
 
 
 def _rule_15(ctx: Ctx) -> list[Finding]:
-    """规则 15：CORS 的 `Access-Control-Allow-Origin` 默认不得是 `*`。
+    """规则 15：CORS 只对显式白名单生效，默认**完全不启用**。
 
-    判据：`dispatch.enable_cors` 的默认参数值不得为 `"*"`；
-    且 `_apply_cors` 里要给"没有 Origin 的请求"留一条**不发头**的路径
-    —— 否则无 Origin 的请求会拿到通配符广播。
+    `docs/06` 的原文判据是 `grep 'allow_origins=["*"]'` 必须为空。这条判据
+    被审计 F1 整个绕过了：代码里没有那个字面量，只有
+    `enable_cors(allow_origin: str = "echo")` 这样的关键字默认值，
+    于是 grep 通过、行为却是"任何 Origin 都逐字回显"。
+
+    更糟的是当时的测试把这个 bug 写成了期望行为
+    （`test_cors_echoes_origin_when_present`），888 条全绿却漏掉整条
+    攻击链：恶意页面读 `/panel/pair-code` → 拿码 → `text/plain` POST
+    `/api/pair` → 换 90 天 token → 读走全库。
+
+    判据因此改成四条**行为性**约束：
+
+      (a) 不传白名单时 `self._cors` 必须被赋成 `None`（= 不启用），
+          而不是选一个"更安全的回显策略"。**用 AST 判，不用文本匹配** ——
+          注释里写一句"这里应该 self._cors = None"不该算实现；
+      (b) 白名单比对必须是精确成员判断 —— 出现 `startswith`/`endswith`
+          就说明有人想用前缀匹配，而 `https://a.example.com.evil.com`
+          正是靠这种写法混过去的；
+      (c) `_apply_cors` 必须有不命中就 return 的分支，否则"不在白名单"
+          依然会拿到 `Allow-Headers` 之类的头，浏览器会以为这条路通；
+      (d) `allow_origins` 的默认值必须为空 —— 通配符只允许**显式传入**。
+
+    `(b)(c)` 依赖 `_apply_cors` 存在；`(a)(d)` 不依赖，缺了函数也照跑 ——
+    判据之间不该有隐式耦合（缺失的函数把另一条独立判据一起静默关掉，
+    正是"看起来 0 违规"的另一种成因）。
     """
     out: list[Finding] = []
     src = ctx.app / "core" / "dispatch.py"
@@ -1151,30 +1173,64 @@ def _rule_15(ctx: Ctx) -> list[Finding]:
     if tree is None:
         return [Finding(15, "backend/app/core/dispatch.py", 0, "无法解析")]
 
+    # ---------- (a) 默认必须是不启用：找 `self._cors = None` 的真实赋值 ----------
+    def _is_self_cors(target: ast.expr) -> bool:
+        return (isinstance(target, ast.Attribute) and target.attr == "_cors"
+                and isinstance(target.value, ast.Name) and target.value.id == "self")
+
+    disable_line: int | None = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(_is_self_cors(t) for t in node.targets):
+            continue
+        if isinstance(node.value, ast.Constant) and node.value.value is None:
+            disable_line = node.lineno
+            break
+    if disable_line is None:
+        out.append(Finding(15, ctx.rel(src), 0,
+                           "enable_cors 没有真实的 `self._cors = None` 赋值"
+                           "（空白名单必须完全不启用 CORS）"))
+
+    # ---------- (b)(c) 白名单比对与早退分支 ----------
+    apply_node: ast.FunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_apply_cors":
+            apply_node = node
+            break
+    if apply_node is None:
+        out.append(Finding(15, ctx.rel(src), 0,
+                           "找不到 _apply_cors —— 无法确认白名单是否被真正执行"))
+    else:
+        body = ast.unparse(apply_node)
+        if " in allowed" not in body and "in self._cors" not in body:
+            out.append(Finding(15, ctx.rel(src), apply_node.lineno,
+                               "_apply_cors 没有对白名单做精确成员判断"
+                               "（`origin in allowed`）"))
+        for bad in ("startswith", "endswith"):
+            if f"{bad}(" in body and "origin" in body:
+                out.append(Finding(15, ctx.rel(src), apply_node.lineno,
+                                   f"_apply_cors 用 {bad} 比对 Origin —— 子域可绕过"))
+
+        has_reject = any(
+            isinstance(n, ast.If) and not n.orelse
+            and any(isinstance(stmt, ast.Return) for stmt in n.body)
+            for n in ast.walk(apply_node)
+        )
+        if not has_reject:
+            out.append(Finding(15, ctx.rel(src), apply_node.lineno,
+                               "_apply_cors 没有\"不在白名单就 return\"的分支"))
+
+    # ---------- (d) 默认值必须为空 ----------
     for node in ast.walk(tree):
         if not (isinstance(node, ast.FunctionDef) and node.name == "enable_cors"):
             continue
         for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults):
-            if arg.arg != "allow_origin" or default is None:
+            if arg.arg != "allow_origins" or default is None:
                 continue
-            if isinstance(default, ast.Constant) and default.value == "*":
+            if isinstance(default, ast.Constant) and default.value:
                 out.append(Finding(15, ctx.rel(src), default.lineno,
-                                   'allow_origin 默认值是 "*" —— 无 Origin 的请求会拿到通配符'))
-
-    # `_apply_cors` 必须有"无 Origin → 直接 return"的分支
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "_apply_cors":
-            has_early_return = any(
-                isinstance(n, ast.If)
-                and isinstance(n.test, ast.UnaryOp)
-                and isinstance(n.test.op, ast.Not)
-                and not n.orelse
-                and any(isinstance(s, ast.Return) for s in n.body)
-                for n in ast.walk(node)
-            )
-            if not has_early_return:
-                out.append(Finding(15, ctx.rel(src), node.lineno,
-                                   "_apply_cors 没有\"无 Origin 就不发头\"的早退分支"))
+                                   f"allow_origins 默认值是 {default.value!r}，必须是空"))
     return out
 
 
@@ -1444,6 +1500,9 @@ def _rule_20(ctx: Ctx) -> list[Finding]:
     所有注册路径，逐个确认它要么在 `PUBLIC_PATHS` 里，要么被
     `auth_middleware` 覆盖（即 `server.py` 注册了该中间件）。
 
+    判据另外包含两条 F1 相关的接线检查：`/panel/**` 必须有「默认关 +
+    仅回环」两道门，`auth.py` 必须真的调用 `netguard.check_host`。
+
     ⚠️ 本项目的 `Router` 用的是 `r.add("GET", "/api/...", handler, name=...)`
     这种三参数形式（`backend/app/routers/__init__.py:28` 起 24 条），
     **不是** `r.get(path)` / `@router.get(...)` 装饰器风格。第一版按
@@ -1498,13 +1557,40 @@ def _rule_20(ctx: Ctx) -> list[Finding]:
             continue
         if p.startswith("/panel") and not _panel_is_loopback_only(ctx):
             out.append(Finding(20, ctx.rel(routers), lineno,
-                               f"{p} 属管理面板，但 auth.py 里看不到仅限回环的限制"))
+                               f"{p} 属管理面板，但 auth.py 里看不到"
+                               f"「默认关 + 仅回环」两道门"))
+
+    # 规则 20 顺带守住 F1-c：Host 校验必须真的接线。
+    # 它不属于"端点的鉴权"，但同属"请求入口的身份判定"，
+    # 单开一条规则会让 20 条编号与文档彻底对不上。
+    if not _host_guard_wired(ctx):
+        out.append(Finding(20, "backend/app/auth.py", 0,
+                           "auth.py 没有调用 netguard.check_host —— Host 校验未接线"))
     return out
 
 
 def _panel_is_loopback_only(ctx: Ctx) -> bool:
+    """`/panel/**` 必须同时有"默认关"与"仅回环"两道门。
+
+    ★ 只查 `is_loopback` 是不够的（审计 F1-b）：本机浏览器发起的请求
+    来源 IP 就是 127.0.0.1，与用户本人无从区分，所以"仅回环"这单独
+    一道门等于没有门。必须有 `panel_http_enabled` 这个默认 False 的开关，
+    让整条 prefix 在用户没有显式打开时直接 404。
+    """
     text = ctx.read(ctx.app / "auth.py")
-    return "PANEL_PATHS" in text and "is_loopback" in text
+    return ("PANEL_PATHS" in text
+            and "is_loopback" in text
+            and "panel_http_enabled" in text)
+
+
+def _host_guard_wired(ctx: Ctx) -> bool:
+    """Host 校验必须在鉴权中间件里真的被调用（审计 F1-c）。
+
+    只查 `netguard.py` 存在毫无意义 —— 一个永远不会被调用的模块
+    与不存在没有区别。必须确认 `auth.py` 里同时出现 import 与调用。
+    """
+    auth_text = ctx.read(ctx.app / "auth.py")
+    return ("netguard" in auth_text) and ("check_host(" in auth_text)
 
 
 # ---------------------------------------------------------------------------
@@ -1526,7 +1612,7 @@ RULES: dict[int, tuple[str, Callable[[Ctx], list[Finding]]]] = {
     12: ("新建文件必须排他创建（O_EXCL / 'xb'）", _rule_12),
     13: ("数据目录绝不能成为媒体根", _rule_13),
     14: ("错误响应不得含内部细节（堆栈/SQL/绝对路径）", _rule_14),
-    15: ("CORS 默认不得返回 *", _rule_15),
+    15: ("CORS 只对显式白名单生效，默认不启用", _rule_15),
     16: ("图片解码不得在事件循环线程上", _rule_16),
     17: ("审计日志只追加 + fsync", _rule_17),
     18: ("默认只绑回环，通配地址必须过三道门", _rule_18),

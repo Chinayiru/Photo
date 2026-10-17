@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Final, Iterable, Iterator
 
-from . import exif, sandbox
+from . import exif, sandbox, uploads
 from .config import Config, RootConfig
 from .events import EventBus
 from .errors import AppError
@@ -58,6 +58,8 @@ class ScanStats:
     unchanged: int = 0       # 已存在且未变
     missing: int = 0         # 标记为 missing
     skipped_ext: int = 0     # 扩展名不在白名单
+    skipped_content: int = 0  # 扩展名像照片但内容不是（审计 F3）
+    skipped_name: int = 0    # 文件名含双向控制字符，显示顺序会骗人（审计 F10）
     skipped_dir: int = 0     # 排除目录
     skipped_link: int = 0    # ★ junction/symlink，绝不进入
     errors: int = 0
@@ -81,8 +83,8 @@ class ScanStats:
     def as_dict(self) -> dict[str, object]:
         d = {k: getattr(self, k) for k in (
             "root_id", "seen", "added", "updated", "unchanged", "missing",
-            "skipped_ext", "skipped_dir", "skipped_link", "errors",
-            "thumb_queued", "aborted",
+            "skipped_ext", "skipped_content", "skipped_name", "skipped_dir",
+            "skipped_link", "errors", "thumb_queued", "aborted",
         )}
         d["elapsed"] = round(self.elapsed, 2)
         d["started_at"] = self.started_at
@@ -93,7 +95,9 @@ class ScanStats:
         return (
             f"[{self.root_id}] {self.seen} 个候选，新增 {self.added}，"
             f"更新 {self.updated}，未变 {self.unchanged}，丢失 {self.missing}，"
-            f"跳过 扩展名 {self.skipped_ext}/目录 {self.skipped_dir}/链接 {self.skipped_link}，"
+            f"跳过 扩展名 {self.skipped_ext}/内容 {self.skipped_content}/"
+            f"文件名 {self.skipped_name}/目录 {self.skipped_dir}/"
+            f"链接 {self.skipped_link}，"
             f"错误 {self.errors}，缩略图入队 {self.thumb_queued}，"
             f"耗时 {self.elapsed:.1f}s"
         )
@@ -148,6 +152,54 @@ def _ext_of(name: str) -> str:
     """
     _, dot, ext = name.rpartition(".")
     return ext.lower() if dot else ""
+
+
+#: 索引时读文件头的字节数。与 `uploads.MAGIC_HEAD_BYTES` 同一个值。
+_HEAD_BYTES: Final[int] = uploads.MAGIC_HEAD_BYTES
+
+#: 扩展名 → 期望的魔术字节类型。直接从上传那边取，**不复制一份**：
+#: 两份表一定会漂移，而漂移的表现是"上传能收、扫描不收"（或反过来）。
+_EXT_KIND: Final[dict[str, str]] = uploads._EXT_KIND  # noqa: SLF001 —— 同包内的共享常量
+
+
+def check_content(path: str, *, size: int = -1) -> bool:
+    """目录里的这个文件，内容看起来是不是照片？**只读 32 字节，绝不抛异常。**
+
+    为什么要做这一步（审计 F3）：`should_index` 只判扩展名，于是往库里
+    丢一个 `planted.jpg`（内容是 51 字节的 HTML），`POST /api/index/rescan`
+    之后它会被 `search` 收录，`GET /api/items/127/raw` 会以
+    `Content-Type: image/jpeg` **原样端出去**。上传接口有魔术字节校验，
+    但索引器面对的是"SMB 拷进来的、U 盘拔过来的、用户自己改名的"文件，
+    完全绕过上传接口。同一条规则不能只在上传侧成立。
+
+    判据设计（三条都必须成立，否则不算照片）：
+
+    1. 文件至少 12 字节 —— 比这更短的不可能是任何合法图片头；
+    2. 头 32 字节里的魔术字节能被 `uploads.sniff_kind()` 识别；
+    3. 若扩展名在白名单表里，识别出的类型**必须与扩展名相符**。
+       扩展名不在表里（配置放宽了白名单）时只要求"看起来是图片"。
+
+    ⚠️ 读失败（权限、被占用、文件已消失）一律返回 **True**：
+    索引器的第一条原则是"绝不因为一个坏文件中断扫描"，而"读不到"
+    不等于"内容不对" —— 判成 False 会让一张权限受限的正常照片
+    永远进不了库。
+    """
+    try:
+        if 0 <= size < 12:
+            return False
+        with open(path, "rb") as fh:
+            head = fh.read(_HEAD_BYTES)
+    except OSError:
+        return True
+    if len(head) < 12:
+        return False
+    actual = uploads.sniff_kind(head)
+    if actual is None:
+        return False
+    declared = _EXT_KIND.get("." + _ext_of(path))
+    if declared is not None and declared != actual:
+        return False
+    return True
 
 
 def _walk(root: RootConfig, stats: ScanStats) -> Iterator[tuple[str, os.stat_result]]:
@@ -222,6 +274,22 @@ def _walk(root: RootConfig, stats: ScanStats) -> Iterator[tuple[str, os.stat_res
                 if not _is_excluded_file(name, root):
                     stats.skipped_ext += 1
                 continue
+            # 双向控制字符（审计 F10）：这类名字**能建出来**（Windows 允许），
+            # 但显示顺序与真实字符顺序不同 —— 用户看到的文件名与实际不是
+            # 同一个。`sandbox.resolve()` 对"用户主动起名"是拒绝的，但这里
+            # 处理的是"已经在磁盘上的遗产文件"（从别的系统拷进来、U 盘、
+            # 或者本程序改名功能修好之前就建出来的）。
+            # 对这类文件**不收进库**，计入 skipped_name：让它在时间线上
+            # 彻底消失，比让它以一个骗人的名字出现要好 —— 后者用户会点开、
+            # 会以为这是另一张照片。文件本身仍在磁盘上，用户随时能用
+            # 资源管理器找到并改名。
+            if not sandbox.BIDI_CONTROLS.isdisjoint(name):
+                stats.skipped_name += 1
+                log.warning(
+                    "跳过文件名含双向控制字符的文件：%s（%s）",
+                    rel, sandbox._describe_bidi(sandbox.BIDI_CONTROLS.intersection(name)),
+                )
+                continue
             # 文件级的 reparse（符号链接文件）同样跳过：它指向库外
             if sandbox._is_reparse_or_link(Path(entry.path), st):
                 stats.skipped_link += 1
@@ -268,6 +336,9 @@ class Indexer:
         self._cancel = asyncio.Event()
         self._running = False
         self.last_stats: dict[str, ScanStats] = {}
+        #: `check_content()` 的同进程缓存：`(root_id, rel) -> (mtime, size, ok)`。
+        #: 见 `_content_ok()` —— 重扫 4915 张照片不该把每张都重新 open 一遍。
+        self._content_cache: dict[tuple[str, str], tuple[float, int, bool]] = {}
 
     # --- 控制 -------------------------------------------------------------
 
@@ -404,19 +475,32 @@ class Indexer:
             stats.seen_rels.add(rel)
 
             prev = known.get(rel)
-            # ★ `prev["missing"]` 必须参与判断。`_load_known` 会把
-            #   missing=1 的行也载入内存，如果只比 mtime/size，
-            #   一张"曾经被标丢失、如今又回来了"的照片会走 unchanged
-            #   分支被 continue 掉，missing 永远清不掉 —— 文件就在
-            #   磁盘上，用户却一直看到"照片已丢失"。
-            #   触发场景很常见：拔了移动硬盘再插回来、临时改名目录后
-            #   又改回去、_mark_missing 因某次根目录不可读而误标。
-            if prev is not None and not prev["missing"] and not self._changed(prev, st):
+
+            # ★ 内容校验：只读 32 字节，判"这真的是一张照片吗"（审计 F3）。
+            #   放在 `seen_rels` 累积**之后**：文件确实在磁盘上，
+            #   不能说它"丢失"。放在 `unchanged` 判断**之前**，但
+            #   内容已经校验过的老行不再重复读盘 —— 见下方 dirty 判定。
+            #
+            #   为什么用"上次是否已通过校验"当缓存：`_load_known()` 现在
+            #   会载入 `width`，而 `_build_row()` 只有在内容校验通过时
+            #   才会去抽 EXIF，所以 `width` 非空 ⟺ 这一行是通过校验进来的
+            #   （`check_content` 返回 True 才会走到 `_build_row`）。
+            #   重扫 4915 张照片时只读新增/变更的那几张的头，不会把
+            #   "首次索引 30 秒"变成"每次 30 秒 + 4915 次 open"。
+            if (prev is not None and not prev["missing"]
+                    and not self._changed(prev, st)
+                    and prev.get("width") is not None):
                 stats.unchanged += 1
                 # 未变但仍缺缩略图 → 补入队（上次可能没跑完）
                 if prev["thumb_state"] == "pending" and self.thumbs is not None:
                     if self.thumbs.enqueue(prev["id"]):
                         stats.thumb_queued += 1
+            elif not self._content_ok(root, rel, st):
+                # 扩展名像照片、内容不是 → 不收，也把已有的坏行标 missing。
+                stats.skipped_content += 1
+                if prev is not None and not prev["missing"]:
+                    self._mark_missing_quietly(prev["id"])
+                continue
             else:
                 row = await self._build_row(root, rel, st, prev)
                 batch.append(row)
@@ -518,13 +602,53 @@ class Indexer:
         为什么要全量载入内存：4915 行的 (rel_path, mtime, size, id, thumb_state)
         约 1.5MB，而逐文件查库要做 4915 次 SELECT。全量载入把首次索引从
         "4915 次查询 + 4915 次写"降到 "1 次查询 + 约 10 次批量写"。
+
+        `width` 也被载入：它充当"这一行的内容校验过了吗"的判据 ——
+        `_build_row()` 只在 `check_content()` 通过后才被调用，而 EXIF 抽不到
+        宽高时是 NULL……所以不能只看它。真正可靠的判据是
+        `_content_ok()` 的**同进程缓存**，见那里的说明。
         """
         rows = self.db.query(
-            "SELECT id, rel_path, mtime, size, thumb_state, missing"
+            "SELECT id, rel_path, mtime, size, thumb_state, missing, width"
             " FROM media WHERE root_id = ?",
             (root_id,),
         )
         return {r["rel_path"]: dict(r) for r in rows}
+
+    def _content_ok(self, root: RootConfig, rel: str, st: os.stat_result) -> bool:
+        """`check_content()` 的带缓存版本（按 rel_path + mtime + size 记忆）。
+
+        缓存键必须含 mtime 与 size：否则用户把 `photo.jpg` 原地替换成
+        另一个文件（同步工具会这么做）时，同一进程内的重扫会沿用旧的
+        "通过"结论，坏内容又混进去了。
+        """
+        key = (root.id, rel)
+        hit = self._content_cache.get(key)
+        if hit is not None and hit[0] == st.st_mtime and hit[1] == st.st_size:
+            return hit[2]
+        try:
+            src = str(sandbox.resolve(root, rel, "read", cfg=self.cfg))
+        except Exception:      # noqa: BLE001 —— 沙箱拒绝就是"不该收"
+            return False
+        ok = check_content(src, size=int(st.st_size))
+        self._content_cache[key] = (st.st_mtime, st.st_size, ok)
+        if not ok:
+            log.warning(
+                "跳过内容不像照片的文件（扩展名像）：%s/%s（%d 字节）",
+                root.id, rel, st.st_size,
+            )
+        return ok
+
+    def _mark_missing_quietly(self, media_id: int) -> None:
+        """把一行标成 missing，失败只记日志。
+
+        用于"内容校验没过"的分支：这是**修正**而不是主流程，
+        一条 UPDATE 失败不该中断整轮扫描。
+        """
+        try:
+            self.db.execute("UPDATE media SET missing = 1 WHERE id = ?", (media_id,))
+        except Exception:      # noqa: BLE001
+            log.debug("标记 missing 失败：media#%s", media_id, exc_info=True)
 
     @staticmethod
     def _changed(prev: dict, st: os.stat_result) -> bool:

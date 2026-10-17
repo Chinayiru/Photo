@@ -134,6 +134,23 @@ DEFAULT_CONFIG: Final[dict[str, Any]] = {
         # 是否允许绑到非回环地址。False 时 server 启动前会拒绝 0.0.0.0/::，
         # 防止"配置里写错了就整个库暴露在公网"。
         "allow_lan": True,
+        # 允许的 Host 头（防 DNS rebinding，审计 F1-c）。
+        # 留空 = 自动取「回环 + 本机所有真实网卡 + 主机名」；
+        # 写 ["*"] = 完全不校验，**只在反向代理改写 Host 时才用**。
+        "trusted_hosts": [],
+        # 是否把 /panel/** 挂到 HTTP 上。
+        #
+        # ★ 默认 False，因为**没有任何调用方**：托盘直接用 handler 函数
+        # （不走 HTTP），前端 `grep /panel` 零命中。开着它唯一的作用就是
+        # 给"本机上打开的任何网页"留一条路 —— 而本机网页的来源 IP 恰好
+        # 就是 127.0.0.1，与用户本人无从区分（审计 F1-b）。
+        # 需要面板接口时（脚本化取配对码、排查设备列表）显式打开。
+        "panel_http": False,
+        # 允许跨源的 Origin 白名单（审计 F1-a）。
+        # 空 = 不启用 CORS（一期手机端与 API 同源，不需要）；
+        # 开发期 Vite 在 5173，加 "http://localhost:5173" 即可；
+        # 写 ["*"] = 显式通配，仅本机调试用。
+        "cors_origins": [],
     },
     "roots": [],                    # [{id, path, label, mode, enabled, ...}]
     "upload": {
@@ -232,6 +249,22 @@ class RootConfig:
 class ConfigError(Exception):
     """配置文件无法使用。这类错误必须让用户看到原文（含路径），
     因为它唯一的修复方式就是用户去改那个文件——与 API 响应的脱敏规则不同。"""
+
+
+class UnknownRootError(ConfigError):
+    """请求里指定的 `root` / `root_id` 不存在（审计 F7）。
+
+    与 `ConfigError` 分开，是因为两者的**责任方不同**：
+
+    - `ConfigError`：配置文件本身有问题 → 该由用户在电脑上改 config.json，
+      必须连路径一起打印，且不该被 API 层改写成 4xx。
+    - `UnknownRootError`：**请求**带了一个不存在的根 id → 客户端的错，
+      应当 400，且不该把磁盘路径拼进响应体。
+
+    早先两者混为一谈，后果是 `?root=nope` 走 `EXC_MAP` 未命中 → `Internal(None)`
+    → `500 E3001 internal_error`。用户在手机上看到的提示是"服务器开小差了"，
+    而真正的原因（根 id 写错）只有看电脑日志才知道。
+    """
 
 
 class Config:
@@ -347,7 +380,11 @@ class Config:
         return [r for r in self.roots if r.enabled]
 
     def root_by_id(self, root_id: str | None) -> RootConfig:
-        """按 id 取根。root_id 为空时返回第一个启用的根。"""
+        """按 id 取根。root_id 为空时返回第一个启用的根。
+
+        未知 id 抛 `UnknownRootError`（ConfigError 的子类，见其 docstring）——
+        这是请求参数错，要被 API 层翻成 400，而不是 500。
+        """
         if root_id is None:
             roots = self.enabled_roots
             if not roots:
@@ -356,7 +393,7 @@ class Config:
         for r in self.roots:
             if r.id == root_id:
                 return r
-        raise ConfigError(f"未知的根目录 id: {root_id!r}")
+        raise UnknownRootError(f"未知的根目录 id: {root_id!r}")
 
     @property
     def default_root_id(self) -> str:
@@ -727,6 +764,11 @@ def check_bind_safety(host: str, cfg: Config | None = None) -> tuple[bool, str]:
             return False, "尚未配置媒体根目录，拒绝监听所有网卡"
         if not c.auth.get("require_pairing", True):
             return False, "auth.require_pairing 为 false，监听所有网卡将无鉴权暴露照片库"
+        if bool(c.get("server.panel_http", False)):
+            # `/panel/**` 只有"来源 IP 是回环"一道门（审计 F1-b），而本机
+            # 浏览器发出的请求来源 IP 就是 127.0.0.1 —— 与用户本人无从区分。
+            # 局域网可达时把面板挂出去，等于让任何网页都能替用户生成配对码。
+            return False, "server.panel_http 为 true 时不允许监听所有网卡"
         return True, "局域网可访问（需配对）"
 
     if not c.server.get("allow_lan", True):
@@ -1123,7 +1165,7 @@ __all__ = [
     "ALLOWED_IMAGE_EXTS", "APP_ROOT", "CONFIG_PATH", "Config", "ConfigError",
     "DATA_DIR", "DEFAULT_CONFIG", "DEFAULT_EXCLUDE_DIRS", "DEFAULT_TZ_OFFSET_MIN",
     "FUTURE_RAW_EXTS", "FUTURE_VIDEO_EXTS", "LOOPBACK_HOSTS", "ROOT_MODES",
-    "RootConfig", "SECRETS_PATH", "TMP_DIRNAME", "WILDCARD_HOSTS",
+    "RootConfig", "SECRETS_PATH", "TMP_DIRNAME", "WILDCARD_HOSTS", "UnknownRootError",
     "bootstrap_default_root", "check_bind_safety", "ensure_dirs", "get",
     "is_first_run", "is_loopback_host", "load", "local_ipv4_addresses",
 ]

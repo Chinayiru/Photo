@@ -403,14 +403,78 @@ def test_rule_14_catches_unsanitized_error(tmp_path: Path) -> None:
 
 
 def test_rule_15_catches_wildcard_cors_default(tmp_path: Path) -> None:
-    """规则 15：CORS 默认值是 `*` 必须报。"""
+    """规则 15：`allow_origins` 的默认值是 `*` 必须报。
+
+    审计 F1 的原始写法是 `allow_origin: str = "*"`（单数、关键字默认值），
+    旧判据 `grep 'allow_origins=["*"]'` 连碰都没碰到它 —— 这就是
+    "判据合规、行为敞开"的典型。
+    """
     t = Tree(tmp_path)
     t.write("core/dispatch.py", (
-        "def enable_cors(self, *, allow_origin: str = '*') -> None:\n"
-        "    self._cors = allow_origin\n"
+        "def enable_cors(self, *, allow_origins: Iterable[str] | str = '*') -> None:\n"
+        "    self._cors = {'origins': allow_origins}\n"
     ))
     findings = t.run(15)
-    assert any("allow_origin" in f.message or "*" in f.message for f in findings)
+    assert any("allow_origins" in f.message for f in findings), \
+        [f.render() for f in findings]
+
+
+def test_rule_15_demands_cors_off_by_default(tmp_path: Path) -> None:
+    """规则 15：空白名单时必须 `self._cors = None`，不许选"更安全的回显"。"""
+    t = Tree(tmp_path)
+    t.write("core/dispatch.py", (
+        "def enable_cors(self, *, allow_origins=()) -> None:\n"
+        "    # 没有 self._cors = None，等价于总是启用某种策略\n"
+        "    self._cors = {'origins': frozenset(allow_origins)}\n"
+    ))
+    findings = t.run(15)
+    assert any("_cors = None" in f.message for f in findings), \
+        [f.render() for f in findings]
+
+
+def test_rule_15_rejects_prefix_matching(tmp_path: Path) -> None:
+    """规则 15：用 startswith 比对 Origin 必须报（子域可绕过）。"""
+    t = Tree(tmp_path)
+    t.write("core/dispatch.py", (
+        "def enable_cors(self, *, allow_origins=()) -> None:\n"
+        "    if not allow_origins:\n"
+        "        self._cors = None\n"
+        "        return\n"
+        "    self._cors = {'origins': frozenset(allow_origins)}\n"
+        "\n"
+        "def _apply_cors(self, ctx, r):\n"
+        "    origin = ctx.headers.get('origin')\n"
+        "    allowed = self._cors['origins']\n"
+        "    if origin and any(origin.startswith(a) for a in allowed):\n"
+        "        r.set_header('Access-Control-Allow-Origin', origin)\n"
+        "        return\n"
+        "    return\n"
+    ))
+    findings = t.run(15)
+    assert any("startswith" in f.message for f in findings), \
+        [f.render() for f in findings]
+
+
+def test_rule_15_demands_early_return_for_unknown_origin(tmp_path: Path) -> None:
+    """规则 15：不在白名单也必须一个头都不发（不能只跳过 ACAO）。"""
+    t = Tree(tmp_path)
+    t.write("core/dispatch.py", (
+        "def enable_cors(self, *, allow_origins=()) -> None:\n"
+        "    if not allow_origins:\n"
+        "        self._cors = None\n"
+        "        return\n"
+        "    self._cors = {'origins': frozenset(allow_origins)}\n"
+        "\n"
+        "def _apply_cors(self, ctx, r):\n"
+        "    origin = ctx.headers.get('origin')\n"
+        "    allowed = self._cors['origins']\n"
+        "    if origin and origin in allowed:\n"
+        "        r.set_header('Access-Control-Allow-Origin', origin)\n"
+        "    r.set_header('Access-Control-Allow-Headers', 'Authorization')\n"
+    ))
+    findings = t.run(15)
+    assert any("return" in f.message for f in findings), \
+        [f.render() for f in findings]
 
 
 def test_rule_16_catches_missing_executor(tmp_path: Path) -> None:
@@ -504,6 +568,46 @@ def test_rule_20_catches_unparsed_routes(tmp_path: Path) -> None:
     assert any("空判据" in f.message for f in findings), [f.render() for f in findings]
 
 
+def test_rule_20_catches_panel_without_default_off(tmp_path: Path) -> None:
+    """规则 20：`/panel` 只有 `is_loopback` 一道门必须报（审计 F1-b）。
+
+    本机浏览器发起的请求来源 IP 就是 127.0.0.1，与用户本人无从区分 ——
+    所以"仅回环"单独一道门等于没有门。
+    """
+    t = Tree(tmp_path)
+    t.write("routers/__init__.py", (
+        "def build_router(r):\n"
+        "    r.add('POST', '/panel/pair-code', h.pair, name='p')\n"
+    ))
+    t.write("server.py", "def serve():\n    router.use(auth_middleware)\n")
+    t.write("auth.py", (
+        "from .netguard import check_host\n"
+        "PANEL_PATHS = ('/panel',)\n"
+        "def is_loopback(c):\n"
+        "    return True\n"
+        "def middleware(c):\n"
+        "    return check_host(c.headers.get('host'))\n"
+    ))
+    findings = t.run(20)
+    assert any("panel" in f.message.lower() for f in findings), \
+        [f.render() for f in findings]
+
+
+def test_rule_20_catches_unwired_host_guard(tmp_path: Path) -> None:
+    """规则 20：`netguard.py` 写了却没人调用必须报（死代码等于不存在）。"""
+    t = Tree(tmp_path)
+    t.write("routers/__init__.py", (
+        "def build_router(r):\n"
+        "    r.add('GET', '/api/system/ping', h.ping, name='p')\n"
+    ))
+    t.write("server.py", "def serve():\n    router.use(auth_middleware)\n")
+    t.write("auth.py", "PANEL_PATHS = ('/panel',)\ndef is_loopback(c):\n    return True\n")
+    t.write("netguard.py", "def check_host(raw, cfg=None):\n    return None\n")
+    findings = t.run(20)
+    assert any("check_host" in f.message for f in findings), \
+        [f.render() for f in findings]
+
+
 def test_rule_20_parses_r_add_style_routes(tmp_path: Path) -> None:
     """规则 20：`r.add("GET", path, ...)` 必须被解析到（否则判据空转）。"""
     t = Tree(tmp_path)
@@ -514,7 +618,16 @@ def test_rule_20_parses_r_add_style_routes(tmp_path: Path) -> None:
         "    r.add('GET', '/api/timeline', h.timeline, name='t')\n"
     ))
     t.write("server.py", "def serve():\n    router.use(auth_middleware)\n")
-    t.write("auth.py", "PANEL_PATHS = ('/panel',)\ndef is_loopback(c):\n    return True\n")
+    t.write("auth.py", (
+        "from .netguard import check_host\n"
+        "PANEL_PATHS = ('/panel',)\n"
+        "def panel_http_enabled(cfg):\n"
+        "    return False\n"
+        "def is_loopback(c):\n"
+        "    return True\n"
+        "def middleware(c):\n"
+        "    return check_host(c.headers.get('host'))\n"
+    ))
     assert t.run(20) == []
 
 

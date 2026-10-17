@@ -228,7 +228,12 @@ def env(tmp_path: Path):
 
     cfg = Config(
         {
-            "server": {"host": "127.0.0.1", "port": 0, "allow_lan": False},
+            # `panel_http: True` —— 这个测试文件**本身**就是"用 HTTP 调面板
+            # 接口拿配对码"的调用方（`_pair()` 走 POST /panel/pair-code）。
+            # 生产默认是 False（审计 F1-b：本机浏览器与用户无从区分），
+            # 这里显式打开，等价于用户自己把面板接口开出来。
+            "server": {"host": "127.0.0.1", "port": 0, "allow_lan": False,
+                       "panel_http": True},
             "roots": [
                 {
                     "id": "library",

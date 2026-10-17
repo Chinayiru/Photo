@@ -153,7 +153,15 @@ def build_app(cfg: Config | None = None, *, state: AppState | None = None) -> An
     # 这样请求日志能包住 401（否则鉴权失败不进访问日志，排障看不到）。
     router.use(_request_log_middleware)
     router.use(auth_middleware)
-    router.enable_cors()
+    origins = _cors_origins(cfg)
+    if origins:
+        # 只放行配置里显式列出的源（审计 F1-a）。默认空 = 完全不启用 CORS，
+        # 响应里一个 `Access-Control-*` 头都不会出现。
+        #
+        # ★ 不要写成 `enable_cors()`：那曾经等于"谁来都回显"，任何网页
+        # 都能读到 `/panel/pair-code` 的响应并据此换 token。
+        router.enable_cors(allow_origins=origins)
+        log.info("已启用 CORS，白名单：%s", ", ".join(origins))
 
     # 静态前端兜底：手机访问 http://<电脑IP>:8787/ 直接看到界面。
     # 用 set_fallback 而不是再注册一条 `/{path:path}` 路由 —— 后者会
@@ -166,6 +174,25 @@ def build_app(cfg: Config | None = None, *, state: AppState | None = None) -> An
     # 这里与所有 handler 都不用改。见 transports/__init__.py。
     transport = build_transport(cfg, router)
     return router, transport, st
+
+
+def _cors_origins(cfg: Config) -> tuple[str, ...]:
+    """从 `server.cors_origins` 读白名单。非法/缺失返回空元组（= 不启用 CORS）。"""
+    raw = cfg.get("server.cors_origins", ()) or ()
+    if isinstance(raw, str):
+        raw = (raw,)
+    out: list[str] = []
+    for item in raw:
+        s = str(item).strip()
+        if not s:
+            continue
+        if s != "*" and "://" not in s:
+            # 少写 scheme 的源在浏览器里永远匹配不上（Origin 头带 scheme），
+            # 静默变成一个永不放行的白名单项比报错更难查。
+            log.warning("server.cors_origins 里的 %r 缺少 scheme，已忽略", s)
+            continue
+        out.append(s)
+    return tuple(out)
 
 
 def _dist_dir(cfg: Config) -> Path | None:

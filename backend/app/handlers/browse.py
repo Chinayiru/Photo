@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 import shutil
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -113,7 +114,7 @@ async def timeline(ctx: Ctx) -> Reply:
     limit = ctx.q_int("limit", DEFAULT_LIMIT, minimum=1, maximum=MAX_LIMIT)
     order_sql = timeline_order(ctx.q("order"))
 
-    root_id = ctx.q("root")
+    root_id = common.root_id_param(ctx)
     if root_id is not None and root_id != "":
         if not st.cfg.has_root(root_id):
             raise AppError(E1001, f"未知的 root：{root_id}")
@@ -300,11 +301,23 @@ async def _serve_thumb(st: AppState, ctx: Ctx, mid: int) -> Reply:
             except Exception as e:  # noqa: BLE001
                 log.warning("thumb sync generate failed media_id=%s: %s", mid, e)
 
-    if not dst.exists():
+    if row["missing"] or not dst.exists():
         # ★ 不返回 404/500，而是返回灰色占位图 + 200。
         # 时间线上一个破图会让用户以为"照片丢了"，而实际只是
         # 缩略图还没生成出来（后台队列在忙）。前端看到 200 的占位图
         # 会正常渲染，用户稍后刷新即可。
+        #
+        # ★★ `row["missing"]` 也走这条路（审计 F5）。
+        # 已删除/已丢失的照片，缩略图缓存文件通常**还在磁盘上** ——
+        # 它从不被清理（`thumb_path` 没有任何 unlink 调用）。
+        # 早先这里只判 `not dst.exists()`，于是 missing 的行照旧走
+        # `_file_thumb_reply()`，带上 `Cache-Control: max-age=31536000,
+        # immutable` 端出去 —— 手机缓存一年且**不再发请求**。
+        # 用户删了照片、界面上看着消失了，可只要那台手机曾经加载过
+        # 列表，一年之内它仍然能把这批"已删除"的缩略图从缓存里拿出来；
+        # 反过来，如果用户删错了想恢复，客户端也不会重新请求，
+        # 因为他手上那份看起来完全正常。
+        # 占位图只缓存 60 秒，真实内容一恢复就能马上看到。
         data = placeholder_webp(size or PLACEHOLDER_SIZE)
         r = Reply(status=200, body=data, media_type="image/webp")
         r.headers["Content-Type"] = "image/webp"
@@ -550,7 +563,7 @@ async def folders(ctx: Ctx) -> Reply:
     st = _st(ctx)
     db = st.db
 
-    root_id = ctx.q("root") or st.cfg.default_root_id
+    root_id = common.root_id_param(ctx) or st.cfg.default_root_id
     if not root_id or not st.cfg.has_root(root_id):
         raise AppError(E1001, f"未知的 root：{root_id}")
     root = st.cfg.root_by_id(root_id)
@@ -653,7 +666,7 @@ async def search(ctx: Ctx) -> Reply:
     db = st.db
 
     q = (ctx.q("q") or "").strip()
-    root_id = ctx.q("root") or None
+    root_id = common.root_id_param(ctx) or None
     ts_from = parse_ts(ctx.q("from"), what="from")
     ts_to = parse_ts(ctx.q("to"), what="to")
     camera = ctx.q("camera") or None
@@ -976,6 +989,63 @@ def _move_one_sync(src: Path, dst: Path, *, size: int) -> None:
     os.unlink(src)
 
 
+def _update_rel_path(
+    db: Any, mid: int, dst_rel: str, name: str,
+    *, taken: tuple[float, str] | None = None,
+) -> None:
+    """把 media 行的 `rel_path`/`file_name`（以及可能的 taken_*）改掉。
+
+    ★ **必须在文件搬完之后调用，且必须能失败**（审计 F4）。
+
+    原来这里是裸 `db.execute("UPDATE media SET rel_path = ...")`，写在
+    搬文件的 `try` 之外、没有 `IntegrityError` 处理。而 `media` 表有
+    `UNIQUE(root_id, rel_path)` 表级约束 —— 已删除的照片只被标
+    `missing=1`、行仍占着 `(root_id, rel_path)`。于是"移动到一个曾
+    删除过同名文件的目录"会抛 `IntegrityError` → 500，而此时**文件
+    已经搬走了**，磁盘与数据库就此分叉：用户以为还在这儿的照片，
+    库里指向一个不存在的路径，下次扫描把它标成"已丢失"。
+
+    注意 `browse.py` 里挑候选名时本来就写了 `WHERE ... AND missing = 0`
+    —— 也就是说选名逻辑认为"墓碑不占位"，而唯一索引认为"墓碑占位"，
+    两处语义相反。**现在统一成"墓碑不占位"**：撞上墓碑行时把那条
+    墓碑删掉（它指向的文件早已进回收站，行留着只会继续占坑、
+    还会在下一次扫描时被"复活"成一条重复记录）。
+
+    只删墓碑、不删活行：撞上 `missing=0` 的行仍然是真冲突，
+    那是调用方挑选名字时应该避开的情况，不该在这里静默吞掉。
+    """
+    # * 两条 SQL 都是全字面量，不做字符串拼接（check_lint 规则 3）。
+    # 早先写成 `"... file_name = ?" + extra_sql + " WHERE id = ?"` ——
+    # 虽然调用方只传字面量、实际没有注入面，但"把变量拼进 SQL"正是
+    # 规则 3 要禁止的形态，留着它等于给下一个人示范错误写法。
+    if taken is None:
+        sql = "UPDATE media SET rel_path = ?, file_name = ? WHERE id = ?"
+        params: tuple[Any, ...] = (dst_rel, name, mid)
+    else:
+        sql = (
+            "UPDATE media SET rel_path = ?, file_name = ?,"
+            " taken_at = ?, taken_src = ? WHERE id = ?"
+        )
+        params = (dst_rel, name, taken[0], taken[1], mid)
+    try:
+        db.execute(sql, params)
+    except sqlite3.IntegrityError:
+        # 墓碑占位：清掉它再重试一次。墓碑的定义就是 missing=1 且
+        # 指向的文件已不在磁盘上，删行不会丢任何用户数据。
+        tomb = db.query_one(
+            "SELECT id FROM media WHERE root_id ="
+            " (SELECT root_id FROM media WHERE id = ?)"
+            " AND rel_path = ? AND missing = 1",
+            (mid, dst_rel),
+        )
+        if tomb is None:
+            raise
+        log.info("清理占位的墓碑行 media#%s（%s）", tomb["id"], dst_rel)
+        db.execute("DELETE FROM media WHERE id = ?", (tomb["id"],))
+        db.execute(sql, params)
+
+
+
 async def move_items(ctx: Ctx) -> Reply:
     """`POST /api/items/move` —— 批量移动到指定目录。
 
@@ -1138,10 +1208,22 @@ async def move_items(ctx: Ctx) -> Reply:
         # 先搬文件再改库（与 _trash_one 同源的理由）：反过来如果进程在
         # 中间被杀，库里指向新路径而文件还在旧路径，下次扫描会把这条
         # 标 missing，用户以为照片丢了。
-        db.execute(
-            "UPDATE media SET rel_path = ?, file_name = ? WHERE id = ?",
-            (dst_rel, name, mid),
-        )
+        #
+        # ★ 但"先搬文件"也有它自己的坏结局：改库失败时文件已经搬走了。
+        #   所以这里必须能被撤销 —— 撞上墓碑行时 `_update_rel_path`
+        #   会先清墓碑再重试；真撞上活行才抛，此时把文件搬回原处。
+        #   见审计 F4。
+        try:
+            _update_rel_path(db, mid, dst_rel, name)
+        except Exception as exc:  # noqa: BLE001 —— 一项失败不该中断整批
+            log.error("移动后写库失败，回滚文件 media_id=%s: %s", mid, exc)
+            await loop.run_in_executor(
+                None,
+                lambda s=src, d=dst: _move_one_sync(d, s, size=row["size"]),
+            )
+            failed.append({"id": mid, "code": "E3012",
+                           "message": "目标位置已有同名记录，移动已撤销"})
+            continue
         moved.append({
             "id": mid,
             "from": src_rel,
@@ -1275,11 +1357,19 @@ async def rename_item(ctx: Ctx) -> Reply:
         info = await loop.run_in_executor(None, extract_sync, dst)
         taken_at, taken_src = resolve_taken_at(info, new_name, st_mtime)
 
-    db.execute(
-        "UPDATE media SET rel_path = ?, file_name = ?, taken_at = ?,"
-        " taken_src = ? WHERE id = ?",
-        (dst_rel, new_name, taken_at, taken_src, mid),
-    )
+    try:
+        _update_rel_path(
+            db, mid, dst_rel, new_name,
+            taken=(taken_at, taken_src),
+        )
+    except Exception as exc:  # noqa: BLE001
+        # 与 move_items 同理：文件已经改名了，写库失败必须把名字改回去，
+        # 否则库里指向一个不存在的路径，照片在时间线上"消失"。
+        log.error("改名后写库失败，回滚文件名 media_id=%s: %s", mid, exc)
+        await loop.run_in_executor(
+            None, lambda: _move_one_sync(dst, src, size=row["size"])
+        )
+        raise Conflict("同目录下已有同名记录，改名已撤销", spec=E3012) from exc
     audit.record(
         db, st.cfg, audit.ACTION_RENAME,
         rel_path=dst_rel, device=st.device_name,
@@ -1315,7 +1405,7 @@ async def rescan(ctx: Ctx) -> Reply:
         raise AppError(E3012, "已有扫描在进行中")
 
     body = await ctx.json()
-    root_id = body.get("root") or ctx.q("root")
+    root_id = common.root_id_payload(body, ctx)
 
     loop = asyncio.get_running_loop()
     if root_id:

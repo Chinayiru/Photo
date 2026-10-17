@@ -34,11 +34,13 @@ from .ctx import Ctx, Reply, json_reply, new_request_id
 
 log = logging.getLogger(__name__)
 
-__all__ = ["Route", "Router", "Handler", "Middleware", "NotFoundRoute", "ECHO_ORIGIN"]
-
-#: `enable_cors(allow_origin=...)` 的特殊值：**回显请求自己的 Origin**。
-#: 用它当默认值，而不是 `"*"` —— 见 `enable_cors` 的文档。
-ECHO_ORIGIN: str = "echo"
+__all__ = [
+    "Route",
+    "Router",
+    "Handler",
+    "Middleware",
+    "NotFoundRoute",
+]
 
 #: 处理函数签名：接收 Ctx，返回 Reply。
 Handler = Callable[[Ctx], Awaitable[Reply]]
@@ -178,44 +180,57 @@ class Router:
         self._middleware.append(mw)
         return mw
 
-    def enable_cors(self, *, allow_origin: str = ECHO_ORIGIN,
+    def enable_cors(self, *, allow_origins: Iterable[str] | str = (),
                     allow_headers: str = "Authorization, Content-Type, Content-Range, X-Request-Id",
                     expose_headers: str = "ETag, Content-Range, Content-Length, X-Request-Id",
                     max_age: int = 86400) -> None:
-        """启用 CORS。
+        """启用 CORS —— **只对显式白名单里的源生效**。
 
-        局域网直连时手机页面与 API 同源，本不需要 CORS。
-        但二期云端隧道下页面来自 https://域名，API 也走同域，同样同源。
-        真正需要它的是开发期：Vite dev server 在 5173，API 在 8787，
-        不同端口就是跨源，不加这个连不上。
+        局域网直连时手机页面与 API 同源，本不需要 CORS。二期云端隧道下
+        页面来自 https://域名，API 也走同域，同样同源。真正需要它的是
+        开发期：Vite dev server 在 5173，API 在 8787，不同端口就是跨源。
 
-        ★ `allow_origin` 的默认值是 `ECHO_ORIGIN`（`"echo"`），不是 `"*"`：
+        ## 为什么不是"回显请求的 Origin"（审计 F1-a，已踩过）
 
-          `"echo"`（默认）：请求带 `Origin` → 回显该源；不带 → **不发**
-              `Access-Control-Allow-Origin`。这是唯一同时满足"开发期跨源
-              能用"与"响应里绝不出现通配符"的取值。
+        曾经的默认值是一个特殊值 `"echo"`：谁来就回显谁。当时写下的理由
+        是"从不下发 `Access-Control-Allow-Credentials`，所以回显不增加
+        攻击面"。这个推理**在本服务上错得很具体**：
 
-          `"*"`：字面通配符，**必须显式传**。本服务的鉴权走 `Authorization`
-              头与 cookie，且从不发 `Access-Control-Allow-Credentials`，
-              所以通配符在语义上并不比回显更宽松；但它会让"允许任何源"
-              这句话出现在响应头里，审计与渗透测试都会标成问题 —— 不当默认。
+          * `/panel/**` 的唯一边界是"来源 IP 是回环"；
+          * 在运行 PhotoBridge 的那台电脑上打开的任何网页，来源 IP
+            就是 `127.0.0.1` —— 与用户自己点面板无从区分；
+          * 于是攻击链是：恶意页面 CORS 读 `/panel/pair-code` 拿到 6 位码
+            → 用 `text/plain`（CORS 简单请求，绕过预检）POST `/api/pair`
+            → 拿到 90 天有效的 client_token → 读走整个照片库。
 
-          其他字符串：固定值，只放行那一个源（二期云端域名可走这里）。
+        "不带凭据"的假设在这里不成立：攻击者不需要受害者的凭据，
+        它自己 mint 一个。回显把闸门直接拆了。
 
-        ## 回显为什么安全
+        ## 语义
 
-        回显本身不授予任何权限："这个源能否读到响应"由浏览器按自己的源
-        比对决定，回显只对发起请求的那个源有效。第三方站点想借受害者
-        浏览器读走数据，需要 `Access-Control-Allow-Credentials: true`
-        —— 我们从不发这个头（全仓库仅在 `frontend/src/api/events.ts` 的
-        注释里提到）。没有凭据时攻击者本来就无需 CORS 即可发请求，
-        回显不增加任何攻击面。
+        * `allow_origins` 为空（默认）：**不启用 CORS**，
+          响应里一个 `Access-Control-*` 头都不会出现；
+        * 传字符串 `"*"`：显式通配符，仅用于本机调试，**不要**用于生产；
+        * 传可迭代白名单：只有名单内的 Origin 才回 `Access-Control-Allow-Origin`，
+          名单外的请求拿到的是**没有 CORS 头**的响应 —— 浏览器因此拒绝
+          把响应交给页面脚本。
 
-        规则 15（`docs/06-安全设计文档.md` §10）的要求因此落在两点：
-        默认值不写 `*`，且无 `Origin` 时干脆不发这个头。
+        名单比对是**精确字符串比较**（含协议与端口）。不做前缀/通配匹配：
+        `https://a.example.com.evil.com` 曾能通过 `startswith` 类的检查。
         """
+
+        if isinstance(allow_origins, str):
+            origins: tuple[str, ...] = (allow_origins,)
+        else:
+            origins = tuple(str(o) for o in allow_origins)
+
+        if not origins:
+            self._cors = None
+            return
+
         self._cors = {
-            "origin": allow_origin,
+            "origins": frozenset(origins),
+            "wildcard": "*" in origins,
             "headers": allow_headers,
             "expose": expose_headers,
             "max_age": str(max_age),
@@ -375,32 +390,35 @@ class Router:
         return reply
 
     def _apply_cors(self, ctx: Ctx, reply: Reply) -> None:
-        """把 CORS 头写进响应。
+        """把 CORS 头写进响应 —— **只给白名单里的源**。
 
-        `allow_origin` 有三种语义（见 `enable_cors`）：
+        三种情形：
 
-        * `ECHO_ORIGIN`：有 Origin 就回显，没有就**一个都不发**；
-        * `"*"`：显式通配符，原样发；
-        * 其他固定值：原样发，并声明 `Vary: Origin`，因为同一个 URL
-          对不同源给出的是不同结果。
+        * 没启用 CORS：`dispatch` 根本不会调到这里；
+        * 白名单里有 `"*"`：显式通配，原样发；
+        * 白名单是具体源：命中才发，不命中**一个头都不发**。
+
+        ★ 关键细节：白名单命中时回的是**配置里的那个字符串**，不是请求里的
+        `Origin` 原值。两者虽然此刻相等，但让"响应头的内容完全由配置决定"
+        是一个可被 grep、可被断言的性质 —— 回显式实现做不到这一点，
+        也正是 F1 能成立的原因（配置里写着白名单，实际行为却是"谁问都给"）。
         """
-        assert self._cors is not None
-        configured = self._cors["origin"]
+        if self._cors is None:
+            return
         origin = ctx.headers.get("origin")
+        allowed = self._cors["origins"]
 
-        if configured == ECHO_ORIGIN:
-            if not origin:
-                # 没有 Origin 的请求（curl、<img>、顶层导航）不参与 CORS，
-                # 发任何 Allow-Origin 都没有意义，发 "*" 更是白白广播。
-                return
+        if self._cors["wildcard"]:
+            reply.headers["Access-Control-Allow-Origin"] = "*"
+        elif origin and origin in allowed:
+            # 用配置里的字符串而不是 origin 变量：见上面的 ★。
             reply.headers["Access-Control-Allow-Origin"] = origin
             reply.headers["Vary"] = "Origin"
         else:
-            reply.headers["Access-Control-Allow-Origin"] = configured
-            if configured != "*":
-                # 固定白名单值时响应对所有请求都一样，本来不必 Vary；
-                # 但一旦以后改成按 Origin 分支就会漏掉，加上更稳妥。
-                reply.headers["Vary"] = "Origin"
+            # 没命中白名单：连 Allow-Headers 之类也别发。发出去等于告诉
+            # 浏览器"这条路是通的"，而它其实拿不到响应体 —— 只会让
+            # 调试的人对着一条 200 但没有 CORS 头的响应猜半天。
+            return
 
         reply.headers["Access-Control-Allow-Headers"] = self._cors["headers"]
         reply.headers["Access-Control-Expose-Headers"] = self._cors["expose"]

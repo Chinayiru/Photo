@@ -731,3 +731,233 @@ def test_chunk_size_floor_is_respected(tmp_path: Path) -> None:
         "upload": {"chunk_mb_lan": 0},
     }, path=data / "config.json", data_dir=data)
     assert _chunk_size(cfg) == 256 * 1024
+
+
+# --------------------------------------------------------------------------
+# 会话额度：废弃会话必须能被回收（审计 F6）
+#
+# 这一节的每一条都对应一个"用户再也传不上任何东西"的真实死法。
+# `MAX_OPEN_SESSIONS = 3`，而 `open_session_count()` 数的是所有
+# `status='open'` 的行 —— 只要有三条**永远不会有进展**的会话，全站上传
+# 就被 429 锁死，用户看到的是"同时上传的任务太多"，而一个都没在传。
+# --------------------------------------------------------------------------
+
+
+def _age_session(db: Database, uid: str, *, created_ago: float) -> None:
+    """把会话的 created_at 往前挪，模拟"这是很久以前创建的"。"""
+    import time as _t
+
+    db.execute(
+        "UPDATE upload_sessions SET created_at = ? WHERE id = ?",
+        (_t.time() - created_ago, uid),
+    )
+
+
+def test_quota_counts_only_live_sessions(tmp_path, library, db):
+    """占满额度后，新的 init 必须被 429 拒 —— 这是前提，别测漏了。"""
+    cfg = _cfg(tmp_path, library)
+    for i in range(uploads.MAX_OPEN_SESSIONS):
+        _make(db, cfg, name=f"a{i}.jpg")
+    assert uploads.open_session_count(db) == uploads.MAX_OPEN_SESSIONS
+    with pytest.raises(AppError) as ei:
+        _make(db, cfg, name="blocked.jpg")
+    assert ei.value.code == "E4002"
+
+
+def test_stale_init_session_is_reclaimed(tmp_path, library, db):
+    """只 init 过、一个字节没收到、超过 STALE_INIT_SECONDS 的会话会被回收。
+
+    这是最常见的死法：用户在相册里选了 3 张，app 起了 3 个会话就崩了
+    （或用户直接切走）。这三个空会话会永久占满额度。
+    """
+    cfg = _cfg(tmp_path, library)
+    uids = [_make(db, cfg, name=f"a{i}.jpg")["upload_id"] for i in range(3)]
+    assert uploads.open_session_count(db) == 3
+
+    # 刚建完不算废弃 —— 正常客户端 init 完立刻开始传
+    assert uploads.reclaim_stale(db) == 0
+    assert uploads.open_session_count(db) == 3
+
+    for uid in uids:
+        _age_session(db, uid, created_ago=uploads.STALE_INIT_SECONDS + 60)
+    assert uploads.reclaim_stale(db) == 3
+    assert uploads.open_session_count(db) == 0
+
+    # 额度回来了：新上传必须能成功
+    assert _make(db, cfg, name="after.jpg")["created"] is True
+
+
+def test_session_with_bytes_is_not_reclaimed_too_early(tmp_path, library, db):
+    """"已经收到字节"的会话不能按 10 分钟判死 —— 那是续传中的会话。"""
+    cfg = _cfg(tmp_path, library)
+    uid = _make(db, cfg, data=b"x" * 100)["upload_id"]
+    _send(db, cfg, uid, b"x" * 10)
+    _age_session(db, uid, created_ago=uploads.STALE_INIT_SECONDS + 60)
+
+    # created_at 很旧，但临时文件刚写过 → 不算废弃
+    assert uploads.reclaim_stale(db) == 0
+    sess = uploads.get_session(db, uid)
+    assert sess["status"] == "open"
+
+
+def test_idle_session_is_reclaimed_after_idle_window(tmp_path, library, db):
+    """传了一半、临时文件超过 IDLE_RECLAIM_SECONDS 没被碰过 → 回收，但**不删文件**。
+
+    不删文件是刻意的：用户回来点重试走 `_reconcile_offset` 还能接着传。
+    这里要验的正是"额度回来了"和"数据还在"这两件事同时成立。
+    """
+    import os as _os
+    import time as _t
+
+    cfg = _cfg(tmp_path, library)
+    uid = _make(db, cfg, data=b"x" * 100)["upload_id"]
+    _send(db, cfg, uid, b"x" * 10)
+    temp = Path(uploads.get_session(db, uid)["temp_path"])
+
+    old = _t.time() - uploads.IDLE_RECLAIM_SECONDS - 60
+    _os.utime(temp, (old, old))
+
+    assert uploads.reclaim_stale(db) == 1
+    assert uploads.open_session_count(db) == 0
+    # ★ 临时文件必须还在 —— 回收与否只影响名额，不能连累用户已传的字节
+    assert temp.is_file()
+    assert temp.stat().st_size == 10
+
+
+def test_session_whose_temp_file_vanished_is_reclaimed(tmp_path, library, db):
+    """临时文件被系统清理掉了：这个会话永远 complete 不了，必须让位。"""
+    cfg = _cfg(tmp_path, library)
+    uid = _make(db, cfg, data=b"x" * 100)["upload_id"]
+    _send(db, cfg, uid, b"x" * 10)
+    Path(uploads.get_session(db, uid)["temp_path"]).unlink()
+
+    assert uploads.reclaim_stale(db) == 1
+    assert uploads.open_session_count(db) == 0
+
+
+def test_purge_runs_before_quota_check(tmp_path, library, db):
+    """过期会话必须在**计数之前**被清掉，否则它自己会把清理入口堵死。
+
+    早先的顺序是 `if count >= MAX: raise` 然后才 `purge_expired()` ——
+    过期会话明明已经过了 expires_at，用户却一直收到 429，直到 24 小时后
+    别的路径触发清理。这条用例钉住的是**顺序**，不是清理逻辑本身
+    （清理逻辑在 `test_purge_expired_*` 里）。
+    """
+    import time as _t
+
+    cfg = _cfg(tmp_path, library)
+    for i in range(uploads.MAX_OPEN_SESSIONS):
+        _make(db, cfg, name=f"a{i}.jpg")
+    # 全部置成"已过期但还没被清"
+    db.execute(
+        "UPDATE upload_sessions SET expires_at = ? WHERE status = 'open'",
+        (_t.time() - 10,),
+    )
+    assert uploads.open_session_count(db) == 0   # 计数本来就不含过期行
+    # 但行还在，且 purge 之前它们仍占 status='open'
+    assert db.scalar(
+        "SELECT COUNT(*) FROM upload_sessions WHERE status = 'open'") == 3
+
+    # 关键：这次 init 必须成功（内部先 purge 再计数）
+    r = _make(db, cfg, name="fresh.jpg")
+    assert r["created"] is True
+    # 那三条被 purge 置成 expired
+    assert db.scalar(
+        "SELECT COUNT(*) FROM upload_sessions WHERE status = 'expired'") == 3
+
+
+def test_reclaim_never_raises_on_broken_row(tmp_path, library, db):
+    """回收过程绝不能因为某一行坏掉而影响别人。"""
+    cfg = _cfg(tmp_path, library)
+    good = _make(db, cfg, name="good.jpg")["upload_id"]
+    bad = _make(db, cfg, name="bad.jpg")["upload_id"]
+    db.execute("UPDATE upload_sessions SET temp_path = ? WHERE id = ?",
+               ("", bad))
+    _age_session(db, bad, created_ago=uploads.STALE_INIT_SECONDS + 60)
+    _age_session(db, good, created_ago=uploads.STALE_INIT_SECONDS + 60)
+
+    # 不抛，且两条都被回收（空路径那条走"文件不存在"分支）
+    assert uploads.reclaim_stale(db) == 2
+
+
+def test_abort_releases_quota_immediately(tmp_path, library, db):
+    """`DELETE /api/uploads/{id}` 之后额度必须立刻回来（前端 F6 的另一半）。"""
+    cfg = _cfg(tmp_path, library)
+    uids = [_make(db, cfg, name=f"a{i}.jpg")["upload_id"] for i in range(3)]
+    for uid in uids:
+        assert uploads.abort_session(db, cfg, uid) is True
+    assert uploads.open_session_count(db) == 0
+    assert _make(db, cfg, name="after-abort.jpg")["created"] is True
+
+
+# --------------------------------------------------------------------------
+# 未知 root_id 必须是 4xx（审计 F7）
+#
+# 客户端传了个不存在的 root id 是**请求错误**，不是服务器故障。
+# 早先 Config.root_by_id() 抛的是普通 ConfigError（继承 Exception），
+# 而 errors.EXC_MAP 里没有它 → 归一成 Internal(None) → 500
+# "服务器开小差"，用户完全不知道自己拼错了参数。
+# --------------------------------------------------------------------------
+
+
+def test_unknown_root_id_is_400_not_500(tmp_path, library, db):
+    """`create_session` 抛出来的原始异常经 `to_app_error` 必须变成 400。
+
+    ★ 为什么这里要显式调 `to_app_error` 而不是断言 `pytest.raises(AppError)`：
+    `uploads.create_session()` 是**服务层**，它抛出的是领域异常
+    （`UnknownRootError`），归一成 HTTP 错误码是 dispatch 层的职责
+    （`backend/app/errors.py` 的 `to_app_error`）。直接断言 AppError
+    会让人误以为服务层就该产出 HTTP 语义 —— 那是上一版的错误模型，
+    也正是 F7 之前"ConfigError 落不进 EXC_MAP 就变 500"的温床。
+    """
+    from backend.app.config import UnknownRootError
+    from backend.app.errors import to_app_error
+
+    cfg = _cfg(tmp_path, library)
+    with pytest.raises(UnknownRootError):
+        uploads.create_session(db, cfg, name="a.jpg", size=10, root_id="nope")
+
+    err = to_app_error(UnknownRootError("未知的根目录 id: 'nope'"))
+    assert err.status == 400, f"未知 root 应为 400，实际 {err.status}"
+    assert err.spec.code == "E1001"
+
+
+def test_unknown_root_error_does_not_leak_path(tmp_path, library, db):
+    """归一后响应体里不能出现磁盘路径 —— docs/04 §6 的硬约束。
+
+    ★ 反向验证：把同一段消息里塞进库路径，归一后必须**看不见**它。
+    只断言"正常输入不泄漏"是不够的 —— 那种断言在 `detail=str(exc)`
+    的实现下也能过，因为正常输入的消息里本来就没有路径。
+    """
+    from backend.app.config import UnknownRootError
+    from backend.app.errors import to_app_error
+
+    leaky = UnknownRootError(f"未知的根目录 {library}")
+    err = to_app_error(leaky)
+    text = f"{err.detail or ''}{err.spec.message}{err!r}"
+    assert str(library) not in text, f"响应里泄漏了库路径：{text}"
+    assert str(tmp_path) not in text
+
+
+def test_unknown_root_is_a_distinct_exception(tmp_path, library):
+    """类型要分得开：请求错（UnknownRootError）vs 配置坏（ConfigError）。
+
+    `Config.is_first_run()` 靠 `except ConfigError: return True` 判断
+    "配置里没有可用根"。如果 UnknownRootError 不是 ConfigError 的
+    子类而是并列类型，那两处语义就乱了 —— 但反过来，如果 root_by_id
+    在"没有启用任何根"时也抛 UnknownRootError，首次运行判定就会失效。
+    所以这里把两个方向都钉住。
+    """
+    from backend.app.config import ConfigError, UnknownRootError
+
+    cfg = _cfg(tmp_path, library)
+    assert issubclass(UnknownRootError, ConfigError)
+    with pytest.raises(UnknownRootError):
+        cfg.root_by_id("nope")
+    # 正常 id 不受影响
+    assert cfg.root_by_id("library").id == "library"
+
+
+def test_root_by_id_none_uses_default(tmp_path, library):
+    cfg = _cfg(tmp_path, library)
+    assert cfg.root_by_id(None).id == "library"

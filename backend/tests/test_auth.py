@@ -62,6 +62,11 @@ def _state(tmp_path: Path, db: Database, *, require_pairing: bool = True,
         auth["token_ttl_days"] = ttl
     cfg = Config({
         "app": {"mode": "readwrite"},
+        # ★ `panel_http: True`：本文件的用例全部围绕 `/panel/**` 的访问控制，
+        # 而生产默认是"整条关掉"（审计 F1-b：本机上任何网页的来源 IP 都是
+        # 127.0.0.1，与用户本人无从区分）。显式打开才能测那层"回环 + 非回环"
+        # 的判定；"默认关掉时连回环也 404"由 test_handlers / 专门用例覆盖。
+        "server": {"panel_http": True},
         "roots": [{"id": "library", "path": str(lib), "mode": "readwrite"}],
         "auth": auth,
     }, path=data / "config.json", data_dir=data)
@@ -1126,3 +1131,38 @@ def test_panel_devices_reports_expiry(tmp_path: Path, db: Database) -> None:
     db.execute("UPDATE devices SET expires_at = ?", (time.time() - 10,))
     r = _call(st, "/panel/devices", client_ip="127.0.0.1")
     assert _json(r)["items"][0]["expired"] is True
+
+
+def test_is_loopback_rejects_empty_and_missing_ip() -> None:
+    """空 IP 绝不能当成回环（审计 F11）。
+
+    `Ctx.client_ip` 的默认值就是空串，任何忘了填 IP 的构造路径
+    （新传输层、测试夹具、某个 future 的进程内调用）会让
+    `/panel/**` 静默变成公开接口 —— 而 `/panel/pair-code` 能直接
+    签发配对码，等于把配对机制整个绕过。
+
+    ★ 反向用例是这条测试的重点。只断言"127.0.0.1 为真"的话，
+    把整个函数改成 `return True` 也能过。
+    """
+    class _C:
+        def __init__(self, ip):
+            self.client_ip = ip
+
+    assert not is_loopback(_C(""))
+    assert not is_loopback(_C("   "))
+    assert not is_loopback(_C(None))
+    # 回环本身仍然要认
+    assert is_loopback(_C("127.0.0.1"))
+    assert is_loopback(_C("::1"))
+
+
+def test_panel_is_unreachable_when_client_ip_is_unknown(tmp_path: Path, db: Database) -> None:
+    """端到端确认：client_ip 为空时 /panel 必须 404，而不是放行。
+
+    这条测的是行为而不是辅助函数 —— `is_loopback` 被三处调用
+    （中间件 + 三个 handler 里的第二次判定），任何一处漏用都会
+    让上一层的修复白做。
+    """
+    st = _state(tmp_path, db)
+    r = _call(st, "/panel/pair-code", method="POST", client_ip="")
+    assert r.status == 404, f"空 client_ip 竟然能签发配对码：{r.status}"
