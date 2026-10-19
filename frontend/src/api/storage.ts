@@ -14,11 +14,19 @@
 
 export const K_TOKEN = "pb.token";
 export const K_DEVICE_ID = "pb.device_id";
+/** 局域网基址，如 `http://192.0.2.10:8787`（**候选**，不是当前生效值）。 */
 export const K_BASE = "pb.base";
+/** 云端基址，如 `https://pb.example.com/d/<云端 device_id>`（候选）。 */
+export const K_CLOUD = "pb.cloud";
+/** 当前生效通路：`"lan"` | `"cloud"`。缺省按 `"lan"`。 */
+export const K_VIA = "pb.via";
 /** 电脑端显示名，仅用于界面文案（不是鉴权信息）。 */
 export const K_DEVICE_NAME = "pb.device_name";
 /** 本机自定义的客户端名，作为 `X-PB-Client` 头发给电脑端审计日志。 */
 export const K_CLIENT_NAME = "pb.client_name";
+
+/** 两条通路。命名与后端 `ctx.via`（`lan`/`cloud`）对齐。 */
+export type Via = "lan" | "cloud";
 
 function read(key: string): string {
   try {
@@ -50,16 +58,56 @@ export function getBase(): string {
   return read(K_BASE);
 }
 
-export function getDeviceName(): string {
-  return read(K_DEVICE_NAME);
+/** 云端候选基址（`https://域名/d/<id>`）；没配云端时为空串。 */
+export function getCloudBase(): string {
+  return read(K_CLOUD);
 }
 
-export function setClientName(name: string): void {
-  write(K_CLIENT_NAME, name);
+/**
+ * 当前生效的通路。
+ *
+ * 为什么要把它落盘：`client.ts` 的 `currentBase()` 每次请求都读一次
+ * （`docs/03` §5.2.2 的硬要求），而它必须在**同步**路径里算出基址 ——
+ * `fetch` 之前不能 await。所以"哪条通路"只能是一个同步可读的值。
+ *
+ * ⚠️ 不能"两条都存着、请求时再挑"：一次时间线请求打 A、下一张缩略图
+ * 打 B，用户会看到一半照片来自云端、一半来自局域网，而缓存键（`v=`）
+ * 是同一个 —— 排查时完全对不上。
+ */
+export function getVia(): Via {
+  return read(K_VIA) === "cloud" ? "cloud" : "lan";
 }
 
-export function getClientName(): string {
-  return read(K_CLIENT_NAME);
+export function setVia(via: Via): void {
+  write(K_VIA, via);
+}
+
+/**
+ * 当前**实际生效**的通路。
+ *
+ * 与 `getVia()` 的区别只在一种情况下可见：落盘值是 `cloud` 但云端地址
+ * 是空的（用户清了站点数据的一部分、或从旧版本升级上来）。那时请求
+ * 会回退到局域网（见 `activeBase()`），所以"生效通路"必须是 `lan` ——
+ * 否则状态条会显示"云端中继"而实际走的是直连，排查时对不上。
+ */
+export function currentVia(): Via {
+  if (getVia() === "cloud" && getCloudBase()) return "cloud";
+  return "lan";
+}
+
+/**
+ * 当前应该用的基址。
+ *
+ * 云端通路选了但云端地址是空的（用户清了 localStorage 的一部分、
+ * 或从旧版本升级上来）时**回退到局域网**而不是返回空串：返回空串会让
+ * `client.ts` 抛 `NO_BASE`，界面显示"尚未配对"，而其实局域网是通的。
+ */
+export function activeBase(): string {
+  if (getVia() === "cloud") {
+    const c = getCloudBase();
+    if (c) return c;
+  }
+  return getBase();
 }
 
 /** 配对成功后一次性落盘。 */
@@ -68,11 +116,17 @@ export function savePairing(p: {
   deviceId: string;
   deviceName: string;
   base: string;
+  /** 云端基址（`POST /api/devices/{id}/pair` 的返回值里带；直连配对时没有）。 */
+  cloudBase?: string;
 }): void {
   write(K_TOKEN, p.token);
   write(K_DEVICE_ID, p.deviceId);
   write(K_DEVICE_NAME, p.deviceName);
   write(K_BASE, normalizeBase(p.base));
+  write(K_CLOUD, normalizeBase(p.cloudBase ?? ""));
+  // 刚配对完一定是直连（用户就在电脑边上扫码），把它钉住，
+  // 免得上一台电脑留下的 `pb.via="cloud"` 让首次请求打到云端。
+  write(K_VIA, "lan");
   // ★ 同一浏览器里 `base` 变了就必须重发 cookie：cookie 是**按
   // host:port 隔离**的，换一台电脑（或换了端口）时旧 cookie 不会
   // 跟着走，但也不会被覆盖，于是新电脑上缩略图全部 401 而 JS
@@ -85,13 +139,32 @@ export function saveBase(base: string): void {
   write(K_BASE, normalizeBase(base));
 }
 
+/** 只改云端基地址（配对响应里带回来，或用户在设置页填的）。 */
+export function saveCloudBase(base: string): void {
+  write(K_CLOUD, normalizeBase(base));
+}
+
 /** 退出配对：清掉全部凭证，但保留客户端名（下次配对不用重输）。 */
 export function clearPairing(): void {
   write(K_TOKEN, "");
   write(K_DEVICE_ID, "");
   write(K_DEVICE_NAME, "");
   write(K_BASE, "");
+  write(K_CLOUD, "");
+  write(K_VIA, "");
   clearTokenCookie();
+}
+
+export function getDeviceName(): string {
+  return read(K_DEVICE_NAME);
+}
+
+export function setClientName(name: string): void {
+  write(K_CLIENT_NAME, name);
+}
+
+export function getClientName(): string {
+  return read(K_CLIENT_NAME);
 }
 
 /* ------------------------------------------------------------------ *

@@ -46,7 +46,7 @@
  *     host:port 隔离的，换一台电脑就是换一个 host，旧连接必然 401。
  */
 import { absUrl, backoffMs, sleep } from "./client";
-import { getBase, getToken } from "./storage";
+import { activeBase, getToken } from "./storage";
 
 /** 事件类型（与 `backend/app/events.py: EVENT_TYPES` 对齐）。 */
 export type EventType =
@@ -153,7 +153,7 @@ export function isConnected(): boolean {
  * 而服务端每条连接都占一个订阅者队列（`QUEUE_MAX` = 256 条事件）。
  */
 export function connectEvents(): void {
-  const base = getBase();
+  const base = activeBase();
   const url = `${absUrl("/api/events")}`;
 
   // 没有 base 说明还没配对：连了也是 401，直接不连。

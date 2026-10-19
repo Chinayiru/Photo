@@ -198,8 +198,15 @@ DEFAULT_CONFIG: Final[dict[str, Any]] = {
     },
     "cloud": {
         # 二期字段。一期留空即可，transport 不会读取。
+        #
+        # `device_id` 是**云端**分配的 32 位 hex（`scripts/cloud_init.py`
+        # 打印的那一行），与本地 `state.device_id`（16 位、电脑自己生成）
+        # 是两个不同的东西。云端 `/agent/ws` 的握手要求 HELLO 报的是
+        # 前者，因为 `agent_token` 绑在云端那行 `devices.id` 上。
         "base_url": "",
         "enabled": False,
+        "device_id": "",
+        "agent_token": "",
     },
 }
 

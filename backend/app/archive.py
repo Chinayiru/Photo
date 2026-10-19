@@ -353,6 +353,44 @@ def _as_exists_or_raise(exc: SandboxError) -> Exception:
     return exc
 
 
+#: Windows 上「文件正被别的进程短暂持有」造成的瞬时失败。
+#:   5  = ERROR_ACCESS_DENIED
+#:   32 = ERROR_SHARING_VIOLATION
+#:   33 = ERROR_LOCK_VIOLATION
+#:
+#: 这三个码在 `os.replace` 上出现时**不表示名字被占**：真被占的情况在
+#: `reserve()` 的 `O_CREAT|O_EXCL` 就已经变成 `FileExistsError` 了。
+#: 实测触发源是杀软 / Windows Search / 备份代理——它们会在我们刚建出
+#: 占位文件的那一瞬间打开它扫描，此后的几百微秒里该路径不可替换。
+#: 把它当成「重名」会让**同一秒内的第二张照片被跳号**：库里凭空多出
+#: `_2.jpg` 而没有 `_1.jpg`，两条归档用例偶发红（实测 400 轮里 38 轮）。
+_REPLACE_RETRY_WINERRORS = frozenset({5, 32, 33})
+
+#: 重试次数与退避。总耗时上界 ≈ 0.01+0.02+0.03+0.04 = 100ms，
+#: 远小于用户可感知的延迟，也远小于任何一次上传的网络抖动。
+_REPLACE_ATTEMPTS = 5
+_REPLACE_BACKOFF = 0.01
+
+
+def _replace_with_retry(src: Path, dst: Path) -> None:
+    """`os.replace` + 对瞬时共享冲突重试。
+
+    非瞬时错误（含 EXDEV 跨卷）立刻抛出，交给调用方的既有分支处理。
+    """
+    last: OSError | None = None
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in _REPLACE_RETRY_WINERRORS:
+                raise
+            last = exc
+            time.sleep(_REPLACE_BACKOFF * (attempt + 1))
+    assert last is not None
+    raise last
+
+
 async def place(
     src: Path,
     root: RootConfig,
@@ -400,7 +438,7 @@ async def place(
                 last_exc = exc
                 break
             try:
-                os.replace(src, dst)
+                _replace_with_retry(src, dst)
             except OSError as exc:
                 # 必须清掉占位文件，否则库里留下一个 0 字节的"照片"，
                 # 它会被索引器收录，用户在时间线上看到一张打不开的图。

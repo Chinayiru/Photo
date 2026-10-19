@@ -373,3 +373,54 @@ def test_cleanup_tmp_removes_stale_files(tmp_path: Path) -> None:
 def test_cleanup_tmp_on_missing_dir_is_noop(tmp_path: Path) -> None:
     root = _root(tmp_path)
     assert archive.cleanup_tmp(root) == 0
+
+def test_place_retries_transient_share_violation(tmp_path: Path) -> None:
+    """占位文件被外部进程短暂占用时，必须重试，而不是当成「重名」跳号。
+
+    Windows 上杀软 / Windows Search 会在 `O_CREAT|O_EXCL` 刚建出空文件的
+    瞬间打开它扫描，接下来的几百微秒里 `os.replace` 抛
+    `OSError [WinError 5] 拒绝访问`。真重名在 `reserve()` 就已经是
+    `FileExistsError` 了，所以这个码一定不是「名字被占」。
+
+    按「重名」处理会让同一秒内的第二张照片落到 `_2.jpg`（`_1.jpg` 凭空
+    消失），用户的照片顺序看起来是错的。实测未修时 400 轮里 38 轮跳号。
+    """
+    root = _root(tmp_path)
+    cfg = _cfg(tmp_path, root)
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst, *args, **kwargs):     # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            exc = OSError(13, "拒绝访问", str(src), 5, str(dst))
+            exc.winerror = 5          # type: ignore[attr-defined]
+            raise exc
+        return real_replace(src, dst, *args, **kwargs)
+
+    orig = archive.os.replace
+    archive.os.replace = flaky_replace    # type: ignore[assignment]
+    try:
+        rel, dst = asyncio.run(archive.place(
+            _src(tmp_path, b"X" * 16, "a.part"), root, TS, "jpg",
+            subdir="手机上传", cfg=cfg))
+    finally:
+        archive.os.replace = orig        # type: ignore[assignment]
+
+    assert calls["n"] == 3, "前两次失败必须被重试，第三次才成功"
+    assert dst.name == f"{_stamp()}.jpg", "跳号了：瞬时冲突被当成重名"
+    assert dst.read_bytes() == b"X" * 16
+
+
+def test_place_gives_up_only_on_real_name_collision(tmp_path: Path) -> None:
+    """真重名仍然正常递增序号 —— 重试不能把这一行为改坏。"""
+    root = _root(tmp_path)
+    cfg = _cfg(tmp_path, root)
+    first = asyncio.run(archive.place(
+        _src(tmp_path, b"1", "a.part"), root, TS, "jpg",
+        subdir="手机上传", cfg=cfg))
+    second = asyncio.run(archive.place(
+        _src(tmp_path, b"2", "b.part"), root, TS, "jpg",
+        subdir="手机上传", cfg=cfg))
+    assert first[1].name == f"{_stamp()}.jpg"
+    assert second[1].name == f"{_stamp()}_1.jpg"

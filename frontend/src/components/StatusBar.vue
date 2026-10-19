@@ -2,12 +2,43 @@
 /**
  * 顶部状态条：显示通路与设备名。
  *
- * 一期只有局域网直连，所以只有 🟢 与 🔴 两态；
- * 二期接云隧道时这里再加 🔵 云端中继（docs/03 §5.1.3）。
+ * 四个视觉态（`docs/03` §5.1.3）：
+ *
+ * | 通路 | 点 | 文案 |
+ * |---|---|---|
+ * | 局域网直连 | 🟢 绿 | 局域网直连 |
+ * | 云端中继 | 🔵 蓝 | 云端中继 |
+ * | 正在探测 | 🟡 闪 | 正在连接… |
+ * | 不通/配对失效 | 🔴 红 | 电脑离线 / 配对已失效 |
+ *
+ * 为什么云端要单独一个颜色而不是也用绿：两种通路都"能用"，但延迟、
+ * 手机流量、是否经过公网完全不同。用同一个绿点，用户在家里 Wi-Fi 没连上、
+ * 悄悄走了 4G 云端时完全看不出来 —— 而这正是最该让他知道的一件事。
+ * 同理，云端态的设备名后面加一枚 📶 之类的标记反而不如直接换色清楚。
+ *
+ * 点击 = 手动重新探测（`transport.rescan()`，会清掉"局域网失败记忆"，
+ * 是用户手动纠正"刚才明明连着"的唯一入口）。
  */
-import { authStore, connClass, connText, deviceLabel, probe } from "../stores/auth";
+import { computed } from "vue";
+import {
+  authStore, connClass, connText, deviceLabel, deviceMismatch, reconnect,
+} from "../stores/auth";
 
 defineProps<{ title: string }>();
+
+/**
+ * 设备名只在确认连上的态显示。
+ * 探测中/离线时那个名字是**上一次**的缓存值，显示出来会让人以为还连着。
+ */
+const showDevice = computed<boolean>(() => {
+  const s = authStore.state.conn;
+  return (s === "DIRECT" || s === "CLOUD") && Boolean(deviceLabel.value);
+});
+
+const hint = computed<string>(() => {
+  if (deviceMismatch.value) return "连到了另一台电脑，点击重新探测";
+  return `连接状态：${connText.value}，点击重新探测`;
+});
 </script>
 
 <template>
@@ -17,12 +48,13 @@ defineProps<{ title: string }>();
       class="conn"
       :class="connClass"
       type="button"
-      :aria-label="`连接状态：${connText}，点击重新探测`"
-      @click="probe"
+      :aria-label="hint"
+      :title="hint"
+      @click="reconnect"
     >
       <span class="dot" aria-hidden="true" />
       <span class="conn-text ellipsis">{{ connText }}</span>
-      <span v-if="authStore.state.conn === 'DIRECT'" class="dev ellipsis">
+      <span v-if="showDevice" class="dev ellipsis">
         {{ deviceLabel }}
       </span>
     </button>
@@ -73,6 +105,21 @@ defineProps<{ title: string }>();
 .conn.ok .dot {
   background: var(--ok);
   box-shadow: 0 0 6px var(--ok);
+}
+
+/* 云端中继：蓝点 + 淡蓝底。不加动画 —— 它是稳态，不是过渡态；
+   动起来会让人以为"还在连"，而实际已经可以用了 */
+.conn.cloud {
+  background: var(--cloud-dim);
+}
+
+.conn.cloud .dot {
+  background: var(--cloud);
+  box-shadow: 0 0 6px var(--cloud);
+}
+
+.conn.cloud .conn-text {
+  color: var(--cloud);
 }
 
 .conn.busy .dot {

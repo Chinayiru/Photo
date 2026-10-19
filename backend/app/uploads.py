@@ -612,6 +612,12 @@ def _chunk_size(cfg: Config) -> int:
     为什么按 transport 而不是按"客户端声称的网络类型"：客户端不可信，
     而且它自己往往也判断不出来（手机连着的 Wi-Fi 背后可能是 4G 中继）。
     服务端知道自己在用哪条通路。
+
+    ⚠️ `cloud_tunnel` 适配器**同时**开着局域网与隧道（双通路）。此时
+    `server.transport` 只能填一个值，于是"本地那半条路"也会被算成 WAN
+    档。这是**刻意的**：同一个上传会话可能在中途从 Wi-Fi 切到 4G
+    （`docs/03` §5.1 的通路切换），分片大小由服务端在 init 时一次定死，
+    选小的那个永远安全；反过来选 8 MB 会让切换后的每一片都重传失败。
     """
     transport = str(cfg.get("server.transport", "local_http") or "local_http")
     key = "chunk_mb_lan" if transport == "local_http" else "chunk_mb_wan"

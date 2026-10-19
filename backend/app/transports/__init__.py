@@ -105,15 +105,22 @@ def build(cfg: Any, router: Any) -> ServerTransport:
 
 
 def _register_builtin() -> None:
-    """登记一期自带的通路。
+    """登记自带的通路。
 
     放在函数里而不是模块顶层，是为了让 `register()` 的调用点集中可见，
     同时避免 `import .local_http` 与 `local_http` 反过来 `import .base`
     形成循环。
+
+    `cloud_tunnel` 的 import 也在这里：它内部 `from . import register`，
+    而此刻本模块已经把 `register` 定义好了，所以不会形成循环。若改成
+    在 `cloud_tunnel.py` 顶层 `from . import register` 而本模块顶层
+    `import .cloud_tunnel`，两者就会互等到 `ImportError`。
     """
+    from .cloud_tunnel import _register as _register_cloud
     from .local_http import LocalHttpTransport
 
     register("local_http", LocalHttpTransport)
+    _register_cloud()
 
 
 _register_builtin()

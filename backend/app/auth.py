@@ -41,6 +41,7 @@ from typing import Any, Final
 
 from .core import Ctx
 from .netguard import check_host
+from shared import client_token as token_mod
 from .errors import (
     E1002,
     E1003,
@@ -76,6 +77,7 @@ __all__ = [
     "revoke_all_codes",
     "require_client",
     "optional_client",
+    "sync_revoked_clients",
     "auth_middleware",
     "PUBLIC_PATHS",
     "PANEL_PATHS",
@@ -468,6 +470,144 @@ def _lookup_device(db: Any, token: str) -> Any:
     )
 
 
+#: 云端令牌的本地缓存表名。**不改 `devices` 表**是有意的：
+#: `devices` 的 `id` 是本地配对时生成的 16 位 hex，而云端令牌的
+#: `client_id` 是云端生成的 32 位 hex，两者语义不同却能同名，
+#: 混在一张表里会让"撤销一台设备"变成"两张表的行都可能被改"。
+_CLOUD_TOKEN_TABLE: Final = "cloud_clients"
+
+
+def _ensure_cloud_table(db: Any) -> None:
+    """首次用云端令牌时建缓存表（老库升级上来时没有这张表）。"""
+    db.execute(
+        f"CREATE TABLE IF NOT EXISTS {_CLOUD_TOKEN_TABLE} ("
+        "  client_id  TEXT PRIMARY KEY,"
+        "  device_id  TEXT NOT NULL,"
+        "  name       TEXT,"
+        "  expires_at REAL,"
+        "  created_at REAL NOT NULL,"
+        "  last_seen  REAL"
+        ")"
+    )
+
+
+def _cloud_cfg(cfg: Any = None) -> Any:
+    """取当前配置。`require_client` 只拿得到 `ctx`，配置只能从这里拿。"""
+    if cfg is not None:
+        return cfg
+    from .config import get as _get_cfg
+
+    try:
+        return _get_cfg()
+    except Exception:  # noqa: BLE001 —— 配置坏了不该让鉴权抛别的异常
+        return None
+
+
+def _tunnel_secret(cfg: Any = None) -> str:
+    """两端共享的 HMAC 密钥 = `sha256(agent_token)`。
+
+    没配 `cloud.agent_token` 时返回空串，调用方据此跳过云端令牌校验
+    —— 一台根本没用过云端的电脑不该因为"表里有个不认识的令牌"而
+    多走一次 HMAC 计算（那是每个缩略图请求一次）。
+    """
+    cfg = _cloud_cfg(cfg)
+    if cfg is None:
+        return ""
+    raw = str(cfg.get("cloud.agent_token", "") or "").strip()
+    if not raw:
+        return ""
+    return token_mod.secret_for_agent_token(raw)
+
+
+def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
+    """二期路径：验签云端签发的 HMAC 令牌，成功则落一行缓存并返回设备信息。
+
+    ★ 验签通过**不等于**放行：还要让本地库记下这枚令牌，否则下面这个
+    场景会静默失效 —— 用户在手机上点"移除这台设备"，云端把它标成
+    revoked，但电脑永远不知道（它只验签、不查吊销）。所以这里先写
+    缓存行，再让 `revoked` 由 `sync_revoked_clients()` 从云端拉回来。
+    缓存行同时是"`GET /api/devices` 里能看到这台手机"的依据。
+
+    ★ `expires_at` 用令牌自己的 `exp`，不用 `token_ttl_days` 配置：
+    令牌是云端签的，它的寿命由云端决定，本地配置改了也不该让它变长。
+    """
+    secret = _tunnel_secret(ctx.app.cfg if ctx.app is not None else None)
+    if not secret:
+        return None
+    st = ctx.app
+    # ★ 这里比对的必须是**云端**设备 id，不是本地那个 16 位 id。
+    # 云端令牌的 `dev` claim 出自 `clients.device_id`，它引用的是
+    # `devices.id`（32 位、云端分配）；本地 `state.device_id` 是电脑首次
+    # 启动自己生成的 16 位串。混用会让每一枚云端令牌都验签失败，而症状
+    # 是"配对成功、之后所有请求 401"——见 `tunnel.cloud_device_id` 的表。
+    from .tunnel import cloud_device_id
+
+    cfg = ctx.app.cfg if ctx.app is not None else None
+    device_id = cloud_device_id(cfg, st.device_id if st is not None else "")
+    claims = token_mod.verify_token(secret, token, device_id=device_id)
+    if claims is None:
+        return None
+
+    client_id = str(claims["sub"])
+    name = str(claims.get("nam") or "")[:64] or "手机"
+    exp = float(claims["exp"])
+    now = time.time()
+    try:
+        _ensure_cloud_table(db)
+        db.execute(
+            f"INSERT INTO {_CLOUD_TOKEN_TABLE}"
+            "(client_id, device_id, name, expires_at, created_at, last_seen)"
+            " VALUES (?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(client_id) DO UPDATE SET"
+            "   name = excluded.name, expires_at = excluded.expires_at,"
+            "   last_seen = excluded.last_seen",
+            (client_id, device_id, name, exp, now, now),
+        )
+    except Exception as e:  # noqa: BLE001 —— 缓存写失败不该让请求 500
+        log.debug("写入云端令牌缓存失败 client_id=%s: %s", client_id, e)
+
+    # 云端已撤销的令牌不能再放行。缓存行被 `sync_revoked_clients()`
+    # 打了 `expires_at=0`，这里一次主键查询就够（比再算一遍 HMAC 便宜）。
+    row = None
+    try:
+        row = db.query_one(
+            f"SELECT expires_at FROM {_CLOUD_TOKEN_TABLE} WHERE client_id = ?",
+            (client_id,))
+    except Exception:  # noqa: BLE001 —— 表刚建/并发建，退化为"按令牌判"
+        row = None
+    if row is not None and float(row["expires_at"] or 0) <= now:
+        return None
+
+    return {"id": client_id, "name": name, "cloud": True, "expires_at": exp}
+
+
+def sync_revoked_clients(st: Any, revoked_ids: list[str],
+                         *, access_token: str = "") -> int:
+    """把云端撤销列表落到本地缓存（`docs/04` §3.6）。
+
+    用 `expires_at = 0` 表示"已撤销"而不是删行：删了之后再验签会
+    **重新插入**一行干净记录，撤销就失效了（令牌本身没过期，签名也
+    还是对的）。这是本条链路唯一容易写错的地方。
+
+    返回实际影响的缓存行数。
+    """
+    if not revoked_ids:
+        return 0
+    _ensure_cloud_table(st.db)
+    n = 0
+    for cid in revoked_ids:
+        key = str(cid or "").strip()
+        if not key:
+            continue
+        n += int(st.db.execute_rowcount(
+            f"UPDATE {_CLOUD_TOKEN_TABLE} SET expires_at = 0"
+            " WHERE client_id = ? AND (expires_at IS NULL OR expires_at > 0)",
+            (key,)))
+    if n:
+        log.info("从云端同步到 %d 台被撤销的手机", n)
+    return n
+
+
 def require_client(ctx: Ctx) -> dict[str, Any]:
     """校验 Bearer token，返回设备信息；失败抛 401/403。
 
@@ -491,6 +631,28 @@ def require_client(ctx: Ctx) -> dict[str, Any]:
 
     row = _lookup_device(st.db, token)
     if row is None:
+        # --- 二期路径：云端签发的 HMAC 令牌（`shared/client_token.py`）---
+        #
+        # 先查本地库再验签，顺序不能反：
+        #   * 一期令牌（本地 `devices` 表里的行）校验是**一次索引查询**，
+        #     而验签每次要做一次 HMAC —— 缩略图滚动时这是每秒几十次的
+        #     差别，而绝大多数请求走的都是一期路径（局域网直连）；
+        #   * 反过来的顺序（先验签）在**没配云端**的机器上每次都要先
+        #     算一次空密钥短路，再落回查库，等于给常见路径加了一层。
+        info = _verify_cloud_token(ctx, st.db, token)
+        if info is not None:
+            ctx.state["client"] = info
+            ctx.state["via_cookie"] = not via_header
+            if via_header:
+                # 与一期同因（见下面那段"自愈路径"）：`<img>` 与
+                # `EventSource` 发不了自定义头，必须让浏览器也拿到 cookie。
+                # 云端令牌自带 `exp`，cookie 寿命按它算，不能按本地
+                # `token_ttl_days` —— 否则 cookie 比令牌活得久，
+                # 缩略图会在令牌过期后一直 401。
+                ctx.set_cookies.append(
+                    (CLIENT_COOKIE, token,
+                     cookie_max_age_for(info.get("expires_at"))))
+            return info
         # 失效的 cookie 必须清掉，否则浏览器会**永远**带着它：
         # 用户重新配对拿到新 token 后，`<img>` 仍优先发旧 cookie
         # （cookie 与 localStorage 是两个独立存储），缩略图继续 401，

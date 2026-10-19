@@ -35,7 +35,11 @@ dependencies = { file = ["requirements.txt"] }
 optional-dependencies = { dev = { file = ["requirements-dev.txt"] } }
 
 [tool.setuptools.packages.find]
-include = ["backend*", "shared*"]
+# `cloud*` 是二期的云端中继。它不随桌面安装包分发，但**必须在**这里：
+# 少一行 `include` 时 `pip install .` 会静默不装它，而 `python -m
+# cloud.relay.main` 在开发机上照样能跑（当前目录在 sys.path 里）——
+# 于是只有"用 pip 装到 VPS"这一条路会炸，且炸在部署当天。
+include = ["backend*", "shared*", "cloud*"]
 
 # ---------------------------------------------------------------------------
 # pytest

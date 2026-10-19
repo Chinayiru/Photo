@@ -789,7 +789,7 @@ def test_build_raises_on_unknown_transport_with_options() -> None:
     `ConfigError` 一样直接冒泡给启动日志，不做 API 脱敏 —— 用户需要
     看到自己写的那个名字和正确的候选。
     """
-    from app.transports import UnknownTransport, build
+    from app.transports import UnknownTransport, available, build
 
     cfg = _make_cfg()
     cfg.raw.setdefault("server", {})["transport"] = "relay_typo"
@@ -797,7 +797,11 @@ def test_build_raises_on_unknown_transport_with_options() -> None:
         build(cfg, router=None)
     assert "relay_typo" in str(ei.value)
     assert "local_http" in str(ei.value), "报错里没列出可用通路，用户无法自救"
-    assert ei.value.known == ["local_http"]
+    # ★ 不写死一份完整列表：二期会往注册表里加 `cloud_tunnel`/`relay`
+    # （P1-4），写死等于"每加一条通路都要回来改这条用例"，而这条用例
+    # 真正要钉的是"报错列出的候选 == 注册表里真实存在的候选"。
+    assert ei.value.known == available()
+    assert "local_http" in ei.value.known
 
 
 def test_build_treats_empty_name_as_default() -> None:

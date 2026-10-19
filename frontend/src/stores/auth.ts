@@ -1,14 +1,34 @@
 /**
  * 配对 / 连接状态 store。
  *
- * 一期只有局域网直连，所以这里没有 docs/03 §5.1 的双通路状态机
- * （PROBING/CLOUD/OFFLINE 那套是二期云隧道的）—— 但保留同样的
- * `ConnState` 词汇，二期接云端时只需在 `probe()` 里加分路。
+ * ## 一期到二期的变化
+ *
+ * 一期只有局域网直连，`probe()` 里就一处 ping。二期加了云端中继之后，
+ * "连接状态"变成一台**双通路状态机**（`docs/03` §5.1、`docs/09` P1-8），
+ * 实现搬到 `api/transport.ts`：
+ *
+ * ```text
+ *   IDLE ─► PROBING ─200─► DIRECT         （局域网 http://ip:8787）
+ *              └─失败─► CLOUD_PROBING ─200─► CLOUD   （https://域名/d/<id>）
+ *                            └─失败─► OFFLINE
+ * ```
+ *
+ * 本模块仍然持有 `ConnState`（界面读它），但**不再自己做探测** ——
+ * 它订阅 `transport.ts` 的状态变化并镜像进来。依赖方向是单向的：
+ *
+ * ```text
+ *   auth.ts ──► transport.ts ──► client.ts / storage.ts / netstate.ts
+ * ```
+ *
+ * 为什么不把状态机直接写在这个 store 里：`transport.ts` 要在请求失败时
+ * 被调用（`netstate.ts` 的中介回调），而请求层不该 import 一个 Vue store ——
+ * 那会让 `client.ts` 间接依赖 Vue 运行时，且形成 `store → client → store`
+ * 的循环。
  *
  * 职责：
- *   - 冷启动探活（`GET /api/system/ping`）
+ *   - 冷启动探活（交给 `transport.probe()`）
  *   - 校验 `device_id` 是否仍是同一台电脑（不一致要明确提示）
- *   - 配对（`POST /api/pair`）
+ *   - 配对（`POST /api/pair` 或云端的 `POST /api/devices/{id}/pair`）
  *   - 退出配对（清 localStorage）
  */
 
@@ -16,25 +36,51 @@ import { computed } from "vue";
 import { ApiError, api } from "../api/client";
 import type { PairResponse, PingResponse } from "../api/types";
 import {
+  activeBase,
   clearPairing,
   getBase,
+  getCloudBase,
   getDeviceId,
   getDeviceName,
   getToken,
   normalizeBase,
   saveBase,
+  saveCloudBase,
   savePairing,
 } from "../api/storage";
+import {
+  installTransport,
+  onPathChange,
+  pathDeviceName,
+  pathError,
+  pathMismatch,
+  pathState,
+  pathVersion,
+  probe as probeTransport,
+  rescan,
+  testBase,
+} from "../api/transport";
 import { createStore } from "./index";
 
 /**
- * `IDLE`      未探测（冷启动瞬间）
- * `PROBING`   正在 ping
- * `DIRECT`    局域网直连可用
- * `OFFLINE`   连不上电脑
- * `UNAUTHORIZED` 配对失效，需要重新配对
+ * `IDLE`          未探测（冷启动瞬间）
+ * `PROBING`       正在 ping 局域网
+ * `CLOUD_PROBING` 正在 ping 云端
+ * `DIRECT`        局域网直连可用
+ * `CLOUD`         云端中继可用
+ * `RE_PROBE`      通路失败后的重探测（`docs/03` §5.1.3）
+ * `OFFLINE`       两条通路都不通
+ * `UNAUTHORIZED`  配对失效，需要重新配对
  */
-export type ConnState = "IDLE" | "PROBING" | "DIRECT" | "OFFLINE" | "UNAUTHORIZED";
+export type ConnState =
+  | "IDLE"
+  | "PROBING"
+  | "CLOUD_PROBING"
+  | "DIRECT"
+  | "CLOUD"
+  | "RE_PROBE"
+  | "OFFLINE"
+  | "UNAUTHORIZED";
 
 const initial = {
   conn: "IDLE" as ConnState,
@@ -53,14 +99,17 @@ const initial = {
 
 export const authStore = createStore(initial);
 
-export const isPaired = (): boolean => Boolean(getToken() && getBase());
-export const currentBase = (): string => getBase();
+export const isPaired = (): boolean => Boolean(getToken() && (getBase() || getCloudBase()));
+export const currentBase = (): string => activeBase();
 
 /** 供模板用的派生值。 */
 export const connText = computed<string>(() => {
   switch (authStore.state.conn) {
     case "DIRECT": return "局域网直连";
-    case "PROBING": return "正在连接…";
+    case "CLOUD": return "云端中继";
+    case "PROBING":
+    case "CLOUD_PROBING":
+    case "RE_PROBE": return "正在连接…";
     case "OFFLINE": return "电脑离线";
     case "UNAUTHORIZED": return "配对已失效";
     default: return "未连接";
@@ -71,7 +120,10 @@ export const connText = computed<string>(() => {
 export const connClass = computed<string>(() => {
   switch (authStore.state.conn) {
     case "DIRECT": return "ok";
-    case "PROBING": return "busy";
+    case "CLOUD": return "cloud";
+    case "PROBING":
+    case "CLOUD_PROBING":
+    case "RE_PROBE": return "busy";
     case "OFFLINE": return "bad";
     case "UNAUTHORIZED": return "bad";
     default: return "idle";
@@ -79,52 +131,86 @@ export const connClass = computed<string>(() => {
 });
 
 /**
- * 探活。冷启动、以及每次切回前台时调用。
+ * 探活。冷启动、切回前台、用户点状态条、以及请求连续失败时调用。
  *
- * `expectDeviceId` 为 true 时校验设备一致性：用户家里两台电脑跑同一个
- * 程序、手机连过 A 之后 DHCP 把 IP 分给了 B，此时 base 能通、token 却
- * 属于 A —— 后端会返回 401 E2002，看起来像"配对失效"，用户会一头雾水地
- * 重新配对。所以配对前先 ping，发现 device_id 不同就直接告诉他
- * "连到了另一台电脑"。
+ * 真正的探测在 `api/transport.ts`（双通路状态机）。这里只做三件事：
+ *   1. 把状态机的进展镜像进 `authStore.state`（界面只读这一个 store）；
+ *   2. 校验 `device_id` —— 用户家里两台电脑跑同一个程序、手机连过 A 之后
+ *      DHCP 把 IP 分给了 B，此时基址能通、token 却属于 A。后端会返回
+ *      401 E2002，看起来像"配对失效"，用户会一头雾水地重新配对。所以
+ *      探测时就核对 device_id，不一致直接告诉他"连到了另一台电脑"；
+ *   3. 配对失效（401 E2002 / 403 E2004）时把状态置成 `UNAUTHORIZED`。
+ *
+ * 注意 `transport.probe()` 自己已经做了 device_id 校验，这里再读一次
+ * 是为了把值填进 store（`serverDeviceId` / `deviceName` / `version`）。
  */
 export async function probe(): Promise<boolean> {
   const s = authStore.state;
-  if (!getBase()) {
+  if (!getBase() && !getCloudBase()) {
     s.conn = "IDLE";
     return false;
   }
   s.probing = true;
-  s.conn = "PROBING";
   try {
-    // ping 不需要 token（后端 ping 不校验），所以配对前后都能调
-    const r = await api.get<PingResponse>("/api/system/ping", {
-      timeoutMs: 5000,
-      skipAuthLost: true,
-    });
-    s.serverDeviceId = r.device_id;
-    s.deviceName = r.device_name;
-    s.version = r.version;
-    s.lastError = "";
-    s.lastOkAt = Date.now();
-
-    const expected = getDeviceId();
-    if (expected && r.device_id !== expected) {
-      s.deviceMismatch = true;
-      s.conn = "OFFLINE";
-      s.lastError = "连到了另一台电脑";
-      return false;
-    }
-    s.deviceMismatch = false;
-    s.conn = getToken() ? "DIRECT" : "IDLE";
-    return true;
+    const ok = await probeTransport();
+    syncFromTransport();
+    s.probing = false;
+    return ok;
   } catch (e) {
     const err = e instanceof ApiError ? e : null;
     s.lastError = err?.friendly ?? "无法连接";
     s.conn = err?.isAuthLost ? "UNAUTHORIZED" : "OFFLINE";
-    return false;
-  } finally {
     s.probing = false;
+    return false;
   }
+}
+
+/** 把 `transport.ts` 的状态镜像进本 store。 */
+function syncFromTransport(): void {
+  const s = authStore.state;
+  const st = pathState();
+  s.conn = st as ConnState;
+  s.deviceMismatch = pathMismatch();
+  if (s.deviceMismatch) s.lastError = "连到了另一台电脑";
+  else s.lastError = pathError() || s.lastError;
+  if (pathDeviceName()) s.deviceName = pathDeviceName();
+  if (pathVersion()) s.version = pathVersion();
+  if (st === "DIRECT" || st === "CLOUD") {
+    s.serverDeviceId = getDeviceId();
+    s.lastOkAt = Date.now();
+  }
+}
+
+/**
+ * 安装双通路状态机（`main.ts` 在挂载前调一次，幂等）。
+ *
+ * 注册之后，`transport.ts` 每次状态变化都会镜像进 store —— 于是
+ * **状态条不需要轮询**，也不需要任何组件去订阅 `transport.ts`。
+ */
+export function setupConnection(): void {
+  installTransport();
+  onPathChange(syncFromTransport);
+  // 冷启动时若已经有落盘的通路，立刻把状态显示成"正在连接…"而不是
+  // "未连接"：后者会让用户在首屏看到一秒的"未连接"，像没配对成功。
+  if (getBase() || getCloudBase()) authStore.state.conn = "PROBING";
+}
+
+/** 探测一个用户手输的基址（设置页"测试这个地址"用）。 */
+export { testBase };
+
+/** 是否连到了"另一台电脑"（token 属于 A、当前基址是 B）。 */
+export const deviceMismatch = computed<boolean>(() => authStore.state.deviceMismatch);
+
+/**
+ * 用户手动重探（点状态条）。
+ *
+ * 与 `probe()` 的差别：它会**清掉记忆**（"5 分钟内不再试局域网"那条），
+ * 然后再走完整状态机。这是用户唯一能手动纠正"刚才明明连着"的入口 ——
+ * 没有它，DHCP 换了 IP 之后用户可能要在 5 分钟内反复点都没反应。
+ */
+export function reconnect(): Promise<boolean> {
+  authStore.state.lastError = "";
+  return rescan();
 }
 
 /**

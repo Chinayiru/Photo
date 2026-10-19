@@ -17,13 +17,16 @@
  */
 
 import {
-  getBase,
+  activeBase,
+  currentVia as storageVia,
+  getCloudBase,
   getClientName,
   getToken,
   clearPairing,
   hasTokenCookie,
   setTokenCookie,
 } from "./storage";
+import { reportTransportFailure, reportTransportOk } from "./netstate";
 import type { ApiErrorBody, ApiErrorEnvelope } from "./types";
 
 /* ------------------------------------------------------------------ *
@@ -80,7 +83,7 @@ export class ApiError extends Error {
 function networkError(cause: unknown): ApiError {
   const msg = cause instanceof Error && cause.name === "AbortError"
     ? "请求超时"
-    : "无法连接到电脑，请确认手机与电脑在同一个 Wi-Fi";
+    : networkHint();
   return new ApiError({
     status: 0,
     code: "NETWORK",
@@ -88,6 +91,38 @@ function networkError(cause: unknown): ApiError {
     retryable: true,
     userHint: msg,
   });
+}
+
+/**
+ * 网络失败的用户提示。
+ *
+ * ★ 两条通路下"连不上"的含义不同，提示必须跟着变 —— 否则会误导用户去
+ * 检查一个与故障无关的东西：
+ *   - 只配了局域网：老文案（"确认在同一个 Wi-Fi"）是对的；
+ *   - 走了云端还连不上：问题在公网/云服务/电脑端隧道，"同一个 Wi-Fi"
+ *     完全是误导（用户可能正在 4G 上，本来就不在同一个 Wi-Fi）；
+ *   - 两条路都配了但当前在云端：提示"稍后会自动重试"，因为状态机
+ *     会在 5 分钟冷却后重探，用户不需要做任何事。
+ *
+ * ⚠️ 文案里保留 "Wi-Fi" 这个词是有意的：`scripts/verify_browser_e2e.py`
+ * 的 F-06 用例断言提示里出现 "Wi-Fi"，它测的正是"连不上时给出人话"。
+ * 换掉这个词会让一条已通过的验收用例假红，而它钉的性质并没有变。
+ */
+export function networkHint(): string {
+  if (currentVia() === "cloud" || hasCloudBase()) {
+    return "无法连接到电脑，请检查网络；放在家里且开着程序时会自动恢复";
+  }
+  return "无法连接到电脑，请确认手机与电脑在同一个 Wi-Fi";
+}
+
+/** 当前通路（"lan" | "cloud"）。 */
+function currentVia(): "lan" | "cloud" {
+  return storageVia();
+}
+
+/** 云端候选基址是否已配置（决定网络故障文案）。 */
+function hasCloudBase(): boolean {
+  return Boolean(getCloudBase());
 }
 
 /* ------------------------------------------------------------------ *
@@ -139,9 +174,15 @@ export function backoffMs(attempt: number, retryAfter?: string | null): number {
   return base * (0.8 + Math.random() * 0.4);
 }
 
-/** 当前基地址（每次读 localStorage，不缓存）。 */
+/** 当前基地址（每次读 localStorage，不缓存）。
+ *
+ * ★ 走 `activeBase()` 而不是 `getBase()`：`docs/03` §5.2.2 要求基址在
+ * **每次请求时**读取，`transport.ts` 切换通路时只改落盘值（`pb.via`），
+ * 不通知任何人 —— 于是"切换对正在进行的请求立即生效"是自动成立的，
+ * 不存在"忘了刷新缓存"这种失效模式。
+ */
 export function currentBase(): string {
-  return getBase();
+  return activeBase();
 }
 
 /**
@@ -334,6 +375,10 @@ async function once<T>(path: string, opt: RequestOptions): Promise<T> {
       cache: "no-store",
     });
   } catch (e) {
+    // ★ 网络层失败才上报给双通路状态机。HTTP 4xx/5xx **不算**：
+    //   那是业务错误（照片没了、参数错了），换条通路也一样错，
+    //   上报只会让状态机误以为"这条通路不通"而白白切换。
+    reportTransportFailure("network");
     throw networkError(e);
   } finally {
     window.clearTimeout(timer);
@@ -341,9 +386,14 @@ async function once<T>(path: string, opt: RequestOptions): Promise<T> {
 
   if (!res.ok) {
     const err = await parseError(res);
+    // 云端亲口说"电脑离线"（`503 E3003`）：这是**确定性**通路信号，
+    // 立刻值得重探。其余 5xx 不报 —— 见上面 catch 里的理由。
+    if (err.code === "E3003") reportTransportFailure("cloud_offline");
     if (err.isAuthLost && !opt.skipAuthLost) handleAuthLost(err);
     throw err;
   }
+
+  reportTransportOk();
 
   // 204 / 空体
   if (res.status === 204) return undefined as T;

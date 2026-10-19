@@ -42,6 +42,42 @@ async def ping(ctx: Ctx) -> Reply:
     })
 
 
+def _tunnel_info(cfg: Any) -> dict[str, Any]:
+    """隧道状态。
+
+    ★ 从进程级单例读，而不是从配置推断。二期之前这里恒为 offline；
+    接上隧道后，同一个字段名与同一组成员的含义保持不变，前端零改动
+    （`docs/09` §9.6 的"业务代码零改动"包括这类"只读状态"端点）。
+
+    没有隧道时仍返回同样的键，值取自配置 —— 手机端据此显示"云端未启用"
+    而不是"未知"：两者的区别在于用户能不能自己修好。
+    """
+    empty = {
+        "mode": "offline",
+        "cloud_url": str(cfg.get("cloud.base_url", "")),
+        "connected": False,
+        "session_id": None,
+        "connected_at": None,
+        "last_error": None,
+    }
+    try:
+        from ..tunnel import get_tunnel
+
+        client = get_tunnel()
+    except Exception:      # noqa: BLE001 —— 状态端点绝不能因此 500
+        return empty
+    if client is None:
+        return empty
+    try:
+        st = client.status()
+    except Exception:      # noqa: BLE001
+        log.debug("读取隧道状态失败", exc_info=True)
+        return empty
+    for k, v in empty.items():
+        st.setdefault(k, v)
+    return st
+
+
 async def info(ctx: Ctx) -> Reply:
     """手机端首页所需的全部元信息（一次请求拿全，减少弱网往返）。"""
     st = _state(ctx)
@@ -56,16 +92,9 @@ async def info(ctx: Ctx) -> Reply:
             "started_at": st.started_at,
             "uptime_sec": round(st.uptime_sec(), 1),
         },
-        # 一期只有局域网，tunnel 恒为 offline；字段先留着，
-        # 二期接上云端隧道后这里会变成 "ws" 而前端无需改动。
-        "tunnel": {
-            "mode": "offline",
-            "cloud_url": str(cfg.get("cloud.base_url", "")),
-            "connected": False,
-            "session_id": None,
-            "connected_at": None,
-            "last_error": None,
-        },
+        # 二期接上云端隧道后这里会变成 "ws" 而前端无需改动；
+        # 一期/未配置时恒为 offline（见 _tunnel_info）。
+        "tunnel": _tunnel_info(cfg),
         "device": {
             "device_id": st.device_id,
             "device_name": st.device_name,
