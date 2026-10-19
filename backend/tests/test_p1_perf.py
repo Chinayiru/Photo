@@ -44,7 +44,10 @@ def _load(name: str) -> dict:
 
 
 def test_perf_003_two_gigabytes_fits_in_200_mb() -> None:
-    """TC-TUNNEL-PERF-003 / TC-CLOUD-SEC-007 / PERF-006：2 GB 传输。
+    """TC-TUNNEL-PERF-003 / TC-TUNNEL-PERF-006 / TC-CLOUD-SEC-007。
+
+    TC-TUNNEL-PERF-006（电脑端内存 ≤ 300 MB）也在这里断言：三份数据
+    来自同一次传输，分开写会让人以为它们各测一次。
 
     三份数据在同一个文件里：云端 RSS、电脑端 RSS、字节完整性。
     ★ 云端与电脑端必须**分开**量 —— 同进程量"云端内存"量到的是整个
@@ -138,3 +141,30 @@ def test_slow_consumer_never_wedges_the_read_loop() -> None:
     assert m._BODY_PUT_TIMEOUT <= m.CREDIT_DEADLOCK_TIMEOUT, (
         "投递超时必须不晚于信用死锁超时，否则先被后者判死，"
         "报出来的错误码会指向错误的方向")
+
+
+def test_cloud_leaves_no_temp_files_after_large_transfers() -> None:
+    """TC-CLOUD-SEC-008：大文件传输后云端不留临时文件。
+
+    分两个方向钉：
+
+    ① **结构**：`cloud/**` 里没有任何 tempfile 写入路径（AST 扫的，
+       见 `test_cloud_deploy.py::test_cloud_code_never_writes_files_except_sqlite`）。
+       云端把响应体当作生成器直接往 socket 吐，从头到尾没有落盘的理由。
+
+    ② **只读根就在这条的地方**：`cloud/docker-compose.yml` 的
+       `read_only: true` 让"不小心写了盘"变成一个**立即崩溃**的缺陷，
+       而不是"磁盘慢慢被占满"的隐性缺陷。
+    """
+    import ast
+
+    for path in sorted((REPO / "cloud").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Attribute)
+                    and node.attr in ("TemporaryFile", "NamedTemporaryFile",
+                                      "mkstemp", "mkdtemp",
+                                      "TemporaryDirectory")):
+                raise AssertionError(
+                    f"{path.relative_to(REPO)}:{node.lineno} 用了 "
+                    f"tempfile.{node.attr} —— 云端不该有任何临时文件")
