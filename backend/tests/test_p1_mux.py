@@ -34,6 +34,7 @@ from shared.mux import (                                          # noqa: E402
     InboundRequest,
     Mux,
     MuxClosed,
+    PendingRequest,
     ReqIdAllocator,
 )
 from shared.protocol import (                                     # noqa: E402
@@ -794,3 +795,156 @@ def test_sse_deadline_is_unbounded() -> None:
             await left.close("done")
 
     assert _run(main()) is True
+
+
+# ---------------------------------------------------------------------------
+# 响应体队列满：两条历史上真的会"打死别的东西"的路径
+# ---------------------------------------------------------------------------
+#
+# `body` 是 `asyncio.Queue(maxsize=_BODY_QUEUE_MAX=64)`。手机读得慢时它会
+# 填满，而**填满之后的两个分支原来都会抛 `asyncio.QueueFull`**：
+#
+#   * `finish_body()` 里 `put_nowait(None)` —— 结束标记进不去 ⇒ 消费者
+#     永远等在 `iter_body()` 里；更糟的是它从 `_sweep_once()` 与 `close()`
+#     里被调用，抛出去会**打死清扫协程**或**让连接关不掉**。
+#   * `_on_res_body()` 里 `await body.put(data)` 没有上限 ⇒ 堵住的是
+#     **整条连接共享的读循环**，PING/CREDIT/CANCEL 一起收不到，云端
+#     心跳（`DEAD_AFTER=75s`）会把整条隧道判死。
+#
+# 这两条都不是"慢一点"，是"一张没看完的图让所有请求一起失败"。
+
+def _sender() -> tuple[object, list[bytes]]:
+    """`Mux` 的构造参数是一个 `async def send(bytes)` 回调。"""
+    sent: list[bytes] = []
+
+    async def sink(data: bytes) -> None:
+        sent.append(data)
+
+    return sink, sent
+
+
+def test_finish_body_never_raises_when_queue_is_full() -> None:
+    """结束标记进不去满队列时不能抛，也**不能**为此丢掉一块数据。
+
+    丢数据等于把一张照片截断，而调用方会把它当完整响应发给手机 ——
+    比"多等一会儿"严重得多。所以契约是：不抛、数据一块不少、
+    消费者仍然能收尾。
+    """
+    async def main() -> None:
+        import shared.mux as m
+        sink, _ = _sender()
+        mux = Mux(sink, role="probe")
+        p = PendingRequest(1, timeout=None)
+        mux._pending[1] = p
+        for _ in range(m._BODY_QUEUE_MAX):
+            p.push_body(b"x" * 10)
+
+        p.finish_body()                     # 原来这里抛 QueueFull
+
+        # 数据一块都不能少；结束标记挤不进去是允许的（由 `_body_done` 兜）
+        assert p.body.qsize() == m._BODY_QUEUE_MAX, (
+            f"丢数据了：{p.body.qsize()} / {m._BODY_QUEUE_MAX}")
+        assert p._body_done is True
+
+        # 消费者仍然能收尾 —— 不依赖队列里那个 None
+        import time as _t
+        t0 = _t.monotonic()
+        got = [c async for c in p.iter_body(idle_timeout=5.0)]
+        elapsed = _t.monotonic() - t0
+        assert len(got) == m._BODY_QUEUE_MAX
+        assert all(c == b"x" * 10 for c in got)
+        # ★ 必须**立刻**收尾，而不是先干等一个 idle_timeout 再靠超时分支
+        #   兜底。两者对用户都不卡死，但白等 5 秒会让每个满队列响应的
+        #   收尾都慢一拍 —— 而且掩盖了"队列空 + 已结束"这类正常情况。
+        assert elapsed < 1.0, f"收尾白等了 {elapsed:.2f}s（idle_timeout=5s）"
+
+    _run(main())
+
+
+def test_sweeper_survives_full_body_queue(tmp_path: Path) -> None:
+    """清扫协程不能被 `QueueFull` 打死 —— 死了之后没有任何东西清理超时。
+
+    `req_id` 泄漏的后果是 4096 个之后所有请求 429，**而隧道看起来还连着**。
+    """
+    async def main() -> None:
+        import shared.mux as m
+        sink, _ = _sender()
+        mux = Mux(sink, role="probe")
+        old = m.SWEEP_INTERVAL
+        m.SWEEP_INTERVAL = 0.01
+        task = asyncio.create_task(mux._sweep_loop())
+        try:
+            p1 = PendingRequest(1, timeout=0.0)
+            mux._pending[1] = p1
+            for _ in range(m._BODY_QUEUE_MAX):
+                p1.push_body(b"x" * 10)
+            await asyncio.sleep(0.08)
+            assert not task.done(), (
+                f"清扫协程死了：{task.exception()!r}")
+
+            p2 = PendingRequest(2, timeout=0.0)
+            mux._pending[2] = p2
+            await asyncio.sleep(0.15)
+            assert mux._pending.get(2) is None, "清扫协程还活着但不再清理超时请求"
+        finally:
+            m.SWEEP_INTERVAL = old
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):      # noqa: BLE001
+                pass
+
+    _run(main())
+
+
+def test_close_survives_full_body_queue() -> None:
+    """`close()` 必须能关掉连接，即使某个响应体队列是满的。"""
+    async def main() -> None:
+        import shared.mux as m
+        sink, _ = _sender()
+        mux = Mux(sink, role="probe")
+        p = PendingRequest(1, timeout=None)
+        mux._pending[1] = p
+        for _ in range(m._BODY_QUEUE_MAX):
+            p.push_body(b"x" * 10)
+
+        await mux.close("probe")             # 原来这里抛 QueueFull
+        assert mux.closed is True
+
+    _run(main())
+
+
+def test_slow_consumer_does_not_wedge_the_read_loop() -> None:
+    """消费者不取数据时，读循环必须自己脱身，而不是永久堵住。
+
+    堵住的读循环收不到 PING/CREDIT/CANCEL —— 那不只是这个请求慢，
+    是整条隧道被判死。所以投递有上限，超时就放弃**这一个**请求。
+    """
+    async def main() -> None:
+        import shared.mux as m
+        sink, sent = _sender()
+        mux = Mux(sink, role="probe")
+        p = PendingRequest(1, timeout=None)
+        mux._pending[1] = p
+        for _ in range(m._BODY_QUEUE_MAX):
+            p.push_body(b"x" * 10)          # 队列满，下一次 put 必然阻塞
+
+        old = m._BODY_PUT_TIMEOUT
+        m._BODY_PUT_TIMEOUT = 0.2
+        try:
+            from shared.protocol import Frame
+            task = asyncio.create_task(
+                mux.feed(Frame(m.FrameType.RES_BODY, 1, b"y" * 100)))
+            await asyncio.sleep(0.8)
+            assert task.done(), "读循环被一个满队列永久堵住了"
+        finally:
+            m._BODY_PUT_TIMEOUT = old
+            if not task.done():
+                task.cancel()
+
+        # 该请求必须以可重试的错误结束，而不是无声消失
+        head = p.head.result()
+        assert head["status"] == 0
+        assert head["error"]["code"] == "E5008"
+
+    _run(main())

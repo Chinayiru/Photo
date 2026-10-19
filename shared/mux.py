@@ -85,6 +85,13 @@ MAX_BODY_CHUNK: int = MAX_FRAME - 6
 #: 内存峰值越大而吞吐不变。
 _BODY_QUEUE_MAX = 64
 
+#: 往响应体队列投递一块数据的等待上限。队列只有 `_BODY_QUEUE_MAX` 深，
+#: 而 `_on_res_body()` 跑在**整条连接共享的读循环**上 —— 无限等下去会
+#: 让 PING/PONG、CREDIT、CANCEL 一起收不到，云端心跳（`DEAD_AFTER=75s`）
+#: 会判死整条隧道。30 秒与 `CREDIT_DEADLOCK_TIMEOUT` 同量级：那个是
+#: "对端不给我额度"，这个是"对端不取走数据"，都属于消费者跟不上的情形。
+_BODY_PUT_TIMEOUT = 30.0
+
 
 class MuxClosed(Exception):
     """连接已关闭，不能再发起请求。"""
@@ -286,10 +293,17 @@ class PendingRequest:
         while True:
             if total_timeout is not None and start + total_timeout < now():
                 raise asyncio.TimeoutError("响应体总时长超限")
+            # 队列已空且对端已经说过"结束"—— 结束标记可能因为队列满而
+            # 没能入队（见 `finish_body()`），这里补上这次收尾，否则消费
+            # 者会在一个再也不会有数据的队列上等到 `idle_timeout`。
+            if self._body_done and self.body.empty():
+                return
             try:
                 chunk = await asyncio.wait_for(
                     self.body.get(), timeout=idle_timeout)
             except asyncio.TimeoutError:
+                if self._body_done and self.body.empty():
+                    return
                 raise asyncio.TimeoutError(
                     f"{idle_timeout:.0f}s 内没有收到新的 RES_BODY") from None
             if chunk is None:
@@ -308,9 +322,30 @@ class PendingRequest:
         self.body.put_nowait(chunk)
 
     def finish_body(self) -> None:
-        if not self._body_done:
-            self._body_done = True
+        """标记响应体结束。
+
+        ★ 这个结束标记**必须让消费者最终看得见**，否则它会永远等在
+        `iter_body()` 里。而 `body` 是有限的（`maxsize=64`），队列满时
+        `put_nowait(None)` 抛 `asyncio.QueueFull` —— 历史上这个异常从
+        `_sweep_once()` / `close()` 里冒出去过两次，后果分别是"清扫协程
+        静默死掉、此后没有任何东西清理超时请求"与"连接关不掉"。
+
+        ★ 但**不能**为了塞进标记而丢掉一块数据：`_on_res_end()` 在成功
+        路径上也会调这里，此时队列满只说明消费者落后约 4 MB，数据本身
+        完好 —— 丢一块等于把一张照片截断，而调用方会把它当成完整响应
+        发给手机。所以队列满时**不塞标记**，只把 `_body_done` 置上；
+        `iter_body()` 在队列排空后依据这个标志收尾。
+        """
+        if self._body_done:
+            return
+        self._body_done = True
+        try:
             self.body.put_nowait(None)
+        except asyncio.QueueFull:
+            # 队列满：标记进不去，由 `iter_body()` 的 `_body_done` 分支收尾。
+            # 这里绝不能抛 —— 调用方包括清扫协程与 `close()`。
+            log.debug("响应体队列已满，结束标记改由 _body_done 生效（rid=%s）",
+                      self.req_id)
 
 
 class InboundRequest:
@@ -784,7 +819,21 @@ class Mux:
             return
         if self._credit.on_recv(len(data)):
             await self.send_credit()
-        await p.body.put(data)
+        # ★ 这一步会阻塞**共享读循环**。队列只有 `_BODY_QUEUE_MAX` 深
+        #   （≈4 MB），而 credit 窗口是 8 MB ⇒ 消费者慢到某个程度时必然
+        #   填满。无上限地等下去，后果不只是这个请求变慢：读循环停摆后
+        #   PING/PONG、CREDIT、CANCEL 全都收不到，**整条隧道**的心跳会
+        #   被判死（云端 `DEAD_AFTER=75s`），所有并发请求一起失败。
+        #   所以给一个上限：超过就说明消费者已经跟不上，放弃这个请求，
+        #   比拖死整条连接好。
+        try:
+            await asyncio.wait_for(p.body.put(data), timeout=_BODY_PUT_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning("响应体投递超时 %.0fs（rid=%s，消费者过慢），"
+                        "放弃该请求", _BODY_PUT_TIMEOUT, rid)
+            # 复用 E5008「传输卡住，请重试」（可重试）——语义就是这里：
+            # 不是请求本身有问题，是这条连接当前送不动了。
+            await self._fail(rid, "E5008", "传输卡住，请重试")
 
     def _on_res_end(self, rid: int) -> None:
         p = self._pending.get(rid)
