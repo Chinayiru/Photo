@@ -105,6 +105,12 @@ class Browser:
 
     def __init__(self, exe: str, profile: Path, port: int) -> None:
         self.port = port
+        # 每个新标签页都要重放的设置（设备度量、触摸模拟、注入脚本）。
+        # `recover()` 换标签页之后必须重放，否则恢复出来的标签页会以
+        # 桌面视口 + 无触摸跑剩下的断言，而断言本身不会因此报错 ——
+        # 那是最难发现的一类假绿。
+        self._durable: list[tuple[str, str, dict]] = []
+        self._target_id = ""
         self.proc = subprocess.Popen(
             [exe, "--headless=new", "--disable-gpu", "--no-first-run",
              "--no-default-browser-check", "--disable-extensions",
@@ -149,7 +155,7 @@ class Browser:
             url, max_size=64 * 1024 * 1024))
         self._events = []
 
-    def send(self, method: str, **params):
+    def send(self, method: str, *, _timeout: float = 120.0, **params):
         self._id += 1
         mid = self._id
         self._loop.run_until_complete(self.ws.send(json.dumps(
@@ -159,12 +165,16 @@ class Browser:
             #   整个脚本挂在那里（实测挂过 40 分钟以上，日志停在某一行的
             #   下一行，看不出是谁卡的）。CDP 的每条命令都应当很快回，
             #   120 秒不回就是环境出了问题 —— 宁可明确报错，不要静默挂死。
+            #
+            #   `_timeout` 供"拿不准会不会回"的少数命令（`Page.navigate`）
+            #   缩短等待：那一条实测会整段挂死，而调用方有自愈手段（换一个
+            #   标签页），没必要陪着它等两分钟。
             try:
                 raw = self._loop.run_until_complete(
-                    asyncio.wait_for(self.ws.recv(), timeout=120))
+                    asyncio.wait_for(self.ws.recv(), timeout=_timeout))
             except asyncio.TimeoutError:
                 raise RuntimeError(
-                    f"CDP {method} 等待响应超过 120 秒（事件已收 "
+                    f"CDP {method} 等待响应超过 {_timeout:.0f} 秒（事件已收 "
                     f"{len(self._events)} 条）") from None
             msg = json.loads(raw)
             if msg.get("id") != mid:
@@ -229,7 +239,21 @@ class Browser:
         把事件抽出来（`evaluate` 内部要 recv，事件就在那条流里）。
         """
         self.send("Page.enable")
-        r = self.send("Page.navigate", url=url)
+        # ★ `Page.navigate` 给短超时 + 自愈。实测它偶发**永久不回**：目标
+        #   标签页发出 `Page.frameStartedNavigating` 之后就再没有下文，
+        #   同时服务端 0.01 秒就回了 200、`Page.getNavigationHistory` 里
+        #   根本没有那条 URL、同浏览器其它同源标签页 evaluate 全部正常
+        #   （详见 `recover()` 的注释与 `build/_probe_e2e_hang2.py`）。
+        #   那种情况下等满 120 秒只是把一次可自愈的抖动变成整轮失败。
+        try:
+            r = self.send("Page.navigate", _timeout=20.0, url=url)
+        except RuntimeError as exc:
+            if "等待响应超过" not in str(exc):
+                raise
+            print(f"      标签页导航卡死（{exc}）→ 换一个标签页重试")
+            if not self.recover(url):
+                raise RuntimeError(f"换标签页后仍未就绪（{url}）") from None
+            return
         if r.get("errorText"):
             raise RuntimeError(f"Page.navigate 被拒: {r['errorText']}（{url}）")
         lid = r.get("loaderId") or ""
@@ -287,8 +311,12 @@ class Browser:
         这是最容易产出假绿的地方，所以下面每个手势断言都先确认
         事件真的到达了（用 `window.__touched` 计数器）。
         """
-        self.send("Emulation.setTouchEmulationEnabled",
-                  enabled=True, maxTouchPoints=5)
+        # ★ 用 `remember()` 而不是 `send()`：这三处设置是**按标签页**生效的，
+        #   而 `recover()` 会换标签页。忘了重放的话，恢复出来的标签页会以
+        #   桌面视口 + 无触摸继续跑后面的断言 —— 断言本身不会报错，
+        #   只是变成"什么都没验证"的假绿。
+        self.remember("Emulation.setTouchEmulationEnabled",
+                      enabled=True, maxTouchPoints=5)
 
     def touch(self, kind: str, points: list[tuple[float, float]]) -> None:
         """派发一次触摸事件。kind ∈ touchStart/touchMove/touchEnd/touchCancel。"""
@@ -304,6 +332,10 @@ class Browser:
         不到一个事件（实测等 18 轮 × 0.8 秒仍是 0，而 `document.readyState`
         一直是 `complete`、`navigator.maxTouchPoints` 仍是 5）。同一浏览器
         里新开的标签页则是干净的。
+
+        ★★ 顺便记下"这个标签页是哪个 target"。`recover()` 会丢掉整个
+        标签页重开一个，端口/用户目录都不变（localStorage 还在同一个
+        profile 里），所以恢复后仍是同一台"手机"。
         """
         req = urllib.request.Request(
             f"http://127.0.0.1:{self.port}/json/new?"
@@ -322,6 +354,71 @@ class Browser:
             info["webSocketDebuggerUrl"], max_size=64 * 1024 * 1024))
         self._events = []
         self._id = 0
+        self._target_id = str(info.get("id") or "")
+        self._replay_durable()
+
+    def remember(self, method: str, *, _key: str = "", **params) -> None:
+        """记下一条"每个新标签页都要重放"的 CDP 设置并立即执行。
+
+        `_key` 用来区分同类多条设置（`Page.addScriptToEvaluateOnNewDocument`
+        会被调用好几次，每次注入不同的脚本，不能让后一条覆盖前一条）。
+        """
+        key = _key or method
+        self._durable = [x for x in self._durable if x[0] != key]
+        self._durable.append((key, method, params))
+        self.send(method, **params)
+
+    def _replay_durable(self) -> None:
+        for _key, method, params in self._durable:
+            try:
+                self.send(method, **params)
+            except Exception:                          # noqa: BLE001
+                pass
+
+    def recover(self, url: str) -> bool:
+        """丢掉卡死的标签页，换一个新的并导航到 `url`。
+
+        用于 `goto()` 检测到「渲染器卡在导航提交阶段」时自愈。
+        返回是否恢复成功。
+
+        为什么需要它：实测（`build/_probe_e2e_hang2.py`）在
+        `?code=&did=` 自动配对那一步，`Page.navigate` 会**永久不回**，
+        而同一时刻
+          * 服务端 0.01 秒就回了 200（不是后端卡住）；
+          * `Page.getNavigationHistory` 里根本没有那条 URL（导航未提交）；
+          * 同一浏览器里其它 5 个同源标签页 `evaluate` 全部正常
+            （不是渲染进程整体卡死、不是 CPU 空转、没有 JS 对话框）。
+        即：这是**那一个标签页**的命运，不是应用的行为。用新标签页
+        （真机扫码本来也是开新页）即可，无需放宽任何断言。
+        """
+        old = self._target_id
+        try:
+            self.new_page(url)
+        except Exception:                              # noqa: BLE001
+            return False
+        # 新标签页是由 `PUT /json/new?...` 直接带着目标地址创建的，
+        # 所以不需要再走一次 `Page.navigate`；只要等它就绪。
+        ok = self.wait_ready(budget=30.0)
+        # ★ `Page.addScriptToEvaluateOnNewDocument` 只管**以后**的文档，
+        #   而这个新标签页的文档在连上之前就已经提交了。不补一次的话，
+        #   `window.__errors` 之类会不存在 —— 后面的"没有 JS 报错"断言
+        #   于是变成读一个 undefined 数组，静默通过。这里把它直接
+        #   evaluate 进当前文档，效果与新文档一致。
+        for _key, method, params in self._durable:
+            if method != "Page.addScriptToEvaluateOnNewDocument":
+                continue
+            try:
+                self.evaluate(str(params.get("source") or "void 0"))
+            except Exception:                          # noqa: BLE001
+                pass
+        if ok and old:
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    f"http://127.0.0.1:{self.port}/json/close/{old}",
+                    method="GET"), timeout=10).read()
+            except Exception:                          # noqa: BLE001
+                pass
+        return ok
 
     def reconnect(self) -> None:
         """关掉 CDP WebSocket 再连回来（同一个浏览器 / 同一个标签页）。"""
@@ -585,14 +682,16 @@ def main() -> int:
         br.send("Page.enable")
         # 触摸事件计数器：用来证明 `Input.dispatchTouchEvent` 真的送到了页面。
         # 没有它，一个"事件根本没派发"的环境会让所有手势断言凭空通过。
-        br.send("Page.addScriptToEvaluateOnNewDocument", source="""
+        br.remember("Page.addScriptToEvaluateOnNewDocument", _key="inject:touch",
+                    source="""
             window.__touch = {start: 0, move: 0, end: 0, cancel: 0};
             window.addEventListener('touchstart', () => window.__touch.start++, true);
             window.addEventListener('touchmove', () => window.__touch.move++, true);
             window.addEventListener('touchend', () => window.__touch.end++, true);
             window.addEventListener('touchcancel', () => window.__touch.cancel++, true);
         """)
-        br.send("Page.addScriptToEvaluateOnNewDocument", source="""
+        br.remember("Page.addScriptToEvaluateOnNewDocument", _key="inject:errors",
+                    source="""
             window.__errors = [];
             window.addEventListener('error', e => {
               window.__errors.push(String(e.message || e.error));
@@ -607,7 +706,8 @@ def main() -> int:
         # 这里记录的是原生 SSE 事件对象，与应用代码无关 —— 服务端到底
         # 有没有把 `scan_progress` / `media_changed` 推过网络，一目了然。
         # 同时记下 URL，用来证明 token 没有拼进查询串（AC 的安全要求）。
-        br.send("Page.addScriptToEvaluateOnNewDocument", source="""
+        br.remember("Page.addScriptToEvaluateOnNewDocument", _key="inject:sse",
+                    source="""
             window.__sse = {urls: [], events: []};
             (() => {
               const Native = window.EventSource;
@@ -2274,7 +2374,7 @@ def main() -> int:
         #   于是"320px / 251css = 1.27x"判不糊失败。必须先切标签页再设。
         br.new_page()
         br.send("Page.bringToFront")
-        br.send("Emulation.setDeviceMetricsOverride", width=390, height=844,
+        br.remember("Emulation.setDeviceMetricsOverride", width=390, height=844,
                 deviceScaleFactor=3, mobile=True,
                 screenOrientation={"type": "portraitPrimary", "angle": 0})
         br.goto(base + "/")
@@ -2318,7 +2418,11 @@ def main() -> int:
         # ---- C-06 三级顺序 ----
         # 在打开查看器**之前**装上探针，记录 <img> 的 src 出现顺序。
         # 只记录 /thumb、/preview、/raw 三类，其他忽略。
-        br.send("Page.addScriptToEvaluateOnNewDocument", source="""
+        # ★ 走 `remember()`：本段后面紧跟 `br.new_page()` 与若干次 `goto()`，
+        #   任何一次自愈换掉标签页都会让这个探针消失，而它消失的表现是
+        #   `window.__tier` 为 undefined → 顺序断言读空数组 → 静默通过。
+        br.remember("Page.addScriptToEvaluateOnNewDocument", _key="inject:tier",
+                    source="""
             window.__tier = [];
             (() => {
               const push = (u) => {
@@ -2475,7 +2579,7 @@ def main() -> int:
         # ---------------------------------------------------------------
         # 「旋转屏幕」在 headless 里就是改视口尺寸 + 换朝向。判据落在
         # **布局真的重排了**上：横屏比竖屏宽、网格还是 3 列、没有横向溢出。
-        br.send("Emulation.setDeviceMetricsOverride", width=390, height=844,
+        br.remember("Emulation.setDeviceMetricsOverride", width=390, height=844,
                 deviceScaleFactor=3, mobile=True,
                 screenOrientation={"type": "portraitPrimary", "angle": 0})
         time.sleep(0.8)
@@ -2502,7 +2606,7 @@ def main() -> int:
         check(int(pd.get("vw") or 0) < int(pd.get("vh") or 0),
               "竖屏视口成立（宽 < 高）", f"{pd.get('vw')}×{pd.get('vh')}")
 
-        br.send("Emulation.setDeviceMetricsOverride", width=844, height=390,
+        br.remember("Emulation.setDeviceMetricsOverride", width=844, height=390,
                 deviceScaleFactor=3, mobile=True,
                 screenOrientation={"type": "landscapePrimary", "angle": 90})
         time.sleep(1.0)
@@ -2533,7 +2637,7 @@ def main() -> int:
               f"scrollW={ld.get('scrollW')} clientW={ld.get('clientW')}")
 
         # 还原成竖屏，后面的节仍按手机竖屏跑
-        br.send("Emulation.setDeviceMetricsOverride", width=390, height=844,
+        br.remember("Emulation.setDeviceMetricsOverride", width=390, height=844,
                 deviceScaleFactor=3, mobile=True,
                 screenOrientation={"type": "portraitPrimary", "angle": 0})
         time.sleep(0.6)
@@ -2598,7 +2702,7 @@ def main() -> int:
             # 没被调用过一次 —— 一个"看起来在工作"的死函数。
             br.new_page()
             br.send("Page.bringToFront")
-            br.send("Emulation.setDeviceMetricsOverride", width=390, height=844,
+            br.remember("Emulation.setDeviceMetricsOverride", width=390, height=844,
                     deviceScaleFactor=3, mobile=True,
                     screenOrientation={"type": "portraitPrimary", "angle": 0})
             br.goto(lan_origin + "/")
@@ -3203,7 +3307,7 @@ def main() -> int:
         #   浏览器开新标签），代价只是要重新套一次手机视口。
         br.new_page()
         br.send("Page.bringToFront")
-        br.send("Emulation.setDeviceMetricsOverride", width=390, height=844,
+        br.remember("Emulation.setDeviceMetricsOverride", width=390, height=844,
                 deviceScaleFactor=3, mobile=True,
                 screenWidth=390, screenHeight=844)
         # ★ 新标签页刚开时是 `about:blank`，那个文档的 localStorage 是
@@ -3312,7 +3416,7 @@ def main() -> int:
         br.connect()
         br.send("Page.enable")
         br.send("Page.bringToFront")
-        br.send("Emulation.setDeviceMetricsOverride", width=390, height=844,
+        br.remember("Emulation.setDeviceMetricsOverride", width=390, height=844,
                 deviceScaleFactor=3, mobile=True,
                 screenWidth=390, screenHeight=844)
         br.goto(base2 + "/")
@@ -3330,7 +3434,7 @@ def main() -> int:
                 + json.dumps(k) + ", " + json.dumps(v or "") + "); return 1; })()")
         br.evaluate("(() => { location.reload(); return 1; })()")
         time.sleep(1.5)
-        br.send("Emulation.setDeviceMetricsOverride", width=390, height=844,
+        br.remember("Emulation.setDeviceMetricsOverride", width=390, height=844,
                 deviceScaleFactor=3, mobile=True,
                 screenWidth=390, screenHeight=844)
         ok_f05 = br.wait_for(
