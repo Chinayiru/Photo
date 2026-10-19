@@ -53,6 +53,7 @@ from typing import Any
 __all__ = [
     "TOKEN_PREFIX",
     "TOKEN_TTL_DAYS",
+    "MAX_TTL_DAYS",
     "issue_token",
     "verify_token",
     "secret_for_agent_token",
@@ -65,6 +66,15 @@ TOKEN_PREFIX = "pbc1"
 
 #: 与一期 `backend/app/auth.py:106 TOKEN_TTL_DAYS` 保持一致。
 TOKEN_TTL_DAYS = 90
+
+#: "永不过期"用到的 ttl 天数（100 年）。
+#:
+#: 一期 `auth.token_ttl_days = 0` 的语义是**永不过期**，而 HMAC 令牌的
+#: `exp` 是一个绝对时刻，没有"不含 exp"这种编码。用 100 年表示它：
+#: 到 2126 年才会过期，而那时这张照片库早已不在（本项目的数据模型
+#: 里没有"跨世纪"这个概念）。**不要**改成 `exp = 2**63`：`verify_token`
+#: 会把 exp 转成 float 参与比较，极端值上 `int`/`float` 混算会抛。
+MAX_TTL_DAYS = 36500
 
 #: 令牌长度上限。三段式 + 32 字节 MAC 大约 150 字符，给到 1024，
 #: 同时挡住"拿 1 MB 字符串当令牌"这种把 HMAC 当哈希炮灰的请求。

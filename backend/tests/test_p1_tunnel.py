@@ -403,6 +403,16 @@ class _Rig:
 
     # ---- 云端配对 ----
 
+    async def lan_pair_code(self) -> str:
+        """领一枚**局域网**配对码（`POST /panel/pair-code`，托盘那条路）。
+
+        与 `aissue_pair_code()`（云端 `/api/devices/{id}/paircode`）是两条
+        不同的路径：手机 UI 只会走这一条，云端那条是账号后台用的。
+        """
+        status, body, _ = await self.lan.arequest("POST", "/panel/pair-code")
+        assert status == 201, (status, body)
+        return str(body["code"])
+
     async def aissue_pair_code(self) -> str:
         status, body, _ = await self.cloud.arequest(
             "POST", f"/api/devices/{self.device_id}/paircode", body={},
@@ -1270,6 +1280,119 @@ def test_revoked_client_is_pushed_to_agent(rig_factory) -> None:
     assert out["after"][0] == 401, (
         "撤销后电脑端必须停止接受该令牌（AC-5.8）", out["after"])
     assert out["after_tunnel"][0] == 401, out["after_tunnel"]
+
+
+def test_lan_paired_token_works_over_cloud(rig_factory) -> None:
+    """局域网配对拿到的令牌，必须能直接走云端（P1 的核心可用性前提）。
+
+    产品里手机**只有一条**配对路径：在家连局域网、扫托盘二维码、
+    `POST /api/pair`（`frontend/src/stores/auth.ts` 只投递这一个接口；
+    云端 `/api/devices/{id}/pair` 是账号后台用的，手机 UI 走不到）。
+    如果那枚令牌过不了云端，P1 的全部价值（出门也能看）当场归零，
+    而症状是"在家好好的、一到 4G 就提示配对失效"。
+
+    修复前实测（`build/_probe_lan_token_on_cloud.py`）：
+
+        LAN  token→LAN    = [200]
+        LAN  token→CLOUD  = [401] E2002 配对已失效，请重新配对
+
+    修复后两者都是 200。判据不止状态码：两条通路的时间线必须**逐字段
+    相同**（AC-6.7），否则"能连上但数据不对"更难查。
+    """
+    async def main() -> dict[str, Any]:
+        rig = rig_factory()
+        await rig.start()
+        await rig.wait_tunnel()
+
+        # 完全按产品路径：局域网配对码 → 局域网 /api/pair
+        code = await rig.lan_pair_code()
+        st, body, _ = await rig.lan.arequest("POST", "/api/pair", body={"code": code})
+        assert st == 201, (st, body)
+        tok = str(body["client_token"])
+
+        lan = await rig.lan.arequest("GET", "/api/timeline", token=tok)
+        cloud = await rig.cloud.arequest(
+            "GET", rig.tunnel_path("/api/timeline"), token=tok)
+        # 撤销列表接口里要能看见这台手机（否则用户点不了"移除"）
+        st_list, listing, _ = await rig.cloud.arequest(
+            "GET", "/api/clients/revoked", token=rig.agent_token)
+        return {"token": tok, "lan": lan, "cloud": cloud,
+                "listing": (st_list, listing)}
+
+    out = _run(main())
+    assert out["token"].startswith("pbc1."), (
+        "配了云端时局域网配对必须签 HMAC 令牌，否则云端无从验签", out["token"][:12])
+    assert out["lan"][0] == 200, out["lan"]
+    assert out["cloud"][0] == 200, (
+        "局域网配对拿到的令牌到了云端必须仍然有效（否则出门即失效）",
+        out["cloud"])
+    # AC-6.7：两条通路必须给出同一份数据
+    assert out["cloud"][1]["items"] == out["lan"][1]["items"], out
+    assert out["listing"][0] == 200, out["listing"]
+
+
+def test_lan_token_is_adopted_so_it_can_be_revoked(rig_factory) -> None:
+    """局域网令牌被云端收编后，撤销它必须**同时**堵住两条通路。
+
+    只收编不撤销等于埋了个洞：用户在账号后台点"移除这台手机"，
+    云端 403 了，但手机回家走局域网照样能看全部照片。
+    """
+    async def main() -> dict[str, Any]:
+        rig = rig_factory()
+        await rig.start()
+        await rig.wait_tunnel()
+        # 账号令牌是"账号后台"那一侧的凭证（撤销手机要用它）。走局域网
+        # 配对流程本身不需要它，所以这里显式登录一次 —— 忘了这步的表现
+        # 是后面的 `device_status` / `DELETE` 全 401，看起来像"收编失败"。
+        await rig.alogin()
+        code = await rig.lan_pair_code()
+        st, body, _ = await rig.lan.arequest("POST", "/api/pair", body={"code": code})
+        assert st == 201, (st, body)
+        tok = str(body["client_token"])
+        cid = str(body["client_id"])
+
+        # 先经云端走一次，触发收编
+        before_cloud = await rig.cloud.arequest(
+            "GET", rig.tunnel_path("/api/timeline"), token=tok)
+        # 收编的判据看 `device_status.clients`（`revoked_clients` 只列已撤销的）
+        st_status, status_body, _ = await rig.cloud.arequest(
+            "GET", f"/api/devices/{rig.device_id}/status",
+            token=rig.account_token)
+        adopted = [str(c["id"]) for c in (status_body or {}).get("clients", [])]
+
+        st, _, _ = await rig.cloud.arequest(
+            "DELETE", f"/api/devices/{rig.device_id}/clients/{cid}",
+            token=rig.account_token)
+        revoked_status = st
+        st_list2, listing2, _ = await rig.cloud.arequest(
+            "GET", "/api/clients/revoked", token=rig.agent_token)
+        ids = [str(c["id"]) for c in listing2.get("clients", [])]
+
+        from backend.app.auth import sync_revoked_clients
+
+        changed = sync_revoked_clients(rig.state, ids)
+        after_lan = await rig.lan.arequest("GET", "/api/timeline", token=tok)
+        after_cloud = await rig.cloud.arequest(
+            "GET", rig.tunnel_path("/api/timeline"), token=tok)
+        return {"before_cloud": before_cloud, "adopted": adopted, "cid": cid,
+                "revoked_status": revoked_status, "changed": changed,
+                "after_lan": after_lan, "after_cloud": after_cloud}
+
+    out = _run(main())
+    assert out["before_cloud"][0] == 200, out["before_cloud"]
+    assert out["cid"] in out["adopted"], (
+        "局域网令牌必须被收编进云端 clients，否则账号后台看不到、也移除不掉",
+        out["adopted"], out["cid"])
+    assert out["revoked_status"] == 204, out["revoked_status"]
+    assert out["changed"] >= 1, out
+    # 局域网通路走的是本地 `devices` 表，撤销后是 **403 E2004**（"这台设备
+    # 被主动移除"），与"令牌不存在"的 401 E2002 刻意区分开 ——
+    # 两者都回 401 的话，用户在电脑上移除手机后，手机只会提示"配对失效"
+    # 而不知道是被移除，于是反复重试同一枚令牌。
+    assert out["after_lan"][0] == 403, (
+        "撤销后局域网通路也必须拒绝，否则被移除的手机回家照样能看", out["after_lan"])
+    assert out["after_lan"][1]["error"]["code"] == "E2004", out["after_lan"]
+    assert out["after_cloud"][0] in (401, 403), out["after_cloud"]
 
 
 def test_traffic_meter_records_both_directions(rig_factory) -> None:

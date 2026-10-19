@@ -243,6 +243,70 @@ def new_token() -> str:
     return secrets.token_urlsafe(TOKEN_BYTES)
 
 
+def _issue_client_token(now: float, client_id: str,
+                        device_name: str | None, cfg: Any = None) -> str:
+    """签发一枚 client_token，**配了云端时签成两端都能验的 HMAC 令牌**。
+
+    ## 为什么局域网配对也必须签 HMAC 令牌
+
+    产品里手机只有一条配对路径：在家连局域网、扫托盘二维码、
+    `POST /api/pair` 换令牌（`frontend/src/stores/auth.ts` 只投递这一个
+    接口，云端 `/api/devices/{id}/pair` 是"账号后台"用的，手机 UI 走不到）。
+    而云端 `/d/**` 只认它自己 `clients` 表里的 `token_hash` —— 局域网配对
+    签出来的随机串从没进过云端库，于是手机上拿到的令牌一出门就 401
+    `E2002配对已失效`。
+
+    实测（`build/_probe_lan_token_on_cloud.py`，真 uvicorn 全链路）：
+
+        LAN  token→LAN    = [200] 时间线正常
+        LAN  token→CLOUD  = [401] E2002 配对已失效，请重新配对
+
+    结果是"在家能用、出门即失效"，而 P1 的全部价值就在出门那一段。
+
+    ## 密钥从哪来（两端凭什么算出同一个值）
+
+    `sha256(agent_token)`：云端手里是 `devices.agent_token` 那一列
+    （`cloud/relay/db.py` 的 DDL 存的就是这个 sha256），电脑端手里是
+    `cloud.agent_token` 明文，`token_mod.secret_for_agent_token()` 算一次
+    就得到同一个 hex。**实测两端逐字节相同**，所以谁都不必回源。
+
+    ## 没配云端时仍然回退到随机串
+
+    一台纯局域网的机器没有 `agent_token`，也就没有可共享的密钥。
+    此时照旧用 `new_token()`：本地库里有这一行，`_lookup_device` 查得到。
+    不这样回退的话，`token_mod.issue_token` 会因 `secret` 为空抛
+    `ValueError`，配对直接 500。
+
+    ## 为什么 `token_ttl_days = 0` 要换成一个极大值
+
+    一期把 0 解释成"永不过期"（`token_expiry` 返回 None）。HMAC 令牌的
+    `exp` 是绝对时刻，没有"不含 exp"这种编码，只能用一个远超使用年限的
+    天数表示 —— 用 `MAX_TTL_DAYS`（100 年）。
+    """
+    cfg = _cloud_cfg(cfg)
+    secret = _tunnel_secret(cfg)
+    if secret:
+        # 延迟导入：`tunnel.py` 在模块级 import 了本模块的常量，顶层
+        # 反向 import 会成环（`backend/app/tunnel.py:53` 那组 import）。
+        from .tunnel import cloud_device_id
+
+        device_id = cloud_device_id(cfg, "")
+        if device_id:
+            days = token_ttl_days(cfg)
+            if days <= 0:
+                days = token_mod.MAX_TTL_DAYS
+            try:
+                return token_mod.issue_token(
+                    secret, client_id=client_id, device_id=device_id,
+                    ttl_days=days, now=now,
+                    client_name=str(device_name or ""))
+            except (ValueError, TypeError):
+                # 签名失败不该让配对整体失败：退回随机串，局域网照常可用，
+                # 只是这枚令牌过不了云端（与修复前行为一致，是可控的降级）。
+                log.warning("签发 HMAC 令牌失败，退回随机串", exc_info=True)
+    return new_token()
+
+
 def generate_pair_code() -> str:
     """生成 6 位数字配对码（允许前导 0）。
 
@@ -390,7 +454,7 @@ def consume_pair_code(
 
     # --- 通过校验，签发 token ---
     client_id = secrets.token_hex(16)
-    token = new_token()
+    token = _issue_client_token(now, client_id, device_name, cfg)
     # AC-5.10：过期时刻**必须落库**。
     #
     # 原来这里只把 `now + 90 天` 拼进响应体给客户端看，库里一个字段都
@@ -609,6 +673,18 @@ def sync_revoked_clients(st: Any, revoked_ids: list[str],
     **重新插入**一行干净记录，撤销就失效了（令牌本身没过期，签名也
     还是对的）。这是本条链路唯一容易写错的地方。
 
+    ## 为什么还要动本地 `devices` 表
+
+    局域网配对现在也签发 HMAC 令牌（见 `_issue_client_token`），而那枚
+    令牌**同时**会在本地 `devices` 表留一行（`consume_pair_code` 写的）。
+    `require_client` 是先查本地库、查不到才验签的，所以这类令牌走的是
+    `_lookup_device` 那条路 —— 只写 `cloud_clients` 的话，用户在账号
+    后台点"移除这台手机"，云端通路立刻 403，但**局域网通路仍然放行**，
+    而用户以为自己已经把手机摘掉了。
+
+    两张表的 `id` 是同一个值（`consume_pair_code` 用同一个 `client_id`
+    同时写两处），所以按 id 直接落 `revoked = 1` 即可。
+
     返回实际影响的缓存行数。
     """
     if not revoked_ids:
@@ -622,6 +698,10 @@ def sync_revoked_clients(st: Any, revoked_ids: list[str],
         n += int(st.db.execute_rowcount(
             f"UPDATE {_CLOUD_TOKEN_TABLE} SET expires_at = 0"
             " WHERE client_id = ? AND (expires_at IS NULL OR expires_at > 0)",
+            (key,)))
+        # 幂等：已经 revoked 的行不重复计数（rowcount 只数真正改到的行）。
+        n += int(st.db.execute_rowcount(
+            "UPDATE devices SET revoked = 1 WHERE id = ? AND revoked = 0",
             (key,)))
     if n:
         log.info("从云端同步到 %d 台被撤销的手机", n)

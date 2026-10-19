@@ -36,12 +36,14 @@ from typing import Any, Iterable
 
 from ..relay.db import CloudDB
 from . import security
+from shared import client_token as _shared_token
 
 __all__ = [
     "TunnelConnection",
     "DeviceRegistry",
     "find_device_by_agent_token",
     "find_client_by_token",
+    "find_or_adopt_lan_token",
     "touch_device",
     "touch_client",
     "record_traffic",
@@ -50,6 +52,11 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+
+#: 电脑端局域网配对签发的令牌前缀（`shared/client_token.py:TOKEN_PREFIX`）。
+#: 只对带这个前缀的令牌走"验签 + 收编"回退，随机串一律不进那条路径
+#: —— 否则每一枚野令牌都要做一次 HMAC，等于给未鉴权请求开了个 CPU 面。
+_TOKEN_PREFIX = "pbc1"
 
 #: 单设备并发隧道请求上限（`docs/04` §3.3：超出回 429 E4003）。
 #:
@@ -219,6 +226,93 @@ def find_client_by_token(db: CloudDB, token: str) -> sqlite3.Row | None:
     if expires is not None and float(expires) <= time.time():
         return None
     return row
+
+
+def find_or_adopt_lan_token(db: CloudDB, token: str,
+                            device_id: str) -> sqlite3.Row | None:
+    """接受**电脑端在局域网配对时签发**的 HMAC 令牌，并把它收编进 `clients`。
+
+    ## 为什么需要这条回退
+
+    产品里手机只有一条配对路径：在家连局域网、扫托盘二维码、
+    `POST /api/pair`（`frontend/src/stores/auth.ts` 只投递这一个接口；
+    云端 `/api/devices/{id}/pair` 是账号后台用的，手机 UI 走不到）。
+    只查 `clients.token_hash` 的话，那枚令牌从没进过云端库，于是
+    "在家能用、出门 401 E2002"——而 P1 的全部价值就在出门那一段。
+    实测见 `build/_probe_lan_token_on_cloud.py`。
+
+    ## 凭什么能验
+
+    `client_token` 的 HMAC 密钥就是 `sha256(agent_token)`，而
+    `devices.agent_token` 存的正是这个值（`cloud/relay/db.py` 的 DDL）。
+    两端算出来逐字节相同，所以云端**不需要回源电脑**就能验签 ——
+    这正是 `shared/client_token.py` 存在的理由。
+
+    设备从哪来：用**路径里的** `device_id` 去查那台设备的 `agent_token`，
+    再用令牌自带的 `dev` claim 反查一遍（`verify_token(device_id=...)`
+    会拒掉不一致的）。所以为 A 签的令牌在 B 的路径上无效。
+
+    ## 为什么要收编进 `clients`
+
+    不收编的话这枚令牌在账号后台里是隐形的：用户看到"已配对 0 台手机"，
+    点不了移除，而令牌还在用。落一行之后
+    `DELETE /api/devices/{id}/clients/{cid}` 与
+    `GET /api/clients/revoked` 才覆盖得到它（电脑端靠后者把撤销拉回本地）。
+
+    ## 收编之后仍然要判撤销
+
+    `INSERT ... ON CONFLICT(id) DO NOTHING` 而不是 `DO UPDATE`：一行已经
+    被标成 `revoked=1` 时，重放同一枚令牌不该把它改回 `revoked=0`
+    —— 那正是审计里"撤销只生效一次"那类缺陷的形态。
+    """
+    if not isinstance(token, str) or not token:
+        return None
+    if not token.startswith(_TOKEN_PREFIX):
+        return None
+    dev = str(device_id or "").strip().lower()
+    if not dev:
+        return None
+
+    row = db.query_one(
+        "SELECT id, agent_token, revoked FROM devices WHERE id = ?", (dev,))
+    if row is None or int(row["revoked"] or 0) != 0:
+        return None
+    secret = str(row["agent_token"] or "")
+    if not secret:
+        return None
+
+    claims = _shared_token.verify_token(secret, token, device_id=dev)
+    if claims is None:
+        return None
+
+    client_id = str(claims.get("sub") or "")[:64]
+    if not client_id:
+        return None
+    name = str(claims.get("nam") or "").strip()[:64] or "手机"
+    expires = float(claims.get("exp") or 0.0) or None
+    now = time.time()
+    try:
+        db.execute(
+            "INSERT INTO clients(id, device_id, name, token_hash, last_seen,"
+            " created_at, revoked, expires_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, 0, ?)"
+            " ON CONFLICT(id) DO NOTHING",
+            (client_id, dev, name, security.hash_token(token), now, now, expires))
+    except sqlite3.Error:
+        # 收编失败不该让请求挂掉：令牌本身验签已经通过了。日志里
+        # 只记 client_id，不记令牌本身（`scripts/check_lint.py` 规则 4）。
+        log.warning("局域网令牌收编失败 client_id=%s", client_id)
+        return None
+
+    cached = db.query_one(
+        "SELECT id, device_id, name, token_hash, last_seen, created_at, "
+        "revoked, expires_at FROM clients WHERE id = ?", (client_id,))
+    if cached is None or int(cached["revoked"] or 0) != 0:
+        return None
+    exp = cached["expires_at"]
+    if exp is not None and float(exp) <= now:
+        return None
+    return cached
 
 
 #: 同一个设备/客户端的 `last_seen` 最多每 60 秒写一次。

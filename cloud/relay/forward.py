@@ -43,6 +43,7 @@ from ..relay.devices import (
     DeviceRegistry,
     TunnelConnection,
     find_client_by_token,
+    find_or_adopt_lan_token,
     record_traffic,
     touch_client,
 )
@@ -236,6 +237,13 @@ class Forwarder:
         if not token:
             return _error(401, "E2002", "缺少配对令牌", request_id=rid)
         row = find_client_by_token(self.db, token)
+        if row is None:
+            # --- 局域网配对签发的令牌 ---
+            #
+            # 产品里手机只走 `POST /api/pair`（局域网），那枚令牌从没进过
+            # 云端库。这里用 `devices.agent_token` 验签并收编（见
+            # `find_or_adopt_lan_token` 的 docstring）；验不过仍然是 401。
+            row = find_or_adopt_lan_token(self.db, token, device_id)
         if row is None:
             # 令牌死透了：顺手清掉浏览器里的死 cookie，否则 `<img>` 会
             # 用同一个死令牌一直 401（它发不出 Authorization 头）。
