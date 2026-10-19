@@ -1010,3 +1010,91 @@ def test_credit_is_returned_on_consume_not_on_arrival() -> None:
         assert mux._credit.recv_total > before, "消费后没有归还信用"
 
     _run(main())
+
+
+def test_inbound_credit_is_returned_on_consume_not_on_arrival() -> None:
+    """请求体方向的同一条不变量：信用必须在业务层取走后才归还。
+
+    这条是上一条的镜像。上传方向上它更刺眼：业务层读分片的速度取决于
+    手机发多快，而对端拿到信用后可以立刻再发满一窗 ⇒ `body` 队列必然被
+    填满，`_on_req_body` 的 `put()` 停在共享读循环里 ⇒ 心跳停摆、整条
+    隧道被 keepalive 掐断。
+    """
+    async def main() -> None:
+        import shared.mux as m
+
+        sink, sent = _sender()
+        mux = Mux(sink, role="probe")
+        gate = asyncio.Event()
+
+        async def handler(req: InboundRequest) -> None:
+            await gate.wait()          # 先不消费
+            async for _chunk in req.iter_body():
+                pass
+
+        mux.on_request = handler
+        await mux.feed(decode_frame(encode_frame(
+            FrameType.REQ_HEAD, 1,
+            {"method": "POST", "path": "/api/x",
+             "body_len": 64 * MAX_BODY_CHUNK})))
+        req = mux._inbound.get(1)
+        assert req is not None
+        assert req.on_consume is not None, "InboundRequest 没有接上 on_consume"
+
+        before = mux._credit.recv_total
+        chunk = b"z" * MAX_BODY_CHUNK
+        for _ in range(64):
+            await mux.feed(decode_frame(
+                encode_frame(FrameType.REQ_BODY, 1, chunk)))
+
+        # 数据全部到达、但业务层一个字节都没取走 ⇒ 一条 CREDIT 都不该发
+        assert req.body.qsize() == 64
+        assert mux._credit.recv_total == before, (
+            "请求体只是到达就归还了信用，窗口没有约束未消费字节")
+        assert not any(
+            decode_frame(f).type is FrameType.CREDIT for f in sent), \
+            "未消费就回了 CREDIT"
+
+        # 放开消费后，信用才归还
+        gate.set()
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert mux._credit.recv_total > before, "消费后没有归还信用"
+
+    _run(main())
+
+
+def test_inbound_queue_full_does_not_break_read_loop() -> None:
+    """请求体队列满时 `_on_req_end` 绝不能把异常泄进读循环。
+
+    历史形态：`_on_req_end()` 用 `put_nowait(None)`，队列满时抛
+    `asyncio.QueueFull`；`feed()` 只捕 `ProtocolError` ⇒ 它穿到
+    `_read_loop()` 的兜底 `except Exception` ⇒ **整条隧道断开重连**，
+    而对端只是发完了一个分片。
+    """
+    async def main() -> None:
+        import shared.mux as m
+
+        sink, _ = _sender()
+        mux = Mux(sink, role="probe")
+
+        async def handler(req: InboundRequest) -> None:
+            await asyncio.sleep(3600)      # 永远不消费：队列必然填满
+
+        mux.on_request = handler
+        await mux.feed(decode_frame(encode_frame(
+            FrameType.REQ_HEAD, 1,
+            {"method": "POST", "path": "/api/x", "body_len": -1})))
+        req = mux._inbound.get(1)
+        assert req is not None
+        # 直接灌满队列（跳过 `_on_req_body` 的 30s 超时）
+        for _ in range(m._BODY_QUEUE_MAX):
+            req.body.put_nowait(b"z" * MAX_BODY_CHUNK)
+        assert req.body.full()
+
+        # 这一行过去会抛 QueueFull 并断开整条隧道，现在必须安静生效
+        await mux.feed(decode_frame(encode_frame(FrameType.REQ_END, 1)))
+        assert req._body_done is True
+        assert not mux.closed, "队列满不该导致连接被判死"
+
+    _run(main())

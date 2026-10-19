@@ -375,7 +375,7 @@ class InboundRequest:
     """响应侧（电脑端）收到的一个请求：头部 + 请求体流。"""
 
     __slots__ = ("req_id", "head", "body", "cancelled", "created_at",
-                 "body_len", "received")
+                 "body_len", "received", "on_consume", "_body_done")
 
     def __init__(self, req_id: int, head: dict[str, Any]) -> None:
         self.req_id = req_id
@@ -387,12 +387,44 @@ class InboundRequest:
         self.body_len: int = int(raw_len) if isinstance(raw_len, int) else -1
         self.received = 0
         self.created_at = now()
+        #: 消费者取走 `n` 字节时回调（由 `Mux` 装上）。**信用必须在这里
+        #: 归还** —— 与 `PendingRequest.on_consume` 同一个理由，方向相反：
+        #: 这边是"我在收别人的请求体"，我该在**交给业务层之后**才告诉
+        #: 对方可以继续发。见 `_on_req_body` 的注释。
+        self.on_consume: Callable[[int], None] | None = None
+        #: 对端已发 `REQ_END`。队列满时结束标记塞不进去，靠这个标志收尾
+        #: （与 `PendingRequest._body_done` 同构）。
+        self._body_done = False
+
+    def finish_body(self) -> None:
+        """标记请求体结束。队列满时**不抛**，由 `_body_done` 收尾。
+
+        `put_nowait(None)` 在队列满时抛 `asyncio.QueueFull`，而调用方是
+        `_on_req_end()` —— 它跑在**整条连接共享的读循环**上。`feed()` 只
+        捕 `ProtocolError`，因此这个异常会一路穿到 `_read_loop()` 的兜底
+        `except Exception`，行为是**整条隧道断开重连**。而对端只是发完了
+        一个分片，完全无辜。这与 `PendingRequest.finish_body()` 记着的
+        那两次历史事故（清扫协程静默死掉、连接关不掉）是同一个形态。
+        """
+        self._body_done = True
+        try:
+            self.body.put_nowait(None)
+        except asyncio.QueueFull:
+            log.debug("请求体队列已满，结束标记改由 _body_done 生效（rid=%s）",
+                      self.req_id)
 
     async def iter_body(self) -> AsyncIterator[bytes]:
         while True:
+            # 队列已空且对端说过"结束"——结束标记可能因队列满没塞进去。
+            if self._body_done and self.body.empty():
+                return
             chunk = await self.body.get()
             if chunk is None:
                 return
+            # ★ 信用在这里归还 —— 数据**已经被业务层取走**，对端才可以
+            #   再发。见 `_on_req_body` 的注释。
+            if self.on_consume is not None:
+                self.on_consume(len(chunk))
             yield chunk
 
 
@@ -475,7 +507,7 @@ class Mux:
         self._pending.clear()
         for rid, req in list(self._inbound.items()):
             req.cancelled.set()
-            req.body.put_nowait(None)
+            req.finish_body()
         self._inbound.clear()
         await self._credit.wake()
 
@@ -801,7 +833,7 @@ class Mux:
             req = self._inbound.get(rid)
             if req is not None:
                 req.cancelled.set()
-                req.body.put_nowait(None)
+                req.finish_body()
 
     async def _on_req_head(self, rid: int, head: dict[str, Any]) -> None:
         if self.on_request is None:
@@ -810,6 +842,7 @@ class Mux:
                 {"code": "E5004", "message": "peer is not a server", "fatal": False})
             return
         req = InboundRequest(rid, head)
+        req.on_consume = self._on_consume
         self._inbound[rid] = req
         # 不 await 回调：处理器要边读体边处理，若在这里 await，读循环
         # 就停了，`REQ_BODY` 永远收不到 —— 经典的自锁。
@@ -840,14 +873,28 @@ class Mux:
             await self.res_error(rid, "E5003", "请求体超出声明长度")
             return
         req.received += len(data)
-        if self._credit.on_recv(len(data)):
-            await self.send_credit()
-        await req.body.put(data)
+        # ★ 信用**不在这里**归还（与 `_on_res_body` 对称）。
+        #
+        #   原来写的是 `if self._credit.on_recv(len(data)):
+        #   await self.send_credit()` —— 请求体一到就告诉对端"我又能收
+        #   更多了"。同一个错误：窗口约束的应该是**未消费**字节，而不是
+        #   "未到达字节"。上传方向上它的后果更刺眼：业务层读上传分片的
+        #   速度取决于手机发多快，而对端拿到信用后可以立刻再发一个满窗，
+        #   于是 `body` 队列必然被填满，`put()` 停在读循环里。
+        #
+        #   而现在改由 `InboundRequest.iter_body()` 在业务层**真正取走**
+        #   一块之后调用 `on_consume` 归还额度。
+        try:
+            await asyncio.wait_for(req.body.put(data), timeout=_BODY_PUT_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning("请求体投递超时 %.0fs（rid=%s，业务层过慢），"
+                        "放弃该请求", _BODY_PUT_TIMEOUT, rid)
+            await self.res_error(rid, "E5008", "传输卡住，请重试")
 
     async def _on_req_end(self, rid: int) -> None:
         req = self._inbound.get(rid)
         if req is not None:
-            req.body.put_nowait(None)
+            req.finish_body()
 
     def _on_res_head(self, rid: int, head: dict[str, Any]) -> None:
         p = self._pending.get(rid)
@@ -899,7 +946,7 @@ class Mux:
         req = self._inbound.get(rid)
         if req is not None:
             req.cancelled.set()
-            req.body.put_nowait(None)
+            req.finish_body()
             self._inbound.pop(rid, None)
 
     async def _fail(self, rid: int, code: str, message: str) -> None:
