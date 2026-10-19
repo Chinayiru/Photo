@@ -21,18 +21,23 @@
 * **响应侧**（电脑端处理 REQ_*）：`on_request` 回调 → `res_head()` /
   `res_body()` / `res_end()`。
 
-## 信用（CREDIT）语义与 `docs/04` 的差异
+## 信用（CREDIT）语义
 
-`docs/04` §2.3.10 规定 CREDIT 帧带 12 字节 payload（window/consumed/flags），
-但 `shared/protocol.py` 把 CREDIT 放进 `FIXED_LENGTH_TYPES`
-（`backend/tests/test_protocol.py:279` 断言带 payload 必须报错）。
-两边冲突时以**已冻结并被 68 条用例钉住的协议文件**为准：本模块的 CREDIT
-是空 payload，语义是"**把对端发送信用重置回满窗口**"。
+`docs/04` §2.3.10 规定 CREDIT 帧带 12 字节 payload（`window` / `consumed` /
+`flags`），本模块按此实现：`payload` 里的 `window` 是**本次归还的字节数**，
+不是绝对窗口值。信用在**消费者真正取走一块数据时**才归还（`on_consume`
+→ `_CreditGate.on_recv` → `send_credit`），而不是在数据**到达**时 —— 后者
+会让对端合法地领先一个永远追不上它的慢消费者，是 ISSUE-021 的形态。
 
-这不会放大内存：接收方只有在**已消费 ≥ 窗口一半**时才回 CREDIT，所以
-发送方最多多拿到半个窗口的额度（8 MB → 峰值 ≤ 12 MB，仍远低于
-`docs/01` AC-1.4 的 200 MB 上限）。少掉的只是"精确到字节的对账"，
-而那个数字在排障时由 `bytes_in/bytes_out` 统计提供，不靠 CREDIT。
+★ 这里曾经与 `shared/protocol.py` 冲突：协议文件把 CREDIT 冻在
+`FIXED_LENGTH_TYPES` 里（带 payload 就 `ProtocolError`），于是本模块只能发
+空帧、语义退化成"重置回满窗"。那个退化有两个已实测的严重后果：
+① 10 KB/s 慢读时接收方要攒满 4 MB 才回一次信用，凑满需 410 秒，而发端
+   30 秒就判死（`E5010`）⇒ 大图在 8 MB（恰好一个窗口）处被放弃；
+② 放弃时不发 `RES_END` ⇒ 手机收到 **HTTP 200 + 半张照片**。
+详见 `docs/11` ISSUE-022。现在协议文件已把 CREDIT 移出定长集合，并且
+**两端都声明 `credit_v2` 能力**才发带 payload 的帧（`Mux(credit_v2=)`），
+老对端仍收空帧走"重置"语义，不会被新格式打断。
 """
 from __future__ import annotations
 
