@@ -771,6 +771,127 @@ def test_forward_preserves_405_and_allow_header(rig_factory) -> None:
     assert "GET" in out["headers"]["allow"].upper(), out["headers"]
 
 
+def test_tunnel_refuses_non_api_paths(rig_factory) -> None:
+    """云端绝不允许 `/panel/**` 或静态资源走隧道（审计 F1 / F11 的延伸）。
+
+    ★ 这条钉的是**安全属性**，不是功能：`/panel/**` 在电脑端只靠
+    `is_loopback(ctx)` 守（`backend/app/auth.py`），而云端通路的
+    `client_ip` 兜底是字符串 `"cloud"`。如果隧道放行 `/panel/pair-code`，
+    那台电脑的配对码就能被任何持有隧道令牌的手机反复领取 —— 一期审计
+    F1 里"任意网页能读走整个库"的放大器会以另一种形式回来。
+
+    两端各判一次 `_clean_path`（云端 `Forwarder` 与电脑端
+    `TunnelDispatcher` 用的是同一个函数），所以这里同时验两条：
+    云端直接拒（403 `E5004`），且**根本到不了电脑端**。
+    """
+    async def main() -> dict[str, Any]:
+        rig = rig_factory()
+        await rig.start()
+        await rig.wait_tunnel()
+        await rig.apair()
+        out = {}
+        for path in ("/panel/pair-code", "/panel/devices", "/panel/audit",
+                     "/index.html", "/", "/api/../panel/pair-code",
+                     "/API/system/ping"):
+            out[path] = await rig.cloud.arequest(
+                "GET", rig.tunnel_path(path), token=rig.client_token)
+        return out
+
+    out = _run(main())
+    for path, (status, body, _h) in out.items():
+        assert status == 403, (path, status, body)
+        assert body["error"]["code"] == "E1009", (path, body)
+        # `detail` 必须为空：错误响应里不能回显被拒的路径
+        assert body["error"]["detail"] is None, (path, body)
+
+
+
+def test_agent_side_rejects_non_api_paths_too() -> None:
+    """纵深防御：**电脑端**也判一次，云端被绕过时仍然安全。
+
+    `TunnelDispatcher.handle` 和云端 `Forwarder` 调的是同一个
+    `_clean_path`（`docs/04` §2.3.1 明确要求两端各判一次）。这条用例
+    绕开云端、直接喂一个 `InboundRequest` 给 dispatcher，模拟"云端被
+    改成放行"——电脑端必须自己拒。
+
+    `client_ip` 兜底 `"cloud"` 这件事在这里也顺带钉住：如果哪天有人把
+    兜底改成 `""`，`auth.is_loopback("")` 会返回 True（一期审计 F11），
+    `/panel/**` 就从这个口子回来了。
+    """
+    from backend.app.transports.cloud_tunnel import (            # noqa: PLC0415
+        TunnelDispatcher,
+    )
+
+    from shared.mux import InboundRequest                   # noqa: PLC0415
+
+    sent: list[tuple] = []
+
+    class _Mux:
+        async def res_error(self, rid, code, message="", *, fatal=True):
+            sent.append(("error", rid, code, message))
+
+        async def res_head(self, rid, status, headers, **kw):
+            sent.append(("head", rid, status))
+
+        async def res_body(self, rid, chunk):
+            pass
+
+        async def res_end(self, rid, **kw):
+            pass
+
+    async def main() -> None:
+        # router 传 None：一旦路径被放行，`self.router.dispatch` 会抛
+        # AttributeError —— 那本身就是"没拦住"的证据。
+        disp = TunnelDispatcher(None)                      # type: ignore[arg-type]
+        for path in ("/panel/pair-code", "/index.html", "/"):
+            req = InboundRequest(req_id=1, head={
+                "method": "GET", "path": path, "client_ip": ""})
+            await disp.handle(_Mux(), req)
+
+    _run(main())
+    assert len(sent) == 3, sent
+    for item in sent:
+        assert item[0] == "error", item
+        assert item[2] == "E5004", item
+    # 被拒时 message 里可以回显**请求方自己发来**的路径（那不是泄漏），
+    # 但绝不能出现服务器本地路径。审计 F14 的判据就是这个。
+    for item in sent:
+        assert "H:\\" not in item[3], item
+        assert "Traceback" not in item[3], item
+
+
+def test_panel_is_not_reachable_even_if_path_check_is_bypassed() -> None:
+    """第二道防线：`/panel/**` 靠 `client_ip` 挡，不靠路径白名单。
+
+    上一条用例证明电脑端会拒非 `/api` 路径。**但那是第一道防线**，
+    它哪天被放宽（例如允许 `/d/{id}/favicon.ico`）时，`/panel/**` 不该
+    跟着一起开门。这里直接把 `client_ip` 设成隧道兜底值 `"cloud"`，
+    走完 `_clean_path`（即假设第一道防线被绕过），断言 `is_loopback`
+    仍然为 False —— 守护这道防线的是"云端通路的 IP 永远不是回环"。
+
+    ★ 一期审计 F11 就是这条防线破了的后果：`is_loopback` 当时把空串
+    当回环，于是任何 `client_ip` 漏填的路径都会把 `/panel/**` 变成公开
+    端点。`backend/app/auth.py:762-763` 现在 `if not ip: return False`。
+    """
+    from backend.app.auth import is_loopback                  # noqa: PLC0415
+    from backend.app.core.ctx import Ctx                      # noqa: PLC0415
+
+    def ctx_for(ip: str) -> Ctx:
+        return Ctx(method="GET", path="/panel/devices",
+                   headers={}, body=None, client_ip=ip)
+
+    # 云端通路里 `client_ip` 只会是这些值（`CloudTunnelDispatcher` 从
+    # head 里取，取不到就是字符串 "cloud"）
+    for ip in ("cloud", "", "   ", "172.16.0.5", "203.0.113.9",
+               "10.0.0.1", "::ffff:172.16.0.5", "unknown"):
+        assert is_loopback(ctx_for(ip)) is False, ip
+    # 真正的回环仍然要认（用户在电脑前点托盘"打开面板"）
+    for ip in ("127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1",
+               "  127.0.0.1  "):
+        assert is_loopback(ctx_for(ip)) is True, ip
+
+
+
 def test_forward_streams_large_body_without_buffering(rig_factory) -> None:
     """AC-4.2：下载走流式，云端不整体缓冲。
 
