@@ -48,6 +48,7 @@
 import type { PingResponse, SystemInfo } from "./types";
 import {
   activeBase,
+  cloudBaseFromLocation,
   currentVia,
   getBase,
   getCloudBase,
@@ -185,6 +186,13 @@ function isCellular(): boolean {
  */
 export function shouldTryLan(): boolean {
   if (!navigator.onLine) return false;
+  // ★ 页面本身由**云端**伺服时（`https://域名/d/<id>/`），`getBase()` 里
+  //   存的很可能就是云端基址（配对就发生在云端 origin 上），于是"试直连"
+  //   实际是把同一个云端地址又打一遍 —— 白等 1.5 秒，还会把状态条标成
+  //   "局域网直连"（用户在外面看到"直连"会以为令牌泄漏到了公网）。
+  //   而真正的局域网地址在 https 页面里根本发不出去：`http://192.168.x.x`
+  //   是 Mixed Content，浏览器在发出请求之前就拦掉了。
+  if (cloudBaseFromLocation()) return false;
   if (isCellular()) return false;
   if (!getBase()) return false;
   if (memory.lanFailedAt !== null

@@ -175,9 +175,11 @@ export function savePairing(p: {
   write(K_DEVICE_NAME, p.deviceName);
   write(K_BASE, normalizeBase(p.base));
   write(K_CLOUD, normalizeBase(p.cloudBase ?? ""));
-  // 刚配对完一定是直连（用户就在电脑边上扫码），把它钉住，
-  // 免得上一台电脑留下的 `pb.via="cloud"` 让首次请求打到云端。
-  write(K_VIA, "lan");
+  // 刚配对完的通路：在电脑边扫码是直连；**页面由云端伺服时就是云端**
+  // （P1-13 之后二维码主入口指向云端，这是最常见的情形）。写死 `"lan"`
+  // 会让状态条在第一次探测完成前显示"局域网直连"，而请求其实一直走中继
+  // —— 用户在外面看到"直连"会以为令牌泄到了公网。
+  write(K_VIA, cloudBaseFromLocation() ? "cloud" : "lan");
   // ★ 同一浏览器里 `base` 变了就必须重发 cookie：cookie 是**按
   // host:port 隔离**的，换一台电脑（或换了端口）时旧 cookie 不会
   // 跟着走，但也不会被覆盖，于是新电脑上缩略图全部 401 而 JS

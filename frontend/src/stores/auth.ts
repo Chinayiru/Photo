@@ -293,7 +293,8 @@ export async function pair(base: string, code: string,
     s.deviceName = r.device_name;
     s.deviceMismatch = false;
     s.lastError = "";
-    s.conn = "DIRECT";
+    // 页面由云端伺服时走的是中继，状态条不能显示"局域网直连"。
+    s.conn = here ? "CLOUD" : "DIRECT";
     s.lastOkAt = Date.now();
     return r;
   } finally {

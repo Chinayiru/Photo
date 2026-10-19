@@ -145,12 +145,26 @@ def _qr_pil_image(data: str, *, box: int = 8, border: int = 3) -> Any:
     return qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
 
-def _show_qr_window(title: str, url: str, code: str, ips: list[str]) -> None:
+def _show_qr_window(title: str, url: str, code: str, ips: list[str],
+                    alt_urls: list[str] | None = None) -> None:
     """弹出一个二维码窗口（阻塞直到用户关闭）。
 
     在**独立线程**里跑自己的 `tkinter` 主循环。不用主线程是因为
     主线程要跑 asyncio；`tkinter` 要求在主线程创建，所以这里
     自己起一个线程并让它成为那个线程的"主线程"。
+
+    ## `alt_urls` 是干什么的
+
+    二维码只编**一个** URL，而"云端入口"（`https://域名/d/<id>/`）与
+    "局域网入口"（`http://192.168.x.x:8787/`）是两个不同的 origin，
+    各自有**独立的 localStorage 与 cookie**：在哪个 origin 上配对，
+    令牌就落在哪个 origin。所以二维码编哪个，决定了这台手机以后
+    默认从哪个入口进来。
+
+    P1 之后二维码编**云端**入口（否则用户出门后打开域名是一个空的
+    配对页，而 6 位码要人站在电脑边上才看得到 —— 见 `docs/11` ISSUE-024）。
+    代价是在家里也走中继，所以窗口里把局域网地址**明文列出来**：
+    用户想在家直连，照着输一次即可（那个 origin 会独立配一次对）。
     """
     def _run() -> None:
         try:
@@ -189,6 +203,15 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str]) -> None:
                 others = "  ".join(f"http://{ip}" for ip in ips[1:])
                 tk.Label(root, text=f"其他网卡：{others}", font=("Segoe UI", 8),
                          fg="#6b7280", wraplength=380).pack(padx=16)
+            # 备选入口（二维码编云端地址时，这里就是局域网直连地址）。
+            # 必须明文显示而不能藏在二维码里：两个 origin 各自独立配对，
+            # 用户想在家里直连就得手动打开一次这个地址。
+            alt = [u for u in (alt_urls or []) if u and u != url]
+            if alt:
+                tk.Label(root, text="在家直连（更快，需单独配一次）：",
+                         font=("Segoe UI", 8), fg="#6b7280").pack(pady=(6, 0))
+                tk.Label(root, text="\n".join(alt), font=("Consolas", 8),
+                         fg="#059669", wraplength=380).pack(padx=16)
 
             tk.Label(root, text="配对码 5 分钟内有效，过期后重新生成",
                      font=("Segoe UI", 8), fg="#9ca3af").pack(pady=(6, 0))
@@ -327,6 +350,43 @@ class TrayController:
         lan = [u for u in urls if "127.0.0.1" not in u and "localhost" not in u]
         return lan or urls
 
+    def _cloud_entry(self) -> str:
+        """云端入口基址 `https://域名/d/<云端 device_id>`，不可用时空串。
+
+        ★ 为什么二维码要编**云端**地址而不是局域网地址
+
+        两条通路的 origin 必然不同（`http://192.168.x.x:8787` vs
+        `https://域名`），而 localStorage 与 cookie 都按 origin 隔离。
+        一期只编局域网地址，于是用户出门打开域名时 LocalStorage 是空的
+        —— 手机回到配对页，而配对码要人站在电脑边上看（`docs/11`
+        ISSUE-024 有浏览器实测证据）。让二维码直接指云端入口，用户
+        第一次配对就发生在云端 origin 上，令牌、cookie、图片全同源，
+        出门回家都能用；代价是在家里也走中继（窗口里另外列出局域网
+        地址，想要直连的人照着输一次即可）。
+
+        取不到就返回空串，让调用方回退到局域网 —— 二维码编一个连不上
+        的地址比"编局域网地址"更糟：用户会以为程序坏了。
+        """
+        st = self._state
+        if st is None:
+            return ""
+        try:
+            from .tunnel import get_tunnel
+
+            client = get_tunnel()
+            if client is None:
+                return ""
+            base = str(client.public_base() or "").strip()
+            # 只有隧道**真的连着**才把二维码指过去。`public_base()` 在
+            # 配置齐备但连不上时也会算出地址（它是纯函数），拿它编二维码
+            # 会得到一个"手机打不开"的码。
+            if not base or not bool(client.status().get("connected")):
+                return ""
+            return base
+        except Exception:       # noqa: BLE001 —— 托盘任何功能都不该因此崩
+            log.debug("读取云端入口失败", exc_info=True)
+            return ""
+
     def _new_pair_code(self) -> tuple[str, str, list[str]] | None:
         """生成一枚新配对码，返回 (code, url, ips)。失败返回 None。"""
         st = self._state
@@ -346,12 +406,37 @@ class TrayController:
 
         ips = local_ipv4_addresses()
         lan = self._lan_urls()
-        base = lan[0] if lan else (f"http://127.0.0.1:{self._port()}")
+        lan_base = lan[0] if lan else (f"http://127.0.0.1:{self._port()}")
+        # 云端可用就编云端入口（见 `_cloud_entry` 的长注释）；否则退回局域网。
+        base = self._cloud_entry() or lan_base
+        if base != lan_base:
+            log.info("二维码指向云端入口 %s（局域网 %s 作为备选）", base, lan_base)
         log.info("托盘生成配对码，%d 秒内有效", int(PAIR_CODE_TTL))
         return code, pair_qr_url(base, code, st.device_id), ips
 
     def _port(self) -> int:
         return int(self.cfg.server.get("port", 8787))
+
+    def _alt_urls_for(self, url: str) -> list[str]:
+        """二维码编的是云端入口时，返回要列出来的局域网备选地址。
+
+        判据用"URL 是否以某个局域网地址开头"而不是"再问一次隧道"：
+        二维码到底编了哪个地址，只有这个 URL 说了算，重新推导一遍
+        会在隧道恰好断开的一瞬间给出与二维码不一致的结论。
+
+        `transport.urls` 里尾斜杠形态不固定（`http://ip:port` 与
+        `http://ip:port/` 都可能出现），所以这里去重 —— 同一个地址在
+        窗口里出现两次，用户会以为有两个不同的入口。
+        """
+        lan = self._lan_urls()
+        if any(url.startswith(u.rstrip("/") + "/") for u in lan):
+            return []       # 二维码本来就是局域网地址，不需要备选
+        out: list[str] = []
+        for u in lan:
+            entry = u.rstrip("/") + "/"
+            if entry not in out:
+                out.append(entry)
+        return out
 
     def _on_show_qr(self, *_: Any) -> None:
         got = self._new_pair_code()
@@ -359,7 +444,8 @@ class TrayController:
             notify_error("生成配对码失败，详见 data/logs/agent.log")
             return
         code, url, ips = got
-        _show_qr_window("PhotoBridge 配对", url, code, ips)
+        _show_qr_window("PhotoBridge 配对", url, code, ips,
+                        self._alt_urls_for(url) or None)
 
     def _has_paired_device(self) -> bool:
         """是否已经有手机配对过（未撤销的）。"""
