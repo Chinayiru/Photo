@@ -574,6 +574,9 @@ class Mux:
         #: 底层发送失败过一次（socket 已关、ASGI 消息已终结）。见 `_send_frame`。
         self._failed = False
         self._sweeper: asyncio.Task[None] | None = None
+        #: 在飞的 `send_credit` 任务。持引用只为在 `close()` 时能取消，
+        #: 以及让 `add_done_callback` 能消费掉它们的异常（见 `_on_consume`）。
+        self._credit_tasks: set[asyncio.Task[None]] = set()
         self._role = role
 
         #: 响应侧回调（电脑端设置）。云端转发侧不设置。
@@ -608,6 +611,11 @@ class Mux:
         if self._sweeper is not None:
             self._sweeper.cancel()
             self._sweeper = None
+        # 在飞的 CREDIT 发送没有意义了（对端已不可达），且它们会在
+        # `_send_frame` 里抛 `MuxClosed`。取消而不是放着跑：留着就成了
+        # 一组永远不结束的任务，`_credit_tasks` 会一直涨。
+        for task in list(self._credit_tasks):
+            task.cancel()
         err = {"status": 0, "error": {"code": "E5010",
                                       "message": f"tunnel closed: {reason or 'closed'}"}}
         for rid, p in list(self._pending.items()):
@@ -738,9 +746,27 @@ class Mux:
         if not self._credit.on_recv(n):
             return
         try:
-            asyncio.get_running_loop().create_task(self.send_credit())
+            loop = asyncio.get_running_loop()
         except RuntimeError:            # 没有运行中的循环（拆卸阶段）
-            pass
+            return
+        # ★ 必须接住任务异常：`send_credit` 在连接关闭时重抛 `MuxClosed`，
+        #   而 `create_task` 不 await 的异常只会变成 "Task exception was
+        #   never retrieved" —— 关闭期间每个未完成请求刷一行噪音日志，
+        #   真正的告警被淹掉。这里丢掉 CREDIT 是安全的：对端会在
+        #   `CREDIT_DEADLOCK_TIMEOUT` 后重试，而且连接本来就已关。
+        task = loop.create_task(self.send_credit())
+        self._credit_tasks.add(task)
+        task.add_done_callback(self._drop_credit_task)
+
+    def _drop_credit_task(self, task: asyncio.Task[None]) -> None:
+        """取走 `send_credit` 的结果 —— 不取会变成 "Task exception was never
+        retrieved"，关闭期间每个在飞请求刷一行噪音，真告警被淹掉。"""
+        self._credit_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None and not isinstance(exc, MuxClosed):
+            log.warning("回补 CREDIT 失败：%s: %s", type(exc).__name__, exc)
 
     async def send_body(self, p: PendingRequest, chunk: bytes) -> None:
         """送一块请求体（自动按 `MAX_BODY_CHUNK` 切片并过信用窗）。"""

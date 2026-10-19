@@ -1245,3 +1245,66 @@ def test_inbound_queue_full_does_not_break_read_loop() -> None:
         assert not mux.closed, "队列满不该导致连接被判死"
 
     _run(main())
+
+
+def test_credit_send_task_is_tracked_and_never_leaks_warnings() -> None:
+    """`_on_consume` 用 `create_task` 发 CREDIT，必须持有引用并取走异常。
+
+    历史形态：`asyncio.get_running_loop().create_task(self.send_credit())`
+    的返回值被丢掉。`send_credit` 在连接关闭时**重抛** `MuxClosed`，而那些
+    异常从来没被读取 —— 运行时会打 "Task exception was never retrieved"。
+    关闭期间每个在飞请求各刷一行，真正的告警被淹掉；任务对象也不会被回收。
+
+    判据分两处：① `close()` 必须取消在飞任务；② `_drop_credit_task` 必须
+    调 `task.exception()`（不调就没人消费异常）。
+    """
+    async def main() -> None:
+        import shared.mux as m
+
+        # ① 关闭时必须取消在飞的发信任务，否则它们永远不结束
+        sink, _ = _sender()
+        mux = Mux(sink, role="probe")
+        assert mux._credit_tasks == set(), "初始就该是空集合"
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        real_send = mux.send_credit
+
+        async def slow_send(n: int | None = None) -> None:
+            started.set()
+            await release.wait()          # 卡住，模拟"帧还没发出去"
+            await real_send(n)
+
+        mux.send_credit = slow_send       # type: ignore[method-assign]
+        # 归还量必须越过 `on_recv` 的阈值（max(CREDIT_THRESHOLD, window//2)），
+        # 否则这条任务根本不会被创建 —— 第一版传了 1024 字节，断言直接假失败。
+        mux._on_consume(m.CREDIT_WINDOW // 2)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert started.is_set()
+        assert len(mux._credit_tasks) == 1, "在飞任务没有被持有引用"
+
+        await mux.close("test")
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert mux._credit_tasks == set(), "close() 之后在飞任务仍在集合里"
+
+        # ② done_callback 必须真去读异常，否则运行时打 "never retrieved"
+        mux2 = Mux(_sender()[0], role="probe2")
+        boom = asyncio.get_running_loop().create_task(_raiser())
+        mux2._credit_tasks.add(boom)
+        boom.add_done_callback(mux2._drop_credit_task)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert mux2._credit_tasks == set(), "回调没有把任务移出集合"
+        # ★ 只断言"移出集合"是不够的（移出发生在读异常之前，实测变异逃逸）。
+        #   `_log_traceback` 正是 CPython 用来决定要不要打
+        #   "Task exception was never retrieved" 的标志：读一次 `exception()`
+        #   就会把它置 False。用它才能钉住"异常真的被消费了"。
+        assert boom._log_traceback is False, (
+            "回调没读 task.exception()，运行时会打 never-retrieved 警告")
+
+    async def _raiser() -> None:
+        raise MuxClosed("模拟发送失败")
+
+    _run(main())
