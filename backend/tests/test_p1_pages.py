@@ -385,26 +385,47 @@ def test_cloud_serves_the_app_shell_at_root_and_device_prefix(
     `/d/<id>/assets/...`，同一份产物两种前缀都对。
     """
     import asyncio
+    import re
 
     async def main():
         root = await asyncio.to_thread(_http, live_rig.cloud_port, "GET", "/")
         dev = await asyncio.to_thread(
             _http, live_rig.cloud_port, "GET", f"/d/{live_rig.device_id}/")
-        asset = await asyncio.to_thread(
-            _http, live_rig.cloud_port, "GET", "/assets/index-C8PdhKZN.js")
-        dev_asset = await asyncio.to_thread(
-            _http, live_rig.cloud_port, "GET",
-            f"/d/{live_rig.device_id}/assets/index-C8PdhKZN.js")
-        return root, dev, asset, dev_asset
+        return root, dev
 
-    root, dev, asset, dev_asset = asyncio.run(main())
+    root, dev = asyncio.run(main())
     for status, body, hdrs in (root, dev):
         assert status == 200, (status, body[:80])
         assert "text/html" in hdrs["content-type"], hdrs
         assert b'id="app"' in body or b"id=app" in body, body[:120]
-    for status, body, hdrs in (asset, dev_asset):
+
+    # ★ 资源名从 index.html 里现取，不写死。
+    #   构建产物是 `assets/index-<hash>.js`，hash 每次改前端都会变 ——
+    #   写死的话这条用例会在"某次纯前端改动之后"变红，且红得毫无信息量
+    #   （上一次就是这么红的：`index-C8PdhKZN.js` → `index-Dn27c4np.js`）。
+    #   顺带这条比原来更强：它验的正是"index.html 引用的那个文件真的取得到"。
+    names = sorted(set(re.findall(rb"\./(assets/[^\"']+\.js)", root[1])))
+    assert names, root[1][:400]
+
+    async def fetch_assets():
+        out = []
+        for raw in names:
+            rel = raw.decode("utf-8")
+            out.append((
+                await asyncio.to_thread(
+                    _http, live_rig.cloud_port, "GET", "/" + rel),
+                await asyncio.to_thread(
+                    _http, live_rig.cloud_port, "GET",
+                    f"/d/{live_rig.device_id}/{rel}"),
+            ))
+        return out
+
+    pairs = asyncio.run(fetch_assets())
+    for (status, _body, hdrs), (dstatus, _dbody, dhdrs) in pairs:
         assert status == 200, status
+        assert dstatus == 200, dstatus
         assert "javascript" in hdrs["content-type"], hdrs
+        assert "javascript" in dhdrs["content-type"], dhdrs
     # 同源页面不带隧道标记
     assert "x-pb-tunnel" not in root[2]
 
