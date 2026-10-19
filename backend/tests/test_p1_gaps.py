@@ -296,3 +296,224 @@ def test_touch_device_only_writes_when_values_change(tmp_path) -> None:
     finally:
         db.close_all()
         cdb.set_db(None)
+
+
+# ---------------------------------------------------------------------------
+# 心跳判死（TC-TUNNEL-EDGE-002 / EDGE-003）
+# ---------------------------------------------------------------------------
+
+
+class _FakeMux:
+    """心跳循环只需要 `closed` / `last_frame_at` / `send_ping()` 三样。"""
+
+    def __init__(self, *, silent_for: float = 0.0, closed: bool = False) -> None:
+        import time as _t
+        self.closed = closed
+        self.last_frame_at = _t.monotonic() - silent_for
+        self.pings = 0
+
+    async def send_ping(self) -> None:
+        self.pings += 1
+        import time as _t
+        self.last_frame_at = _t.monotonic()
+
+
+class _FakeWS:
+    def __init__(self) -> None:
+        self.closes: list[tuple[int, str]] = []
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        self.closes.append((code, reason))
+
+
+def test_cloud_heartbeat_disconnects_a_silent_agent(monkeypatch) -> None:
+    """TC-TUNNEL-EDGE-002：静默超过阈值 → 云端主动断开（1001）。
+
+    ★ 走 `DEAD_AFTER` 而不是"收到 PONG"：大文件下载时隧道上永远是满的，
+    判据只能是"有没有收到任何帧"。这里把两个周期常量压到毫秒级，
+    否则要真等 90 秒。
+    """
+    import asyncio
+
+    import cloud.relay.tunnel as t
+
+    monkeypatch.setattr(t, "CLOUD_PING_SEC", 0.02)
+    monkeypatch.setattr(t, "DEAD_AFTER", 0.01)
+
+    async def main() -> tuple[list[tuple[int, str]], int]:
+        mux = _FakeMux(silent_for=60.0)      # 已经静默一分钟
+        ws = _FakeWS()
+        await asyncio.wait_for(t.TunnelServer._heartbeat_loop(None, mux, ws), 5)
+        return ws.closes, mux.pings
+
+    closes, pings = _run(main())
+    assert closes == [(1001, "heartbeat_timeout")], closes
+    # 判死发生在发 PING **之前**，否则会给一条死连接继续灌流量
+    assert pings == 0
+
+
+def test_agent_heartbeat_stops_the_client_when_cloud_goes_silent(
+        monkeypatch) -> None:
+    """TC-TUNNEL-EDGE-003：Agent 侧判死后置 `stop` ⇒ 外层重连循环接手。"""
+    import asyncio
+
+    import backend.app.tunnel as t
+
+    monkeypatch.setattr(t, "DEAD_AFTER", 0.01)
+
+    async def main() -> tuple[bool, int]:
+        client = t.TunnelClient({}, dispatcher=None, base_url="", agent_token="")
+        # 心跳间隔有 5 秒地板（`interval = max(5.0, ...)`），故意不压：
+        # 那条地板是"别把服务器打爆"的保护，用例不该假定它可以变小。
+        client._peer_heartbeat = 0.01
+        mux = _FakeMux(silent_for=60.0)
+        stop = asyncio.Event()
+        await asyncio.wait_for(client._heartbeat_loop(mux, stop), 12)
+        return stop.is_set(), mux.pings
+
+    stopped, pings = _run(main())
+    assert stopped is True, "判死必须置 stop，否则外层 while 会一直等下去"
+    assert pings == 0
+
+
+# ---------------------------------------------------------------------------
+# 流控不变量（TC-TUNNEL-PERF-002 / PERF-007 / PERF-008）
+# ---------------------------------------------------------------------------
+
+
+def test_frame_header_overhead_is_under_one_percent() -> None:
+    """TC-TUNNEL-PERF-002：64 KB 分片下帧头开销 < 1%。"""
+    import asyncio
+
+    from shared.mux import Mux
+
+    sent: list[int] = []
+
+    async def main() -> tuple[int, int]:
+        async def sink(data: bytes) -> None:
+            sent.append(len(data))
+
+        mux = Mux(sink, role="framer")
+        payload = bytes(8 * 1024 * 1024)          # 8 MB = 128 片
+        p = await mux.open({"method": "GET", "path": "/api/x"})
+        await mux.send_body(p, payload)
+        await mux.end_body(p)
+        return len(payload), sum(sent)
+
+    payload_len, wire = _run(main())
+    overhead = (wire - payload_len) / payload_len
+    assert overhead < 0.01, f"帧开销 {overhead:.4%} 超过 1%"
+    # 顺带钉住分片大小：改小会让开销线性上涨，改大没意义
+    assert wire > payload_len, "线上字节必须多于净荷（否则说明没加帧头）"
+
+
+def test_credit_never_goes_negative_or_exceeds_the_window() -> None:
+    """TC-TUNNEL-PERF-007：信用值始终落在 `[0, window]`。
+
+    信用为负意味着"发出了比允许更多的字节"——对端会按协议丢帧；
+    超过窗口意味着窗口根本没起作用（`docs/04` §2.6 的 OOM 风险）。
+    """
+    import asyncio
+
+    from shared.mux import CREDIT_WINDOW, Mux
+
+    seen: list[int] = []
+
+    async def main() -> None:
+        async def sink(data: bytes) -> None:
+            return None
+
+        mux = Mux(sink, role="credit")
+        p = await mux.open({"method": "GET", "path": "/api/x"})
+        chunk = bytes(65530)
+        for _ in range(40):                       # 40 × 64 KB = 2.6 MB
+            await mux.send_body(p, chunk)
+            seen.append(mux._credit.credit)
+        await mux._credit.grant()
+        seen.append(mux._credit.credit)
+
+    _run(main())
+    assert all(0 <= c <= CREDIT_WINDOW for c in seen), (
+        f"信用越界：min={min(seen)} max={max(seen)} window={CREDIT_WINDOW}")
+    assert min(seen) < CREDIT_WINDOW, "如果信用从没被扣过，这条用例什么也没测到"
+
+
+def test_credit_does_not_decay_across_many_transfers() -> None:
+    """TC-TUNNEL-PERF-008：多批传输后信用不逐批衰减（没有泄漏）。
+
+    ★ 不能断言"结束时恰好等于 window"。信用是**按阈值回补**的
+    （消费满 `max(CREDIT_THRESHOLD, window//2)` 才发一帧 CREDIT），
+    所以稳态下总有 0..阈值 的尾巴没还。第一版就是这么写的，跑出
+    `剩 4907008` 看着像泄漏，其实只差 3.3 MB < 4 MB 阈值 —— 是
+    正常状态。判据应该是"每一批结束时的剩余量都不低于 window-阈值"，
+    也就是**不随批次数单调下降**。
+    """
+    import asyncio
+
+    from shared.mux import CREDIT_THRESHOLD, Mux
+
+    WINDOW = 1024 * 1024            # 1 MB：让阈值与批量都小，跑得快
+    THRESHOLD = max(CREDIT_THRESHOLD, WINDOW // 2)
+    BATCH = 8                       # 每批 8 × 200 KB = 1.6 MB > 窗口
+    EARLY = 30                      # 同一批里连续发的次数上限
+
+    async def main() -> list[int]:
+        holder: dict[str, object] = {}
+
+        async def to_right(data: bytes) -> None:
+            await holder["right"].feed(p.decode_frame(data))    # type: ignore[union-attr]
+
+        async def to_left(data: bytes) -> None:
+            await holder["left"].feed(p.decode_frame(data))     # type: ignore[union-attr]
+
+        left = Mux(to_right, window=WINDOW, role="client")
+        right = Mux(to_left, window=WINDOW, role="server")
+        holder["left"] = left
+        holder["right"] = right
+
+        async def on_req(req) -> None:
+            async for _ in req.iter_body():
+                pass
+            await right.res_head(req.req_id, 200,
+                                 {"content-type": "text/plain"}, body_len=2)
+            await right.res_body(req.req_id, b"ok")
+            await right.res_end(req.req_id)
+
+        right.on_request = on_req
+
+        payload = bytes(200 * 1024)
+        marks: list[int] = []
+        # ★ 采样必须发生在**发送过程中**。只在每批收尾时看的话，
+        #   那时响应已经读完、CREDIT 已经回补，信用永远是满的 ——
+        #   第一版就是这样，"看不出被扣过"（实测 `worst == WINDOW`）。
+        for _ in range(EARLY):
+            low = WINDOW
+            for _ in range(BATCH):
+                pr = await left.open({"method": "POST", "path": "/api/x"})
+                await left.send_body(pr, payload)
+                low = min(low, left._credit.credit)
+                await left.end_body(pr)
+                got = b""
+                async for chunk in pr.iter_body():
+                    got += chunk
+                assert got == b"ok", got
+                left.finish(pr.req_id)
+            marks.append(low)
+        marks.append(left._credit.credit)
+        return marks
+
+    marks = _run(main())
+
+    worst = min(marks)
+    # ① 没有单调衰减：泄漏的形态是"每批最低点都比上一批更低"，
+    #    而不是"最低点很低"（后者是正常的窗口内波动）。
+    assert min(marks[EARLY // 2:]) >= min(marks[:EARLY // 2]), (
+        f"信用逐批下降：前 {EARLY//2} 批最低 {min(marks[:EARLY//2])} → "
+        f"后 {EARLY//2} 批最低 {min(marks[EARLY//2:])} —— 每次少还一点，"
+        "攒够一个窗口就永久卡死")
+    # ② 每一批都能回到满窗：这是"CREDIT 真的被回补"的直接证据
+    assert marks[-1] == WINDOW, (
+        f"收尾时信用只剩 {marks[-1]}（应为 {WINDOW}）—— 回补失效")
+    # ③ 别太乐观：从没被扣过说明这条用例什么也没测到
+    assert worst < WINDOW // 2, (
+        f"信用最低只用到 {worst}（窗口 {WINDOW}）—— 扣减路径可能没走")
