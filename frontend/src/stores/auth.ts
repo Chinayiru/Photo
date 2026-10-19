@@ -38,6 +38,7 @@ import type { PairResponse, PingResponse } from "../api/types";
 import {
   activeBase,
   clearPairing,
+  cloudBaseFromLocation,
   getBase,
   getCloudBase,
   getDeviceId,
@@ -223,7 +224,13 @@ export function reconnect(): Promise<boolean> {
 export async function pair(base: string, code: string,
                            expectedDid = ""): Promise<PairResponse> {
   const s = authStore.state;
-  const cleanBase = normalizeBase(base);
+  // ★ 页面由云端伺服时（`https://域名/d/<id>/`），基址必须取**当前
+  //   location**，不能用调用方传进来的值：`PairView.onMounted` 是拿
+  //   `window.location.hostname` + `port || 8787` 拼的，在云端页面上会
+  //   拼成 `http://pb.example.com:8787` —— 既错了协议、也多了一个端口，
+  //   请求直接打不到云端。
+  const here = cloudBaseFromLocation();
+  const cleanBase = here || normalizeBase(base);
   if (!cleanBase) throw new ApiError({ status: 0, code: "E1001", message: "请填写电脑地址" });
 
   const cleanCode = code.replace(/[\s-]/g, "");
@@ -278,6 +285,9 @@ export async function pair(base: string, code: string,
       deviceId: r.device_id,
       deviceName: r.device_name,
       base: cleanBase,
+      // 页面本身就在云端时，云端基址就是它 —— 顺手落盘，下次冷启动
+      // 即使落盘值被清掉也能从 URL 认回来（`cloudBaseFromLocation`）。
+      cloudBase: here || undefined,
     });
     s.serverDeviceId = r.device_id;
     s.deviceName = r.device_name;

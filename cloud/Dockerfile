@@ -8,9 +8,9 @@
 # （docs/09 §9.6 第 4 条 —— 共享才不会有帧格式漂移）。把 `shared/`
 # 复制进 `cloud/` 会造成两份副本，那正是设计要避免的事。
 #
-# `.dockerignore` 把除 cloud/、shared/、requirements.txt 以外的全部
-# 排除在外，所以"上下文是仓库根"不会把 frontend/dist、data/、模拟照片
-# 这些几百 MB 的东西塞进构建缓存。
+# `.dockerignore` 把除 cloud/、shared/、frontend/dist/、requirements.txt
+# 以外的全部排除在外，所以"上下文是仓库根"不会把 frontend/node_modules、
+# data/、模拟照片这些几百 MB 的东西塞进构建缓存。
 
 FROM python:3.12-slim
 
@@ -31,6 +31,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY shared/ ./shared/
 COPY cloud/ ./cloud/
 COPY scripts/cloud_init.py ./scripts/cloud_init.py
+
+# ★ 手机端构建产物。没有它，`https://域名/` 就是一个 404 —— 手机上
+#   出门只有域名，于是整条隧道在产品上不可达（实测见 `cloud/relay/main.py`
+#   的模块文档）。`pages.StaticPages` 从 `/app/frontend/dist` 读，
+#   与 `DEFAULT_DIST`（`cloud/relay/pages.py`）一致。
+#   构建前必须先 `cd frontend && npm run build`；`deploy.sh` 的 `--check`
+#   会验证这个目录存在，否则构建出来的镜像里没有页面。
+COPY frontend/dist/ ./frontend/dist/
 
 # 数据目录（会被 compose 的卷覆盖）
 RUN mkdir -p /data

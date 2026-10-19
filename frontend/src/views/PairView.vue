@@ -9,9 +9,19 @@
  */
 import { computed, onMounted, ref } from "vue";
 import { ApiError } from "../api/client";
-import { buildBase } from "../api/storage";
+import { buildBase, cloudBaseFromLocation } from "../api/storage";
 import { pair, pairParamsFromLocation, parsePairInput } from "../stores/auth";
 import { toastError, toastOk } from "../stores/toast";
+
+/**
+ * 页面是不是由**云端**伺服的（`https://域名/d/<id>/`）。
+ *
+ * 是的话这里没有"电脑地址"可填 —— 基址就是当前 location，配对请求要打到
+ * 云端的 `/d/<id>/api/pair`（`cloud/relay/forward.py` 的匿名白名单）。
+ * 让用户在这种情况下还去填一个 IP 是自相矛盾的：他人在外面，根本不知道
+ * 家里电脑今天被 DHCP 分到了哪个地址。
+ */
+const cloudPage = ref(cloudBaseFromLocation() !== "");
 
 const host = ref("");
 const port = ref("8787");
@@ -31,7 +41,8 @@ const expectedDid = ref("");
 
 const base = computed(() => buildBase(host.value, port.value));
 const canSubmit = computed(() =>
-  !!host.value.trim() && /^\d{6}$/.test(code.value.replace(/[\s-]/g, "")) && !busy.value);
+  (cloudPage.value || !!host.value.trim())
+  && /^\d{6}$/.test(code.value.replace(/[\s-]/g, "")) && !busy.value);
 
 onMounted(() => {
   // 扫码进来时 URL 里已经带好了参数，别让用户再输一遍
@@ -69,7 +80,7 @@ function onHostBlur(): void {
 async function submit(): Promise<void> {
   if (busy.value) return;
   error.value = "";
-  if (!host.value.trim()) {
+  if (!cloudPage.value && !host.value.trim()) {
     error.value = "请填写电脑的 IP 地址";
     return;
   }
@@ -126,7 +137,7 @@ function onCodeInput(e: Event): void {
     </div>
 
     <div class="card">
-      <label class="field">
+      <label v-if="!cloudPage" class="field">
         <span class="lbl">电脑地址</span>
         <div class="addr">
           <input
@@ -151,6 +162,9 @@ function onCodeInput(e: Event): void {
         </div>
         <span class="hint">电脑上打开 PhotoBridge 就能看到这个地址</span>
       </label>
+      <p v-else class="cloud-note">
+        正在通过中继连接家里的电脑。输入电脑上显示的配对码即可。
+      </p>
 
       <label class="field">
         <span class="lbl">配对码</span>
@@ -197,7 +211,12 @@ function onCodeInput(e: Event): void {
     </details>
 
     <p class="foot-note">
-      手机和电脑要连同一个 Wi-Fi。照片只在局域网内传输，不会上传到互联网。
+      <template v-if="cloudPage">
+        配对码由电脑上的 PhotoBridge 显示。照片不经过中继保存，只在传输时路过。
+      </template>
+      <template v-else>
+        手机和电脑要连同一个 Wi-Fi。照片只在局域网内传输，不会上传到互联网。
+      </template>
     </p>
   </div>
 </template>
@@ -335,5 +354,14 @@ function onCodeInput(e: Event): void {
   color: var(--fg-3);
   line-height: 1.6;
   text-align: center;
+}
+
+.cloud-note {
+  font-size: 13px;
+  color: var(--fg-2);
+  line-height: 1.6;
+  background: var(--bg-2, var(--bg-1));
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
 }
 </style>

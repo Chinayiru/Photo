@@ -156,16 +156,22 @@ def test_websocket_and_streaming_handles_disable_buffering() -> None:
     assert text.count("write_timeout 0") >= 2
 
 
-def test_unmatched_paths_are_404_not_200() -> None:
-    """兜底必须是 404。
+def test_unmatched_paths_are_not_served_as_200_pages() -> None:
+    """兜底不能把未匹配路径当静态文件服务。
 
-    relay 不托管页面，所以任何未匹配路径都不该返回 200 —— 否则
-    扫描器请求 `/.env` 也会拿到"页面存在"的信号。
+    P1 之前这里断言"兜底必须 404 且不含 `file_server`"，因为 relay 不
+    托管页面、`frontend/dist` 也不进镜像。P1 之后页面**由 relay 自己
+    伺服**（`cloud/relay/pages.py`），所以兜底改成 `reverse_proxy`；
+    404 的保证挪到了 relay 里（带扩展名的未知路径仍 404）。
+
+    这条用例钉的仍是"不能无脑 `file_server`"这个性质 —— Caddy 直接
+    服务目录会绕过 relay 的路径判定，`/app.js.map` 之类就被放出来了。
     """
     text = _caddyfile()
     tail = text[text.index("handle {"):]
-    assert "404" in tail, tail
-    assert "file_server" not in tail, "兜底不该是静态文件服务（没有前端产物）"
+    assert "file_server" not in tail, "兜底不该是静态文件服务（会绕过 relay 的 404 判定）"
+    assert "respond" not in tail, "兜底不再直接 404 —— 页面由 relay 伺服"
+    assert "reverse_proxy relay:8000" in tail, tail
 
 
 def test_caddyfile_has_no_media_caching() -> None:
@@ -224,9 +230,13 @@ def test_dockerfile_trusts_only_docker_ranges_for_forwarded_headers() -> None:
 def test_dockerignore_excludes_heavy_and_secret_paths() -> None:
     """构建上下文是仓库根，所以排除清单必须靠谱。
 
-    `frontend/dist`(123 MB) + `data/thumbs`(800 MB) + `dist`(434 MB)
+    `frontend/node_modules` + `data/thumbs`(800 MB) + `dist`(434 MB)
     一起塞进构建缓存的话，一次 build 要好几分钟；而 `.env` 进了镜像
     等于把配置连着镜像一起分发。
+
+    ★ `frontend/dist` 恰恰**必须**放回（云端要伺服页面），所以这里
+    断言的是"放回的是 dist 而不是整个 frontend"—— 一条 `!frontend`
+    看着更省事，实际会把 `node_modules` 也带进去。
     """
     text = (REPO / ".dockerignore").read_text(encoding="utf-8")
     # 注释行不算规则
@@ -236,6 +246,21 @@ def test_dockerignore_excludes_heavy_and_secret_paths() -> None:
         assert needed in lines, f".dockerignore 缺 {needed}"
     # 全排之后必须有选择地放回，否则上下文是空的
     assert lines[0] == "*", f"第一条规则必须是全排，实际是 {lines[0]!r}"
+    # 页面产物要进镜像（`cloud/Dockerfile` 的 `COPY frontend/dist/`）
+    assert "!frontend/dist" in lines, "缺 !frontend/dist ⇒ 镜像里没有页面"
+    assert "!frontend/dist/**" in lines, lines
+    # ★ `!frontend` 是必需的（docker 不允许在已排除的目录里放回子项），
+    #   但**必须紧跟一条 `frontend/*` 把子项再排掉**，否则 node_modules
+    #   会跟着进构建上下文。这个"放回目录、立刻排掉子项、再放回子目录"
+    #   的三步是 dockerignore 的硬要求，不是这里的啰嗦。
+    if "!frontend" in lines:
+        after = lines[lines.index("!frontend") + 1:]
+        assert after and after[0] == "frontend/*", (
+            "`!frontend` 之后紧跟着的必须是 `frontend/*`，"
+            f"否则 node_modules 会进构建上下文；实际是 {after[:2]}")
+        assert lines.index("!frontend") < lines.index("!frontend/dist")
+    # sourcemap 不进镜像（`pages.py` 的 `_BLOCKED_SUFFIXES` 也不服务它）
+    assert "frontend/dist/**/*.map" in lines, lines
 
 
 def test_env_example_has_no_secrets() -> None:

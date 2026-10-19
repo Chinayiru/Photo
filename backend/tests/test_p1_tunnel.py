@@ -803,9 +803,23 @@ def test_tunnel_refuses_non_api_paths(rig_factory) -> None:
     那台电脑的配对码就能被任何持有隧道令牌的手机反复领取 —— 一期审计
     F1 里"任意网页能读走整个库"的放大器会以另一种形式回来。
 
+    ★ P1 之后判据变了，别退回旧写法：云端现在**自己伺服手机端页面**
+    （`cloud/relay/pages.py`），所以 `/d/{id}/panel/pair-code` 不再回
+    403，而是被单页回退吃成 `200 text/html`（一份 index.html，和
+    `/` 完全一样）。真正要钉住的性质是**它没有进隧道**：
+
+    * 响应里不能有 `x-pb-tunnel: relay`（那是"由电脑端产生"的标记）；
+    * 响应体必须是页面，不能是任何来自电脑端的数据。
+
+    只看状态码 403 的话，未来把页面改回 404、或者换成别的拒绝方式，
+    用例会假红；而如果有人真的把 `/panel/**` 转发进隧道，状态码可能
+    仍然是 200（电脑端 router 里 `/panel/*` 是存在的），只有 `x-pb-tunnel`
+    与响应体形状能区分出来。
+
     两端各判一次 `_clean_path`（云端 `Forwarder` 与电脑端
     `TunnelDispatcher` 用的是同一个函数），所以这里同时验两条：
-    云端直接拒（403 `E5004`），且**根本到不了电脑端**。
+    页面路径**到不了电脑端**，而 `/api/../panel/...` 这种"看着像 /api
+    实则越界"的仍然被 403 `E5004` 挡住。
     """
     async def main() -> dict[str, Any]:
         rig = rig_factory()
@@ -814,14 +828,30 @@ def test_tunnel_refuses_non_api_paths(rig_factory) -> None:
         await rig.apair()
         out = {}
         for path in ("/panel/pair-code", "/panel/devices", "/panel/audit",
-                     "/index.html", "/", "/api/../panel/pair-code",
-                     "/API/system/ping"):
+                     "/index.html", "/", "/API/system/ping"):
+            out[path] = await rig.cloud.arequest(
+                "GET", rig.tunnel_path(path), token=rig.client_token)
+        # 越界写法单独一组：它们**看着**以 /api 开头，会进转发器，
+        # 必须在那里被 `_clean_path` 拒掉。
+        for path in ("/api/../panel/pair-code", "/api/./../panel/audit"):
             out[path] = await rig.cloud.arequest(
                 "GET", rig.tunnel_path(path), token=rig.client_token)
         return out
 
     out = _run(main())
-    for path, (status, body, _h) in out.items():
+
+    page_paths = ("/panel/pair-code", "/panel/devices", "/panel/audit",
+                  "/index.html", "/", "/API/system/ping")
+    for path in page_paths:
+        status, body, hdrs = out[path]
+        assert status == 200, (path, status, body)
+        # 决定性判据：没有 `x-pb-tunnel` 就说明它根本没经过隧道
+        assert "x-pb-tunnel" not in hdrs, (path, hdrs.get("x-pb-tunnel"))
+        assert "text/html" in str(hdrs.get("content-type", "")), (path, hdrs)
+        assert "pb.token" not in str(body), path
+
+    for path in ("/api/../panel/pair-code", "/api/./../panel/audit"):
+        status, body, _hdrs = out[path]
         assert status == 403, (path, status, body)
         assert body["error"]["code"] == "E1009", (path, body)
         # `detail` 必须为空：错误响应里不能回显被拒的路径

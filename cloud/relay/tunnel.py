@@ -334,6 +334,7 @@ async def forward_request(
     cancel: asyncio.Event | None = None,
     head_timeout: float = HEAD_TIMEOUT,
     total_timeout: float | None = TOTAL_TIMEOUT,
+    client_ip: str = "",
 ) -> tuple[Any, asyncio.Task[None] | None]:
     """把一条 HTTP 请求塞进隧道，返回 `(PendingRequest, body_pump_task)`。
 
@@ -361,6 +362,20 @@ async def forward_request(
         "enc": None,
         "proto": PROTO_VERSION,
     }
+    # ★ 来源 IP 必须进帧。电脑端把它填进 `Ctx.client_ip`，而那里有两个
+    #   依赖它的判断：
+    #     * `/panel/**` 的 `is_loopback()` —— 空串会被当成非回环（审计
+    #       F11 修过），所以**不能**省略，否则每次隧道请求都被判成"外来"
+    #       而 403，症状是"配对码在云通路上永远领不到"（这是对的），但
+    #       `_PAIR_WINDOW_MAX` 的按 IP 限流会全部落进同一个桶；
+    #     * `handlers/auth.py:_rate_limit` 按 IP 计数。云端二十台手机
+    #       挤在 `"cloud"` 一个桶里时，A 的暴力破解会连累 B 正常配对。
+    #   ★ 只放 IP 本身，不放 `X-Forwarded-For` 原文 —— 后者是客户端可
+    #     伪造的一串，直接塞进去等于把电脑端限流交给攻击者摆布。云端的
+    #     `_client_ip()` 用的是 ASGI 给的 `request.client.host`（uvicorn
+    #     已按 `forwarded_allow_ips` 处理过代理头）。
+    if client_ip:
+        head["client_ip"] = client_ip
     p = await mux.open(head, timeout=total_timeout)
     pump: asyncio.Task[None] | None = None
     if body is not None:

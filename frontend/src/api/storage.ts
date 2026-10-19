@@ -91,6 +91,8 @@ export function setVia(via: Via): void {
  * 否则状态条会显示"云端中继"而实际走的是直连，排查时对不上。
  */
 export function currentVia(): Via {
+  // 页面由云端伺服 ⇒ 就是云端通路，与落盘值无关（见 `cloudBaseFromLocation`）。
+  if (cloudBaseFromLocation()) return "cloud";
   if (getVia() === "cloud" && getCloudBase()) return "cloud";
   return "lan";
 }
@@ -103,11 +105,60 @@ export function currentVia(): Via {
  * `client.ts` 抛 `NO_BASE`，界面显示"尚未配对"，而其实局域网是通的。
  */
 export function activeBase(): string {
+  // ★ 页面本身由云端伺服时（`https://域名/d/<id>/`），**当前域名就是
+  //   基址**，比任何落盘值都权威：用户可能从家里那台电脑的局域网地址
+  //   打开过同一个 App，`pb.base` 里存的是 `http://192.168.x.x:8787`，
+  //   而这句话在 4G 上根本不可达。
+  const here = cloudBaseFromLocation();
+  if (here) return here;
   if (getVia() === "cloud") {
     const c = getCloudBase();
     if (c) return c;
   }
   return getBase();
+}
+
+/**
+ * 如果当前页面是被**云端**伺服的，返回它的基址；否则空串。
+ *
+ * 云端把手机端页面挂在 `/d/<云端 device_id>/` 下（`cloud/relay/pages.py`），
+ * 于是 `window.location` 本身就带着基址的全部信息：
+ *
+ * ```
+ * https://pb.example.com/d/9f3c...e1/assets/index-abc.js
+ * └──────── origin ────┘└─ 这里 ──┘
+ * ```
+ *
+ * ## 为什么必须从 location 推，而不能只信 `pb.cloud`
+ *
+ * `pb.cloud` 是**另一个源**上的 localStorage —— 用户在
+ * `http://192.0.2.10:8787` 配对时写进去的那条云端基址，在
+ * `https://pb.example.com` 这个源上**读不到**（同源策略）。反过来也一样。
+ * 所以"页面从云端来"这件事只能靠 URL 判断，靠落盘值会在第一次
+ * 从云端打开时判定失败，随后 `activeBase()` 回落到局域网地址，
+ * 局域网的 `http://192.168...` 在 4G 上又必然超时 —— 症状是
+ * "手机在外面打开云端页面，一直显示连不上电脑"。
+ *
+ * ## 为什么只认 32 位十六进制
+ *
+ * `/d/<id>` 里的 id 是云端分配的 128 位能力值（32 位十六进制，
+ * `cloud/relay/security.py: new_device_id()`）。收紧到"必须像 id"
+ * 可以避免把 `/d/../api/timeline` 这类畸形路径当成基址 —— 那会把
+ * 请求发到 `https://域名/d/../api/timeline`，浏览器和中间代理对
+ * 路径规范化的处理并不一致。
+ */
+export function cloudBaseFromLocation(): string {
+  try {
+    const { protocol, host, pathname } = window.location;
+    // 只认 http/https：`file://`、`chrome-extension://` 下没有可用的
+    // fetch 基址，强行拼出来只会得到一堆 "Failed to fetch"。
+    if (protocol !== "https:" && protocol !== "http:") return "";
+    const m = /^\/d\/([0-9a-fA-F]{32})(?:\/|$)/.exec(pathname);
+    if (!m) return "";
+    return `${protocol}//${host}/d/${m[1]!.toLowerCase()}`;
+  } catch {
+    return "";
+  }
 }
 
 /** 配对成功后一次性落盘。 */

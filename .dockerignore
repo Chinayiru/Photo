@@ -8,12 +8,13 @@
 # ── 全排 ──────────────────────────────────────────────────────
 *
 .*
+
+# ── 放回云端需要的 ────────────────────────────────────────────
 !cloud
 !shared
 !scripts
 !requirements.txt
 
-# ── 放回云端需要的 ────────────────────────────────────────────
 !cloud/**/*.py
 !cloud/Dockerfile
 !cloud/Caddyfile
@@ -22,6 +23,19 @@
 !cloud/*.example
 !shared/**/*.py
 !requirements.txt
+
+# 手机端构建产物：云端要把它挂到 `/` 与 `/d/<id>/` 下
+# （`cloud/relay/pages.py`）。
+#
+# ★ 三步缺一不可：docker 的规则是"目录被排除后，里面的东西无法再放回"，
+#   所以必须先把 `frontend` 这个目录本身放回，再**立刻**把它的所有子项
+#   排掉，最后单独放回 `dist`。少了中间那行 `frontend/*`，放回整个
+#   `frontend` 会把 `node_modules`（几百 MB）一起带进构建上下文。
+!frontend
+frontend/*
+!frontend/dist
+!frontend/dist/**
+frontend/dist/**/*.map
 
 # ── 仍然排除的（放回规则里再排一次，dockerignore 后者优先）────
 cloud/**/__pycache__

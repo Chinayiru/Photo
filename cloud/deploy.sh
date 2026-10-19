@@ -78,6 +78,10 @@ ok "daemon 可访问"
 [ -f "${CLOUD_DIR}/Caddyfile" ]         || die "缺 ${CLOUD_DIR}/Caddyfile"
 [ -f "${CLOUD_DIR}/Dockerfile" ]        || die "缺 ${CLOUD_DIR}/Dockerfile"
 [ -f "${REPO_ROOT}/shared/protocol.py" ] || die "缺 ${REPO_ROOT}/shared/protocol.py —— 构建上下文必须是仓库根"
+# 手机端页面由 relay 伺服（`cloud/relay/pages.py`），镜像里没有它就等于
+# 手机打开域名得到 404 —— 而隧道本身一切正常，排查会从错误的方向开始。
+# (`frontend/dist` 被 gitignore，克隆下来必须自己构建一次。)
+[ -f "${REPO_ROOT}/frontend/dist/index.html" ] || die "缺 ${REPO_ROOT}/frontend/dist/index.html —— 先在仓库根跑 (cd frontend && npm ci && npm run build)"
 ok "部署文件齐全（上下文 = ${REPO_ROOT}）"
 
 # .env

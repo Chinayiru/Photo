@@ -82,12 +82,22 @@
         reverse_proxy relay:8000
     }
 
-    # ── 兜底：没有前端产物，直接给 404 ─────────────────────────
-    # relay 不托管页面（账号与设备管理目前走命令行 `scripts/cloud_init.py`）。
-    # 任何未匹配的路径都不该返回 200，否则扫描器会把 `/.env`
-    # 也当成"存在"。
+    # ── 手机端页面与其余路径（P1 起由 relay 伺服）───────────────
+    # 这里**必须转发**，不能像早期版本那样 `respond "not found" 404`：
+    # 手机出门后手里只有域名，`https://域名/` 一旦是 404，整条隧道在
+    # 产品上就不可达（页面打不开，`/d/<id>/api/**` 通着也没用）。
+    #
+    # 404 的保证挪进了 relay（`cloud/relay/pages.py`）：
+    #   * 不存在的**带扩展名**路径（`/.env`、`/app.js.map`）→ 404，
+    #     所以扫描器仍然拿不到"这个站什么都有"的信号；
+    #   * 不存在的 `/api/**` → 404 纯文本，不会被 SPA 回退吃成
+    #     `200 text/html`（前端 `JSON.parse` 会炸）。
+    # 无扩展名的未知路径 → index.html，交给前端路由，这是单页应用的惯例。
     handle {
-        respond "not found" 404
+        reverse_proxy relay:8000 {
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
     }
 
     # ── 日志 ────────────────────────────────────────────────────

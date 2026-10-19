@@ -143,13 +143,43 @@ _FLUSH_SEC: float = 30.0
 #: 加一个匿名端点"变成"云端也跟着放开一个"。两边不一致时的表现是
 #: "探活通了但业务 401"或反过来，都只会出现在部署当天。
 #:
-#: 只放 `/api/system/ping`：它是双通路状态机的探针，必须在**还没有
-#: 令牌**时可用。
-PUBLIC_PATHS: frozenset[str] = frozenset({"/api/system/ping"})
+#: * `/api/system/ping` —— 双通路状态机的探针，必须在**还没有令牌**时可用；
+#: * `/api/pair` —— 配对本身就是"换令牌"的过程，此时不可能已有令牌。
+#:
+#: ★ 为什么 `POST /api/pair` 可以匿名而**根路径的 `/api/pair` 不可以**：
+#: 这条路径带着 `/d/{device_id}` 前缀，而那个 id 是云端分配的 **128 位
+#: 能力值**（32 位十六进制）。攻击者要爆破配对码，必须先知道某台设备的
+#: id —— 猜不到，也无法枚举（云端不提供设备列表）。而如果在根路径上做
+#: 一个"按码找设备"的接口，128 位这一层就没了，6 位数字（100 万种）
+#: 就成了唯一屏障，配上公网可匿名访问，那是不可接受的。
+#:
+#: 放开的代价仍然要挡住：匿名 + 6 位码 → 云端必须自己限速（见
+#: `PAIR_RATE_PER_MIN`），且把**真实来源 IP** 塞进帧里，让电脑端那层
+#: `_PAIR_WINDOW_MAX` 按 IP 生效（否则所有人共用 `"cloud"` 一个桶）。
+PUBLIC_PATHS: frozenset[str] = frozenset({
+    "/api/system/ping",
+    "/api/pair",
+})
+
+#: 允许匿名的**非只读**方法。目前只有配对：它必须 POST。
+#:
+#: 单列一张表而不是"`/api/pair` 就放行所有方法"，是因为后者会让
+#: `PUT/DELETE /d/{id}/api/pair` 也免鉴权进隧道 —— 虽然电脑端只有
+#: POST 路由、其余会 405，但"白名单只管路径不管方法"是一条下次会被
+#: 复制的坏模式（`docs/06` 规则 15 对 CORS 前缀匹配的批评同源）。
+PUBLIC_POST_PATHS: frozenset[str] = frozenset({"/api/pair"})
 
 #: 匿名探活的限流（每个来源 IP，每秒）。比鉴权路径的 120/s 宽，因为
 #: 它不读库、不落盘，且状态机的探活频率天然更高。
 PUBLIC_RATE_PER_SEC: int = 300
+
+#: 匿名**配对**的限流（每个来源 IP，每分钟）。
+#:
+#: 比探活严格得多，因为配对码只有 6 位。10 次/分钟 = 每天最多约 1.4 万次
+#: 猜测，命中率约 1.4%；而电脑端还有一层"每个码最多 5 次、锁定 10 分钟"，
+#: 真正能到手的成功率远低于此。云端这一层的意义是**别让公网把家里的电脑
+#: 拖进暴力破解**：每次猜测都要穿透隧道、落一次审计。
+PAIR_RATE_PER_MIN: int = 10
 
 
 class TrafficMeter:
@@ -202,8 +232,8 @@ class Forwarder:
     在结论之外）。
     """
 
-    __slots__ = ("registry", "db", "rate", "public_rate", "inflight",
-                 "uploads", "meter")
+    __slots__ = ("registry", "db", "rate", "public_rate", "pair_rate",
+                 "inflight", "uploads", "meter")
 
     def __init__(self, registry: DeviceRegistry, db: Any) -> None:
         self.registry = registry
@@ -213,6 +243,11 @@ class Forwarder:
         # 就比业务请求频率高（双通路状态机 1.5 s 一次，加上手机切网时
         # 的重探），而且它不读库、不落盘，成本只有一次隧道往返。
         self.public_rate = RateLimiter(PUBLIC_RATE_PER_SEC)
+        # 匿名配对：按分钟计。窗口取 60 秒、额度 PAIR_RATE_PER_MIN。
+        # 单独一个桶而不是复用 `public_rate`：探活被限流会让状态条显示
+        # "离线"，而配对被限流只该影响"试着配一台新手机"，两件事的
+        # 用户体验完全不同，混在一起的症状是"点了几下之后连状态都不对了"。
+        self.pair_rate = RateLimiter(PAIR_RATE_PER_MIN, window=60.0)
         self.inflight = ConcurrencyLimiter(MAX_INFLIGHT_PER_DEVICE)
         self.uploads = UploadLimiter()
         self.meter = TrafficMeter(db)
@@ -220,7 +255,7 @@ class Forwarder:
     async def handle(self, request: Request, device_id: str) -> Response:
         rid = request.headers.get("x-request-id") or ""
 
-        # ---- 0 匿名探活 ----
+        # ---- 0 匿名探活 / 匿名配对 ----
         # `docs/04` §1.2 与 §4.1.2 都写死了一条：`/api/system/ping` 必须匿名，
         # 因为它在**通路选择阶段**被调用 —— 那时手机可能还没有令牌（首次使用），
         # 也可能令牌刚过期。如果云端要求令牌，云端通路就永远探测不通，
@@ -229,6 +264,10 @@ class Forwarder:
         # 这样放开安全吗：`device_id` 是 32 位 hex（128 bit 能力值），猜不到；
         # ping 只回 device_id/device_name/version，与一期 CORS 审计里已经
         # 泄漏的那几个字段同集，不含任何照片信息。限流仍然生效（下面按 IP 计数）。
+        #
+        # `/api/pair` 同理但更严：它在把 6 位码换成令牌，所以走独立的
+        # `pair_rate`（10 次/分钟/IP），且必须把真实来源 IP 带进帧里，
+        # 让电脑端那层"每码 5 次"按 IP 生效。
         if _is_public(request):
             return await self._handle_public(request, device_id, rid)
 
@@ -265,26 +304,37 @@ class Forwarder:
                           request_id=rid)
 
         try:
-            return await self._relay(request, device_id, rid, client_id=client_id)
+            # 来源 IP 也要带进帧（不只是匿名配对那一条）：电脑端的审计
+            # 记录与 `_rate_limit` 都读 `Ctx.client_ip`，缺了会全部落成
+            # `"cloud"` 一个桶。
+            return await self._relay(request, device_id, rid,
+                                     client_id=client_id,
+                                     client_ip=_client_ip(request))
         finally:
             self.inflight.release(device_id)
 
     async def _handle_public(self, request: Request, device_id: str,
                              rid: str) -> Response:
-        """匿名探活的转发（只可能是 `GET /api/system/ping`）。
+        """匿名转发（`GET /api/system/ping` 与 `POST /api/pair`）。
 
         与鉴权分支共用同一条转发路径，但限流键换成**来源 IP**：没有
         `client_id` 可用，而"不设限流"会让这个匿名端点变成免费的打点
         工具（每个请求都要穿透隧道，成本落在用户自己家里那台电脑上）。
+
+        配对走**另一个**桶，而且额度小一个量级 —— 见 `PAIR_RATE_PER_MIN`
+        的注释：6 位码 + 公网匿名 = 必须挡住。
         """
-        ok, retry = self.public_rate.hit(_client_ip(request))
+        ip = _client_ip(request)
+        limiter = self.pair_rate if _is_pair(request) else self.public_rate
+        ok, retry = limiter.hit(ip)
         if not ok:
             return _error(429, "E4001", "请求太频繁", request_id=rid,
                           retry_after=max(1, int(retry)))
-        return await self._relay(request, device_id, rid, client_id="")
+        return await self._relay(request, device_id, rid, client_id="",
+                                 client_ip=ip)
 
     async def _relay(self, request: Request, device_id: str, rid: str,
-                     *, client_id: str) -> Response:
+                     *, client_id: str, client_ip: str = "") -> Response:
         """把一次 HTTP 请求变成帧、再把帧变回 HTTP 响应。"""
         # ---- 5 在线判断 ----
         conn = self.registry.get(device_id)
@@ -316,6 +366,7 @@ class Forwarder:
                     body_len=_content_length(request),
                     cancel=cancel,
                     total_timeout=_total_timeout(request),
+                    client_ip=client_ip,
                 )
             except MuxClosed:
                 return _error(503, "E3003", "电脑离线", request_id=rid)
@@ -615,14 +666,23 @@ def _is_upload(request: Request) -> bool:
 def _is_public(request: Request) -> bool:
     """是不是一个**不需要 client_token** 的请求。
 
-    只读方法 + 精确路径匹配。刻意不用 `startswith`：`/api/system/ping/../info`
+    只读方法 + 精确路径匹配；此外还放行 `PUBLIC_POST_PATHS` 里的
+    非只读路径（目前只有配对）。刻意不用 `startswith`：`/api/system/ping/../info`
     这种在 Starlette 里不会路由到 info，但"前缀匹配"这个写法一旦被复制到
     别处就是一条越权路径（审计里 `docs/06` 规则 15 对 CORS 前缀匹配的
     批评是同一个道理）。
     """
-    if request.method not in ("GET", "HEAD"):
-        return False
-    return _inner_path(request) in PUBLIC_PATHS
+    path = _inner_path(request)
+    if request.method in ("GET", "HEAD"):
+        return path in PUBLIC_PATHS
+    if request.method == "POST":
+        return path in PUBLIC_POST_PATHS
+    return False
+
+
+def _is_pair(request: Request) -> bool:
+    """是不是一次匿名配对（决定用哪个限流桶）。"""
+    return _inner_path(request) in PUBLIC_POST_PATHS
 
 
 def _client_ip(request: Request) -> str:
