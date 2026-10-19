@@ -42,7 +42,6 @@ from shared.protocol import (                                     # noqa: E402
     CREDIT_PAYLOAD_SIZE,
     HEAD_TIMEOUT,
     FrameType,
-    ProtocolError,
     TooManyRequests,
     decode_frame,
     encode_frame,
@@ -440,20 +439,35 @@ def test_old_peer_with_payload_credit_would_break() -> None:
 
     这条用例不是测我们的代码，而是把"为什么必须协商"钉成可执行事实 ——
     否则后来人会觉得 `credit_v2` 开关是多余的防御。
+
+    ★ 第一版写成了 `with pytest.raises(ProtocolError): raise ProtocolError(...)`，
+    那是**恒真**的（自己抛自己接），只能证明 pytest 会捕异常。现在改为
+    直接断言那条造成断连的规则本身：`CREDIT` 不在 `FIXED_LENGTH_TYPES`
+    里，而老实现里它在 —— 所以老解析器见到 payload 必然走 `raise` 分支。
     """
-    from shared.protocol import decode_frame, encode_credit
+    from shared.protocol import (
+        FIXED_LENGTH_TYPES,
+        HEADER_SIZE,
+        FrameType,
+        decode_frame,
+        encode_credit,
+        encode_frame,
+    )
 
     raw = encode_frame(FrameType.CREDIT, 0, encode_credit(4096))
-    # 新解析器接受
-    assert decode_frame(raw).type is FrameType.CREDIT
-    # 老解析器的行为：FIXED_LENGTH_TYPES 含 CREDIT ⇒ 有 payload 就抛
-    from shared.protocol import HEADER_SIZE, _HEADER
-
     assert len(raw) > HEADER_SIZE
-    # 直接模拟老代码的两行判断，证明它会抛
-    with pytest.raises(ProtocolError):
-        # 等价于老实现的 `if ftype in FIXED_LENGTH_TYPES and payload: raise`
-        raise ProtocolError("CREDIT must have empty payload, got 12B")
+    # 新解析器接受 12 字节 payload
+    assert decode_frame(raw).type is FrameType.CREDIT
+    # 而老实现把 CREDIT 归入定长帧 ⇒ 只要它在集合里，解析 12 字节就必抛。
+    assert FrameType.CREDIT not in FIXED_LENGTH_TYPES
+    # 其余五个定长帧仍在集合里（防止有人"顺手"把整个集合清空来让上面那行过）
+    assert {
+        FrameType.REQ_END,
+        FrameType.RES_END,
+        FrameType.CANCEL,
+        FrameType.PING,
+        FrameType.PONG,
+    } == set(FIXED_LENGTH_TYPES)
 
 
 def test_credit_v2_negotiation_is_symmetric() -> None:
