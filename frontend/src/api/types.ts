@@ -125,6 +125,12 @@ export interface SystemInfo {
     session_id: string | null;
     connected_at: number | null;
     last_error: string | null;
+    /**
+     * 手机端在云端的基址 `https://域名/d/<云端 device_id>`；未配云端时为空串。
+     *
+     * 可选：老服务端（二期之前）不返回它，`_assert_fields` 只查必需字段。
+     */
+    public_base?: string;
   };
   device: { device_id: string; device_name: string };
   roots: RootInfo[];

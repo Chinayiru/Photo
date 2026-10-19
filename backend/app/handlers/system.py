@@ -42,6 +42,32 @@ async def ping(ctx: Ctx) -> Reply:
     })
 
 
+def _public_base(cfg: Any) -> str:
+    """`https://域名/d/<云端 device_id>`，没配云端或没配 device_id 时为空串。
+
+    ★ 为什么不直接取 `client.status()["public_base"]`：那个值在**第一次
+    握手成功之后**才有（`TunnelClient._device_id` 是在 `_handshake` 里
+    填的）。但手机恰恰是在家里走局域网配对时学会云端基址的 —— 那时
+    隧道可能正断着，而"断着"不该导致手机永远学不到云端地址（否则
+    用户出门后才发现用不了，回家再配对一次）。
+
+    所以这里从**配置**算。配置里的 `cloud.device_id` 是部署时
+    `scripts/cloud_init.py` 写进去的，与握手时用的是同一个值
+    （`backend/app/tunnel.py:cloud_device_id` 优先读配置、读不到才回退
+    本地 id）。
+    """
+    try:
+        from ..tunnel import cloud_device_id, public_base_for
+
+        dev = cloud_device_id(cfg, "")
+        if not dev:
+            return ""
+        return public_base_for(str(cfg.get("cloud.base_url", "") or ""), dev)
+    except Exception:      # noqa: BLE001 —— 状态端点绝不能因此 500
+        log.debug("计算云端基址失败", exc_info=True)
+        return ""
+
+
 def _tunnel_info(cfg: Any) -> dict[str, Any]:
     """隧道状态。
 
@@ -59,6 +85,12 @@ def _tunnel_info(cfg: Any) -> dict[str, Any]:
         "session_id": None,
         "connected_at": None,
         "last_error": None,
+        # 手机端靠它学会自己的云端基址（`https://域名/d/<id>`）。
+        # 为什么由电脑端上报而不是让用户手输：这个 URL 里的 `<id>` 是
+        # **云端** device_id，与电脑本地 device_id 是两个不同的值
+        # （`backend/app/tunnel.py:cloud_device_id`），用户拿不到；
+        # 而电脑端在 HELLO 时就已经知道自己该出现在哪个前缀下。
+        "public_base": _public_base(cfg),
     }
     try:
         from ..tunnel import get_tunnel
@@ -75,6 +107,8 @@ def _tunnel_info(cfg: Any) -> dict[str, Any]:
         return empty
     for k, v in empty.items():
         st.setdefault(k, v)
+    if not st.get("public_base"):
+        st["public_base"] = _public_base(cfg)
     return st
 
 

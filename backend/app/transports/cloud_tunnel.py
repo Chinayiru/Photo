@@ -359,7 +359,7 @@ class CloudTunnelTransport(ServerTransport):
     # --- ServerTransport ---
 
     async def start(self) -> None:
-        from ..tunnel import TunnelClient
+        from ..tunnel import TunnelClient, set_tunnel
 
         await self._lan.start()
         base = str(self.cfg.get("cloud.base_url", "") or "").strip()
@@ -368,6 +368,7 @@ class CloudTunnelTransport(ServerTransport):
             log.warning(
                 "server.transport=cloud_tunnel 但 cloud.base_url / "
                 "cloud.agent_token 未配置，云端通路不启动（局域网正常）")
+            set_tunnel(None)
             self._started = True
             return
         self._client = TunnelClient(
@@ -376,13 +377,24 @@ class CloudTunnelTransport(ServerTransport):
             base_url=base,
             agent_token=token,
         )
+        # ★ 必须登记到进程级单例，否则 `GET /api/system/info` 的
+        #   `tunnel` 段永远报 offline（`handlers/system.py:_tunnel_info`
+        #   读的就是 `get_tunnel()`），手机端也就永远学不到云端基址
+        #   `public_base` —— 表现是"手机在家能用、出门全灰"。
+        set_tunnel(self._client)
         await self._client.start()
         self._started = True
 
     async def stop(self) -> None:
+        from ..tunnel import set_tunnel
+
         if self._client is not None:
             await self._client.stop()
             self._client = None
+        # 先清单例再停局域网：顺序反过来的话，停机过程中若有请求打到
+        # `/api/system/info`，会读到一个已经 `stop()` 的客户端（`mode`
+        # 仍报 `ws` 但所有请求都会失败）。
+        set_tunnel(None)
         await self._lan.stop()
         self._started = False
 

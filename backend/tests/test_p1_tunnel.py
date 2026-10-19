@@ -681,7 +681,13 @@ def test_forward_business_routes_over_tunnel(rig_factory) -> None:
     st, info = out["info"]
     assert st == 200, info
     assert "tunnel" in info, sorted(info)
-    assert info["tunnel"]["mode"] in ("ws", "connected", "offline"), info
+    # ★ 必须是 "ws"，不能是 "offline"：这里曾经断言 "offline" 也在允许
+    #   集合里，而 `CloudTunnelTransport.start()` 当时**没有**把客户端
+    #   登记进进程级单例（`tunnel.set_tunnel`），于是隧道通了但
+    #   `/api/system/info` 恒报 offline —— 手机端因此永远学不到云端基址，
+    #   表现是"在家能用、出门全灰"。宽松断言正好把这个 bug 放过去了。
+    assert info["tunnel"]["mode"] == "ws", info["tunnel"]
+    assert info["tunnel"]["connected"] is True, info["tunnel"]
 
 
 def test_forward_preserves_405_and_allow_header(rig_factory) -> None:
@@ -1095,3 +1101,102 @@ def test_cloud_never_stores_media_bytes(rig_factory) -> None:
                 if t not in ("schema_version", "account_tokens")]
     assert sorted(business) == sorted(BUSINESS_TABLES), out["tables"]
     assert "media" not in out["tables"], out["tables"]
+
+
+def test_info_reports_public_base(rig_factory) -> None:
+    """`/api/system/info` 的 `tunnel.public_base` 是手机端唯一的云端地址来源。
+
+    ## 为什么这个值必须存在
+
+    云端基址是 `https://域名/d/<云端 device_id>`，其中的 id 是**云端**
+    分配的 32 位十六进制值，与电脑本地 `device_id` 是两个不同的东西。
+    用户在二维码/托盘里只看得到局域网地址，没有任何途径得知这个前缀 ——
+    于是 `pb.cloud` 永远为空、`transport.ts` 的双通路状态机永远进不了
+    `CLOUD`，P1 整套功能在产品里不可达。
+
+    ★ 曾经真的不可达：`CloudTunnelTransport.start()` 建好了 `TunnelClient`
+    却没调 `tunnel.set_tunnel()`，而 `_tunnel_info()` 读的就是那个进程级
+    单例 ⇒ 隧道明明通着，`/api/system/info` 恒报 `offline` 且没有
+    `public_base`。这里的 HTTP 断言就是钉住那条登记。
+    """
+    async def main() -> dict[str, Any]:
+        rig = rig_factory()
+        await rig.start()
+        await rig.wait_tunnel()
+        # 走局域网问（手机第一次配对必然在家里，走的就是这条路）
+        status, body, _ = await rig.lan.arequest(
+            "GET", "/api/system/info", token=await _lan_token(rig))
+        return {"status": status,
+                "tunnel": body.get("tunnel") if isinstance(body, dict) else None,
+                "device_id": rig.device_id,
+                "local_device_id": rig.state.device_id,
+                "cloud_port": rig.cloud_port}
+
+    out = _run(main())
+    assert out["status"] == 200, out
+    tun = out["tunnel"] or {}
+    # 隧道在跑 ⇒ 必须是 ws（`set_tunnel` 生效的证明）
+    assert tun.get("mode") == "ws", tun
+    base = str(tun.get("public_base") or "")
+    assert base, tun
+    # 形如 `http://127.0.0.1:<云端端口>/d/<32位hex>`。测试里云端没 TLS，
+    # 生产是 https；这里只钉"有 /d/<云端 device_id> 后缀"这件事。
+    assert base.rstrip("/").endswith(f"/d/{out['device_id']}"), (base, out)
+    assert f":{out['cloud_port']}" in base, (base, out)
+    # ★ 前缀里的 id 必须是**云端** device_id，不能是电脑本地那个。
+    #   混淆这两个值是"配对成功、之后每个请求 401"这个经典故障的根因
+    #   （本地 16 位 hex vs 云端 32 位 hex）。
+    assert out["device_id"] != out["local_device_id"], out
+    assert out["local_device_id"] not in base, (base, out["local_device_id"])
+
+
+def test_info_public_base_survives_tunnel_down(tmp_path) -> None:
+    """隧道**没连上**时也必须能算出 `public_base`（从配置算，不靠握手）。
+
+    手机第一次配对一定发生在家里（要扫码），走的是局域网。那时隧道可能
+    正断着（电脑刚开机、云端在滚动重启）。若这个值只在握手成功后才有，
+    用户会在家里配对成功、出门才发现用不了，只能回家再配对一次。
+    """
+    from backend.app.handlers.system import _tunnel_info
+    from backend.app import tunnel as tunnel_mod
+
+    data = tmp_path / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    cfg = Config(
+        {"server": {"host": "127.0.0.1", "port": 0, "allow_lan": False},
+         "cloud": {"base_url": "https://pb.example.com",
+                   "device_id": "a" * 32, "agent_token": "t" * 43,
+                   "enabled": True}},
+        path=data / "config.json", data_dir=data)
+
+    # 模拟"从来没连上过"：进程级单例为空。
+    tunnel_mod.set_tunnel(None)
+    info = _tunnel_info(cfg)
+    assert info["mode"] == "offline", info
+    assert info["cloud_url"] == "https://pb.example.com", info
+    assert info["public_base"] == f"https://pb.example.com/d/{'a' * 32}", info
+
+    # 没配 device_id ⇒ 空串（此时无法构成合法的 `/d/<id>` 前缀）。
+    # 用空串而不是瞎猜一个 id，前端按"空即无云端"处理。
+    empty_cfg = Config(
+        {"server": {"host": "127.0.0.1", "port": 0, "allow_lan": False},
+         "cloud": {"base_url": "https://pb.example.com", "enabled": True}},
+        path=data / "config2.json", data_dir=data)
+    tunnel_mod.set_tunnel(None)
+    info2 = _tunnel_info(empty_cfg)
+    assert info2["public_base"] == "", info2
+    # 没配云端 ⇒ 也是空串，且绝不 500
+    blank = Config(
+        {"server": {"host": "127.0.0.1", "port": 0, "allow_lan": False}},
+        path=data / "config3.json", data_dir=data)
+    assert _tunnel_info(blank)["public_base"] == ""
+
+
+async def _lan_token(rig: Any) -> str:
+    """走局域网配对拿一个令牌（`/panel/pair-code` → `/api/pair`）。"""
+    status, body, _ = await rig.lan.arequest("POST", "/panel/pair-code")
+    assert status == 201, (status, body)
+    status, body, _ = await rig.lan.arequest(
+        "POST", "/api/pair", body={"code": str(body["code"])})
+    assert status == 201, (status, body)
+    return str(body["client_token"])

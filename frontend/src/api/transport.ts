@@ -45,7 +45,7 @@
  * 本模块。请求失败通过 `netstate.ts` 这个中介上报，避免 ESM 循环依赖。
  */
 
-import type { PingResponse } from "./types";
+import type { PingResponse, SystemInfo } from "./types";
 import {
   activeBase,
   currentVia,
@@ -53,6 +53,7 @@ import {
   getCloudBase,
   getDeviceId,
   getToken,
+  saveCloudBase,
   setVia,
   type Via,
 } from "./storage";
@@ -94,12 +95,15 @@ interface Memory {
   cloudFailedAt: number | null;
   /** 上次重探的时刻（`RE-PROBE` 冷却用）。 */
   lastReProbeAt: number;
+  /** 上次问电脑端"我的云端基址是什么"的时刻（会话内，防每次请求都问）。 */
+  cloudBaseAskedAt: number;
 }
 
 const memory: Memory = {
   lanFailedAt: null,
   cloudFailedAt: null,
   lastReProbeAt: 0,
+  cloudBaseAskedAt: 0,
 };
 
 let state: PathState = "IDLE";
@@ -229,6 +233,58 @@ export async function testBase(base: string): Promise<PingResponse> {
   return probeAt(base, CLOUD_PROBE_TIMEOUT_MS);
 }
 
+/** 问电脑端"我的云端基址"的最小间隔（会话内）。 */
+const CLOUD_BASE_ASK_INTERVAL_MS = 5 * 60 * 1000;
+
+/**
+ * 走局域网问一次电脑端：我在云端的基址是什么（`tunnel.public_base`）。
+ *
+ * ## 为什么需要这一步
+ *
+ * 云端基址形如 `https://域名/d/<云端 device_id>`，其中的 id 是**云端**
+ * 分配的 32 位十六进制值，与电脑本地 `device_id`（16 位）是两个不同的
+ * 东西。用户在配对的二维码/托盘里只看得到局域网地址，因此这个值唯一
+ * 可信的来源就是电脑端自己 —— 而电脑端在 HELLO 时已经知道自己该出现
+ * 在哪个前缀下（`backend/app/tunnel.py:public_base`）。
+ *
+ * ## 为什么在"直连成功"之后问
+ *
+ * 那是唯一一个既知道局域网地址、又拿得到令牌的时刻。手机第一次配对
+ * 一定发生在家里（要扫码），所以这一次询问几乎必然成功；学到之后
+ * 落盘到 `pb.cloud`，以后出门就靠它。
+ *
+ * ## 失败为什么静默
+ *
+ * 云端未配置是**正常状态**（一期形态），不该在状态条上留个错误。
+ */
+async function learnCloudBase(lanBase: string): Promise<void> {
+  const token = getToken();
+  if (!token) return;
+  if (getCloudBase()) return;                     // 已经知道了
+  const now = Date.now();
+  if (now - memory.cloudBaseAskedAt < CLOUD_BASE_ASK_INTERVAL_MS) return;
+  memory.cloudBaseAskedAt = now;
+  const ctrl = new AbortController();
+  const timer = window.setTimeout(() => ctrl.abort(), LAN_PROBE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${lanBase}/api/system/info`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token}`, "X-PB-Client": "web" },
+      cache: "no-store",
+      credentials: "omit",
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return;
+    const info = (await res.json()) as SystemInfo;
+    const base = String(info.tunnel?.public_base || "").trim();
+    if (base) saveCloudBase(base);
+  } catch {
+    // 静默：探测失败/未配置云端都不影响局域网使用
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 
 interface Landing {
   via: Via;
@@ -320,6 +376,9 @@ function apply(hit: Landing): boolean {
   setVia(hit.via);
   setState(hit.via === "cloud" ? "CLOUD" : "DIRECT");
   reportTransportOk();
+  // 顺带学一次云端基址。不 await：它只是"下次出门能用"，与本次
+  // 探测结果无关，等它会让状态条晚 1.5 秒才变绿。
+  if (hit.via === "lan") void learnCloudBase(hit.base);
   return true;
 }
 

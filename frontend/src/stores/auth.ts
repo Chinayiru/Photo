@@ -45,7 +45,6 @@ import {
   getToken,
   normalizeBase,
   saveBase,
-  saveCloudBase,
   savePairing,
 } from "../api/storage";
 import {
