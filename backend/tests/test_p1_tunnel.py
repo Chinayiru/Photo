@@ -102,6 +102,25 @@ def _free_port() -> int:
         s.close()
 
 
+def _wait_port_free(port: int, timeout: float = 10.0) -> None:
+    """等到 `port` 能重新绑定为止（最多 `timeout` 秒，超时就算了）。
+
+    Windows 上 uvicorn 的 `serve()` 返回不代表监听套接字已从内核里撤掉，
+    紧接着 `bind()` 会 `WinError 10048`。重连用例要"停云端 → 起回来"，
+    中间这一步不能省。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", port))
+            return
+        except OSError:
+            time.sleep(0.02)
+        finally:
+            s.close()
+
+
 def _make_photo(path: Path, *, taken: str, color=(180, 90, 40)) -> None:
     """写一张带 EXIF 拍摄时间的真 JPEG（索引器靠它填 `taken_at`）。"""
     from PIL import Image
@@ -157,6 +176,13 @@ class _Http:
             payload = exc.read()
             status = exc.code
             got = {k.lower(): v for k, v in exc.headers.items()}
+        except (urllib.error.URLError, OSError) as exc:
+            # 对端整个不在（连接被拒 / 超时）。**返回 `None` 而不是抛**：
+            # 断线重连的用例需要在"云端已停"这个状态下发一个请求，用它
+            # 区分"监听套接字都没了"（None）与"云端在、电脑不在"
+            # （503 `E3003`）—— 两者都是对端的错，但只有后者是隧道要
+            # 负责的语义。
+            return None, f"{type(exc).__name__}: {exc}", {}
         if raw:
             return status, payload, got
         try:
@@ -204,6 +230,56 @@ class _Rig:
         self.transport: CloudTunnelTransport | None = None
         self.state = None
         self.cloud_app = None
+        self.cfg: Any = None
+        self.router: Any = None
+
+    async def start_cloud(self) -> None:
+        """起云端 uvicorn。可重复调用 —— 端口在重起时沿用上一次的。
+
+        ★ 端口必须沿用：`backend/app/tunnel.py` 的云端地址来自
+        `cfg.cloud.base_url`，**运行期不会变**。换端口就等于换了一个云端，
+        `TunnelClient` 的重连循环会一直连一个不存在的地址 —— 那样测到的
+        不是"断线重连"，是"配置错了"。
+        """
+        # 登录限流器是模块级单例（`cloud/relay/auth.py:_login_limiter`），
+        # 10 次/600s，跨用例累积。一个测试进程里几十个用例共用同一个
+        # `127.0.0.1` 桶 ⇒ 后面的用例全在 `alogin()` 拿 429，看起来像
+        # "配对坏了"。生产不该清，测试必须清。
+        from cloud.relay.auth import _login_limiter
+
+        _login_limiter.reset()
+        self.cloud_app = create_app(self.cdb, hosts=self._hosts)
+        ucfg = uvicorn.Config(self.cloud_app, host="127.0.0.1",
+                              port=self.cloud_port,
+                              log_level="critical", ws="websockets",
+                              lifespan="off")
+        self._cloud_server = uvicorn.Server(ucfg)
+        self._cloud_task = asyncio.create_task(
+            self._cloud_server.serve(), name="cloud-uvicorn")
+        deadline = time.monotonic() + 20.0
+        while not self._cloud_server.started:
+            if time.monotonic() > deadline:
+                raise TimeoutError("云端 uvicorn 未启动")
+            await asyncio.sleep(0.02)
+        self.cloud_port = int(
+            self._cloud_server.servers[0].sockets[0].getsockname()[1])
+
+    async def stop_cloud(self) -> None:
+        """停云端并**等端口真的释放**。幂等。"""
+        server, task = self._cloud_server, self._cloud_task
+        self._cloud_server = None
+        self._cloud_task = None
+        if server is not None:
+            server.should_exit = True
+        if task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=10)
+            except BaseException:                   # noqa: BLE001
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await task
+        # 等端口可再绑：`serve()` 返回 ≠ 监听套接字已从内核里撤掉。
+        _wait_port_free(self.cloud_port)
 
     # ---- 生命周期 ----
 
@@ -229,20 +305,7 @@ class _Rig:
              security.hash_token(self.agent_token), "0.1.0", time.time()))
 
         # ---- 云端 uvicorn ----
-        self.cloud_app = create_app(self.cdb, hosts=self._hosts)
-        ucfg = uvicorn.Config(self.cloud_app, host="127.0.0.1", port=0,
-                              log_level="critical", ws="websockets",
-                              lifespan="off")
-        self._cloud_server = uvicorn.Server(ucfg)
-        self._cloud_task = asyncio.create_task(
-            self._cloud_server.serve(), name="cloud-uvicorn")
-        deadline = time.monotonic() + 20.0
-        while not self._cloud_server.started:
-            if time.monotonic() > deadline:
-                raise TimeoutError("云端 uvicorn 未启动")
-            await asyncio.sleep(0.02)
-        self.cloud_port = int(
-            self._cloud_server.servers[0].sockets[0].getsockname()[1])
+        await self.start_cloud()
 
         # ---- 电脑端 ----
         lib = tmp / "lib"
@@ -271,17 +334,34 @@ class _Rig:
                           "agent_token": self.agent_token, "enabled": True},
             },
             path=data / "config.json", data_dir=data)
+        self.cfg = cfg
         db = make_db(cfg)
         db.init()
         self.state = build_state(cfg, db=db)
         router, _t, self.state = build_app(cfg, state=self.state)
         await self.state.indexer.scan_all()
-        self.transport = CloudTunnelTransport(cfg, router)
+        self.router = router
+        await self.start_transport()
+
+    async def start_transport(self) -> None:
+        """起电脑端传输（局域网 + 隧道客户端）。可重复调用。
+
+        重连用例要真的把**电脑端**也拆掉再起回来 —— 只重启云端的话，
+        验的是云端侧注册表，验不到 `TunnelClient` 的退避循环。所以
+        `cfg`/`router` 存成实例属性，重起时重建一个全新的 transport。
+        """
+        self.transport = CloudTunnelTransport(self.cfg, self.router)
         await self.transport.start()
         # `CloudTunnelTransport` 没有 `port_actual`（它是复合通路，局域网
         # 端口在 status() 里）。用 status() 而不是内部属性，顺带钉住
         # 这个键对测试是可见的。
         self.lan_port = int(self.transport.status().get("port") or 0)
+
+    async def stop_transport(self) -> None:
+        if self.transport is not None:
+            with contextlib.suppress(BaseException):
+                await self.transport.stop()
+            self.transport = None
 
     async def wait_tunnel(self, timeout: float = 20.0) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
@@ -301,25 +381,8 @@ class _Rig:
         pytest fixture 的 teardown 里（那是另一个 `asyncio.run`），
         结果是每个用例都通过、每个 teardown 都超时。
         """
-        if self.transport is not None:
-            with contextlib.suppress(BaseException):
-                await self.transport.stop()
-            self.transport = None
-        server, task = self._cloud_server, self._cloud_task
-        self._cloud_server = None
-        self._cloud_task = None
-        if server is not None:
-            server.should_exit = True
-        if task is not None:
-            # `shield` 让超时**不**去取消任务本身，超时后我们自己取消：
-            # 否则 `wait_for` 会先 cancel 再 await，异常类型取决于任务
-            # 是否吞掉了取消，很难写对。
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=10)
-            except BaseException:               # noqa: BLE001
-                task.cancel()
-                with contextlib.suppress(BaseException):
-                    await task
+        await self.stop_transport()
+        await self.stop_cloud()
         if self.cdb is not None:
             with contextlib.suppress(BaseException):
                 self.cdb.close_all()
@@ -839,8 +902,137 @@ def test_offline_device_returns_503(rig_factory) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 配对 / 撤销 / 流量
+# 断线重连（`docs/09` P1 DoD 第 5 条 / AC-1.5）
 # ---------------------------------------------------------------------------
+
+def test_tunnel_survives_cloud_restart(rig_factory) -> None:
+    """TC-TUNNEL-FUNC-010/014：**云端**重启后隧道自己接回来。
+
+    这是唯一一条真把云端监听套接字拆掉再起回来的用例。`stop_cloud()`
+    会让端口真的释放（`_wait_port_free` 保证），`TunnelClient` 真的收到
+    `ConnectionClosed`，然后靠 `_run()` 的退避循环自己重连 —— 没有任何
+    人在中间点"重试"。
+
+    断言：
+    1. 云端不在时 `/d/**` 拿不到 200（连不上 listener）；
+    2. 云端回来后 60 秒内自愈（DoD 第 5 条）;
+    3. `session_id` 变了 —— 证明是新连接，不是旧快照；
+    4. 重建后业务照旧（时间线、ping 的 `via == "cloud"`）。
+    """
+    async def main() -> dict[str, Any]:
+        rig = rig_factory()
+        await rig.start()
+        first = await rig.wait_tunnel()
+        await rig.apair()
+
+        ok = await rig.cloud.arequest(
+            "GET", rig.tunnel_path("/api/timeline?limit=2"),
+            token=rig.client_token)
+        assert ok[0] == 200, ok
+
+        # ---- 云端消失 ----
+        await rig.stop_cloud()
+        down = await rig.cloud.arequest(
+            "GET", rig.tunnel_path("/api/system/ping"))
+        # 云端整个不在时 `_Http` 返回 status=None（连接被拒），
+        # 这本身就是"对端不可用"的证据。
+        assert down[0] is None, down
+
+        # ---- 云端回来（同端口）。隧道必须自己接上 ----
+        await rig.start_cloud()
+        t0 = time.monotonic()
+        second = await rig.wait_tunnel(timeout=60.0)
+        elapsed = time.monotonic() - t0
+
+        again = await rig.cloud.arequest(
+            "GET", rig.tunnel_path("/api/timeline?limit=2"),
+            token=rig.client_token)
+        ping = await rig.cloud.arequest(
+            "GET", rig.tunnel_path("/api/system/ping"))
+        return {"first": first, "second": second, "elapsed": elapsed,
+                "again": again, "ping": ping}
+
+    out = _run(main())
+    assert out["second"].get("connected") is True, out["second"]
+    assert out["elapsed"] < 60.0, out["elapsed"]
+    assert out["second"]["session_id"] != out["first"]["session_id"], (
+        out["first"]["session_id"], out["second"]["session_id"])
+    assert out["again"][0] == 200, out["again"]
+    assert len(out["again"][1]["items"]) == 2, out["again"][1]
+    assert out["ping"][0] == 200, out["ping"]
+    assert out["ping"][1]["via"] == "cloud", out["ping"][1]
+
+
+def test_tunnel_survives_agent_restart(rig_factory) -> None:
+    """DoD 第 5 条的本意：**杀掉电脑端进程后重启，60 秒内自动恢复**。
+
+    上面那条重启的是云端；用户的真实场景是关掉电脑上的 PhotoBridge 再
+    打开。两者在隧道里的表现不同：云端重启是"所有电脑一起掉线"，电脑端
+    重启是"注册表里的那条连接还在，但它已经不回帧了" —— 后者才会撞上
+    `Mux._send_frame` 的 `RuntimeError` 那条路径（见
+    `test_offline_device_returns_503`）。
+
+    这里把电脑端 transport 整个停掉、等注册表清空、再起一个新的
+    `TunnelClient`，断言 60 秒内重新上线且业务恢复。
+    """
+    async def main() -> dict[str, Any]:
+        rig = rig_factory()
+        await rig.start()
+        await rig.apair()
+        first = await rig.wait_tunnel()
+
+        before = await rig.cloud.arequest(
+            "GET", rig.tunnel_path("/api/system/ping"))
+        assert before[0] == 200, before
+
+        # ---- 电脑端整个下线 ----
+        await rig.stop_transport()
+        offline = await rig.cloud.arequest(
+            "GET", rig.tunnel_path("/api/system/ping"))
+        assert offline[0] == 503, offline
+        assert offline[1]["error"]["code"] == "E3003", offline
+
+        # ---- 电脑端回来（新的 transport + 新的 TunnelClient）----
+        t0 = time.monotonic()
+        await rig.start_transport()
+        second = await rig.wait_tunnel(timeout=60.0)
+        elapsed = time.monotonic() - t0
+
+        after = await rig.cloud.arequest(
+            "GET", rig.tunnel_path("/api/system/ping"))
+        return {"first": first, "second": second, "elapsed": elapsed,
+                "offline": offline, "after": after}
+
+    out = _run(main())
+    assert out["elapsed"] < 60.0, out["elapsed"]
+    assert out["second"].get("connected") is True, out["second"]
+    assert out["second"]["session_id"] != out["first"]["session_id"], (
+        out["first"]["session_id"], out["second"]["session_id"])
+    assert out["after"][0] == 200, out["after"]
+    assert out["after"][1]["via"] == "cloud", out["after"][1]
+
+
+def test_backoff_is_exponential_and_capped() -> None:
+    """TC-TUNNEL-FUNC-011/012：退避 1→2→4→…→60 s 封顶，且**永不放弃**。
+
+    只测纯函数（`jitter=0.0` 关掉抖动才有可复现值）。"永不放弃"这件事
+    由 `_run()` 的 `while not self._stop` 保证 —— 它是 `while True` 的唯一
+    变体，没有重试次数上限，所以这里只需钉住"退避序列本身有界"。
+    """
+    from backend.app.tunnel import next_backoff
+
+    seq = [next_backoff(i, jitter=0.0) for i in range(0, 12)]
+    assert seq[:7] == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0], seq
+    assert all(v <= 60.0 for v in seq), seq
+    # 封顶之后不允许再增长（否则常驻服务会越退越远）
+    assert seq[-1] == 60.0, seq
+
+    # 抖动只允许在 ±20% 内，且不得把 1 s 抖成负数
+    for _ in range(200):
+        v = next_backoff(0)
+        assert 0.8 <= v <= 1.2, v
+
+
 
 def test_cloud_pairing_issues_usable_token(rig_factory) -> None:
     """云端配对码 → 客户端令牌 → 经隧道访问电脑端（离线验签）。

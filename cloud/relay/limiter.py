@@ -92,6 +92,18 @@ class RateLimiter:
     def count(self) -> int:
         return len(self._buckets)
 
+    def reset(self) -> None:
+        """清空所有窗口。
+
+        只给测试与运维用：`cloud/relay/auth.py` 的登录限流器是**模块级
+        单例**（跨请求、跨连接共享），测试进程里几十个用例共用同一个
+        `127.0.0.1` 桶，很快就把 10 次/600s 打满 —— 症状是后面的用例
+        全在 `alogin()` 上拿 429 `E4001`，看起来像"配对坏了"。生产环境
+        不该调它（清空等于把暴力破解的计数清零）。
+        """
+        self._buckets.clear()
+        self._last_gc = time.monotonic()
+
     def stats(self) -> dict[str, Any]:
         return {"keys": len(self._buckets), "limit": self._limit,
                 "window_sec": self._window}
