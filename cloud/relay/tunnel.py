@@ -30,6 +30,7 @@ HTTP 响应。
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from typing import Any, Awaitable, Callable, Iterable
@@ -40,6 +41,7 @@ from shared.protocol import (
     HEARTBEAT_SEC,
     MAX_FRAME,
     PONG_TIMEOUT,
+    TOTAL_TIMEOUT,
     Frame,
     FrameType,
     ProtocolError,
@@ -186,15 +188,41 @@ class TunnelServer:
                 pass
 
         await _send_ack(ws, session_id=session_id, device_id=device_id)
-        touch_device(self.db, device_id)
+        # `lan_ips` / `version` 是手机回家后走直连的依据（`last_lan`），也是
+        # 运维判断"哪台电脑还在跑旧版本"的依据。它们只出现在 HELLO 里，
+        # 不在这里落库就永远拿不到（详见 `devices.touch_device` 的说明）。
+        touch_device(self.db, device_id, lan_ips=conn.lan_ips,
+                     version=conn.version)
         log.info("隧道上线 device=%s session=%s 在线=%d",
                  device_id, session_id, self.registry.count())
 
         try:
-            await asyncio.gather(
-                self._read_loop(ws, mux, conn),
-                self._heartbeat_loop(mux, ws),
-            )
+            # ★ 必须 `FIRST_COMPLETED`，不能 `gather`。
+            # 两个循环里任意一个结束都意味着连接已经不可用（读循环收到
+            # 断开，或心跳判死）。`gather` 会等**两个**都结束，而心跳循环
+            # 大部分时间睡在 `asyncio.sleep(CLOUD_PING_SEC)`（25 秒）里，
+            # 于是电脑端拔网线后注册表仍把它当作在线约 25 秒：这期间
+            # 手机发来的请求会打进一条死连接，手机看到的是 504 超时
+            # 而不是该看到的 503「电脑离线」。实测清空延迟 24.9 秒。
+            tasks = [
+                asyncio.create_task(self._read_loop(ws, mux, conn),
+                                    name=f"tunnel-read-{device_id[:8]}"),
+                asyncio.create_task(self._heartbeat_loop(mux, ws),
+                                    name=f"tunnel-beat-{device_id[:8]}"),
+            ]
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            for task in pending:
+                # 被取消的循环什么都不用做；它们手里的资源在 finally 里收
+                with contextlib.suppress(BaseException):
+                    await task
+            # 完成的那条若抛了异常，在这里重新抛出交给下面的 except 记日志
+            for task in done:
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
         except asyncio.CancelledError:
             raise
         except Exception:       # noqa: BLE001
@@ -297,6 +325,7 @@ async def forward_request(
     body_len: int | None = None,
     cancel: asyncio.Event | None = None,
     head_timeout: float = HEAD_TIMEOUT,
+    total_timeout: float | None = TOTAL_TIMEOUT,
 ) -> tuple[Any, asyncio.Task[None] | None]:
     """把一条 HTTP 请求塞进隧道，返回 `(PendingRequest, body_pump_task)`。
 
@@ -304,6 +333,15 @@ async def forward_request(
     响应头就能开始往手机写，响应体由 `p.iter_body()` 逐块到达。这条路径
     上没有任何地方 `await request.body()`，2 GB 上传的云端内存只与
     `MAX_BODY_CHUNK` 有关。
+
+    ★ `head_timeout` 与 `total_timeout` **必须分开**。`mux.open(head,
+    timeout=...)` 那个参数定的不是"等响应头多久"，而是 `PendingRequest`
+    的**总时长截止时间**（`deadline = created_at + timeout`），`_sweep_once`
+    到点就把请求连同它的响应体一起 `_abort` 掉。第一版把 `HEAD_TIMEOUT`
+    (30 s) 传进去，症状是**任何超过 30 秒的下载都在传输中途被截断**，
+    手机收到半张照片、且字节数恰好等于"30 秒 × 速率"——2 GB / 8 MB/s
+    实测停在 264.7 MB / 33.1 s。响应头本身仍由 `wait_head(head_timeout)`
+    在 30 秒内单独把关（见 `forward.py`），所以这里给的是总时长。
     """
     mux: Mux = conn.mux
     head: dict[str, Any] = {
@@ -315,7 +353,7 @@ async def forward_request(
         "enc": None,
         "proto": PROTO_VERSION,
     }
-    p = await mux.open(head, timeout=head_timeout)
+    p = await mux.open(head, timeout=total_timeout)
     pump: asyncio.Task[None] | None = None
     if body is not None:
         pump = asyncio.create_task(

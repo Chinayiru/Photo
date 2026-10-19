@@ -267,7 +267,13 @@ def purge_expired_codes(db: CloudDB, *, older_than: float = 86400.0) -> int:
     """
     cutoff = time.time() - older_than
     try:
-        return db.execute_rowcount(
+        # `CloudDB.execute()` 已经返回 `cur.rowcount`，这里**不能**调
+        # `execute_rowcount`——`CloudDB` 没有那个方法（那是电脑端
+        # `backend/app/db.py:Database` 的 API）。第一版写错了，症状是
+        # 每小时 housekeeping 打一行 `清理过期配对码失败
+        # AttributeError: 'CloudDB' object has no attribute
+        # 'execute_rowcount'`，而过期码从来没被清掉。
+        return db.execute(
             "DELETE FROM pair_codes WHERE expires_at < ?", (cutoff,))
     except sqlite3.Error:       # pragma: no cover —— 清理失败不影响发码
         return 0

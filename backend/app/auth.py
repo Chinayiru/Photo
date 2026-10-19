@@ -554,13 +554,33 @@ def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
     now = time.time()
     try:
         _ensure_cloud_table(db)
+        # ★ 撤销标记必须被 `DO UPDATE` 保留。
+        #
+        # 这里原来写的是 `expires_at = excluded.expires_at`，看起来天经地义
+        # ——"令牌的寿命由令牌自己决定"。但那会让撤销**静默失效**：手机被
+        # 移除后 `sync_revoked_clients()` 把 `expires_at` 打成 0，下一次
+        # 请求进来验签通过，这行 upsert 就把 0 改回真实过期时间，撤销标记
+        # 被自己抹掉了。于是"移除这台手机"只对它之后的那一个请求有效。
+        #
+        # 改成 `CASE WHEN 已撤销 THEN 0 ELSE 令牌 exp END`：撤销是**粘性**
+        # 的，只有云端重新配对（新 client_id）才能拿到干净的行走这条路径。
+        # `last_seen` 也不能在撤销后被刷新 —— 它是"这枚令牌最后用过"的
+        # 依据，刷新等于说"它还在正常使用"。
         db.execute(
             f"INSERT INTO {_CLOUD_TOKEN_TABLE}"
             "(client_id, device_id, name, expires_at, created_at, last_seen)"
             " VALUES (?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(client_id) DO UPDATE SET"
-            "   name = excluded.name, expires_at = excluded.expires_at,"
-            "   last_seen = excluded.last_seen",
+            "   name = excluded.name,"
+            "   expires_at = CASE WHEN"
+            f"     {_CLOUD_TOKEN_TABLE}.expires_at IS NOT NULL"
+            f"     AND {_CLOUD_TOKEN_TABLE}.expires_at <= 0"
+            "   THEN 0 ELSE excluded.expires_at END,"
+            f"   last_seen = CASE WHEN"
+            f"     {_CLOUD_TOKEN_TABLE}.expires_at IS NOT NULL"
+            f"     AND {_CLOUD_TOKEN_TABLE}.expires_at <= 0"
+            f"   THEN {_CLOUD_TOKEN_TABLE}.last_seen"
+            "   ELSE excluded.last_seen END",
             (client_id, device_id, name, exp, now, now),
         )
     except Exception as e:  # noqa: BLE001 —— 缓存写失败不该让请求 500

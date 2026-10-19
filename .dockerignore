@@ -1,0 +1,31 @@
+# 构建上下文是仓库根（cloud/Dockerfile 的注释解释了原因）。
+# 这里把除云端真正需要的东西以外全部排除，否则构建会把
+# frontend/dist（123 MB）、data/thumbs（800 MB）、dist/（434 MB）
+# 一起塞进构建缓存，一次 build 好几分钟。
+#
+# 语法：`.dockerignore` 是"白名单式排除"——先全排，再逐个放回。
+
+# ── 全排 ──────────────────────────────────────────────────────
+*
+.*
+!cloud
+!shared
+!scripts
+!requirements.txt
+
+# ── 放回云端需要的 ────────────────────────────────────────────
+!cloud/**/*.py
+!cloud/Dockerfile
+!cloud/Caddyfile
+!cloud/*.md
+!cloud/*.sh
+!cloud/*.example
+!shared/**/*.py
+!requirements.txt
+
+# ── 仍然排除的（放回规则里再排一次，dockerignore 后者优先）────
+cloud/**/__pycache__
+cloud/**/*.pyc
+shared/**/__pycache__
+shared/**/*.pyc
+cloud/data

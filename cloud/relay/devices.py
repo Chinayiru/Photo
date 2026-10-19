@@ -26,12 +26,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterable
 
 from ..relay.db import CloudDB
 from . import security
@@ -224,12 +225,32 @@ def find_client_by_token(db: CloudDB, token: str) -> sqlite3.Row | None:
 _TOUCH_INTERVAL: float = 60.0
 
 
-def touch_device(db: CloudDB, device_id: str, *, now: float | None = None) -> None:
-    """更新 `devices.last_seen`（节流）。
+def touch_device(db: CloudDB, device_id: str, *, now: float | None = None,
+                 lan_ips: Iterable[str] | None = None,
+                 version: str | None = None) -> None:
+    """更新 `devices.last_seen`（节流），并顺带落 `last_lan` / `version`。
 
-    不节流的话，一台电脑每秒几十帧会让 `devices` 表每帧写一次——sqlite
-    的写事务是全局串行的，这会把中继的吞吐压到几百 req/s。`last_seen`
-    的用途是"这台电脑多久没出现了"，60 秒精度完全够用。
+    ## 为什么 `last_lan` 必须落库
+
+    `last_lan`（`docs/04` §3.3）的唯一用途是：手机在云端配好对之后，
+    **回到家里时要能用它直接连局域网**（`docs/03` §5.1 的 `DIRECT` 通路）。
+    它只能从 `HELLO` 里来 —— 云端根本不知道电脑的私网地址。不落库的话，
+    云端配对响应里的 `lan_ips` 永远是空数组，手机就永远只有云端一条路，
+    在家里也绕公网跑（`docs/07` 的 `TC-TUNNEL-FUNC-002` 抓的就是这一点）。
+
+    ## 为什么 `version` 也落
+
+    `devices.version` 在 `cloud/relay/db.py` 的 DDL 里就是"电脑端上报的
+    版本"，`docs/04` §3.3 的 `devices[]` 也把它列为字段。不落库时它永远是
+    `NULL`，运维看不到"哪台电脑还在跑旧版本"——那正是升级时要看的东西。
+    与 `last_lan` 同理，二者都只在握手时才有值，错过就再也拿不到。
+
+    ## 为什么仍然节流
+
+    一台电脑每秒几十帧会让 `devices` 表每帧写一次——sqlite 的写事务是
+    全局串行的，这会把中继的吞吐压到几百 req/s。`last_seen` 的用途是
+    "这台电脑多久没出现了"，60 秒精度完全够用。`lan_ips` / `version`
+    只在**改变时**才写，所以稳态下不会带来额外写入。
     """
     ts = time.time() if now is None else now
     try:
@@ -237,6 +258,20 @@ def touch_device(db: CloudDB, device_id: str, *, now: float | None = None) -> No
             "UPDATE devices SET last_seen = ? WHERE id = ? "
             "AND (last_seen IS NULL OR last_seen < ?)",
             (ts, device_id, ts - _TOUCH_INTERVAL))
+        if lan_ips is not None:
+            payload = json.dumps([str(x)[:64] for x in list(lan_ips)[:16]],
+                                 ensure_ascii=False)
+            # 只在变化时写：同一台电脑重连几十次，地址一般不变
+            db.execute(
+                "UPDATE devices SET last_lan = ? WHERE id = ? "
+                "AND (last_lan IS NULL OR last_lan != ?)",
+                (payload, device_id, payload))
+        if version:
+            text = str(version)[:32]
+            db.execute(
+                "UPDATE devices SET version = ? WHERE id = ? "
+                "AND (version IS NULL OR version != ?)",
+                (text, device_id, text))
     except sqlite3.Error:
         log.debug("更新 last_seen 失败 device=%s", device_id, exc_info=True)
 

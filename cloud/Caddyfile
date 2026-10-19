@@ -1,0 +1,103 @@
+# PhotoBridge Caddyfile —— TLS 终止 + 反向代理
+#
+# 部署位置：/opt/photobridge-cloud/Caddyfile
+# 域名与 ACME 邮箱来自 .env（compose 里传成环境变量）。
+#
+# ★ `/agent/ws` 这条必须写在其它 handle 之前：Caddy 的 handle 是
+#   **互斥匹配、先命中先生效**，写晚了会被通配规则截走，
+#   电脑端会拿到 404 或 index.html，症状是"隧道永远连不上，
+#   但浏览器打开域名是好的"。
+
+{$DOMAIN} {
+    # ── 编码 ────────────────────────────────────────────────────
+    encode zstd gzip
+
+    # ── 安全响应头 ──────────────────────────────────────────────
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        -Server
+    }
+
+    # ── ★★ 电脑端隧道入口（必须最前）★★ ──────────────────────────
+    # 三个要点：
+    #   1. `flush_interval -1` 关缓冲：不关的话帧被攒批，表现是
+    #      "缩略图一张张蹦出来、心跳延迟";
+    #   2. `read_timeout/write_timeout 0`：长连接不能被超时杀掉。
+    #      隧道自己有心跳（25s PING / 75s 判死），但网络抖动时
+    #      Caddy 先超时会把好好的隧道剪断;
+    #   3. `lb_try_duration 0`：WebSocket 不能重试，重试等于另开一条。
+    #
+    # 不需要像 Nginx 那样手写 Upgrade/Connection 头 —— Caddy 自动识别。
+    handle /agent/ws {
+        reverse_proxy relay:8000 {
+            flush_interval -1
+            transport http {
+                read_timeout 0
+                write_timeout 0
+                dial_timeout 10s
+            }
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            lb_try_duration 0
+        }
+    }
+
+    # ── 手机端业务通路 /d/{device_id}/** ────────────────────────
+    # 照片原图动辄十几 MB、2 GB 上传也走这条，所以：
+    #   * 缓冲必须关（否则整张图先在 Caddy 内存里攒一遍，
+    #     而 AC-4.2 要求云端 2 GB 传输内存峰值 < 200 MB）;
+    #   * 超时必须为 0（上传大文件远超默认 10s）。
+    handle /d/* {
+        reverse_proxy relay:8000 {
+            flush_interval -1
+            transport http {
+                read_timeout 0
+                write_timeout 0
+                dial_timeout 10s
+            }
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            # ★ 不重试：上传分片不是幂等的
+            lb_try_duration 0
+        }
+    }
+
+    # ── 云端自身 API（账号、设备、配对码）──────────────────────
+    handle /api/* {
+        reverse_proxy relay:8000 {
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # ── 健康检查别名 ───────────────────────────────────────────
+    # 部署脚本与监控一直用 `/healthz`（docs/08），实现里是
+    # `/api/health`（docs/04 §3.7）。在这里对齐，不为了迁就脚本
+    # 去实现里多开一个端点 —— 多一个匿名端点就多一份被扫的面。
+    handle /healthz {
+        rewrite * /api/health
+        reverse_proxy relay:8000
+    }
+
+    # ── 兜底：没有前端产物，直接给 404 ─────────────────────────
+    # relay 不托管页面（账号与设备管理目前走命令行 `scripts/cloud_init.py`）。
+    # 任何未匹配的路径都不该返回 200，否则扫描器会把 `/.env`
+    # 也当成"存在"。
+    handle {
+        respond "not found" 404
+    }
+
+    # ── 日志 ────────────────────────────────────────────────────
+    # ★ 不记录响应体，也不记录 Authorization 头（Caddy 默认就不记）。
+    #   隧道帧是二进制，永远不进 access.log。
+    log {
+        output file /data/access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+        format console
+    }
+}

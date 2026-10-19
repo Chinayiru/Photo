@@ -39,6 +39,7 @@ P1 的中继是**单进程**（设备注册表是内存 map，多 worker 会各�
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -309,13 +310,19 @@ _db: CloudDB | None = None
 
 
 def open_db(path: str | Path | None = None) -> CloudDB:
-    """打开（并初始化）云端库。重复调用返回同一个实例。"""
+    """打开（并初始化）云端库。重复调用返回同一个实例。
+
+    路径优先级：显式参数 > `PB_CLOUD_DB` 环境变量 > 工作目录下的
+    `cloud.db`。容器里必须落到挂载卷（`/data/cloud.db`），否则
+    "重建容器"这个常规升级动作会把账号、设备、配对码一起清掉 ——
+    容器的工作目录 `/app` 是镜像内部，不持久。
+    """
     global _db
     if _db is not None and (path is None or str(path) == _db.path):
         return _db
     if _db is not None:
         _db.close_all()
-    target = path or "cloud.db"
+    target = path or os.environ.get("PB_CLOUD_DB", "").strip() or "cloud.db"
     db = CloudDB(target)
     db.init()
     _db = db

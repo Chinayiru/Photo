@@ -1,0 +1,84 @@
+# PhotoBridge 云端编排：relay（隧道中继）+ caddy（HTTPS 终止）
+#
+# 部署位置：/opt/photobridge-cloud/
+# 用法：
+#   cp .env.example .env && nano .env      # 改 DOMAIN / ACME_EMAIL
+#   docker compose up -d --build
+#
+# ★ 构建上下文是**仓库根**（`..`），不是本目录。理由见 cloud/Dockerfile
+#   的注释：`cloud/relay/*` 依赖 `shared/`，而那是两端共享的同一份物理
+#   文件，不能复制第二份。
+
+services:
+  # ── 隧道中继服务 ────────────────────────────────────────────────
+  relay:
+    build:
+      context: ..
+      dockerfile: cloud/Dockerfile
+    image: photobridge/relay:0.1
+    container_name: pb-relay
+    restart: unless-stopped
+    environment:
+      # 库必须落在挂载卷上。默认值 `cloud.db` 是相对工作目录 `/app`，
+      # 那是镜像内部 —— 重建容器会清掉账号/设备/配对码。
+      PB_CLOUD_DB: /data/cloud.db
+      PB_CLOUD_HOST: 0.0.0.0
+      PB_CLOUD_PORT: "8000"
+      PB_CLOUD_LOG_LEVEL: INFO
+      # ★ Host 头白名单（逗号分隔）。`cloud/relay/tunnel.py::check_host`
+      # 用它挡 DNS rebinding：攻击者把自己的域名解析到本机 IP 再让
+      # 电脑端 Agent 连过来时，Host 不会是我们的域名，于是 403。
+      # **留空等于不校验**，启动日志会打一条 warning。
+      PB_CLOUD_HOSTS: ${DOMAIN}
+    volumes:
+      - ./data:/data
+    # ★★ 用 expose 而不是 ports ★★
+    # ports 会让 Docker 直接写 iptables 绕过 ufw，把 8000 暴露到公网。
+    # expose 只在 pb-net 内部可见，只有 caddy 能访问。
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - pb-net
+
+  # ── Caddy：自动 HTTPS + 反向代理 ─────────────────────────────────
+  caddy:
+    image: caddy:2
+    container_name: pb-caddy
+    restart: unless-stopped
+    # Caddy 是唯一对外暴露端口的服务
+    ports:
+      - "80:80"        # HTTP（ACME 验证 + 跳转 HTTPS）
+      - "443:443"      # HTTPS
+      - "443:443/udp"  # HTTP/3 (QUIC)
+    environment:
+      # 让 Caddyfile 能用 {$DOMAIN} 引用
+      DOMAIN: ${DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy_data:/data          # ★ 证书存这里，不挂会反复申请触发限流
+      - ./caddy_config:/config
+    depends_on:
+      - relay
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - pb-net
+
+networks:
+  pb-net:
+    driver: bridge

@@ -285,15 +285,29 @@ def main() -> None:
 
     host = os.environ.get("PB_CLOUD_HOST", "127.0.0.1")
     port = int(os.environ.get("PB_CLOUD_PORT", "8000"))
+    # 库的位置。容器里必须指到挂载卷上（`/data/cloud.db`），否则
+    # `cloud.db` 会落在工作目录 `/app` 里 —— 容器一重建，账号、设备、
+    # 配对码、流量统计全部归零，而"重建容器"是升级时的常规动作。
+    db_path = os.environ.get("PB_CLOUD_DB", "").strip()
     logging.basicConfig(
         level=os.environ.get("PB_CLOUD_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)-5s %(name)s: %(message)s")
-    log.info("云端中继启动 %s:%s max_frame=%s", host, port, MAX_FRAME)
+    log.info("云端中继启动 %s:%s max_frame=%s db=%s",
+             host, port, MAX_FRAME, db_path or "cloud.db（相对工作目录）")
     # ★ 必须单进程（`workers=1`）：设备注册表是**内存 map**，多 worker
     # 会让"电脑连在 worker A、手机请求打到 worker B"变成常态，表现是
     # 随机 503。真要横向扩展，注册表得换 Redis，那是另一个设计。
-    uvicorn.run(create_app(), host=host, port=port, log_level="info",
-                ws="websockets", proxy_headers=True)
+    # `--forwarded-allow-ips` 的默认值是 127.0.0.1，那是"前面没有代理"
+    # 的假设。云端部署里前面一定是 Caddy（另一台容器、172.x 网段），
+    # 用默认值会让**所有手机共用 Caddy 那一个 IP**：限流桶变成全局的
+    # ——一个人刷 120 次/秒，所有人一起 429。这里的默认值只信 Docker
+    # 私网段；直连 8000 的外部地址不在其中，所以「真有人绕过 Caddy」
+    # 时反而不会信他们伪造的 X-Forwarded-For。
+    forwarded = os.environ.get("PB_CLOUD_FORWARDED_ALLOW_IPS",
+                               "172.16.0.0/12").strip()
+    uvicorn.run(create_app(open_db(db_path or None)), host=host, port=port,
+                log_level="info", ws="websockets", proxy_headers=True,
+                forwarded_allow_ips=forwarded)
 
 
 if __name__ == "__main__":

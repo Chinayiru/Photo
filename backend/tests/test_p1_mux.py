@@ -625,3 +625,172 @@ def test_priority_frame_send_failure_is_swallowed() -> None:
 
     assert _run(main()) is True
 
+
+class _FakeConn:
+    """`forward_request` 只用到 `conn.mux`，别的一概不碰。"""
+
+    __slots__ = ("mux",)
+
+    def __init__(self, mux: Mux) -> None:
+        self.mux = mux
+
+
+def test_forward_request_survives_past_head_timeout() -> None:
+    """`cloud/relay/tunnel.py:forward_request` 的响应不能被头部超时截断。
+
+    这是把 2 GB 传输截断在 264.7 MB 的那个 bug 的**端到端**回归。修法是把
+    `mux.open(timeout=...)` 的参数从 `head_timeout` 换成 `total_timeout`；
+    这条用例用一个"响应比头部超时慢很多、但远在总时长内"的对端来证明它。
+
+    `head_timeout` 取 0.05 s、对端拖 0.4 s 才回头——若仍用头部超时当
+    deadline，清扫器会在 0.05 s 后 `_abort`，`iter_body()` 拿不到任何
+    字节（甚至连 head 都拿不到）。
+    """
+    async def main() -> tuple[int, bytes]:
+        import shared.mux as m
+
+        # ★ 必须把清扫周期压到毫秒级。默认是 5 秒，而这里只拖 0.4 秒 ——
+        #   清扫器还没跑到第一轮，响应体就已经送完了，于是**用错了 timeout
+        #   也照样通过**（变异测试实测：换回 head_timeout 时这条用例仍然绿）。
+        orig = m.SWEEP_INTERVAL
+        m.SWEEP_INTERVAL = 0.02
+        lb = _Loopback()
+        left, right = lb.build()
+
+        async def on_request(req: InboundRequest) -> None:
+            await asyncio.sleep(0.4)
+            await right.res_head(req.req_id, 200, {}, body_len=5)
+            await right.res_body(req.req_id, b"hello")
+            await right.res_end(req.req_id)
+
+        right.on_request = on_request
+        try:
+            await left.start()
+            await right.start()
+            from cloud.relay.tunnel import forward_request
+
+            p, pump = await forward_request(
+                _FakeConn(left),
+                method="GET",
+                path="/api/items/1/raw",
+                query={},
+                headers={},
+                body=None,
+                body_len=None,
+                head_timeout=0.05,
+                total_timeout=10.0,
+            )
+            head = await p.wait_head(timeout=5.0)
+            data = bytearray()
+            async for chunk in p.iter_body(idle_timeout=5.0,
+                                           total_timeout=10.0):
+                data.extend(chunk)
+            if pump is not None:
+                await pump
+            return int(head.get("status") or 0), bytes(data)
+        finally:
+            m.SWEEP_INTERVAL = orig
+            await left.close("done")
+            await right.close("done")
+
+    status, body = _run(main())
+    assert status == 200, status
+    assert body == b"hello", body
+
+
+def test_forward_request_gives_sse_no_deadline() -> None:
+    """`/api/events` 走 `total_timeout=None` 时 `deadline` 必须是无穷。
+
+    否则清扫器每 30 分钟把手机的事件流掐一次，期间的 `upload_done`
+    推送（AC-3.13）全部丢失。这条与 `forward.py:_total_timeout()` 的
+    `端swith('/api/events')` 判断配套。
+    """
+    async def main() -> float:
+        lb = _Loopback()
+        left, right = lb.build()
+
+        async def on_request(req: InboundRequest) -> None:
+            return           # 永不应答，模拟 SSE 长连接
+
+        right.on_request = on_request
+        try:
+            await left.start()
+            await right.start()
+            from cloud.relay.tunnel import forward_request
+
+            p, _ = await forward_request(
+                _FakeConn(left),
+                method="GET",
+                path="/api/events",
+                query={},
+                headers={},
+                body=None,
+                body_len=None,
+                head_timeout=30.0,
+                total_timeout=None,
+            )
+            return p.deadline - p.created_at
+        finally:
+            await left.close("done")
+            await right.close("done")
+
+    assert _run(main()) == float("inf")
+
+
+def test_open_timeout_becomes_request_deadline() -> None:
+    """`open(timeout=...)` 定的是**请求总时长**，`_sweep_once` 按它掐断。
+
+    这是 2 GB 传输被截断的真根因：`cloud/relay/tunnel.py:forward_request`
+    原本把 `head_timeout`(30 s) 当总时长传给 `mux.open()`，而 `open()`
+    用它算 `PendingRequest.deadline`，清扫器到点就把请求连同响应体一起
+    `_abort`。症状是**任何超过 30 秒的下载都在中途断掉**，收到的字节数
+    恰好等于"30 秒 x 速率"——2 GB @ 8 MB/s 实测停在 264.7 MB / 33.1 s。
+
+    这里不测"30 秒以后还在流"（那需要真的等），而是钉住不变式本身：
+    `deadline` 必须由 `open()` 的参数决定，且 `None` 表示没有上限。
+    """
+    async def main() -> tuple[float, float, float]:
+        mux = _silent_mux()
+        short = await mux.open({"method": "GET", "path": "/a"}, timeout=30.0)
+        longy = await mux.open({"method": "GET", "path": "/b"}, timeout=1800.0)
+        forever = await mux.open({"method": "GET", "path": "/c"}, timeout=None)
+        spans = (short.deadline - short.created_at,
+                 longy.deadline - longy.created_at,
+                 forever.deadline - forever.created_at)
+        await mux.close("done")
+        return spans
+
+    short_span, long_span, forever_span = _run(main())
+    assert abs(short_span - 30.0) < 1.0, short_span
+    assert abs(long_span - 1800.0) < 1.0, long_span
+    assert forever_span == float("inf"), forever_span
+
+
+def test_sse_deadline_is_unbounded() -> None:
+    """`GET /api/events` 走 `total_timeout=None`，清扫器永不掐它。
+
+    `iter_body(total_timeout=None)` 是 SSE 的唯一入口。若 `open()` 仍拿
+    30 秒算 `deadline`，手机上表现为"每半小时事件流莫名重连一次"——
+    而重连本身会漏掉期间的 `upload_done` 推送（AC-3.13）。
+    """
+    async def main() -> bool:
+        import shared.mux as m
+
+        orig = m.SWEEP_INTERVAL
+        m.SWEEP_INTERVAL = 0.02
+        # 必须用 `_silent_mux`：`_Loopback` 的对端若没设 `on_request`，
+        # 会立刻回 ERROR "peer is not a server"，请求瞬间消失。
+        left = _silent_mux()
+        try:
+            await left.start()
+            p = await left.open({"method": "GET", "path": "/api/events"},
+                                timeout=None)
+            assert p.deadline == float("inf")
+            await asyncio.sleep(0.2)
+            assert left.stats["active"] == 1, "无上限的请求被清扫器掐掉了"
+            return True
+        finally:
+            m.SWEEP_INTERVAL = orig
+            await left.close("done")
+
+    assert _run(main()) is True

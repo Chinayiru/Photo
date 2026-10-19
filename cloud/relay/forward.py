@@ -307,6 +307,7 @@ class Forwarder:
                     body=_count_stream(request.stream(), up),
                     body_len=_content_length(request),
                     cancel=cancel,
+                    total_timeout=_total_timeout(request),
                 )
             except MuxClosed:
                 return _error(503, "E3003", "电脑离线", request_id=rid)

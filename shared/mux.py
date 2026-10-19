@@ -240,10 +240,15 @@ class PendingRequest:
     __slots__ = ("req_id", "created_at", "deadline", "head", "body",
                  "cancelled", "_head_done", "_body_done", "_last_body_at")
 
-    def __init__(self, req_id: int, *, timeout: float = TOTAL_TIMEOUT) -> None:
+    def __init__(self, req_id: int, *, timeout: float | None = TOTAL_TIMEOUT) -> None:
         self.req_id = req_id
         self.created_at = now()
-        self.deadline = self.created_at + timeout
+        #: `None` = **没有总额上限**，只给 `GET /api/events`（SSE）用。
+        #: 它按定义永不结束，给它任何总额上限都等于"每 30 分钟把手机的
+        #: 事件流掐一次"。用 `inf` 而不是 `None` 是为了让清扫器的
+        #: `t > p.deadline` 保持单一比较、不必到处判 None。
+        self.deadline = (self.created_at + timeout
+                         if timeout is not None else float("inf"))
         #: 第一个 RES_HEAD / ERROR 的结果（dict）。用 Future 而不是队列：
         #: 头部只会来一次，Future 的"只能 set 一次"正好把它钉住。
         self.head: asyncio.Future[dict[str, Any]] = (
@@ -476,7 +481,7 @@ class Mux:
     # ---- 发起侧 ----
 
     async def open(self, head: dict[str, Any], *,
-                   timeout: float = TOTAL_TIMEOUT) -> PendingRequest:
+                   timeout: float | None = TOTAL_TIMEOUT) -> PendingRequest:
         """发 `REQ_HEAD` 并返回在途请求，**请求体由调用方后续送**。
 
         为什么需要这个而不是只用 `begin()`：转发侧必须**先拿到 req_id**
@@ -519,7 +524,7 @@ class Mux:
 
     async def begin(self, head: dict[str, Any],
                     body: AsyncIterator[bytes] | None = None, *,
-                    timeout: float = TOTAL_TIMEOUT) -> PendingRequest:
+                    timeout: float | None = TOTAL_TIMEOUT) -> PendingRequest:
         """发 REQ_HEAD（+ 可选的 REQ_BODY 流）+ REQ_END，返回在途请求。
 
         ★ 请求体边读边发：手机上传 2 GB 时，云端不能先把整个体读完
