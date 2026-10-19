@@ -48,6 +48,7 @@ from shared.protocol import (
     ProtocolError,
     decode_frame,
     encode_frame,
+    wants_credit_v2,
 )
 
 from ..relay import security
@@ -181,7 +182,7 @@ class TunnelServer:
         #   CREDIT。老电脑端把 CREDIT 当定长帧，收到 payload 会
         #   `decode_frame` 抛 `ProtocolError` 直接断连 —— 症状是
         #   "云端升级后，老电脑端传大文件到一半隧道断"。
-        credit_v2 = CREDIT_V2_CAP in conn.caps
+        credit_v2 = wants_credit_v2(conn.caps)
         mux = Mux(_sender(ws), role=f"relay:{device_id[:8]}",
                   credit_v2=credit_v2)
         conn.mux = mux

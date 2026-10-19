@@ -475,18 +475,67 @@ def test_credit_v2_negotiation_is_symmetric() -> None:
 
     ★ 三向矩阵：旧↔旧、旧↔新、新↔新。只有"新↔新"才该发 12 字节，
     因为只有它两端都装得下 —— 一端升级一端没升级时必须走保守路径。
-    """
-    from shared.protocol import CREDIT_V2_CAP
 
+    ★ 第一版写的是 `enabled = CAP in ours and CAP in theirs`，当场把
+    "两端都声明"这个判断重算了一遍 —— 那是在测 `and` 运算符，产品代码
+    改了它照样绿。现在调用两端**同一个** `wants_credit_v2()`（`shared/
+    protocol.py`），并把对端发来的各种畸形 `caps` 也钉住：它直接来自
+    对端 JSON，`"credit_v2" in "xcredit_v2x"` 这种子串匹配会误判。
+    """
+    from shared.protocol import CREDIT_V2_CAP, wants_credit_v2
+
+    # ① 两端都必须**在协商现场调用**共享判断（不是只 import 了它）
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+
+    def _target_name(node: ast.expr) -> str:
+        """赋值目标名：`x` → "x"，`self.x` → "x"（属性赋值两端都用的形态）。"""
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return ""
+
+    sites = {
+        root / "backend" / "app" / "tunnel.py": "_credit_v2",
+        root / "cloud" / "relay" / "tunnel.py": "credit_v2",
+    }
+    for path, var in sites.items():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "wants_credit_v2"
+        ]
+        assert calls, f"{path.name} 没有调用 wants_credit_v2"
+        # 而且必须真的用返回值给那个变量赋值（不是调了但丢掉）
+        assigned = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(_target_name(t) == var for t in node.targets)
+            and isinstance(node.value, ast.Call)
+            and getattr(node.value.func, "id", None) == "wants_credit_v2"
+        ]
+        assert assigned, (
+            f"{path.name}:{var} 没有由 wants_credit_v2() 的返回值赋值")
     cases = [
         ([], [], False),
         ([CREDIT_V2_CAP], [], False),
         ([], [CREDIT_V2_CAP], False),
         ([CREDIT_V2_CAP], [CREDIT_V2_CAP], True),
+        (["image", CREDIT_V2_CAP], ["notify", CREDIT_V2_CAP], True),
+        (["image"], [CREDIT_V2_CAP], False),
     ]
     for ours, theirs, expected in cases:
-        enabled = CREDIT_V2_CAP in ours and CREDIT_V2_CAP in theirs
+        enabled = wants_credit_v2(ours) and wants_credit_v2(theirs)
         assert enabled is expected, (ours, theirs)
+
+    # ③ 畸形 caps 一律当作不支持（子串匹配会把这些判成支持）
+    for bad in (None, "", "credit_v2", "xcredit_v2x", 123, {"credit_v2": 1}):
+        assert wants_credit_v2(bad) is False, f"{bad!r} 被误判成支持"
 
 
 def test_credit_update_interval_is_well_under_deadlock() -> None:

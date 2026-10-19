@@ -53,6 +53,7 @@ from shared.protocol import (
     RECONNECT_JITTER,
     RECONNECT_MAX,
     FrameType,
+    wants_credit_v2,
 )
 
 log = logging.getLogger(__name__)
@@ -382,9 +383,7 @@ class TunnelClient:
         #   老云端把 CREDIT 当定长帧，带 payload 会让它 `decode_frame` 抛
         #   `ProtocolError` 直接断连 —— 症状是"传大文件到一半隧道断"。
         server_caps = ack.get("server_caps")
-        self._credit_v2 = (
-            isinstance(server_caps, list)
-            and CREDIT_V2_CAP in server_caps)
+        self._credit_v2 = wants_credit_v2(server_caps)
         log.info("握手完成 session=%s proto=%s hb=%.0fs credit_v2=%s",
                  self._session_id, ack.get("proto"), self._peer_heartbeat,
                  self._credit_v2)

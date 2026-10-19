@@ -103,6 +103,23 @@ _CREDIT_STRUCT = struct.Struct(">III")
 #   否则退回空帧（老语义"重置满窗"，慢消费者仍会被误杀，但不比从前更坏）。
 CREDIT_V2_CAP = "credit_v2"
 
+
+def wants_credit_v2(peer_caps: object) -> bool:
+    """对端能力列表里是否声明了 `credit_v2`。
+
+    两端**都必须**用它判断，而不是各自写一次 `CAP in caps` —— 这个判断
+    的错法（`not in`、把 `caps` 当字符串做子串匹配）在单侧写错时只表现为
+    "升级后传大文件到一半隧道断"，很难归因。一次实现 + 两端调用，让一条
+    用例就能覆盖两个方向。
+
+    `peer_caps` 允许是任何东西（`None`/字符串/含非字符串的列表），因为它
+    直接来自对端发来的 JSON：`"credit_v2" in "xcredit_v2x"` 这种子串匹配
+    会误判，所以类型不对时一律当作不支持。
+    """
+    if not isinstance(peer_caps, (list, tuple, set, frozenset)):
+        return False
+    return any(c == CREDIT_V2_CAP for c in peer_caps)
+
 # 超时（§2.5.5）
 HEAD_TIMEOUT = 30.0                 # 发 REQ_HEAD 到收 RES_HEAD/ERROR
 IDLE_TIMEOUT = 60.0                 # 两次 RES_BODY 之间的最大间隔
