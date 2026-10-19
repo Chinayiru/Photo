@@ -55,6 +55,8 @@ from .protocol import (
     FrameType,
     ProtocolError,
     TooManyRequests,
+    decode_credit,
+    encode_credit,
     encode_frame,
 )
 
@@ -106,6 +108,21 @@ _BODY_QUEUE_MAX = CREDIT_WINDOW // MAX_BODY_CHUNK + 2
 # 窗口调大而忘了同步队列，或者将来引入"超出窗口的推送"，也不能让读循环
 # 无限期停摆。30 秒与 `CREDIT_DEADLOCK_TIMEOUT` 同量级。
 _BODY_PUT_TIMEOUT = 30.0
+
+#: 慢消费者下"多久回一次 CREDIT"（按时间触发的回补）。
+#
+# ★ 光有"攒够半个窗口"的字节阈值是不够的，这是 10 KB/s 实测出来的：
+#   消费者要凑满 4 MB 需要 **410 秒**，而发送方只等
+#   `CREDIT_DEADLOCK_TIMEOUT`（30 s）就判对端死掉。于是手机在弱网下看
+#   大图时，隧道层的发送方在 8 MB（= 一个窗口）处放弃，`res_body` 抛
+#   `MuxClosed(E5010)`，而放弃时不发 `RES_END` ⇒ 手机收到 **HTTP 200
+#   + 半张照片**（`build/_probe_slow_mux.py --stall` 可复现）。
+#
+#   取 `HEARTBEAT_SEC`（25 s）而不是更小的值：CREDIT 帧很便宜，但也不该
+#   每来一块就发一条（那同样是"PING 风暴的亲戚"）。25 秒 < 30 秒死锁线
+#   留了 5 秒余量。`_CreditGate.on_recv()` 因此有两个触发条件：
+#   字节够了 **或** 距上次回补够久了。
+CREDIT_UPDATE_INTERVAL = 20.0
 
 
 class MuxClosed(Exception):
@@ -175,7 +192,8 @@ class _CreditGate:
     """
 
     __slots__ = ("_window", "_credit", "_cond", "_recv_unacked",
-                 "_last_progress", "_stalled", "_sent_total", "_recv_total")
+                 "_last_progress", "_stalled", "_sent_total", "_recv_total",
+                 "_last_credit_at")
 
     def __init__(self, window: int = CREDIT_WINDOW) -> None:
         self._window = int(window)
@@ -186,6 +204,8 @@ class _CreditGate:
         self._stalled = False
         self._sent_total = 0
         self._recv_total = 0
+        #: 上次回 CREDIT 的时刻（按时间触发回补用，见 `on_recv`）。
+        self._last_credit_at = now()
 
     @property
     def credit(self) -> int:
@@ -225,26 +245,75 @@ class _CreditGate:
             self._credit -= n
             self._sent_total += n
 
-    async def grant(self) -> None:
-        """收到对端 CREDIT：把额度重置回满窗口。
+    async def grant(self, n: int | None = None) -> None:
+        """收到对端 CREDIT：把额度加回来。
 
-        为什么是"重置"而不是"累加"（见模块 docstring）：帧协议把
-        CREDIT 的 payload 冻结成空，能表达的最小语义就是"我有进展"。
-        重置只会多给，不会少给，因此不可能造成发送方永久卡住。
+        ★ 曾经是"重置回满窗"，理由是 `CREDIT` 的 payload 被协议冻结成空，
+        能表达的最小语义只有"我有进展"。那个设计有三个真实后果：
+
+        ① **慢消费者必然被误杀**。接收方要累积到 `window // 2`（4 MB）
+           才回一次 CREDIT，而发送方只等 `CREDIT_DEADLOCK_TIMEOUT`（30 s）。
+           10 KB/s 看图时凑满 4 MB 需要 **410 秒** ⇒ 发送方在 30 秒时
+           判对端死掉，`res_body` 抛 `MuxClosed(E5010)`。
+        ② **静默截断**。放弃时既不发 `ERROR` 也不发 `RES_END`，云端
+           只能等到 idle 超时，而 `forward.py` 又把超时 `pass` 掉 ⇒
+           手机收到 **HTTP 200 + 半张照片**。
+        ③ **重置让发送方无限领先**。"重置"不携带"消费了多少"，每收到
+           一次就又是满窗，内存上界失效。
+
+        现在 `CREDIT` 带 12 字节 payload（`docs/04` §2.5.3 本来就如此规定，
+        是实现擅自冻结成定长帧的）。`n` 是**本次归还的字节数**，
+        按字节累加并封顶在窗口大小（对端恶意超发也不会把窗口撑大）。
+        `n is None` 只在"确实要重置"的场景使用。
         """
         async with self._cond:
-            self._credit = self._window
+            if n is None:
+                self._credit = self._window
+            else:
+                self._credit = min(self._window, self._credit + max(0, int(n)))
             self._last_progress = now()
+            self._stalled = False
             self._cond.notify_all()
 
     def on_recv(self, n: int) -> int:
-        """记接收字节，返回"该不该回 CREDIT"（1 = 该回，0 = 不用）。"""
+        """记接收字节，返回"该不该回 CREDIT"（1 = 该回，0 = 不用）。
+
+        ★ 两个触发条件缺一不可：
+
+        * **按字节**：攒够 `max(CREDIT_THRESHOLD, window // 2)` 回一次 ——
+          大流量下避免帧数翻倍。
+        * **按时间**：距上次回补超过 `CREDIT_UPDATE_INTERVAL` 且确有未回补
+          字节 —— 慢消费者唯一能靠的触发方式。没有它，10 KB/s 的消费者
+          要 410 秒才凑满 4 MB，而发送方 30 秒就判死。
+
+        时间阈值必须显著小于 `CREDIT_DEADLOCK_TIMEOUT`，否则发送方仍会
+        先超时（`test_credit_update_interval_is_well_under_deadlock` 钉住）。
+        """
         self._recv_unacked += n
         self._recv_total += n
+        if self._recv_unacked <= 0:
+            return 0
         if self._recv_unacked >= max(CREDIT_THRESHOLD, self._window // 2):
-            self._recv_unacked = 0
+            return 1
+        if now() - self._last_credit_at >= CREDIT_UPDATE_INTERVAL:
             return 1
         return 0
+
+    def take_pending(self) -> int:
+        """取走待回补字节数（发送方把这批额度写进 CREDIT 的 `window` 字段）。
+
+        与 `restore_pending()` 配对使用：帧没发出去时必须还回来，否则这批
+        信用永远丢失，对端会一路跑到死锁。
+        """
+        n = self._recv_unacked
+        self._recv_unacked = 0
+        self._last_credit_at = now()
+        return n
+
+    def restore_pending(self, n: int) -> None:
+        """CREDIT 发送失败：把刚取走的额度还回去。"""
+        if n > 0:
+            self._recv_unacked += n
 
     async def wake(self) -> None:
         async with self._cond:
@@ -261,7 +330,7 @@ class PendingRequest:
 
     __slots__ = ("req_id", "created_at", "deadline", "head", "body",
                  "cancelled", "_head_done", "_body_done", "_last_body_at",
-                 "on_consume")
+                 "on_consume", "_body_error")
 
     def __init__(self, req_id: int, *, timeout: float | None = TOTAL_TIMEOUT) -> None:
         self.req_id = req_id
@@ -285,6 +354,16 @@ class PendingRequest:
         #: 消费者取走 `n` 字节时回调（由 `Mux` 装上）。**信用必须在这里
         #: 归还，而不是在数据到达时** —— 见 `_on_res_body` 的注释。
         self.on_consume: Callable[[int], None] | None = None
+        #: 响应体中途失败的原因（`(code, message)`）。
+        #
+        # ★ 为什么需要这个字段，而不是复用 `head`：`RES_HEAD` 早就把 200
+        #   发给了手机，之后隧道才断/对端才放弃。此时 `set_head()` 是
+        #   空操作（Future 只能 set 一次），若只用 `finish_body()` 收尾，
+        #   `iter_body()` 会**正常结束** —— 上层看到的是"响应体就这么长"，
+        #   于是手机拿到 HTTP 200 + 半张照片，日志里一行错都没有。
+        #   响应体流必须能把中途失败表达出来（抛 `MuxClosed`），这是
+        #   数据完整性要求，不是异常美观问题。
+        self._body_error: tuple[str, str] | None = None
 
     # ---- 发起侧消费 ----
 
@@ -316,16 +395,19 @@ class PendingRequest:
             # 没能入队（见 `finish_body()`），这里补上这次收尾，否则消费
             # 者会在一个再也不会有数据的队列上等到 `idle_timeout`。
             if self._body_done and self.body.empty():
+                self._raise_body_error()
                 return
             try:
                 chunk = await asyncio.wait_for(
                     self.body.get(), timeout=idle_timeout)
             except asyncio.TimeoutError:
                 if self._body_done and self.body.empty():
+                    self._raise_body_error()
                     return
                 raise asyncio.TimeoutError(
                     f"{idle_timeout:.0f}s 内没有收到新的 RES_BODY") from None
             if chunk is None:
+                self._raise_body_error()
                 return
             # ★ 信用在这里归还 —— 数据**已经被消费者取走**，对端才可以
             #   再发。见 `_on_res_body` 的注释。
@@ -333,12 +415,30 @@ class PendingRequest:
                 self.on_consume(len(chunk))
             yield chunk
 
+    def _raise_body_error(self) -> None:
+        """响应体正常结束前，若中途失败过就必须抛出去。
+
+        见 `_body_error` 的注释：`RES_HEAD` 已经发出 200 之后，唯一能让
+        上层察觉到"这份响应不完整"的手段就是让流以异常结尾。
+        """
+        if self._body_error is not None:
+            code, message = self._body_error
+            self._body_error = None
+            raise MuxClosed(f"{message}（{code}）")
+
     # ---- 内部：由 Mux 调用 ----
 
     def set_head(self, payload: dict[str, Any]) -> None:
         if not self.head.done():
             self._head_done = True
             self.head.set_result(payload)
+        elif payload.get("status") == 0 and payload.get("error"):
+            # 头已经发过 200 了，之后才收到 ERROR：这是**响应体中途失败**。
+            # 记在 `_body_error` 上，让 `iter_body()` 在收尾时抛出去，
+            # 而不是把它当"响应体正常结束"（那正是静默截断）。
+            err = payload["error"]
+            self._body_error = (str(err.get("code") or "E5010"),
+                                str(err.get("message") or "响应中断"))
 
     def push_body(self, chunk: bytes) -> None:
         self._last_body_at = now()
@@ -453,7 +553,8 @@ class Mux:
 
     def __init__(self, sender: Callable[[bytes], Awaitable[None]], *,
                  window: int = CREDIT_WINDOW,
-                 role: str = "mux") -> None:
+                 role: str = "mux",
+                 credit_v2: bool = True) -> None:
         self._send_raw = sender
         self._alloc = ReqIdAllocator()
         self._pending: dict[int, PendingRequest] = {}
@@ -461,6 +562,10 @@ class Mux:
         self._credit = _CreditGate(window)
         self._send_lock = asyncio.Lock()
         self._closed = False
+        #: 对端是否支持带 12 字节 payload 的 `CREDIT`（见 `CREDIT_V2_CAP`）。
+        #: `False` 时发**空帧**（老语义"重置满窗"）：慢消费者仍会被误杀，
+        #: 但至少不会因为老对端 `decode_frame` 抛 `ProtocolError` 而断连。
+        self._credit_v2 = bool(credit_v2)
         #: 底层发送失败过一次（socket 已关、ASGI 消息已终结）。见 `_send_frame`。
         self._failed = False
         self._sweeper: asyncio.Task[None] | None = None
@@ -565,8 +670,26 @@ class Mux:
         self._ping_seq = (self._ping_seq % 0x3FFFFFFF) + 1
         await self._send_frame(FrameType.PING, self._ping_seq)
 
-    async def send_credit(self) -> None:
-        await self._send_frame(FrameType.CREDIT, 0)
+    async def send_credit(self, n: int | None = None) -> None:
+        """发一条 `CREDIT`，`n` 是本次归还的字节数（`None` = 取待回补量）。
+
+        帧带 12 字节 payload（`docs/04` §2.5.3）。发送失败时必须把额度
+        **还回去**，否则这批信用永久丢失 ⇒ 对端一路跑到死锁。
+        """
+        if n is None:
+            n = self._credit.take_pending()
+        if n <= 0:
+            return
+        # 老对端（没有 `credit_v2` 能力）把 `CREDIT` 当定长帧，带 payload
+        # 会让它的 `decode_frame` 抛 `ProtocolError` 直接断连。退回空帧 =
+        # 老语义"重置满窗"：慢消费者仍会被误杀（那是老版本的已知缺陷），
+        # 但连接不会因为升级顺序而断。
+        payload = encode_credit(n, self._credit.recv_total) if self._credit_v2 else b""
+        try:
+            await self._send_frame(FrameType.CREDIT, 0, payload)
+        except MuxClosed:
+            self._credit.restore_pending(n)
+            raise
 
     # ---- 发起侧 ----
 
@@ -819,7 +942,18 @@ class Mux:
         elif ftype == FrameType.PONG:
             self.last_pong_at = now()
         elif ftype == FrameType.CREDIT:
-            await self._credit.grant()
+            if not frame.payload:
+                # 老版本对端的 CREDIT 是空帧（它把该帧冻结成了定长帧）。
+                # 保持兼容：按老语义"重置回满窗"。新对端一律带 12 字节
+                # payload，走下面按字节归还的路径。
+                # 为什么不能把空帧当 0：老对端只会在消费满 4 MB 时才发
+                # CREDIT，若我们按 0 处理，它会在 8 MB 处被我们判死 ——
+                # 那正是本修复要消灭的症状，不该为兼容而重新引入。
+                log.debug("收到空 payload 的 CREDIT，按老语义重置满窗")
+                await self._credit.grant(None)
+                return
+            granted, _consumed, _flags = decode_credit(frame.payload)
+            await self._credit.grant(granted)
         elif ftype == FrameType.CANCEL:
             rid = frame.req_id
             p = self._pending.get(rid)
@@ -854,8 +988,22 @@ class Mux:
             await self.on_request(req)
         except asyncio.CancelledError:
             raise
-        except MuxClosed:
-            log.debug("mux 已关闭，放弃请求 rid=%s", req.req_id)
+        except MuxClosed as exc:
+            # ★ 这里原来只 `log.debug("mux 已关闭，放弃请求")` 就返回 ——
+            #   于是本条请求**既不回 ERROR 也不回 RES_END**。发起方
+            #   （`forward.py` 的 `body_iter`）看到的是"响应体流干净地
+            #   结束了"，而 HTTP 头早在 `RES_HEAD` 里就发出去了（200）。
+            #   表现：手机拿到 **HTTP 200 + 半张照片**，用户看到图片
+            #   下半截是灰的，日志里一行错都没有。
+            #
+            #   实质是**数据完整性缺陷**，不是性能问题：截断必须可被
+            #   上层察觉。所以放弃前尽最后努力发一条 ERROR（若连 ERROR
+            #   都发不出去，说明对端真的没了，此时静默才是对的）。
+            log.debug("mux 已关闭，放弃请求 rid=%s：%s", req.req_id, exc)
+            try:
+                await self.res_error(req.req_id, "E5010", "传输中断，响应不完整")
+            except Exception:   # noqa: BLE001 —— 连 ERROR 都发不出去才真静默
+                log.debug("放弃请求 rid=%s 时无法发出 ERROR", req.req_id)
         except Exception:      # noqa: BLE001 —— 处理器异常不能打死隧道
             log.exception("隧道请求处理失败 rid=%s", req.req_id)
             try:

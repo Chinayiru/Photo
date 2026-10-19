@@ -37,6 +37,7 @@ from typing import Any, Awaitable, Callable, Iterable
 
 from shared.mux import Mux, MuxClosed
 from shared.protocol import (
+    CREDIT_V2_CAP,
     HEAD_TIMEOUT,
     HEARTBEAT_SEC,
     MAX_FRAME,
@@ -176,7 +177,13 @@ class TunnelServer:
         # 把帧字节直接喂进去会 `TypeError: byte indices must be integers`。
         # `websockets` 客户端的 `send` 恰好收 bytes，两端同名不同义——这正是
         # 集成冒烟（真 uvicorn + 真 client）才能抓到的坑。
-        mux = Mux(_sender(ws), role=f"relay:{device_id[:8]}")
+        # ★ 能力协商：电脑端声明了 `credit_v2` 才给它发带 payload 的
+        #   CREDIT。老电脑端把 CREDIT 当定长帧，收到 payload 会
+        #   `decode_frame` 抛 `ProtocolError` 直接断连 —— 症状是
+        #   "云端升级后，老电脑端传大文件到一半隧道断"。
+        credit_v2 = CREDIT_V2_CAP in conn.caps
+        mux = Mux(_sender(ws), role=f"relay:{device_id[:8]}",
+                  credit_v2=credit_v2)
         conn.mux = mux
         await mux.start()
         old = await self.registry.register(conn)
@@ -453,7 +460,7 @@ async def _send_ack(ws: Any, *, session_id: str, device_id: str) -> None:
         "proto": PROTO_VERSION,
         "session_id": session_id,
         "device_status": "online",
-        "server_caps": ["credit", "notify"],
+        "server_caps": ["credit", "notify", CREDIT_V2_CAP],
     }
     await ws.send_bytes(encode_frame(FrameType.HELLO_ACK, 1, ack))
     log.debug("HELLO_ACK 已发 device=%s", device_id)

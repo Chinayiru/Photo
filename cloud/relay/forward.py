@@ -377,12 +377,33 @@ class Forwarder:
                     sent += len(chunk)
                     conn.bytes_out_today += len(chunk)
                     yield chunk
+            except asyncio.CancelledError:
+                # 客户端自己走了（手机锁屏、用户返回）：静默收尾是对的，
+                # 此时往一个已经关掉的响应里写错误只会产生噪音。
+                log.debug("手机取消响应体 device=%s sent=%d", device_id, sent)
+                raise
             except asyncio.TimeoutError:
-                log.info("手机等响应体超时 device=%s", device_id)
-            except (MuxClosed, asyncio.CancelledError):
-                pass
+                # ★ 这里原来是 `log.info` 后静默返回 —— 而 `RES_HEAD` 早已
+                #   把 200 发出去了，生成器正常结束在 chunked 传输下等于
+                #   **一份合法的、完整的、短了的响应**。手机拿到半张照片，
+                #   状态码是 200，所有层都无感。这是数据完整性问题。
+                #   唯一能让客户端察觉的办法是**让连接异常终止**：
+                #   抛出去 → Starlette 的 StreamingResponse 中断 → uvicorn
+                #   不写结束块直接关连接 → 客户端拿到的是"响应不完整"，
+                #   而不是"文件就这么长"。
+                log.warning("电脑端响应体超时，中断传输 device=%s sent=%d",
+                            device_id, sent)
+                raise RuntimeError(
+                    f"响应体超时，已发送 {sent} 字节，传输不完整") from None
+            except MuxClosed as exc:
+                log.warning("隧道断开，中断传输 device=%s sent=%d：%s",
+                            device_id, sent, exc)
+                raise RuntimeError(
+                    f"隧道断开，已发送 {sent} 字节，传输不完整") from None
             except Exception:       # noqa: BLE001
-                log.debug("响应体流转发中断", exc_info=True)
+                log.warning("响应体流转发中断 device=%s sent=%d",
+                            device_id, sent, exc_info=True)
+                raise
             finally:
                 release()
                 self.meter.add(device_id, bytes_in=up.total,

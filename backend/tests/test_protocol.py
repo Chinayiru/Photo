@@ -98,6 +98,11 @@ def test_fixed_length_types_are_exactly_the_empty_ones() -> None:
 
     多一个：合法帧被拒（连接断掉）；少一个：非空 payload 被静默丢弃，
     对端永远等不到它期待的状态转移。
+
+    ★ `CREDIT` 是**唯一**一个"有 payload 又必须插队"的帧：`docs/04`
+    §2.5.3 规定它带 12 字节 {window, consumed, flags}。它曾经被误放进
+    这个集合，代价是慢消费者被误杀 + 静默截断（见 `shared/mux.py`
+    的 `_CreditGate.grant`）。所以这里显式断言它**不在**里面。
     """
     from shared.protocol import FIXED_LENGTH_TYPES
 
@@ -107,8 +112,9 @@ def test_fixed_length_types_are_exactly_the_empty_ones() -> None:
         FrameType.CANCEL,
         FrameType.PING,
         FrameType.PONG,
-        FrameType.CREDIT,
     }
+    # CREDIT 必须能带 payload，不能被冻成空帧
+    assert FrameType.CREDIT not in FIXED_LENGTH_TYPES
     # 带 JSON 体的帧绝不能进这个集合
     for t in (FrameType.REQ_HEAD, FrameType.RES_HEAD, FrameType.ERROR,
               FrameType.NOTIFY, FrameType.HELLO, FrameType.HELLO_ACK):
@@ -116,12 +122,24 @@ def test_fixed_length_types_are_exactly_the_empty_ones() -> None:
 
 
 def test_priority_types_are_a_subset_of_all_types() -> None:
-    """优先级帧必须是已知类型，且都应该是定长（要能插队立刻处理）。"""
-    from shared.protocol import FIXED_LENGTH_TYPES, PRIORITY_TYPES
+    """优先级帧必须是已知类型，且都要能插队立刻处理。
+
+    ★ 不能再用 `PRIORITY_TYPES <= FIXED_LENGTH_TYPES` 表达"能插队"：
+    `CREDIT` 带 12 字节 payload，不在定长集合里，但它**必须**插队 ——
+    它恰恰是最不能让大文件传输饿死的帧（饿死它就是 30 秒后判死对端）。
+    正确的性质是"优先级帧的 payload 足够小，小到读协程能在不阻塞的
+    前提下立刻处理完"，而不是"没有 payload"。
+    """
+    from shared.protocol import CREDIT_PAYLOAD_SIZE, FIXED_LENGTH_TYPES, PRIORITY_TYPES
 
     assert PRIORITY_TYPES <= set(FrameType)
-    assert PRIORITY_TYPES <= FIXED_LENGTH_TYPES, (
-        "优先级帧带 payload 的话，插队处理就得先读缓冲，失去插队的意义")
+    for t in PRIORITY_TYPES:
+        if t is FrameType.CREDIT:
+            assert CREDIT_PAYLOAD_SIZE <= 64, "CREDIT 的 payload 必须小到可插队解析"
+            continue
+        assert t in FIXED_LENGTH_TYPES, (
+            f"{t.name} 是优先级帧但不是定长帧：插队处理就得先读缓冲，"
+            "失去插队的意义")
     # 心跳与信用回补必须在里面：大文件传输会饿死它们
     assert FrameType.PING in PRIORITY_TYPES
     assert FrameType.PONG in PRIORITY_TYPES
@@ -245,15 +263,56 @@ def test_every_frame_type_roundtrips(ftype: FrameType) -> None:
 
     参数化而不是循环，是为了让失败信息直接指出是哪一种帧坏了。
     """
-    payload = b"" if ftype in __import__(
-        "shared.protocol", fromlist=["FIXED_LENGTH_TYPES"]
-    ).FIXED_LENGTH_TYPES else b"hello"
+    from shared.protocol import FIXED_LENGTH_TYPES, encode_credit
+
+    if ftype is FrameType.CREDIT:
+        # CREDIT 的 payload 是 12 字节定长结构，不是任意字节串
+        payload = encode_credit(4096, 8192)
+    elif ftype in FIXED_LENGTH_TYPES:
+        payload = b""
+    else:
+        payload = b"hello"
     raw = encode_frame(ftype, 42, payload)
     f = decode_frame(raw)
     assert f.type is ftype
     assert f.req_id == 42
     assert f.payload == payload
     assert f.flags == 0
+
+
+def test_credit_payload_roundtrips_through_its_struct() -> None:
+    """⭐ CREDIT 的三元组必须原样往返（`docs/04` §2.5.3）。
+
+    这条是"慢消费者不被误杀"的地基：`window` 字段要能承载**任意字节数**
+    的归还量，否则收端只能退回"重置满窗"的粗粒度语义。
+    """
+    from shared.protocol import decode_credit, encode_credit
+
+    for window, consumed, flags in ((1, 2, 3), (0, 0, 0),
+                                    (8 * 1024 * 1024, 10 ** 9, 0)):
+        raw = encode_frame(FrameType.CREDIT, 0, encode_credit(window, consumed, flags))
+        frame = decode_frame(raw)
+        assert decode_credit(frame.payload) == (window, consumed, flags)
+
+
+def test_credit_payload_must_be_exactly_twelve_bytes() -> None:
+    """CREDIT 的 payload 长度不对时必须拒绝，而不是猜。
+
+    猜的后果很具体：把 8 字节当 12 字节解，`window` 会读出天文数字，
+    于是对端获得无限信用、内存上界失效；反过来读成 0 则会让对端在
+    8 MB 处被判死 —— 两种都是本修复要消灭的症状。
+    """
+    from shared.protocol import CREDIT_PAYLOAD_SIZE, encode_credit
+
+    with pytest.raises(ProtocolError) as ei:
+        decode_frame(encode_frame(FrameType.CREDIT, 0, b"12345"))
+    assert str(CREDIT_PAYLOAD_SIZE) in str(ei.value)
+
+    # 空 payload 仍然可解（兼容老对端），但语义是 0 而非"重置满窗"
+    from shared.protocol import decode_credit
+
+    assert decode_credit(b"") == (0, 0, 0)
+    assert len(encode_credit(1, 2, 3)) == CREDIT_PAYLOAD_SIZE
 
 
 def test_encode_accepts_bytes_str_and_dict() -> None:
@@ -283,10 +342,16 @@ def test_encode_rejects_payload_on_fixed_length_frame() -> None:
     表现是"某次操作之后连接就断了"，且本地没有任何日志指向原因。
     """
     for t in (FrameType.PING, FrameType.PONG, FrameType.CANCEL,
-              FrameType.REQ_END, FrameType.RES_END, FrameType.CREDIT):
+              FrameType.REQ_END, FrameType.RES_END):
         with pytest.raises(ProtocolError) as ei:
             encode_frame(t, 1, b"x")
         assert t.name in str(ei.value)
+
+    # CREDIT **不是**定长帧：它必须接受 12 字节 payload（那正是修复自身）
+    from shared.protocol import encode_credit
+
+    assert decode_frame(
+        encode_frame(FrameType.CREDIT, 0, encode_credit(1))).type is FrameType.CREDIT
 
 
 def test_encode_rejects_oversized_payload() -> None:
@@ -628,12 +693,14 @@ def test_parser_roundtrip_of_all_types_in_one_stream() -> None:
     这是协议层的"全集回归"：任何类型的分帧长度算错都会在这里错位，
     而后面的帧全部解析失败（错位是自解释的，一眼能看出从哪个类型开始崩）。
     """
-    from shared.protocol import FIXED_LENGTH_TYPES
+    from shared.protocol import FIXED_LENGTH_TYPES, encode_credit
 
-    frames = [
-        Frame(t, i + 1, b"" if t in FIXED_LENGTH_TYPES else b'{"k":%d}' % (i + 1))
-        for i, t in enumerate(FrameType)
-    ]
+    def _payload(t: FrameType, i: int) -> bytes:
+        if t is FrameType.CREDIT:
+            return encode_credit(1024 * (i + 1))
+        return b"" if t in FIXED_LENGTH_TYPES else b'{"k":%d}' % (i + 1)
+
+    frames = [Frame(t, i + 1, _payload(t, i)) for i, t in enumerate(FrameType)]
     blob = pack_stream(frames)
     p = FrameParser()
     got: list[Frame] = []

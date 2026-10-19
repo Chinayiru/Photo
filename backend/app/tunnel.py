@@ -46,6 +46,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from shared.mux import Mux, MuxClosed
 from shared.protocol import (
+    CREDIT_V2_CAP,
     HEARTBEAT_SEC,
     PONG_TIMEOUT,
     RECONNECT_BASE,
@@ -174,7 +175,8 @@ class TunnelClient:
     __slots__ = ("cfg", "_dispatcher", "_base_url", "_agent_token",
                  "_task", "_stop", "_mux", "_ws", "_state", "_attempt",
                  "_connected_at", "_last_error", "_session_id", "_next_wake",
-                 "_peer_heartbeat", "_device_id", "_revoke_task")
+                 "_peer_heartbeat", "_device_id", "_revoke_task",
+                 "_credit_v2")
 
     def __init__(self, cfg: Any, *, dispatcher: Any, base_url: str,
                  agent_token: str) -> None:
@@ -192,6 +194,8 @@ class TunnelClient:
         self._session_id: str | None = None
         self._next_wake: float | None = None
         self._peer_heartbeat: float = HEARTBEAT_SEC
+        #: 云端是否支持带 payload 的 `CREDIT`（`CREDIT_V2_CAP`）。握手时定。
+        self._credit_v2: bool = False
         self._device_id = ""
         self._revoke_task: asyncio.Task[None] | None = None
         self._state: str = "idle"
@@ -344,7 +348,7 @@ class TunnelClient:
             "version": st.version() if st is not None else "0.1.0",
             "proto": PROTO_VERSION,
             "lan_ips": list(st.cfg_server_ips()) if st is not None else [],
-            "caps": ["image", "notify", "credit"],
+            "caps": ["image", "notify", "credit", CREDIT_V2_CAP],
             "started_at": st.started_at if st is not None else time.time(),
         }
         try:
@@ -374,12 +378,21 @@ class TunnelClient:
         if isinstance(hb, (int, float)) and 5.0 <= float(hb) <= 120.0:
             self._peer_heartbeat = float(hb)
         self._session_id = ack.get("session_id")
-        log.info("握手完成 session=%s proto=%s hb=%.0fs",
-                 self._session_id, ack.get("proto"), self._peer_heartbeat)
+        # ★ 只有云端也声明了 `credit_v2` 才发带 payload 的 CREDIT。
+        #   老云端把 CREDIT 当定长帧，带 payload 会让它 `decode_frame` 抛
+        #   `ProtocolError` 直接断连 —— 症状是"传大文件到一半隧道断"。
+        server_caps = ack.get("server_caps")
+        self._credit_v2 = (
+            isinstance(server_caps, list)
+            and CREDIT_V2_CAP in server_caps)
+        log.info("握手完成 session=%s proto=%s hb=%.0fs credit_v2=%s",
+                 self._session_id, ack.get("proto"), self._peer_heartbeat,
+                 self._credit_v2)
 
     async def _pump(self, ws: Any) -> None:
         """读循环 + 心跳 + 判活。三个协程，谁先结束谁负责拆连接。"""
-        mux = Mux(lambda data: ws.send(data), role="agent")
+        mux = Mux(lambda data: ws.send(data), role="agent",
+                  credit_v2=self._credit_v2)
         # `on_request` 只收一个参数（`RequestHandler`），而
         # `TunnelDispatcher.handle` 需要知道往哪条 mux 上回帧。用
         # `partial` 把**这一条**连接绑进去，而不是让 dispatcher 存一个

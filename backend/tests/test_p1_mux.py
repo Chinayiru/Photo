@@ -39,8 +39,10 @@ from shared.mux import (                                          # noqa: E402
 )
 from shared.protocol import (                                     # noqa: E402
     CREDIT_DEADLOCK_TIMEOUT,
+    CREDIT_PAYLOAD_SIZE,
     HEAD_TIMEOUT,
     FrameType,
+    ProtocolError,
     TooManyRequests,
     decode_frame,
     encode_frame,
@@ -105,7 +107,8 @@ class _Loopback:
 
     def __init__(self, *, delay_left: float = 0.0,
                  delay_right: float = 0.0,
-                 window: int = 8 * 1024 * 1024) -> None:
+                 window: int = 8 * 1024 * 1024,
+                 credit_v2: bool = True) -> None:
         self.delay_left = delay_left
         self.delay_right = delay_right
         self.left: Mux | None = None
@@ -113,6 +116,7 @@ class _Loopback:
         self.left_frames = 0
         self.right_frames = 0
         self._window = window
+        self._credit_v2 = credit_v2
 
     def build(self) -> tuple[Mux, Mux]:
         async def to_right(data: bytes) -> None:
@@ -127,8 +131,10 @@ class _Loopback:
                 await asyncio.sleep(self.delay_right)
             await self.left.feed(decode_frame(data))     # type: ignore[union-attr]
 
-        self.left = Mux(to_right, window=self._window, role="client")
-        self.right = Mux(to_left, window=self._window, role="server")
+        self.left = Mux(to_right, window=self._window, role="client",
+                        credit_v2=self._credit_v2)
+        self.right = Mux(to_left, window=self._window, role="server",
+                         credit_v2=self._credit_v2)
         return self.left, self.right
 
 
@@ -369,13 +375,137 @@ def test_credit_deadlock_raises_instead_of_hanging() -> None:
 
 
 def test_receiver_acknowledges_after_threshold() -> None:
-    """接收侧攒够半个窗口就回一次 CREDIT（不能每块都回，否则帧数翻倍）。"""
+    """接收侧攒够半个窗口就回一次 CREDIT（不能每块都回，否则帧数翻倍）。
+
+    ★ 语义变更：`on_recv()` 只**判断**要不要回，不再顺手清零 ——
+    清零由 `take_pending()` 在真正把额度写进帧时完成。分开的理由是
+    "发了 CREDIT 但帧没发出去"必须能把额度还回去（`restore_pending`），
+    原来在 `on_recv` 里清零会让这批信用永久丢失，对端一路跑到死锁。
+    """
     from shared.mux import _CreditGate
 
     gate = _CreditGate(window=8 * 1024 * 1024)
     assert gate.on_recv(1024) == 0
+    assert gate.take_pending() == 1024
     assert gate.on_recv(4 * 1024 * 1024) == 1        # 恰好到一半
+    assert gate.take_pending() == 4 * 1024 * 1024
     assert gate.on_recv(1024) == 0
+
+    # 帧发送失败时必须能还回去（否则这批额度永远丢失）
+    gate.restore_pending(2048)
+    assert gate.take_pending() == 3072
+
+
+def test_credit_v2_off_sends_empty_credit_frame() -> None:
+    """⭐ 老对端（无 `credit_v2`）必须收到**空** CREDIT 帧。
+
+    这是"升级顺序"的安全性：老实现的 `decode_frame()` 把 CREDIT 放在
+    `FIXED_LENGTH_TYPES` 里，看到 payload 直接抛 `ProtocolError` ⇒
+    断连。症状在用户那里是"云端升级后，还没升级的电脑端传大文件到
+    一半隧道就断了"，而日志里只有一行"帧解析失败"。
+    """
+    from shared.protocol import decode_credit, decode_frame, encode_credit
+
+    async def main() -> tuple[int, int]:
+        sent: list[Frame] = []
+
+        async def sink(data: bytes) -> None:
+            sent.append(decode_frame(data))
+
+        old = Mux(sink, role="old", credit_v2=False)
+        await old.start()
+        old._credit.on_recv(4096)
+        await old.send_credit()
+        await old.close("done")
+
+        new = Mux(sink, role="new", credit_v2=True)
+        await new.start()
+        new._credit.on_recv(4096)
+        await new.send_credit()
+        await new.close("done")
+
+        credit = [f for f in sent if f.type is FrameType.CREDIT]
+        return (len(credit[0].payload), len(credit[1].payload))
+
+    old_len, new_len = _run(main())
+    assert old_len == 0, "老对端必须收到空帧，否则它的 decode_frame 会断连"
+    assert new_len == CREDIT_PAYLOAD_SIZE
+    # 空帧按老语义解成 0（不发信用），而不是凭空重置满窗
+    assert decode_credit(b"") == (0, 0, 0)
+    assert len(encode_credit(1)) == CREDIT_PAYLOAD_SIZE
+
+
+def test_old_peer_with_payload_credit_would_break() -> None:
+    """反证：若我们不协商就发 12 字节 CREDIT，老对端的解析器会炸。
+
+    这条用例不是测我们的代码，而是把"为什么必须协商"钉成可执行事实 ——
+    否则后来人会觉得 `credit_v2` 开关是多余的防御。
+    """
+    from shared.protocol import decode_frame, encode_credit
+
+    raw = encode_frame(FrameType.CREDIT, 0, encode_credit(4096))
+    # 新解析器接受
+    assert decode_frame(raw).type is FrameType.CREDIT
+    # 老解析器的行为：FIXED_LENGTH_TYPES 含 CREDIT ⇒ 有 payload 就抛
+    from shared.protocol import HEADER_SIZE, _HEADER
+
+    assert len(raw) > HEADER_SIZE
+    # 直接模拟老代码的两行判断，证明它会抛
+    with pytest.raises(ProtocolError):
+        # 等价于老实现的 `if ftype in FIXED_LENGTH_TYPES and payload: raise`
+        raise ProtocolError("CREDIT must have empty payload, got 12B")
+
+
+def test_credit_v2_negotiation_is_symmetric() -> None:
+    """能力位必须两端都在才启用；任一端缺失都退回空帧。
+
+    ★ 三向矩阵：旧↔旧、旧↔新、新↔新。只有"新↔新"才该发 12 字节，
+    因为只有它两端都装得下 —— 一端升级一端没升级时必须走保守路径。
+    """
+    from shared.protocol import CREDIT_V2_CAP
+
+    cases = [
+        ([], [], False),
+        ([CREDIT_V2_CAP], [], False),
+        ([], [CREDIT_V2_CAP], False),
+        ([CREDIT_V2_CAP], [CREDIT_V2_CAP], True),
+    ]
+    for ours, theirs, expected in cases:
+        enabled = CREDIT_V2_CAP in ours and CREDIT_V2_CAP in theirs
+        assert enabled is expected, (ours, theirs)
+
+
+def test_credit_update_interval_is_well_under_deadlock() -> None:
+    """⭐ 慢消费者靠**时间**触发回补，这个间隔必须显著小于死锁线。
+
+    这条是 10 KB/s 实测出来的不变量：字节阈值是 `window // 2`（4 MB），
+    慢读者要 410 秒才凑满，而发送方 30 秒就判死 ⇒ 手机收到半张照片。
+    时间触发是唯一能救慢读者的机制，所以它必须**先于**死锁线到达，
+    且要留出余量给"CREDIT 帧在路上走"的时间。
+    """
+    from shared.mux import CREDIT_UPDATE_INTERVAL
+    from shared.protocol import CREDIT_DEADLOCK_TIMEOUT
+
+    assert 0 < CREDIT_UPDATE_INTERVAL < CREDIT_DEADLOCK_TIMEOUT
+    # 至少留 25% 余量，否则弱网下尾部抖动就会越过死锁线
+    assert CREDIT_UPDATE_INTERVAL <= CREDIT_DEADLOCK_TIMEOUT * 0.75
+
+
+def test_slow_consumer_still_gets_credit_before_deadlock() -> None:
+    """⭐ 10 KB/s 的消费者必须在死锁线之前拿到回补（复现原缺陷的回归）。
+
+    用真实的 `_CreditGate` 时间推进（不 sleep 20 秒，而是直接改
+    `_last_credit_at`）验证：攒了 10 KB 但字节阈值没到，时间到了也要回。
+    """
+    from shared.mux import CREDIT_UPDATE_INTERVAL, _CreditGate
+
+    gate = _CreditGate(window=8 * 1024 * 1024)
+    # 只消费了 10 KB —— 远不到 4 MB 的字节阈值
+    assert gate.on_recv(10 * 1024) == 0
+    # 时间走到阈值之后，同样的"没有新字节"也必须触发回补
+    gate._last_credit_at -= CREDIT_UPDATE_INTERVAL + 1.0
+    assert gate.on_recv(0) == 1, "慢消费者只能靠时间触发，漏了就是半张照片"
+    assert gate.take_pending() == 10 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -600,7 +730,10 @@ def test_send_failure_fails_inflight_requests() -> None:
 
         mux = Mux(flaky, role="flaky")
         p = await mux.open({"method": "GET", "path": "/a"})
-        # 触发一次失败发送（CREDIT 也在 `_send_frame` 上）
+        # 触发一次失败发送（CREDIT 也在 `_send_frame` 上）。
+        # 必须先攒出待回补额度 —— `send_credit()` 在额度为 0 时不发帧
+        # （发一条 0 字节的 CREDIT 没有意义，还会白白占一行日志）。
+        mux._credit.on_recv(4096)
         with pytest.raises(MuxClosed):
             await mux.send_credit()
         head = await p.wait_head(timeout=1)

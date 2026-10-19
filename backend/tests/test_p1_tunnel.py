@@ -61,7 +61,7 @@ from cloud.relay import security  # noqa: E402
 from cloud.relay.auth import create_account  # noqa: E402
 from cloud.relay.db import CloudDB  # noqa: E402
 from cloud.relay.main import create_app  # noqa: E402
-from shared.protocol import FrameType, encode_frame  # noqa: E402
+from shared.protocol import CREDIT_V2_CAP, FrameType, encode_frame  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +634,9 @@ def test_hello_ack_and_device_row(rig_factory) -> None:
     assert ack["credit_window"] == 8 * 1024 * 1024
     assert ack["device_status"] == "online"
     assert "credit" in ack["server_caps"] and "notify" in ack["server_caps"]
+    # ★ 能力协商位必须在 ACK 里出现，否则电脑端会误判成"老云端"而退回
+    #   空帧 CREDIT（慢消费者被误杀），而且没有任何日志提示原因。
+    assert CREDIT_V2_CAP in ack["server_caps"], ack["server_caps"]
     assert ack["session_id"], ack
     assert isinstance(ack["server_time"], (int, float))
 

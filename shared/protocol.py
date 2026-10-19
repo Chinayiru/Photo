@@ -35,7 +35,12 @@ class FrameType(IntEnum):
     CANCEL = 0x08     # 双向     空（req_id 即目标）
     PING = 0x09       # 双向     空；req_id 承载非零序号
     PONG = 0x0A       # 双向     空；req_id 回显 PING 序号
-    CREDIT = 0x0B     # 双向     空；req_id=0 连接级，非 0 请求级
+    # 双向 12 字节 {window, consumed, flags}；req_id 必须为 0（`docs/04` §2.5.3）。
+    # ★ 一度被实现成"空 payload + 收到即重置满窗"，那是**错的**：空 payload
+    #   表达不了"消费者只消费了 10 KB"，发送方只能拿到整个窗口，于是
+    #   (1) 慢消费者（10 KB/s 看图）被当成死连接，(2) 多次回补会让发送方
+    #   无限领先消费者。payload 里的 window 就是"本次归还多少字节"。
+    CREDIT = 0x0B
     NOTIFY = 0x0C     # 电脑→云→手机 UTF-8 JSON {topic, data}
     # --- 以下两个类型为对 docs/03 §2.2.2 与 §2.9 不一致的修正 ---
     # §2.9 的握手时序使用了 HELLO / HELLO_ACK，但 §2.2.2 的类型表未定义它们。
@@ -46,6 +51,12 @@ class FrameType(IntEnum):
 
 
 # 定长帧：payload 必须为空。收到非空 payload 记 warning 并忽略。
+# ★ `CREDIT` **不在**此列（`docs/04` §2.5.3 规定它带 12 字节 payload）。
+#   曾经的实现把它冻结成定长帧，代价是两个真实缺陷：
+#   ① 慢消费者（10 KB/s 看图）永远凑不满回补阈值，发送方 30 秒后按
+#      `E5010` 判死，手机收到**半张照片且状态码仍是 200**；
+#   ② `grant()` 只能"重置回满窗"，无法表达"只消费了 10 KB"，
+#      于是对端可以无限领先一个追不上它的消费者。
 FIXED_LENGTH_TYPES: frozenset[FrameType] = frozenset(
     {
         FrameType.REQ_END,
@@ -53,7 +64,6 @@ FIXED_LENGTH_TYPES: frozenset[FrameType] = frozenset(
         FrameType.CANCEL,
         FrameType.PING,
         FrameType.PONG,
-        FrameType.CREDIT,
     }
 )
 
@@ -79,6 +89,19 @@ CONN_CREDIT_WINDOW = 16 * 1024 * 1024   # 连接级总窗口 16 MB
 CREDIT_THRESHOLD = 512 * 1024           # 消费满 512 KB 回补一次
 CREDIT_DEADLOCK_TIMEOUT = 30.0          # 单 req_id 信用耗尽后无回补则强制关闭
 CONN_DEADLOCK_TIMEOUT = 60.0            # 整连接无 CREDIT 进展则断连重连
+
+#: `CREDIT` 帧的 payload 长度（`docs/04` §2.5.3）：window(4) + consumed(4) + flags(4)。
+CREDIT_PAYLOAD_SIZE = 12
+_CREDIT_STRUCT = struct.Struct(">III")
+
+#: 能力标识：带 12 字节 payload 的 `CREDIT`（按**消费量**归还信用）。
+#:
+# ★ 这是一个**线上协议变更**。老实现把 `CREDIT` 冻在 `FIXED_LENGTH_TYPES`
+#   里，`decode_frame()` 看到 payload 就抛 `ProtocolError` —— 所以"新电脑端
+#   连老云端"会在第一条 CREDIT 上直接断连，症状是"传大文件到一半隧道断"。
+#   因此握手时要交换这个能力位：只有两端都有，才发带 payload 的 CREDIT；
+#   否则退回空帧（老语义"重置满窗"，慢消费者仍会被误杀，但不比从前更坏）。
+CREDIT_V2_CAP = "credit_v2"
 
 # 超时（§2.5.5）
 HEAD_TIMEOUT = 30.0                 # 发 REQ_HEAD 到收 RES_HEAD/ERROR
@@ -223,7 +246,36 @@ def decode_frame(data: bytes) -> Frame:
     payload = data[HEADER_SIZE:]
     if ftype in FIXED_LENGTH_TYPES and payload:
         raise ProtocolError(f"{ftype.name} must have empty payload, got {len(payload)}B")
+    if ftype is FrameType.CREDIT and payload and len(payload) != CREDIT_PAYLOAD_SIZE:
+        raise ProtocolError(
+            f"CREDIT payload must be {CREDIT_PAYLOAD_SIZE}B, got {len(payload)}B")
     return Frame(type=ftype, req_id=rid, payload=payload, flags=flags)
+
+
+def encode_credit(window: int, consumed: int = 0, flags: int = 0) -> bytes:
+    """打包 `CREDIT` 的 12 字节 payload（`docs/04` §2.5.3）。
+
+    `window` 是**本次归还的字节数**（不是绝对窗口大小），`consumed` 是
+    累计已消费量（仅用于排障，收端不依赖它）。
+    """
+    return _CREDIT_STRUCT.pack(max(0, min(int(window), 0xFFFFFFFF)),
+                               max(0, min(int(consumed), 0xFFFFFFFF)),
+                               int(flags) & 0xFFFFFFFF)
+
+
+def decode_credit(payload: bytes) -> tuple[int, int, int]:
+    """解开 `CREDIT` payload → `(window, consumed, flags)`。
+
+    空 payload 视为 0：老版本对端会把 `CREDIT` 发成空帧（那是**曾经**的
+    实现），收端必须还能跑 —— 但这里返回 0 会让发送方**不**获得信用，
+    而非像老代码那样凭空重置满窗。宁可慢一次，也不静默超发。
+    """
+    if not payload:
+        return 0, 0, 0
+    if len(payload) != CREDIT_PAYLOAD_SIZE:
+        raise ProtocolError(
+            f"CREDIT payload must be {CREDIT_PAYLOAD_SIZE}B, got {len(payload)}B")
+    return _CREDIT_STRUCT.unpack(payload)
 
 
 # --------------------------------------------------------------------------
@@ -338,8 +390,15 @@ class Transport(Protocol):
 
 if __name__ == "__main__":  # pragma: no cover
     for ft in FrameType:
-        f = Frame(ft, 7, b"" if ft in FIXED_LENGTH_TYPES else b"x")
+        if ft is FrameType.CREDIT:
+            payload = encode_credit(4096, 8192)
+        else:
+            payload = b"" if ft in FIXED_LENGTH_TYPES else b"x"
+        f = Frame(ft, 7, payload)
         assert decode_frame(encode_frame(ft, 7, f.payload)) == f, ft
+    assert decode_credit(decode_frame(
+        encode_frame(FrameType.CREDIT, 0, encode_credit(1, 2, 3))).payload
+    ) == (1, 2, 3)
     p = FrameParser()
     blob = pack_stream([Frame(FrameType.PING, 1), Frame(FrameType.PONG, 1)])
     got: list[Frame] = []
