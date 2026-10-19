@@ -948,3 +948,65 @@ def test_slow_consumer_does_not_wedge_the_read_loop() -> None:
         assert head["error"]["code"] == "E5008"
 
     _run(main())
+
+
+def test_body_queue_is_deep_enough_for_the_credit_window() -> None:
+    """队列必须装得下整个信用窗口，否则慢消费者必然堵死共享读循环。
+
+    ★ 这条是**设计不变量**，不是随手定的数字。`_CreditGate` 是连接级的
+    （8 MB），所以对端被允许领先消费者的字节数上限就是 8 MB。队列若比它
+    浅，`_on_res_body` 里的 `await body.put(data)` 会在对端还没用完额度时
+    就阻塞 —— 而它跑在整条连接共享的读循环上，PING/CREDIT/CANCEL 全都
+    收不到。
+
+    实测历史：队列写死 64 块（≈4 MB）< 8 MB 窗口，20 KB/s 慢读 47 秒时
+    uvicorn 的 keepalive 以 `1011 keepalive ping timeout` 掐掉连接，手机
+    表现为"看图时整条隧道断了一次"。
+    """
+    import shared.mux as m
+    from shared.protocol import CREDIT_WINDOW
+
+    cap = m._BODY_QUEUE_MAX * m.MAX_BODY_CHUNK
+    assert cap >= CREDIT_WINDOW, (
+        f"队列容量 {cap:,} < 信用窗口 {CREDIT_WINDOW:,}："
+        f"慢消费者会堵死共享读循环")
+    # 也不能无限加深：信用窗口才是内存上界，队列只需装得下它。
+    assert cap <= CREDIT_WINDOW * 2, (
+        f"队列容量 {cap:,} 远超窗口 {CREDIT_WINDOW:,}，"
+        f"这个上界就不再由窗口决定")
+
+
+def test_credit_is_returned_on_consume_not_on_arrival() -> None:
+    """信用必须在**消费者取走**数据后归还，而不是数据到达时。
+
+    否则窗口限制的是"未到达字节"而非"未消费字节"，对端可以无限领先，
+    而消费者永远追不上 —— 队列迟早满（见上一条）。
+    """
+    async def main() -> None:
+        import shared.mux as m
+        sink, _ = _sender()
+        mux = Mux(sink, role="probe")
+        p = PendingRequest(1, timeout=None)
+        p.on_consume = mux._on_consume
+        mux._pending[1] = p
+
+        # 到达 4 MB（恰好到回报阈值）：**不应该**立刻回 CREDIT
+        before = mux._credit.recv_total
+        from shared.protocol import Frame
+        chunk = b"z" * m.MAX_BODY_CHUNK
+        for _ in range(64):
+            await mux.feed(Frame(m.FrameType.RES_BODY, 1, chunk))
+        assert p.body.qsize() == 64
+        # 数据已到达但没人消费 ⇒ 一条 CREDIT 都不该发出去
+        assert mux._credit.recv_total == before, (
+            "数据只是到达就归还了信用，窗口没有约束未消费字节")
+
+        # 真正消费掉这些数据之后，才应该归还信用
+        got = 0
+        async for c in p.iter_body(idle_timeout=1.0):
+            got += len(c)
+            if got >= 64 * m.MAX_BODY_CHUNK:
+                break
+        assert mux._credit.recv_total > before, "消费后没有归还信用"
+
+    _run(main())

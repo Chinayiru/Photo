@@ -80,16 +80,31 @@ MAX_ACTIVE: int = 4096
 #: 写的 65530 就是这个数的十进制（65536 - 6）。
 MAX_BODY_CHUNK: int = MAX_FRAME - 6
 
-#: 响应侧 BODY 队列深度。刻意留得很浅：队列只是"读取协程"与"写手机
-#: 协程"之间的交接点，真正的背压由 CREDIT 窗口施加。队列越深，
-#: 内存峰值越大而吞吐不变。
-_BODY_QUEUE_MAX = 64
+#: 响应侧 BODY 队列深度。
+#
+# ★ 这个数**不是**随手定的，它由 `CREDIT_WINDOW` 反推：信用窗口是
+#   **连接级**的（8 MB，所有 req_id 共享，见 `_CreditGate` 的注释），
+#   所以"对端被允许领先消费者多少字节"的上限就是 8 MB。队列必须装得下
+#   整个窗口，否则读循环必然会在对端还没用完额度时就被 `put` 堵住。
+#
+#   历史教训：原来写死 64 块（≈4 MB），小于 8 MB 窗口 ⇒ 慢读者（手机在
+#   弱网下看原图）必然把**整条连接共享的读循环**堵死半分钟以上，PING、
+#   CREDIT、CANCEL 全都轮不到处理，uvicorn 的 keepalive 在 47 秒时以
+#   `1011 keepalive ping timeout` 掐掉连接 —— 表现是"看图时整条隧道
+#   断了一次"，而不是"这张图慢"。
+#
+#   深层是 0 成本的（`asyncio.Queue` 只用一个计数器），实际占用只与真正
+#   堆着的字节有关；而"堆着的字节"被信用窗口钉在 8 MB 之内。所以加深
+#   不增加内存上界，只是让这个上界真正成立。`+2` 是给结束标记与切片
+#   边界留的余量。
+_BODY_QUEUE_MAX = CREDIT_WINDOW // MAX_BODY_CHUNK + 2
 
-#: 往响应体队列投递一块数据的等待上限。队列只有 `_BODY_QUEUE_MAX` 深，
-#: 而 `_on_res_body()` 跑在**整条连接共享的读循环**上 —— 无限等下去会
-#: 让 PING/PONG、CREDIT、CANCEL 一起收不到，云端心跳（`DEAD_AFTER=75s`）
-#: 会判死整条隧道。30 秒与 `CREDIT_DEADLOCK_TIMEOUT` 同量级：那个是
-#: "对端不给我额度"，这个是"对端不取走数据"，都属于消费者跟不上的情形。
+#: 往响应体队列投递一块数据的等待上限。
+#
+# 有了上面那条不变的式（队列 ≥ 窗口），正常情况下这里**永远**不会等到：
+# 对端拿不到超过一个窗口的额度。留这个超时是防御性的 —— 一旦有人把
+# 窗口调大而忘了同步队列，或者将来引入"超出窗口的推送"，也不能让读循环
+# 无限期停摆。30 秒与 `CREDIT_DEADLOCK_TIMEOUT` 同量级。
 _BODY_PUT_TIMEOUT = 30.0
 
 
@@ -245,7 +260,8 @@ class PendingRequest:
     """发起侧的一个在途请求。`docs/03` §2.5.3 的结构，去掉 E2E 字段。"""
 
     __slots__ = ("req_id", "created_at", "deadline", "head", "body",
-                 "cancelled", "_head_done", "_body_done", "_last_body_at")
+                 "cancelled", "_head_done", "_body_done", "_last_body_at",
+                 "on_consume")
 
     def __init__(self, req_id: int, *, timeout: float | None = TOTAL_TIMEOUT) -> None:
         self.req_id = req_id
@@ -266,6 +282,9 @@ class PendingRequest:
         self._head_done = False
         self._body_done = False
         self._last_body_at = self.created_at
+        #: 消费者取走 `n` 字节时回调（由 `Mux` 装上）。**信用必须在这里
+        #: 归还，而不是在数据到达时** —— 见 `_on_res_body` 的注释。
+        self.on_consume: Callable[[int], None] | None = None
 
     # ---- 发起侧消费 ----
 
@@ -308,6 +327,10 @@ class PendingRequest:
                     f"{idle_timeout:.0f}s 内没有收到新的 RES_BODY") from None
             if chunk is None:
                 return
+            # ★ 信用在这里归还 —— 数据**已经被消费者取走**，对端才可以
+            #   再发。见 `_on_res_body` 的注释。
+            if self.on_consume is not None:
+                self.on_consume(len(chunk))
             yield chunk
 
     # ---- 内部：由 Mux 调用 ----
@@ -533,6 +556,7 @@ class Mux:
             raise MuxClosed("连接已关闭")
         rid = self._alloc.alloc()
         p = PendingRequest(rid, timeout=timeout)
+        p.on_consume = self._on_consume
         self._pending[rid] = p
         try:
             await self._send_frame(FrameType.REQ_HEAD, rid, head)
@@ -540,6 +564,23 @@ class Mux:
             self._abort(rid)
             raise
         return p
+
+    def _on_consume(self, n: int) -> None:
+        """消费者取走 `n` 字节：归还信用（`_CreditGate.on_recv` 语义）。
+
+        这是同步方法（`iter_body` 里直接调用）：`send_credit` 是 async，
+        用 `create_task` 发出去。丢一个 CREDIT 不致命（对端会因
+        `CREDIT_DEADLOCK_TIMEOUT` 重试），而在这里 await 会把消费者的
+        读速和发送速率绑在一起。
+        """
+        if n <= 0 or self._closed:
+            return
+        if not self._credit.on_recv(n):
+            return
+        try:
+            asyncio.get_running_loop().create_task(self.send_credit())
+        except RuntimeError:            # 没有运行中的循环（拆卸阶段）
+            pass
 
     async def send_body(self, p: PendingRequest, chunk: bytes) -> None:
         """送一块请求体（自动按 `MAX_BODY_CHUNK` 切片并过信用窗）。"""
@@ -817,15 +858,22 @@ class Mux:
         p = self._pending.get(rid)
         if p is None:
             return
-        if self._credit.on_recv(len(data)):
-            await self.send_credit()
-        # ★ 这一步会阻塞**共享读循环**。队列只有 `_BODY_QUEUE_MAX` 深
-        #   （≈4 MB），而 credit 窗口是 8 MB ⇒ 消费者慢到某个程度时必然
-        #   填满。无上限地等下去，后果不只是这个请求变慢：读循环停摆后
-        #   PING/PONG、CREDIT、CANCEL 全都收不到，**整条隧道**的心跳会
-        #   被判死（云端 `DEAD_AFTER=75s`），所有并发请求一起失败。
-        #   所以给一个上限：超过就说明消费者已经跟不上，放弃这个请求，
-        #   比拖死整条连接好。
+        # ★ 信用**不在这里**归还。
+        #
+        #   原来的写法是 `if self._credit.on_recv(len(data)):
+        #   await self.send_credit()`，也就是"数据一到就告诉对端我又能收
+        #   更多了"。这把信用窗口的本意（限制**未消费**字节）变成了限制
+        #   "未到达字节" —— 而对端到达即可发送，于是它可以无限领先一个
+        #   永远追不上它的消费者。慢读者场景下的实测后果：
+        #
+        #     `_on_res_body` 跑在整条连接共享的读循环上 ⇒ `body.put`
+        #     堵住 ⇒ PING / CREDIT / CANCEL 全都收不到 ⇒ uvicorn 的
+        #     keepalive 在 47 秒时以 `1011 keepalive ping timeout` 掐掉
+        #     连接 ⇒ 手机上"看图时整条隧道断了一次"并重连。
+        #
+        #   现在改由 `PendingRequest.iter_body()` 在消费者**真正取走**
+        #   一块之后调用 `on_consume` 归还额度，窗口这才真正约束
+        #   "已发未消费"的字节数。
         try:
             await asyncio.wait_for(p.body.put(data), timeout=_BODY_PUT_TIMEOUT)
         except asyncio.TimeoutError:
