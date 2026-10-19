@@ -32,6 +32,20 @@ services:
       PB_CLOUD_HOSTS: ${DOMAIN}
     volumes:
       - ./data:/data
+    # ★ 根文件系统只读（TC-CLOUD-SEC-010）。
+    # 依据：`cloud/**` 全目录除 sqlite 外**没有任何文件写入**（有用例
+    # 用 AST 扫全部 `open(`/`write_text`/`tempfile` 钉住这一点），而
+    # sqlite 落在上面的 `./data` 卷里。只读根的意义是"容器被攻破也改
+    # 不掉自己的代码"，比非 root 用户更强的第二道锁。
+    # `/tmp` 给 tmpfs：Python/sqlite 偶尔要临时文件，写进内存盘既不落
+    # 宿主磁盘也不会被 AC-7.1 的磁盘扫描发现"多出来的字节"。
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     # ★★ 用 expose 而不是 ports ★★
     # ports 会让 Docker 直接写 iptables 绕过 ufw，把 8000 暴露到公网。
     # expose 只在 pb-net 内部可见，只有 caddy 能访问。

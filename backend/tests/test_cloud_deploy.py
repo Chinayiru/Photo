@@ -303,3 +303,139 @@ def test_cloud_entry_trusts_forwarded_only_from_docker_ranges() -> None:
                         if "PB_CLOUD_FORWARDED_ALLOW_IPS" in ln)
     assert '"*"' not in default_line, default_line
     assert "172.16.0.0/12" in src
+
+
+# ---------------------------------------------------- TC-CLOUD-SEC-004 / 009
+
+
+def test_caddyfile_sets_no_media_cache_and_no_cdn() -> None:
+    """TC-CLOUD-SEC-004：无反代层媒体缓存、无 CDN 标记。
+
+    云端**只做透传**，`Cache-Control` 由电脑端按文件类型决定
+    （缩略图 `private, max-age=…`、原图 `private, max-age=0`）。
+    Caddy 这边任何 `cache`/`expires`/`header Cache-Control` 都会把
+    "云端不缓存照片"变成谎话 —— 而且它的缓存落在反代进程里，
+    用户与审计都看不见。
+    """
+    import re
+
+    text = _caddyfile()
+    for directive in ("cache", "expires", "cache-control", "stale",
+                      "header_down", "precompressed"):
+        # ★ 必须按行首匹配（允许缩进）。第一版写的是 `"\n" + directive`，
+        #   而 Caddyfile 里的指令都是缩进的（`\n\texpires 365d`），
+        #   于是**每一种**变异都逃逸 —— 断言看着严格，其实永远为真。
+        hit = re.search(rf"(?im)^\s*{re.escape(directive)}\b", text)
+        assert hit is None, f"Caddyfile 里出现了 {directive}：{hit.group(0)!r}"
+    # 不许注入 CDN 家族的头（Cloudflare / Fastly / Varnish）
+    low = text.lower()
+    for cdn in ("cf-cache-status", "x-cache", "x-served-by", "x-varnish",
+                "cdn-cache-control", "surrogate-control"):
+        assert cdn not in low, cdn
+
+
+def test_forward_never_invents_a_public_cache_control() -> None:
+    """TC-CLOUD-SEC-004 的另一半：云端**不自己造** `public`。
+
+    这条是"透传"的边界。`_res_headers()` 只放行白名单里的头，电脑端
+    没发 `cache-control` 时云端也不能补一个 —— 补 `public, max-age=…`
+    等于替电脑端宣布"这张照片可以进共享缓存"，而手机用的是带令牌的
+    私有请求，中间任何一层共享缓存都会把照片发给下一个请求者。
+    """
+    from cloud.relay.forward import _res_headers
+
+    headers, cookies = _res_headers({"headers": {"content-type": "image/jpeg"}})
+    assert "cache-control" not in headers
+    assert cookies == []
+
+    # 错误响应必须显式 no-store（这条本来就该有）
+    from cloud.relay.forward import _error
+
+    resp = _error(503, "E3003", "电脑离线")
+    assert resp.headers["cache-control"] == "no-store"
+
+
+def test_cloud_access_log_has_no_media_payload() -> None:
+    """TC-CLOUD-SEC-009：云端日志不记媒体路径与查询串。
+
+    电脑端的 `_request_log_middleware` 只记 `ctx.path`（不含查询串），
+    而云端 `forward.py` 的日志分支里只有 device_id 与耗时。这里用
+    AST 找出所有 `log.*` 调用，断言没有任何一处传了
+    `request.url` / `request.query_params` / 完整路径变量。
+    """
+    import ast
+
+    src = (REPO / "cloud" / "relay" / "forward.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    bad: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if not (isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name)
+                and fn.value.id == "log"):
+            continue
+        for arg in node.args:
+            text = ast.unparse(arg)
+            for needle in ("request.url", "query_params", "full_path",
+                           "raw_path"):
+                if needle in text:
+                    bad.append(f"log.{fn.attr}() 传了 {text}")
+    assert bad == [], bad
+
+
+def test_relay_container_has_a_read_only_root_filesystem() -> None:
+    """TC-CLOUD-SEC-010：根文件系统只读，可写的地方只有数据卷与 /tmp。
+
+    前提是**云端代码不写盘**（除 sqlite）。这个前提由下面那条 AST
+    用例守着 —— 两条必须一起看：只读根却不给 /tmp，Python 在某些
+    操作（sqlite 的临时排序文件、locale）上会莫名失败；给了 /tmp
+    却不是 tmpfs，临时文件就落进了容器可写层，`docker commit` 能把
+    照片字节带出来。
+
+    ★ `cap_drop: ALL` 与 `no-new-privileges` 一并钉住：relay 只需要
+    监听 8000、读数据卷，任何 capability 都是多余的授权面。
+    """
+    relay = _compose()["services"]["relay"]
+    assert relay.get("read_only") is True
+    assert "/tmp" in (relay.get("tmpfs") or [])
+    assert relay.get("cap_drop") == ["ALL"]
+    assert "no-new-privileges:true" in (relay.get("security_opt") or [])
+    # 唯一允许持久化的地方是数据卷，且它就是 sqlite 的目录
+    assert "./data:/data" in (relay.get("volumes") or [])
+    assert relay["environment"]["PB_CLOUD_DB"] == "/data/cloud.db"
+
+
+def test_cloud_code_never_writes_files_except_sqlite() -> None:
+    """只读根的**前提条件**：`cloud/**` 不落盘（sqlite 除外）。
+
+    这条如果破了，上一条 `read_only: true` 会让容器在生产上直接
+    `OSError: Read-only file system` —— 而开发机（没开只读）一切正常。
+    这正是"部署文件写错了在开发机看不出来"那一类缺陷，所以用 AST
+    在这里钉死，而不是靠人记。
+    """
+    import ast
+
+    banned = {"write_text", "write_bytes", "mkdir", "makedirs", "unlink",
+              "rmdir", "touch", "symlink_to", "rename", "replace"}
+    bad: list[str] = []
+    for path in sorted((REPO / "cloud").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        rel = path.relative_to(REPO)
+        for node in ast.walk(tree):
+            # ① Path(...).write_text(...) 这类
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr in banned:
+                    bad.append(f"{rel}:{node.lineno} .{node.func.attr}()")
+                # ② 内建 open(...) 写模式
+                if node.func.attr == "open":
+                    mode = node.args[0] if node.args else None
+                    if isinstance(mode, ast.Constant) and isinstance(mode.value, str):
+                        if any(ch in mode.value for ch in "wax+"):
+                            bad.append(f"{rel}:{node.lineno} open({mode.value!r})")
+            # ③ tempfile 家族
+            if isinstance(node, ast.Attribute) and node.attr in (
+                    "NamedTemporaryFile", "mkstemp", "mkdtemp",
+                    "TemporaryDirectory", "TemporaryFile"):
+                bad.append(f"{rel}:{node.lineno} tempfile.{node.attr}")
+    assert bad == [], bad

@@ -474,7 +474,13 @@ def rig_factory(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_agent_ws_rejects_bad_credentials(rig_factory) -> None:
-    """TC-TUNNEL-SEC-001/002/003/004/006：无令牌/错令牌/错 scheme/已撤销/查询串。
+    """TC-TUNNEL-SEC-001 / SEC-002 / SEC-003 / SEC-004 / SEC-006（握手鉴权）。
+
+    TC-TUNNEL-SEC-001 无 `Authorization` → 401 `missing_agent_token`
+    TC-TUNNEL-SEC-002 `Bearer wrong-token` → 401 `invalid_agent_token`
+    TC-TUNNEL-SEC-003 已撤销的 agent_token → 403 `device_revoked`
+    TC-TUNNEL-SEC-004 `Basic <tok>`（错误 scheme）→ 401
+    TC-TUNNEL-SEC-006 令牌放查询串 `?token=` → 401（只读 header）
 
     ★ 真 uvicorn 下 `_deny` 的 `send_denial_response` 生效，手机拿到的是
     **真正的 HTTP 401/403**（不是 1008 关闭）。这一点只有真 uvicorn 才测
@@ -573,7 +579,11 @@ def test_hello_self_check(rig_factory) -> None:
 
 
 def test_hello_ack_and_device_row(rig_factory) -> None:
-    """TC-TUNNEL-FUNC-001/002：握手回 `HELLO_ACK`，且设备行被更新。
+    """TC-TUNNEL-FUNC-001 / FUNC-002：握手回 `HELLO_ACK`，且设备行被更新。
+
+    TC-TUNNEL-FUNC-001 `HELLO_ACK` 含 server_time/heartbeat_sec/
+                      max_frame/credit_window
+    TC-TUNNEL-FUNC-002 `devices.last_seen` 更新，`version`/`last_lan` 写入
 
     ★ 这条用例的第一版写着"`HELLO` 的 `version`/`lan_ips` 只进内存、不落
     库"，并断言 `devices.version != "9.9.9"`。那是在**记录缺陷**，不是在
@@ -903,7 +913,7 @@ def test_panel_is_not_reachable_even_if_path_check_is_bypassed() -> None:
 
 
 def test_forward_streams_large_body_without_buffering(rig_factory) -> None:
-    """AC-4.2：下载走流式，云端不整体缓冲。
+    """TC-TUNNEL-FUNC-006 / AC-4.2：下载走流式，云端不整体缓冲。
 
     这里不量内存（那要专门的 2 GB 用例），只钉住**结构性**事实：
     响应是分多帧回来的，且 `Content-Length` 与实际字节数一致。
@@ -940,7 +950,8 @@ def test_forward_streams_large_body_without_buffering(rig_factory) -> None:
 # ---------------------------------------------------------------------------
 
 def test_tunnel_requires_client_token(rig_factory) -> None:
-    """TC-TUNNEL-SEC-*：`/d/**` 除 `/api/system/ping` 外一律要令牌。
+    """TC-TUNNEL-SEC-001（子集）/ TC-TUNNEL-SEC-005：`/d/**` 除
+    `/api/system/ping` 外一律要令牌；别人设备的令牌 → 403 `E2003`。
 
     ★ 必须用**不带 cookie** 的客户端。`httpx.AsyncClient` 会记住配发下来的
     `Set-Cookie`，于是"不带令牌"的请求实际是 cookie 认证并返回 200 ——
@@ -1037,7 +1048,10 @@ def test_offline_device_returns_503(rig_factory) -> None:
 # ---------------------------------------------------------------------------
 
 def test_tunnel_survives_cloud_restart(rig_factory) -> None:
-    """TC-TUNNEL-FUNC-010/014：**云端**重启后隧道自己接回来。
+    """TC-TUNNEL-FUNC-010 / FUNC-014：**云端**重启后隧道自己接回来。
+
+    TC-TUNNEL-FUNC-010 断开后 5 秒内重连（这里是 60 秒上限的宽松版）
+    TC-TUNNEL-FUNC-014 重连成功后再请求正常返回
 
     这是唯一一条真把云端监听套接字拆掉再起回来的用例。`stop_cloud()`
     会让端口真的释放（`_wait_port_free` 保证），`TunnelClient` 真的收到
@@ -1144,7 +1158,10 @@ def test_tunnel_survives_agent_restart(rig_factory) -> None:
 
 
 def test_backoff_is_exponential_and_capped() -> None:
-    """TC-TUNNEL-FUNC-011/012：退避 1→2→4→…→60 s 封顶，且**永不放弃**。
+    """TC-TUNNEL-FUNC-011 / FUNC-012：退避 1→2→4→…→60 s 封顶，且**永不放弃**。
+
+    TC-TUNNEL-FUNC-011 指数退避序列 1/2/4/8/16
+    TC-TUNNEL-FUNC-012 连续断线后封顶 60 s、永不放弃
 
     只测纯函数（`jitter=0.0` 关掉抖动才有可复现值）。"永不放弃"这件事
     由 `_run()` 的 `while not self._stop` 保证 —— 它是 `while True` 的唯一
@@ -1448,7 +1465,12 @@ def test_traffic_meter_records_both_directions(rig_factory) -> None:
 # ---------------------------------------------------------------------------
 
 def test_cloud_never_stores_media_bytes(rig_factory) -> None:
-    """AC-7.1/7.2/7.7：云端磁盘不出现照片字节，日志里也没有。
+    """TC-CLOUD-SEC-001 / SEC-002 / SEC-005 / SEC-006 / AC-7.1/7.2/7.7。
+
+    TC-CLOUD-SEC-001 云端目录无任何图片文件
+    TC-CLOUD-SEC-002 无 media/photos/files 表
+    TC-CLOUD-SEC-005 所有表都不存 rel_path/file_name
+    TC-CLOUD-SEC-006 不存照片的 sha256
 
     做法：走一遍"取原图 + 上传一个小文件"，然后
     ① 列出云端库目录下所有文件，逐个搜照片的魔术字节；
