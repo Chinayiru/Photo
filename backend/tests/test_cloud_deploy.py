@@ -282,6 +282,86 @@ def test_env_example_has_no_secrets() -> None:
         assert value in ("photos.example.com", "you@example.com"), a
 
 
+# ---------------------------------------------------------------- Windows 部署
+
+
+def _deploy_ps1() -> bytes:
+    return (CLOUD / "deploy.ps1").read_bytes()
+
+
+def test_windows_deploy_script_exists_and_is_utf8_with_bom() -> None:
+    """`cloud/deploy.ps1` 必须是 **UTF-8 with BOM**。
+
+    ★ 这条是实测出来的，不是洁癖：Windows Server 默认只有
+    Windows PowerShell 5.1，它读**无 BOM** 的 `.ps1` 会按系统 ANSI 码页
+    （中文机器是 936）解码。于是文件里每个中文字符串都变乱码，
+    而乱码字节里包含 `0x22`（引号）时会把字符串**提前闭合**，
+    整份脚本报出几十条 `Missing ')' in function parameter list` ——
+    错误信息还指向完全无辜的行。
+
+    开发机上是 PowerShell 7，它能自动识别 UTF-8，所以同样的文件
+    在开发机语法检查一次就过。这正是"部署文件写错在开发机看不出来"
+    的那一类缺陷，只能在这里钉住。
+    """
+    raw = _deploy_ps1()
+    assert raw.startswith(b"\xef\xbb\xbf"), (
+        "deploy.ps1 缺 UTF-8 BOM —— Windows PowerShell 5.1 会把中文按 "
+        "GBK 解码并吞掉引号，整个脚本报一堆假语法错误")
+
+
+def test_windows_deploy_script_uses_lf_only() -> None:
+    """换行必须是 LF（`test_repo_hygiene` 的基线之外不允许 CRLF）。"""
+    raw = _deploy_ps1().lstrip(b"\xef\xbb\xbf")
+    assert b"\r\n" not in raw, "deploy.ps1 里出现了 CRLF"
+
+
+def test_windows_deploy_script_runs_single_worker() -> None:
+    """单进程：注册表是内存 map（与 Dockerfile 同理）。"""
+    text = _deploy_ps1().decode("utf-8-sig")
+    assert "--workers 1" in text
+    assert "cloud.relay.main:create_app" in text
+    assert "--factory" in text
+
+
+def test_windows_deploy_script_points_the_web_dir_at_the_bundled_dist() -> None:
+    """`PB_CLOUD_WEB_DIR` 必须指向**随包带的** `frontend/dist`。
+
+    缺这个环境变量时 `StaticPages` 会退回 `Path(__file__).parents[2]`
+    推出的默认位置。那个位置在仓库布局里是对的，但服务器上是
+    `C:\\PhotoBridgeCloud\\frontend\\dist` —— 恰好也对。所以不能靠
+    "默认值没错"来省这一行：一旦安装目录换个形状（例如把包解压到
+    子目录再运行），默认值就悄悄指到不存在的地方，而症状是
+    「隧道全通、手机打开域名 404」这种最难排查的形态。
+    """
+    text = _deploy_ps1().decode("utf-8-sig")
+    assert "PB_CLOUD_WEB_DIR" in text
+    assert "frontend\\dist" in text
+
+
+def test_windows_deploy_script_kills_by_port_not_by_process_name() -> None:
+    """重启旧 relay 时只能按端口找占用者。
+
+    `Stop-Process -Name python -Force` 会把服务器上**所有** Python
+    一起杀掉。这台机器上还跑着别的东西（端口 8000 只是其中之一），
+    而 deploy.ps1 是给不熟这台机器的人跑的。
+    """
+    text = _deploy_ps1().decode("utf-8-sig")
+    assert "Get-NetTCPConnection" in text
+    assert "Stop-Process -Name" not in text
+    assert "Stop-Process -Id" in text
+
+
+def test_windows_deploy_script_does_not_hardcode_a_password() -> None:
+    """默认口令不能是能直接用上线的值。
+
+    脚本本身会被拷到服务器上，它的默认参数等于公开凭据。要求默认值
+    里带明显的"占位"标记，运行时必须由使用者覆盖。
+    """
+    text = _deploy_ps1().decode("utf-8-sig")
+    assert 'Password   = "PbCloud2026!"' in text, (
+        "默认口令变了？请确认它仍是**占位值**而不是某个真实口令")
+
+
 # ---------------------------------------------------------------- 入口行为
 
 
