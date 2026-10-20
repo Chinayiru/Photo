@@ -158,31 +158,52 @@ class TestLineEndings:
         如果早就有这条断言，`pytest` 会立刻点名它，而不是等提交完去看
         `--stat` 里的 6840 行才发现。
 
-        ★ 判据是**"HEAD 里是不是 LF，而工作区变成了 CRLF"**，而不是
-        "工作区有没有 CRLF"。后者会把 19 个历史遗留文件永久判成失败，
-        于是这条测试只有两种结局：被人加进忽略名单，或者被人删掉。
+        ★ 判据**分两向**，而不是"工作区有没有 CRLF"：后者会把 19 个
+        历史遗留文件永久判成失败，于是这条测试只有两种结局：
+        被人加进忽略名单，或者被人删掉。
+
+          · 基线之外的文件 → 工作区不许有 CRLF（被 Set-Content 之类改成 CRLF）
+          · 基线之内的文件 → 工作区必须有 CRLF（被 `newline="\\n"` 之类洗成 LF）
+
+        ★ 第二向是补上的。原先只查一向，于是 `docs/04`（基线内、CRLF）
+        被整份改写成 LF、5103 行换行全变、`git diff --stat` 显示 +5455/−5155
+        而 `--ignore-all-space` 只有 +369/−69 —— **全库 1397 条测试全绿通过**，
+        一直要等提交推送后才被 `test_baseline_matches_head` 发现，
+        而那条的提示是"请从基线删掉"，指的恰好是相反的方向。
         """
         head_crlf = _head_crlf()
         offenders = []
         for name in _tracked_text_files():
-            if name in CRLF_BASELINE:
-                continue
             try:
                 n = (REPO / name).read_bytes().count(b"\r\n")
             except OSError:
                 continue
-            if n and name not in head_crlf:
-                offenders.append((name, n))
+            if name in CRLF_BASELINE:
+                # 基线内：HEAD 里是 CRLF，工作区也必须是 CRLF
+                if name in head_crlf and not n:
+                    offenders.append((name, 0))
+            else:
+                # 基线外：工作区不许出现 CRLF
+                if n and name not in head_crlf:
+                    offenders.append((name, n))
 
         assert not offenders, (
-            "以下已跟踪文本文件在 HEAD 里是 LF，但工作区变成了 CRLF —— "
+            "以下已跟踪文本文件的换行符被整篇改写了 —— "
             "多半是被某个工具（PowerShell 的 Set-Content、编辑器、格式化器）"
             "整篇改写了换行符。这种改动会让整个文件在 diff 里显示为全改，"
             "`git blame` 失效，但 `git diff --ignore-all-space` 是空的"
-            "（即 0 行语义改动）。请把这些文件转回 LF，然后重新提交：\n"
-            + "\n".join(f"  {name}  CRLF={n}" for name, n in offenders)
-            + "\n提示：用 Python 读写二进制（read_bytes/write_bytes）不会改换行符，"
-              "而 PowerShell 的 Set-Content / Out-File 会。"
+            "（即 0 行语义改动）。\n"
+            "  · CRLF=0 的：HEAD 里是 CRLF，被洗成了 LF —— 转回 CRLF\n"
+            "  · CRLF>0 的：HEAD 里是 LF，被改成了 CRLF —— 转回 LF\n"
+            + "\n".join(
+                f"  {name}  CRLF={n}"
+                + ("  → 转回 CRLF" if n == 0 else "  → 转回 LF")
+                for name, n in offenders
+            )
+            + "\n提示：用 Python 读写二进制（read_bytes/write_bytes）不会改换行符；"
+              "`io.open(..., newline='')` 读、`newline=''` 写也不会。"
+              "而 PowerShell 的 Set-Content / Out-File、以及"
+              "`io.open(..., newline='\\n')` 写整份文件都会。"
         )
 
     def test_baseline_matches_head(self) -> None:
@@ -200,7 +221,13 @@ class TestLineEndings:
         problems = []
 
         for name in sorted(CRLF_BASELINE - set(head_crlf)):
-            problems.append(f"{name}（基线里有，HEAD 里不是 CRLF 或已不存在，请从基线删掉）")
+            if (REPO / name).is_file():
+                problems.append(
+                    f"{name}（基线里有，HEAD 里却变成了 LF —— "
+                    "不是删基线，而是把它转回 CRLF 再提交）"
+                )
+            else:
+                problems.append(f"{name}（基线里有，但文件已不存在，请从基线删掉）")
         for name in sorted(set(head_crlf) - CRLF_BASELINE):
             problems.append(f"{name}（HEAD 里是 CRLF，不在基线里，请加进基线）")
 
