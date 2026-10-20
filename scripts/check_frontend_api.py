@@ -82,8 +82,68 @@ def _route_patterns() -> set[str]:
     return out
 
 
+def _strip_comments(text: str) -> str:
+    r"""把 JS/TS/Vue 的注释替换成等长空白（保留行号与列位置）。
+
+    ★ 不剥注释会让这份检查变成假阳性机器：`transport.ts` 的模块 docstring
+    里写着「两条通路走完全相同的 `/api/**` 路径」，那是一个**通配描述**，
+    不是调用 —— 但 `_PATH_RE` 照样抓到它，于是检查永远红。
+
+    一条永远红的检查等于没有检查：没人会看它，真漂移也就跟着看不见了。
+    这个脚本当时**确实没有任何东西在跑它**（没有测试、也没有 CI 入口），
+    所以它红着也没人知道 —— 直到手动跑了一遍才发现。
+
+    实现是极简状态机，不追求完整 ES 语法，只保证两件事：
+      · 字符串（`"` / `'` / 反引号）内部的 `//` 不当注释，
+        否则 `https://...` 会把后半行吃掉、连带丢掉真实路径；
+      · 注释内容换成空格而不是删掉，行号与原文一一对应，
+        报错信息里的行号仍然可点。
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    quote = ""            # 当前所在的字符串定界符，空串表示不在字符串里
+    while i < n:
+        ch = text[i]
+        if quote:
+            # 字符串内部：只有遇到同种引号（且未被转义）才结束
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            out.append(ch)
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        # 不在字符串里：可能是注释起点
+        if ch in "\"'`":
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            out.append("".join("\n" if c == "\n" else " " for c in text[i:end]))
+            i = end
+            continue
+        if text.startswith("//", i):
+            end = text.find("\n", i + 2)
+            end = n if end < 0 else end
+            out.append(" " * (end - i))
+            i = end
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _frontend_paths() -> dict[str, list[str]]:
-    """前端源码里出现的所有 API 路径 → 出现在哪些文件。"""
+    """前端源码里出现的所有 API 路径 → 出现在哪些文件。
+
+    **只扫代码，不扫注释** —— 见 `_strip_comments()`。
+    """
     found: dict[str, list[str]] = {}
     if not FRONTEND_SRC.is_dir():
         return found
@@ -91,7 +151,7 @@ def _frontend_paths() -> dict[str, list[str]]:
         if f.suffix not in (".ts", ".vue", ".js"):
             continue
         try:
-            text = f.read_text(encoding="utf-8")
+            text = _strip_comments(f.read_text(encoding="utf-8"))
         except OSError:
             continue
         for m in _PATH_RE.finditer(text):
