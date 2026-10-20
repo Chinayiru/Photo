@@ -466,6 +466,21 @@ def create_session(
     name = name.strip()
     if len(name) > 255:
         raise BadRequest("文件名过长")
+    # ★ 审计 F19：`docs/04:3131` 的请求体字段表明写 `name` "不接受路径，
+    # 含 `/` `\` 一律 400 E1001"，而实现此前**照收**（`../escape.jpg`、
+    # `C:\Windows\x.jpg` 全 201）。
+    #
+    # 实现侧原来不是漏洞：`declared_name` 只是记录，归档时服务端按时间戳
+    # 重新命名，沙箱在 `archive.place()` 里再校验一次。但"文档写的拒绝
+    # 行为不存在"是实打实的漂移 —— 按文档写客户端的人会以为这里有校验，
+    # 于是自己不再校验；而哪天归档路径改成"保留原名"（`declared_name`
+    # 就在手边，改起来只有一行），这条就真的成了漏洞。
+    #
+    # 两处一起收：拒绝分隔符，与文档一致。浏览器的 `File.name` 永远不含
+    # 路径（`frontend/src/stores/upload.ts:124` 传的就是 `f.name`），
+    # 所以真实前端一个字节都不用改。
+    if "/" in name or "\\" in name:
+        raise BadRequest("文件名不能包含路径分隔符")
     if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
         raise BadRequest("文件大小必须为正整数")
     max_bytes = int(cfg.upload["max_file_mb"]) * 1024 * 1024
@@ -493,6 +508,13 @@ def create_session(
     subdir = archive.subdir_prefix(
         target_dir if target_dir is not None else cfg.upload.get("subdir")
     )
+    # ★ 审计 F14：`subdir_prefix` 只做形态/字符/保留名检查，不看 `exclude_dirs`。
+    # 于是 `target_dir="data"` 能一路走到归档，照片落在 `data/2026/2026-10/…`：
+    # complete 时 `index_one_file` 照收（它只看文件名）→ 照片**立刻出现在时间线**，
+    # 下一次全量扫描跳过 `data/` → `_mark_missing` 标成 missing → 从界面消失，
+    # 而且此后 move/rename 一律 E1004，API 侧救不回来。
+    # 这里传 `last_is_file=False`：`subdir` 是**目录**前缀，每一段都要判。
+    sandbox.reject_excluded(subdir, root, last_is_file=False)
 
     # --- 1) 秒传：init 阶段就判，能省掉全部字节 ---
     dup = find_duplicate(db, cfg, sha256, root_id=root.id) if _dedup_on(cfg) else None
@@ -641,7 +663,16 @@ def _reconcile_offset(db: Database, sess: dict[str, Any]) -> int:
     （内容相同，无害但浪费），DB 偏大时会跳过一段，文件中间留下
     空洞 —— 在照片上表现为灰条，且 sha256 永远对不上，
     用户反复重传都失败，却没有任何提示指向真正的原因。
+
+    ★ **非 `open` 会话不参与对账**（审计 F13）。`complete` 成功后
+    `.part` 已被 `_unlink_temp()` 删掉，磁盘上是 0 字节 —— 若照样对账，
+    `GET /api/uploads/{id}` 会把这个 0 **写回 DB**，客户端下一次读到的
+    就是 `offset=0, complete=false`，按 0 重传拿 `409 E1012`（不可重试）
+    → 界面报"上传失败"，而照片其实早已入库。一个查询接口不该有写副作用，
+    对已结束的会话更是没有任何可对账的东西：进度就是 `total_size`。
     """
+    if str(sess.get("status") or "") != "open":
+        return int(sess.get("received") or 0)
     temp = sess.get("temp_path")
     actual = 0
     if temp:
@@ -750,8 +781,23 @@ def _append_chunk_locked(
             raise AppError(E3010, "电脑磁盘空间不足") from None
         raise AppError(E3010, f"写入临时文件失败：{exc!r}") from exc
 
+    # ★ 审计 F18：每次成功分片都把 `expires_at` 续成 `now + ttl`，
+    # 与 `docs/04:3405-3409` 的规则一致：`max(created_at + ttl, now + ttl)`。
+    #
+    # 早先只写 `received`，于是 24 小时是**从 init 起算的绝对期限**：
+    # 一个 2 GB 文件在 5 Mbps 云带宽下要 55 分钟；如果用户中途暂停几小时
+    # 再继续（或者中途切网络、关掉页面过夜），继续传时拿到
+    # `409 E1012 retryable=false`，前端 `upload.ts:236` 见不可重试就
+    # `releaseSession()`，重试从 0 开始 —— **已传的字节全部白费**，
+    # 而且界面上没有任何提示说"你必须在 24 小时内传完"。
+    #
+    # `max(created_at + ttl, ...)` 里的 `created_at + ttl` 是下界：
+    # 即使 system clock 被往回拨，续期也不能让过期时间比创建时算出的更早。
+    ttl = float(cfg.upload["session_ttl_hours"]) * 3600.0
+    new_exp = max(float(sess["created_at"]) + ttl, time.time() + ttl)
     db.execute(
-        "UPDATE upload_sessions SET received = ? WHERE id = ?", (new_offset, upload_id)
+        "UPDATE upload_sessions SET received = ?, expires_at = ? WHERE id = ?",
+        (new_offset, new_exp, upload_id),
     )
     complete = new_offset >= int(sess["total_size"])
     return {
@@ -759,6 +805,11 @@ def _append_chunk_locked(
         "offset": new_offset,
         "received": new_offset,
         "total_size": int(sess["total_size"]),
+        "chunk_size": int(sess["chunk_size"]),
+        # ★ 文档 §4.3.2 的 PATCH 字段表列了 `expires_at`（"每次成功分片
+        # 都会刷新"），实现此前不返回它 —— 客户端于是无从知道自己的
+        # 会话被续到什么时候，也就无法在界面上提示"还剩多久"。
+        "expires_at": new_exp,
         "complete": complete,
         "duplicate": False,
     }

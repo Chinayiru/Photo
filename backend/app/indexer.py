@@ -119,7 +119,7 @@ def _is_excluded_file(name: str, root: RootConfig) -> bool:
     return low.startswith("~$") or low.endswith(".tmp")
 
 
-def should_index(name: str, root: RootConfig) -> bool:
+def should_index(name: str, root: RootConfig, *, rel: str | None = None) -> bool:
     """这个文件名该不该进索引？**与 `_walk` 的过滤条件逐条对齐**。
 
     为什么单独抽出来：全量扫描（`_walk`）与单文件增量（`index_one_file`）
@@ -136,9 +136,19 @@ def should_index(name: str, root: RootConfig) -> bool:
     真实上传路径有扩展名校验挡着，所以这条只在"上传白名单被改宽、
     而索引白名单没跟着改"时才炸 —— 而那正是最容易被忽略的配置漂移。
 
+    ★ **目录维**（审计 F14）：传了 `rel` 就同时检查它是否落在
+    `root.exclude_dirs` 里。只对齐文件名不够 —— `_walk` 是在**遍历时**
+    跳目录（`_is_excluded_dir`），而 `index_one_file` 拿到的是一个完整
+    相对路径，它不走遍历，于是 `data/a.jpg`、`node_modules/a.jpg`
+    会被它收进库（`_walk` 永远不收），同样表现为"先出现、后被标 missing"。
+    判定复用 `sandbox.excluded_dir_segment`，与写入口（move / upload）
+    用的是同一个函数，三处不会漂移。
+
     ⚠️ 这里**不含** junction/reparse 检查（那需要 lstat，是调用方的事）。
     """
     if _is_excluded_file(name, root):
+        return False
+    if rel is not None and sandbox.excluded_dir_segment(rel, root):
         return False
     return _ext_of(name) in root.include_exts
 
@@ -814,7 +824,9 @@ class Indexer:
         """
         try:
             p = sandbox.resolve(root, rel, "read", cfg=self.cfg)
-            if not should_index(p.name, root):
+            # ★ 传 rel 而不是只看 p.name：单文件增量不走目录遍历，
+            # 光看文件名会把 `data/a.jpg` 收进来，而全量扫描永远不收。
+            if not should_index(p.name, root, rel=rel):
                 log.info("index_one_file 跳过不在索引白名单内的文件 rel=%s", rel)
                 return None
             st = p.stat()

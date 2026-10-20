@@ -417,6 +417,16 @@ export interface UploadPatchResponse {
   offset: number;
   received: number;
   total_size: number;
+  chunk_size: number;
+  /**
+   * 会话过期时间。**每次成功分片都会刷新**为 `max(created_at + ttl, now + ttl)`。
+   *
+   * ★ 审计 F18：实现早先只写 `received` 不写 `expires_at`，24 小时是
+   * "从 init 起算的绝对期限" —— 跨天续传会 409 `E1012`（`retryable=false`），
+   * 前端 `upload.ts` 见不可重试就 `releaseSession()`，重试从 0 开始，
+   * 已传的字节全部白费。现在续期了，客户端也拿得到这个值。
+   */
+  expires_at: number;
   complete: boolean;
   /** 整片重复上传时的幂等标记。 */
   duplicate?: boolean;
@@ -433,6 +443,23 @@ export interface UploadStatusResponse {
   expires_at: number;
   complete: boolean;
   sha256: string | null;
+  /** 客户端在 `init` 时声明的原始文件名（只作记录，归档时会重新命名）。 */
+  declared_name: string | null;
+  /** 目标目录（相对库根）。 */
+  target_rel: string | null;
+  /** 实际落盘路径，`status === "completed"` 时才有值。 */
+  final_rel: string | null;
+  /**
+   * 已入库的媒体 id，`status === "completed"` 时才有值。
+   *
+   * ★ 审计 F13/F19：这是客户端**判断"其实已经成功了"的唯一依据**。
+   * `complete` 成功后临时文件被删、磁盘 0 字节，早先 `_reconcile_offset`
+   * 会把 `received` 写回 0，客户端于是读到 `offset=0, complete=false`、
+   * 按 0 重传、拿 `409 E1012` 不可重试，白白丢掉整个文件。
+   */
+  media_id: number | null;
+  /** 秒传（内容哈希命中）时为 true；还没完成时为 null。 */
+  dedup: boolean | null;
 }
 
 /**

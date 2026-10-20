@@ -27,6 +27,7 @@ from ..errors import (
     E1008,
     E1012,
     E1015,
+    E1019,
     E3004,
     E3012,
     AppError,
@@ -254,13 +255,6 @@ async def _serve_thumb(st: AppState, ctx: Ctx, mid: int) -> Reply:
     src_sig = _source_sig(st, row)
     sig = f"w{size}-{src_sig}"
 
-    # 条件请求 → 304。省下的是**隧道带宽**，弱网下价值最大。
-    if etag_matches(ctx.header("if-none-match"), sig):
-        r = empty_reply(304)
-        r.set_etag(sig)
-        r.set("Vary", "Authorization")
-        return r
-
     dst = thumb_path(st.cfg, row["root_id"], row["rel_path"], size)
 
     # ★ 是否陈旧必须在**生成之前**判定。
@@ -326,6 +320,20 @@ async def _serve_thumb(st: AppState, ctx: Ctx, mid: int) -> Reply:
         r.headers["Content-Type"] = "image/webp"
         r.headers["Content-Length"] = str(len(data))
         r.headers["Cache-Control"] = "no-store"
+        r.set("Vary", "Authorization")
+        return r
+
+    # ⚠️ 304 必须排在 `missing` 判定**之后**（审计 F5 残留的同源修正）。
+    # 早先它排在函数最前面，于是"已删除的照片 + 手机带着旧 ETag 来问"
+    # 拿到 304，而 304 的语义是"继续用你缓存那份" —— 那份正是照片
+    # 还活着时生成的缩略图。上面那个 `no-store` 占位图分支永远走不到，
+    # `no-store` 也就永远不会被执行。已删除的照片没有可校验的实体，
+    # 只能回一条不缓存的占位图。
+    #
+    # 条件请求 → 304。省下的是**隧道带宽**，弱网下价值最大。
+    if etag_matches(ctx.header("if-none-match"), sig):
+        r = empty_reply(304)
+        r.set_etag(sig)
         r.set("Vary", "Authorization")
         return r
 
@@ -407,13 +415,36 @@ async def get_preview(ctx: Ctx) -> Reply:
     dst = thumb_path(st.cfg, row["root_id"], row["rel_path"], size)
     sig = f"p{size}-{int(row['mtime'])}-{int(row['size'])}"
 
+    # ⚠️ 下面四步的顺序是**判据的一部分**，不能调换（审计 F5 残留）：
+    #   ① missing → 占位图（不管缓存文件在不在）
+    #   ② 缓存文件也不在 → 占位图 / 404
+    #   ③ 都齐了 → 304 与带一年缓存的流
+    #
+    # 早先 304 排在最前、`missing` 只在"缓存文件也不在"的分支里被用到，
+    # 于是已删除的照片仍然命中 `dst.exists()`（缩略图缓存从不被清理），
+    # 一路落到末尾的 `set_cache(31536000, immutable)`：手机缓存一年、
+    # 一年内不再发请求 —— 用户删了照片，那台手机仍能从缓存里拿出来；
+    # 删错了想恢复，也不会重新请求，因为手上那份看着完全正常。
+    #
+    # 占位图**不缓存在 DB 侧也不缓存在客户端**（`no-store`）：60 秒对一个
+    # "删除 → 撤销删除"的动作仍然太长，而占位图只有几百字节，
+    # 重算一次的成本远低于"让用户怀疑照片没救回来"。
+    if row["missing"]:
+        data = placeholder_webp(size)
+        r = Reply(status=200, body=data, media_type="image/webp")
+        r.headers["Content-Type"] = "image/webp"
+        r.headers["Content-Length"] = str(len(data))
+        r.headers["Cache-Control"] = "no-store"
+        r.set("Vary", "Authorization")
+        return r
+
     if etag_matches(ctx.header("if-none-match"), sig):
         r = empty_reply(304)
         r.set_etag(sig)
         r.set("Vary", "Authorization")
         return r
 
-    if not dst.exists() and not row["missing"]:
+    if not dst.exists():
         try:
             if st.thumbs is not None:
                 await _ensure_size(st, row, dst, size)
@@ -431,13 +462,12 @@ async def get_preview(ctx: Ctx) -> Reply:
                 log.warning("preview sync generate failed media_id=%s: %s", mid, e)
 
     if not dst.exists():
-        if row["missing"]:
-            raise NotFound(f"源文件已丢失 media_id={mid}")
         data = placeholder_webp(size)
         r = Reply(status=200, body=data, media_type="image/webp")
         r.headers["Content-Type"] = "image/webp"
         r.headers["Content-Length"] = str(len(data))
-        r.set_cache(60, private=True)
+        r.headers["Cache-Control"] = "no-store"
+        r.set("Vary", "Authorization")
         return r
 
     try:
@@ -669,6 +699,19 @@ async def search(ctx: Ctx) -> Reply:
     db = st.db
 
     q = (ctx.q("q") or "").strip()
+    # ★ 审计 F16：`q` 里含 C0 控制字符就直接 400，别让它进 LIKE。
+    #
+    # SQLite 的 LIKE 在**模式串的 NUL 处截断**：`"%\x00%"` 退化为 `"%"`，
+    # 于是 `?q=<NUL>` 会 200 返回全表（实测 hits=41 = 库里全部行）。
+    # 这不是 SQL 注入（参数化与 `_esc` 都正确），被削掉的是下面那条
+    # "至少需要一个筛选条件"的守卫意图 —— 它想防的正是"手机端一个
+    # bug 就把索引器挤掉"，而一个退化成 `%` 的模式串等价于没有条件。
+    #
+    # 顺带挡掉其它 C0（`\x01`–`\x1f`）：它们在同一条 LIKE 上都不可见、
+    # 也都不是用户在搜索框里能打出或想搜的东西，一并拒绝比逐个解释简单。
+    # `\t` 放行 —— 粘贴来的文本里夹制表符是真实会发生的。
+    if any(ch < " " and ch != "\t" for ch in q):
+        raise AppError(E1001, "搜索词含不可见控制字符")
     root_id = common.root_id_param(ctx) or None
     ts_from = parse_ts(ctx.q("from"), what="from")
     ts_to = parse_ts(ctx.q("to"), what="to")
@@ -1117,7 +1160,28 @@ async def move_items(ctx: Ctx) -> Reply:
             (mid,),
         )
         if row is None or row["missing"]:
-            failed.append({"id": mid, "code": "E1004", "message": "照片不存在"})
+            # ★ 审计 F14 第 3 条：missing 行原本一律回 "照片不存在"，
+            # 而"照片被移进了扫描排除目录"这一种恰恰是**能用一句话说清、
+            # 且用户能自己修**的 —— 文件还在磁盘上，只是索引器以后不再扫它。
+            # 两者回同一句文案，用户会以为照片被删了，而正确的动作是
+            # 去磁盘上把它搬到别的目录。这里点名那个目录段。
+            seg = ""
+            if row is not None:
+                _root = st.cfg.root_by_id(row["root_id"])
+                if _root is not None:
+                    seg = sandbox.excluded_dir_segment(str(row["rel_path"]), _root)
+            # ★ 命中排除目录时用专属码 E1019（与 rename 同源）。
+            # `message` 不是给用户看的——`moveCurrent()` 把它放进
+            # ApiError，前端仍然优先显示 `user_hint`；但代码也不能
+            # 写 E1004，否则客户端无法把"被排除目录"与"真的没了"区开。
+            failed.append({
+                "id": mid,
+                "code": "E1019" if seg else "E1004",
+                "message": (
+                    f"照片位于被排除的目录「{seg}」，请在电脑上把它移到别的目录"
+                    if seg else "照片不存在"
+                ),
+            })
             continue
 
         root = st.cfg.root_by_id(row["root_id"])
@@ -1133,6 +1197,19 @@ async def move_items(ctx: Ctx) -> Reply:
                 # 不调 sandbox.resolve（它本来就是可信的根配置）。
                 if target_rel:
                     sandbox.resolve(root, target_rel, "write", cfg=st.cfg)
+                    # ★ 审计 F14：`resolve()` 只保证"没越出库根"，它不知道
+                    # `data` / `node_modules` / `#recycle` / `.photobridge_tmp`
+                    # 这些目录名在本库的语义里**不该放照片**（索引器会跳过，
+                    # 于是下一次扫描把照片标成 missing，而 missing 行的
+                    # move/rename 一律 E1004 —— 照片从界面上消失且无法用
+                    # API 移回）。这一步必须在写之前，且整批 400：
+                    # `target_dir` 是整批共用的参数，不是逐项冲突。
+                    #
+                    # ⚠️ `target_rel` 是**目录**，不是文件，必须传
+                    # `last_is_file=False`：默认值 True 会把最后一段当成文件名跳过，
+                    # 于是 `target_dir="data"`（只有一段）判出来是空列表，整条防线形同虚设
+                    # —— 而"移到根目录下的 data 子目录"正是用户最容易误选的目标。
+                    sandbox.reject_excluded(target_rel, root, last_is_file=False)
                 resolved_dirs[root.id] = target_rel
             rel_dir = resolved_dirs[root.id]
 
@@ -1296,6 +1373,22 @@ async def rename_item(ctx: Ctx) -> Reply:
         (mid,),
     )
     if row is None or row["missing"]:
+        # 与 move_items 同源（审计 F14 第 3 条）：如果这条行的目录已经落进
+        # 扫描排除范围，说清真正的原因 —— 文件还在，只是索引器不再认它。
+        seg = ""
+        if row is not None:
+            _root = st.cfg.root_by_id(row["root_id"])
+            if _root is not None:
+                seg = sandbox.excluded_dir_segment(str(row["rel_path"]), _root)
+        if seg:
+            # ★ 用专属码 E1019 而不是 NotFound：前端弹的是
+            # `user_hint`（`ViewerView.vue:243`、`client.ts:66`），而 E1004 的
+            # 提示是"内容不存在或已被删除" —— 用户会以为照片被删了。
+            # 不详细写这一条，下面那句话就只能在日志里被看到。
+            raise AppError(
+                E1019,
+                f"照片位于被排除的目录「{seg}」，请在电脑上把它移到别的目录",
+            )
         raise NotFound("照片不存在")
 
     root = st.cfg.root_by_id(row["root_id"])

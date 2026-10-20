@@ -467,6 +467,73 @@ def is_within(child: Path, parent: Path) -> bool:
         return False
 
 
+# --------------------------------------------------------------------------
+# 扫描排除目录 —— **写入口也必须认它**（审计 F14）
+# --------------------------------------------------------------------------
+
+
+def excluded_dir_segment(rel_path: str, root: RootConfig, *, last_is_file: bool = True) -> str:
+    """返回 `rel_path` 里第一个命中 `root.exclude_dirs` 的目录段；没有则空串。
+
+    为什么单独抽出来：排除名单原本只有索引器在用（`indexer._walk` 跳目录），
+    而**写入口**（`POST /api/items/move` 的 `target_dir`、`POST /api/uploads/init`
+    的 `target_dir`）完全不看它。后果不是"多扫了几个文件"，而是：
+
+      1. 照片被移/传进 `data/`、`node_modules/`、`#recycle/`、`.photobridge_tmp/`
+         —— 这些在 Windows 上都是用户真的会建的目录名，界面上完全正常可选；
+      2. `index_one_file` 照收（它只看文件名），照片**先出现在时间线**；
+      3. 下一次全量扫描 `_walk` 跳过那个目录，`_mark_missing` 把它标成 missing；
+      4. 照片从界面消失，而 `move` / `rename` 对 `missing=1` 的行一律 `E1004`
+         —— **API 侧没有任何回退路径**，只能手工去磁盘上搬回来。
+
+    对非技术用户，这三步等于"照片被删了"。
+
+    这也不是新规则，而是 `indexer.should_index` 的 docstring 里那条铁律的
+    字面要求：「全量扫描与单文件增量是两条独立入口，必须给出完全一致的答案」。
+    当前只对齐了**文件名**这一维，目录维漏了 —— 本函数补的正是目录维。
+
+    参数 `last_is_file`：调用方给的是**文件**相对路径时（move/rename/
+    `index_one_file`）传 True，最后一段是文件名、不参与目录判定（`data`
+    作为文件夹被排除，`data.jpg` 作为文件名不受影响）；调用方给的是
+    **目录**相对路径时（上传的 `subdir`）传 False，每一段都要判。
+
+    ⚠️ 与 `indexer._is_excluded_dir` 逐条对齐：`name.lower() in root.exclude_dirs`，
+    而 `root.exclude_dirs` 在 `config.py` 建根时已全部小写化。
+    """
+    if not rel_path:
+        return ""
+    norm = rel_path.replace("\\", "/").strip().strip("/")
+    if not norm:
+        return ""
+    parts = norm.split("/")
+    check = parts[:-1] if last_is_file else parts
+    for seg in check:
+        if seg.lower() in root.exclude_dirs:
+            return seg
+    return ""
+
+
+def reject_excluded(rel_path: str, root: RootConfig, *, last_is_file: bool = True) -> None:
+    """写入口守卫：目标路径落在扫描排除目录里就拒绝（审计 F14）。
+
+    与 `resolve()` 的分工：`resolve()` 管"有没有越出库根"（安全边界），
+    本函数管"这个位置在本库的语义里是不是一个能放照片的地方"（一致性边界）。
+    两者都必须在写之前跑 —— 少了前者是安全漏洞，少了后者是数据消失。
+
+    抛 `E1009 path_denied`（400）而不是 403：这不是权限问题，是参数落在
+    一个不成立的位置上，与 `target_dir` 写 `..` 同类。文案点名那个目录段，
+    让用户知道要换哪个名字，而不是只看到"路径不合法"。
+    """
+    seg = excluded_dir_segment(rel_path, root, last_is_file=last_is_file)
+    if seg:
+        raise SandboxError(
+            "excluded_dir",
+            f"目标目录「{seg}」不在照片库的索引范围内，"
+            f"放进去的照片不会出现在时间线上",
+            E1009,
+        )
+
+
 def assert_writable(root: RootConfig, need: Need = "write") -> None:
     """只校验权限位、不碰文件系统。用于"提前告知用户此操作不被允许"。"""
     try:
@@ -479,6 +546,7 @@ def assert_writable(root: RootConfig, need: Need = "write") -> None:
 __all__ = [
     "FILE_ATTRIBUTE_REPARSE_POINT", "ILLEGAL_CHARS", "MAX_RELPATH", "MAX_SEGMENT",
     "Need", "RESERVED_NAMES",
-    "assert_writable", "exists", "is_dir", "is_within", "normalize_rel",
+    "assert_writable", "excluded_dir_segment", "exists", "is_dir", "is_within",
+    "normalize_rel", "reject_excluded",
     "resolve", "safe_display", "tmp_dir", "tmp_path",
 ]

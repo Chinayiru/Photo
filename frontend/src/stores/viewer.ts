@@ -487,7 +487,22 @@ export async function moveCurrent(targetDir: string): Promise<MoveResponse["move
   }, { retry: 0, timeoutMs: 60_000 });
 
   const item = r.moved[0];
-  if (!item) return null;          // 目标就是当前目录 → skipped
+  if (!item) {
+    // ★ 三种情况都会没有 `moved[0]`：有意跳过、**真的失败**、
+    //   以及响应本身空。早先一律 `return null`，于是失败被
+    //   `ViewerView.vue:311` 当成"照片已经在这个目录里了"提示 ——
+    //   用户看到一句与事实相反的话，而照片其实没动。
+    const bad = r.failed?.[0];
+    if (bad) {
+      throw new ApiError({
+        status: 0,
+        code: bad.code,
+        message: bad.message,
+        retryable: false,
+      });
+    }
+    return null;                   // 目标就是当前目录 → skipped
+  }
 
   const slash = item.to.lastIndexOf("/");
   const fileName = slash >= 0 ? item.to.slice(slash + 1) : item.to;

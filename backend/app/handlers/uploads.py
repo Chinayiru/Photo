@@ -132,21 +132,37 @@ async def get_upload(ctx: Ctx) -> Reply:
 
     手机端切网络后要靠这个接口恢复进度。返回的 `offset` 以磁盘为准，
     不是 DB 里的值（崩溃可能发生在写完文件与更新 DB 之间）。
+
+    ★ 对**已结束**的会话（`status != 'open'`）不做磁盘对账（审计 F13）：
+    `complete` 归档后 `.part` 已被删掉，磁盘是 0 字节，若照旧对账会把
+    DB 里的 `received` 写成 0，返回 `offset=0, complete=false` ——
+    客户端按 0 重传拿到 `409 E1012`（`retryable=false`），界面报"上传失败"，
+    而照片其实早已入库。查询接口不该有写副作用。
+
+    ★ 同时补齐 `media_id` / `dedup` / `final_rel` / `declared_name`（审计 F19）：
+    `docs/04` §4.3.3 列了它们，而客户端正是靠 `media_id` 判断
+    "其实已经成功了、别再传"，缺了它 F13 的后果会更严重。
     """
     st = _state(ctx)
     uid = _upload_id(ctx)
     sess = uploads.get_session(st.db, uid)
     received = uploads._reconcile_offset(st.db, sess)
+    total = int(sess["total_size"])
     return json_reply({
         "upload_id": uid,
         "offset": received,
         "received": received,
-        "total_size": int(sess["total_size"]),
+        "total_size": total,
         "chunk_size": int(sess["chunk_size"]),
         "status": sess["status"],
         "expires_at": float(sess["expires_at"]),
-        "complete": received >= int(sess["total_size"]),
+        "complete": received >= total,
         "sha256": sess["sha256"],
+        "declared_name": sess["declared_name"],
+        "target_rel": sess["target_rel"],
+        "final_rel": sess["final_rel"],
+        "media_id": sess["media_id"],
+        "dedup": None if sess["dedup"] is None else bool(sess["dedup"]),
     })
 
 

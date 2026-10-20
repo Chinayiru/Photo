@@ -53,6 +53,16 @@ E1015: Final = ErrorSpec("E1015", 403, "write_disabled", "此操作已被电脑�
 E1016: Final = ErrorSpec("E1016", 403, "pair_code_wrong_device", "配对码不属于这台电脑")
 E1017: Final = ErrorSpec("E1017", 400, "ext_not_allowed", "不支持的文件格式")
 E1018: Final = ErrorSpec("E1018", 405, "method_not_allowed", "该操作不被支持")
+#: 照片落在"扫描排除目录"里（审计 F14）。
+#:
+#: 为什么单独立一个码而不用 E1009、E1004：前端弹给用户的是
+#: `user_hint`（`client.ts:66 friendly`、`ViewerView.vue:322`），而 E1009 的提示是
+#: "路径不合法"、E1004 是"内容不存在或已被删除" —— 两句都会把用户
+#: 带往错的方向（照片不仅在，而且能一句话说清怎么救）。
+E1019: Final = ErrorSpec(
+    "E1019", 404, "file_in_excluded_dir",
+    "照片在一个不会被扫描的文件夹里，请在电脑上把它移到别的目录",
+)
 
 # --- E2xxx 认证/授权类 ------------------------------------------------------
 E2001: Final = ErrorSpec("E2001", 401, "account_token_invalid", "登录已过期，请重新登录")
