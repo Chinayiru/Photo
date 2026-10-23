@@ -96,7 +96,13 @@ CREATE TABLE IF NOT EXISTS devices (
     last_seen   REAL,
     last_lan    TEXT NOT NULL DEFAULT '[]',
     created_at  REAL NOT NULL,
-    revoked     INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0, 1))
+    revoked     INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0, 1)),
+    -- 配对失败计数。必须落库而不是放进程内存：内存版一次部署/崩溃/实例
+    -- 迁移就清零，攻击者只要等到重启就能把 5 次额度重置一遍
+    -- （`docs/11` SEC-09）。
+    pair_fails  INTEGER NOT NULL DEFAULT 0,
+    pair_window REAL,
+    pair_locked_until REAL
 );
 
 CREATE TABLE IF NOT EXISTS clients (
@@ -165,6 +171,9 @@ CREATE INDEX IF NOT EXISTS idx_account_tokens_expires
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("accounts", "failed_count", "failed_count INTEGER NOT NULL DEFAULT 0"),
     ("accounts", "locked_until", "locked_until REAL"),
+    ("devices", "pair_fails", "pair_fails INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "pair_window", "pair_window REAL"),
+    ("devices", "pair_locked_until", "pair_locked_until REAL"),
 )
 
 #: 只能用索引表达的约束。`ALTER TABLE` 改不了约束，只能建索引。
