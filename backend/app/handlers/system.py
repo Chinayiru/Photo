@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Any, Final
 
+from ..config import WILDCARD_HOSTS
 from ..core import Ctx, Reply, json_reply
 from ..errors import E1001, BadRequest
 from ..state import AppState
@@ -154,7 +155,11 @@ def _bind_scope(host: str) -> str:
     value = (host or "").strip().strip("[]").lower()
     if value in ("", "localhost", "127.0.0.1", "::1"):
         return "loopback"
-    if value in ("0.0.0.0", "::", "*"):
+    # 字面量只准出现在 `config.WILDCARD_HOSTS`（规则 18 的门控放行处）：
+    # 这里写成 `in WILDCARD_HOSTS` 而不是再抄一遍 "0.0.0.0"/"::"，否则
+    # `scripts/check_lint.py` 的规则 18 会判"绑定地址出现在 _bind_scope()"，
+    # 而这不是绑定，只是分类。
+    if value in WILDCARD_HOSTS:
         return "any"
     try:
         ip = ipaddress.ip_address(value)
