@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import sys
+import time
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -456,3 +457,227 @@ def test_agent_ws_handshake_is_rate_limited_before_the_token_lookup() -> None:
     assert allowed is False and retry_after > 0
     # 换一个 IP 不受影响 —— 否则一个被打满的地址会牵连所有人
     assert lim.hit("5.6.7.8")[0] is True
+
+
+# ------------------------------------ ⑥ 配对尝试计数落在库里（SEC-09）
+
+
+def _account_token(client: TestClient, email: str,
+                   password: str = "Correct-Horse-9") -> str:
+    response = _login(client, email, password)
+    assert response.status_code == 200, response.text
+    return str(response.json()["account_token"])
+
+
+def _insert_device(tmp_path: Path, *, name: str = "家里的电脑") -> str:
+    """直接写一行设备：这条路不需要真 agent 连上来。"""
+    database = cloud_db.CloudDB(str(tmp_path / "cloud.db"))
+    account = database.query_one("SELECT id FROM accounts LIMIT 1")
+    device_id = security.new_device_id()
+    database.execute(
+        "INSERT INTO devices(id, account_id, name, agent_token, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (device_id, account["id"], name, security.new_token(), time.time()))
+    return device_id
+
+
+def _pair(client: TestClient, device_id: str, token: str,
+          code: str = "000000"):
+    return client.post(f"/api/devices/{device_id}/pair",
+                       json={"code": code, "client_name": "手机"},
+                       headers={"Authorization": f"Bearer {token}"})
+
+
+def test_migration_adds_the_pair_counter_columns_to_an_old_database(
+        tmp_path: Path) -> None:
+    """老 `devices` 表升级后必须长出 `pair_fails` / `pair_window` /
+    `pair_locked_until`，并且已有设备行也算 0 次失败。
+
+    线上那台服务器的库建于 2026-10-23，`devices` 里没有这三列。迁移漏了
+    的表现是 `/api/devices/{id}/pair` 一条 500（`no such column`），而且
+    只在生产出现 —— 测试建的都是新库，一条都不会红。
+    """
+    import sqlite3
+
+    path = tmp_path / "old-devices.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE accounts ("
+        " id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL,"
+        " pass_hash TEXT NOT NULL, created_at REAL NOT NULL);"
+        "CREATE TABLE devices ("
+        " id TEXT PRIMARY KEY, account_id TEXT NOT NULL,"
+        " name TEXT NOT NULL, agent_token TEXT NOT NULL UNIQUE,"
+        " version TEXT NOT NULL DEFAULT '', last_seen REAL,"
+        " last_lan TEXT NOT NULL DEFAULT '[]',"
+        " created_at REAL NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);")
+    conn.execute("INSERT INTO accounts(id, email, pass_hash, created_at) "
+                 "VALUES ('a1', 'old@example.com', 'x', 1.0)")
+    conn.execute("INSERT INTO devices(id, account_id, name, agent_token, "
+                 "created_at) VALUES ('d1', 'a1', '老电脑', 'tok', 1.0)")
+    conn.commit()
+    conn.close()
+
+    database = cloud_db.CloudDB(str(path))
+    database.init()          # ← 迁移在这里发生
+    row = database.query_one(
+        "SELECT pair_fails, pair_window, pair_locked_until FROM devices "
+        "WHERE id = 'd1'")
+    assert int(row["pair_fails"] or 0) == 0
+    assert row["pair_window"] is None
+    assert row["pair_locked_until"] is None
+
+
+def test_failed_pair_attempts_are_counted_in_the_database(
+        tmp_path: Path) -> None:
+    """一次失败必须落成设备行上的计数，而不是只活在进程内存里。
+
+    修之前 `devices` 表根本没有这几列，`pair_codes.tries` 是"写得进、
+    没人读"的死列 —— 重启一次，5 次额度就白送。
+    """
+    _make_account(tmp_path)
+    client = TestClient(_app(tmp_path, dist=_dist(tmp_path)),
+                        client=("203.0.113.11", 5000))
+    token = _account_token(client, "owner@example.com")
+    device_id = _insert_device(tmp_path)
+
+    first = _pair(client, device_id, token)
+    assert first.status_code == 400
+    assert first.json()["error"]["code"] == "E1002"
+
+    database = cloud_db.CloudDB(str(tmp_path / "cloud.db"))
+    row = database.query_one(
+        "SELECT pair_fails, pair_window, pair_locked_until FROM devices "
+        "WHERE id = ?", (device_id,))
+    assert int(row["pair_fails"]) == 1
+    assert row["pair_window"] is not None, "窗口起点没写，计数永远不会过期"
+    assert row["pair_locked_until"] is None
+
+    assert _pair(client, device_id, token).status_code == 400
+    row = database.query_one(
+        "SELECT pair_fails FROM devices WHERE id = ?", (device_id,))
+    assert int(row["pair_fails"]) == 2
+
+
+def test_five_failures_lock_the_device_across_a_restart(tmp_path: Path) -> None:
+    """5 次失败把**设备**锁住；换个出口 IP、并且模拟一次重启，照样锁着。
+
+    这是 SEC-09 的核心：锁必须属于设备（库），不属于进程（内存）。
+    换 IP 用到的是另一个客户端地址，它的 IP 桶是干净的 —— 如果计数还
+    在内存里，这一次就会被放行。
+    """
+    from cloud.relay import pairing
+
+    _make_account(tmp_path)
+    app = _app(tmp_path, dist=_dist(tmp_path))
+    client = TestClient(app, client=("203.0.113.21", 5000))
+    token = _account_token(client, "owner@example.com")
+    device_id = _insert_device(tmp_path)
+
+    for _ in range(pairing._DEVICE_MAX_TRIES):
+        assert _pair(client, device_id, token).status_code == 400
+
+    # 「重启」：进程内计数清空 + 换一个新的 CloudDB 连接
+    pairing._ATTEMPTS.clear()
+    restarted = TestClient(app, client=("203.0.113.99", 5000))
+    locked = _pair(restarted, device_id, token)
+    assert locked.status_code == 429
+    assert locked.json()["error"]["code"] == "E4004"
+    assert int(locked.headers.get("retry-after", "0")) > 0
+
+    database = cloud_db.CloudDB(str(tmp_path / "cloud.db"))
+    row = database.query_one(
+        "SELECT pair_fails, pair_locked_until FROM devices WHERE id = ?",
+        (device_id,))
+    assert float(row["pair_locked_until"] or 0) > time.time()
+    assert int(row["pair_fails"]) == pairing._DEVICE_MAX_TRIES
+
+
+def test_an_old_window_restarts_the_count_instead_of_locking(
+        tmp_path: Path) -> None:
+    """窗口过期后重新从 1 数起 —— 否则"半年里错 5 次"也会被锁。"""
+    from cloud.relay import pairing
+
+    _make_account(tmp_path)
+    client = TestClient(_app(tmp_path, dist=_dist(tmp_path)),
+                        client=("203.0.113.31", 5000))
+    token = _account_token(client, "owner@example.com")
+    device_id = _insert_device(tmp_path)
+
+    database = cloud_db.CloudDB(str(tmp_path / "cloud.db"))
+    database.execute(
+        "UPDATE devices SET pair_fails = ?, pair_window = ?, "
+        "pair_locked_until = NULL WHERE id = ?",
+        (pairing._DEVICE_MAX_TRIES,
+         time.time() - pairing.PAIR_LOCK_SECONDS - 1, device_id))
+
+    assert _pair(client, device_id, token).status_code == 400
+    row = database.query_one(
+        "SELECT pair_fails, pair_locked_until FROM devices WHERE id = ?",
+        (device_id,))
+    assert int(row["pair_fails"]) == 1, "旧窗口没被重置，第 6 次就误锁了"
+    assert row["pair_locked_until"] is None
+
+
+def test_a_successful_pair_clears_the_device_counters(tmp_path: Path) -> None:
+    """配对成功必须清零 —— 不清等于白送 5 次免费额度。"""
+    _make_account(tmp_path)
+    client = TestClient(_app(tmp_path, dist=_dist(tmp_path)),
+                        client=("203.0.113.41", 5000))
+    token = _account_token(client, "owner@example.com")
+    device_id = _insert_device(tmp_path)
+
+    database = cloud_db.CloudDB(str(tmp_path / "cloud.db"))
+    code = "424242"
+    database.execute(
+        "INSERT INTO pair_codes(code, device_id, expires_at, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (code, device_id, time.time() + 300, time.time()))
+    database.execute(
+        "UPDATE devices SET pair_fails = 3, pair_window = ? WHERE id = ?",
+        (time.time(), device_id))
+
+    paired = _pair(client, device_id, token, code=code)
+    assert paired.status_code == 200, paired.text
+    assert paired.json()["client_token"].startswith("pbc1.")
+
+    row = database.query_one(
+        "SELECT pair_fails, pair_window, pair_locked_until FROM devices "
+        "WHERE id = ?", (device_id,))
+    assert int(row["pair_fails"]) == 0
+    assert row["pair_window"] is None
+    assert row["pair_locked_until"] is None
+
+
+def test_the_pair_code_row_is_the_first_gate(tmp_path: Path) -> None:
+    """`pair_codes.tries` / `locked_until` 不再是被写入却没人读的死列。
+
+    直接给一个真实存在的码记 5 次失败（模拟"码拿对了但不是这台电脑"），
+    第 6 次必须被这道码锁挡住 —— 设备锁此时是干净的，挡住它的只能是码锁。
+    """
+    from cloud.relay import pairing
+
+    _make_account(tmp_path)
+    client = TestClient(_app(tmp_path, dist=_dist(tmp_path)),
+                        client=("203.0.113.51", 5000))
+    token = _account_token(client, "owner@example.com")
+    device_id = _insert_device(tmp_path)
+
+    database = cloud_db.CloudDB(str(tmp_path / "cloud.db"))
+    code = "515151"
+    database.execute(
+        "INSERT INTO pair_codes(code, device_id, expires_at, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (code, device_id, time.time() + 300, time.time()))
+
+    for _ in range(pairing._DEVICE_MAX_TRIES):
+        pairing._note_code_failure(database, code)
+
+    row = database.query_one(
+        "SELECT tries, locked_until FROM pair_codes WHERE code = ?", (code,))
+    assert int(row["tries"]) == pairing._DEVICE_MAX_TRIES
+    assert float(row["locked_until"] or 0) > time.time()
+
+    blocked = _pair(client, device_id, token, code=code)
+    assert blocked.status_code == 429
+    assert blocked.json()["error"]["code"] == "E4004"
