@@ -45,7 +45,6 @@ import {
   getDeviceName,
   getToken,
   normalizeBase,
-  saveBase,
   savePairing,
 } from "../api/storage";
 import {
@@ -243,9 +242,14 @@ export async function pair(base: string, code: string,
     });
   }
 
-  // ★ 先把 base 落到 localStorage，再发请求 —— client.ts 的 baseUrl 是
-  //   每次读 localStorage 的 getter，不写进去就发到了旧地址
-  saveBase(cleanBase);
+  // ★ 这里**不能**先把 base 写进 localStorage。
+  //   之前是"先落盘再请求"，于是用户填错一次地址、或者电脑没开，
+  //   那个连不上的地址就长期留在 localStorage 里：下次冷启动所有请求都
+  //   打到那儿，连"重新配对"的页面都得等它超时；而 `PairView` 每次挂载
+  //   都会自动 `submit()`，失败一次就多攒一次限速额度，用户自己把自己
+  //   锁在门外（`docs/11` SEC-23）。
+  //   改法：基址只随这个请求走（`base` 选项），成功之后由 `savePairing()`
+  //   一并落盘。
 
   // ★ 二维码校验必须在**消费配对码之前**。若先 POST /api/pair 再发现
   //   device_id 不对，服务端已经把那一枚码用掉了（`used_at` 已写），
@@ -255,7 +259,7 @@ export async function pair(base: string, code: string,
     let actual = "";
     try {
       const ping = await api.get<PingResponse>("/api/system/ping", {
-        timeoutMs: 5000, skipAuthLost: true,
+        timeoutMs: 5000, skipAuthLost: true, base: cleanBase,
       });
       actual = ping.device_id;
     } catch {
@@ -279,6 +283,8 @@ export async function pair(base: string, code: string,
       // 配对本身是未鉴权的，不要因为它 401 就触发"配对失效"逻辑
       skipAuthLost: true,
       timeoutMs: 15_000,
+      // 候选地址只走这一次请求；落盘在下面 `savePairing()` 里发生
+      base: cleanBase,
     });
     savePairing({
       token: r.client_token,

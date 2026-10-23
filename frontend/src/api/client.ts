@@ -284,6 +284,14 @@ export interface RequestOptions {
   timeoutMs?: number;
   /** 不触发"配对失效"跳转（配对接口自身用）。 */
   skipAuthLost?: boolean;
+  /**
+   * 这一次请求用的基址，覆盖 `currentBase()`，**不落盘**。
+   *
+   * 只给"基址还没定下来"的场景用（配对时的 ping 与 `/api/pair`）：
+   * 用户在输入框里试一个地址，试错一次就把它写进 localStorage 的话，
+   * 下次冷启动会拿着一个连不上的地址去发所有请求（`docs/11` SEC-23）。
+   */
+  base?: string;
   signal?: AbortSignal;
 }
 
@@ -316,7 +324,8 @@ async function parseError(res: Response): Promise<ApiError> {
 }
 
 async function once<T>(path: string, opt: RequestOptions): Promise<T> {
-  const base = currentBase();
+  // `opt.base` 只用于"这次试一个候选地址"（配对），成功之前不进 localStorage。
+  const base = opt.base || currentBase();
   if (!base) {
     throw new ApiError({
       status: 0,
