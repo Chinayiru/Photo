@@ -14,6 +14,7 @@ import os
 import shutil
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +82,21 @@ __all__ = [
 MAX_LIMIT = 500
 DEFAULT_LIMIT = 100
 PLACEHOLDER_SIZE = 320
+
+#: 兜底缩略图解码用的**单线程**池（没有 ThumbEngine 时才会用到）。
+#:
+#: ★ 原来这里传的是 `run_in_executor(None, ...)`，也就是 asyncio 的默认
+#: 线程池 —— 默认池的大小是 `min(32, cpu+4)`，完全不受 `ThumbEngine._sem`
+#: （4 并发）约束。结果是"正常路径有并发闸门、兜底路径没有"：4 个引擎
+#: 解码 + N 个兜底解码同时跑，一张 48MP 图解码后是 144MB RGB，几路并发
+#: 就能把家用小主机的内存吃光。
+#:
+#: 用模块级单线程而不是"每个请求一个池"：池的创建成本要摊掉，而且这里
+#: 要的正是**全局串行**（同一时刻只解一张图）。它与事件循环无关，
+#: 请求之间的排队发生在队列里，不占事件循环。
+_THUMB_FALLBACK_POOL = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="thumb-fallback"
+)
 
 
 def _st(ctx: Ctx) -> AppState:
@@ -342,15 +358,24 @@ async def _serve_thumb(st: AppState, ctx: Ctx, mid: int) -> Reply:
 
 async def _generate_sync(st: AppState, row: Any, dst: Path, size: int) -> None:
     """没有 ThumbEngine 时的兜底生成（测试与轻量嵌入场景）。"""
-    from ..thumbs import generate_thumb
+    from ..thumbs import OversizedImageError
 
     src = sandbox.resolve(st.cfg.root_by_id(row["root_id"]), row["rel_path"],
                           "read", cfg=st.cfg)
     if not src.exists():
         return
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _call_generate, str(src), dst, size,
-                              row["orientation"])
+    try:
+        await loop.run_in_executor(_THUMB_FALLBACK_POOL, _call_generate, str(src),
+                                   dst, size, row["orientation"])
+    except OversizedImageError as exc:
+        # 声明尺寸超单边上限 → 走与 ThumbEngine 完全相同的"永久失败"落库，
+        # 让时间线拿到占位图而不是反复重试。不落库的话每次刷新都会再试一次，
+        # 而这类图每次都要读文件头 + 抛异常，是个可以被反复触发的放大型操作。
+        log.warning("thumb skipped (image too large) media_id=%s: %s",
+                    row["id"], exc)
+        st.db.execute("UPDATE media SET thumb_state='failed' WHERE id=?", (row["id"],))
+        return
     # ★ 写回**磁盘上**的签名，与 `_source_sig()` 保持同一口径。
     # 若这里写 DB 的旧 mtime，下一次请求算出的 disk 签名与它不等，
     # 就会判定"陈旧"并重新生成 —— 用户每刷新一次页面就重生成一遍缩略图。

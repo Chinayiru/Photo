@@ -81,6 +81,34 @@ def _reset_global_state() -> None:
     except Exception:       # noqa: BLE001
         pass
 
+    # 云端登录的两个限流桶是模块级单例（`cloud/relay/auth.py`）。
+    # `_login_limiter` 10 次/600 s 按来源 IP，`_email_limiter` 同样 10 次/600 s
+    # 按邮箱 —— 整套测试里几十个用例都从 `127.0.0.1` 用同一个邮箱登录，
+    # 不清就会在后半段集体 429，表现成"隧道/配对坏了"，且只在跑全量时出现。
+    # 生产当然不该清，测试必须清。
+    try:
+        from cloud.relay import auth as cloud_auth
+
+        cloud_auth._login_limiter.reset()
+        cloud_auth._email_limiter.reset()
+    except Exception:       # noqa: BLE001
+        pass
+
+    # 缩略图缓存统计的 60 秒 memo（ISSUE-034 ①）。
+    # 不清的话，前一个用例算出的 (文件数, 总字节) 会漏到后一个用例里 ——
+    # 后者往自己的 tmp 缩略图目录里写文件后断言"字节数变了"就会失败，
+    # 而且是"有时失败有时不失败"（取决于 60 秒窗口和用例顺序）。
+    #
+    # ⚠️ 必须清**两种模块名**：测试文件 `sys.path.insert(0, "backend")` 之后
+    # import 的是 `app.handlers.system`，而本文件 import 的是
+    # `backend.app.handlers.system` —— 在 `sys.modules` 里这是**两个不同的
+    # 模块对象**，而 `_thumb_cache_memo` 属于前者。只清后者的效果是"假装清过了"：
+    # 本文件看到的 memo 归零，被测代码用的那份原封不动。
+    for _mod_name in ("app.handlers.system", "backend.app.handlers.system"):
+        _mod = sys.modules.get(_mod_name)
+        if _mod is not None:
+            _mod._thumb_cache_memo = None
+
 
 @pytest.fixture(autouse=True)
 def _isolate_global_state():

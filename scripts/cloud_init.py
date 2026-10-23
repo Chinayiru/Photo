@@ -45,7 +45,31 @@ def _db_path() -> str:
     return os.environ.get("PB_CLOUD_DB", "cloud.db")
 
 
+def _read_password(args: argparse.Namespace) -> str:
+    """取账号口令：优先 stdin，其次参数。
+
+    ★ 为什么需要这条：`--password` 会把明文写进三个地方 —— 进程命令行
+    （`Get-CimInstance Win32_Process` 可见）、PowerShell 的
+    `ConsoleHost_history.txt`、以及开了审核时的 4688 事件。2026-10-23 的
+    安全审计里就有一条：`deploy.ps1` 的用法示例本身在教人把口令写进
+    命令行（`docs/11` ISSUE-032）。
+
+    `--password-stdin` 从管道读一行，口令不进 argv、不进 history。
+    """
+    if getattr(args, "password_stdin", False):
+        line = sys.stdin.readline()
+        if not line:
+            print("--password-stdin 但 stdin 是空的", file=sys.stderr)
+            return ""
+        return line.rstrip("\r\n")
+    return str(getattr(args, "password", "") or "")
+
+
 def cmd_init(args: argparse.Namespace) -> int:
+    password = _read_password(args)
+    if not password:
+        print("缺少口令：用 --password-stdin（推荐）或 --password", file=sys.stderr)
+        return 2
     db = CloudDB(_db_path())
     db.init()
     email = args.email.strip().lower()
@@ -54,7 +78,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"账号已存在：{email}（id={row['id']}）", file=sys.stderr)
         account_id = str(row["id"])
     else:
-        account = create_account(db, email, args.password)
+        account = create_account(db, email, password)
         account_id = account["id"]
         print(f"已建账号：{email} id={account_id}")
 
@@ -117,7 +141,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p_init = sub.add_parser("init", help="建账号并登记一台电脑")
     p_init.add_argument("--email", required=True)
-    p_init.add_argument("--password", required=True)
+    p_init.add_argument("--password", default="",
+                        help="账号口令；建议改用 --password-stdin 免落 argv")
+    p_init.add_argument("--password-stdin", action="store_true",
+                        help="从 stdin 读一行当口令（不进进程命令行与历史）")
     p_init.add_argument("--device-name", default="我的电脑")
     p_init.add_argument("--version", default="0.1.0")
     p_init.add_argument("--base-url", default="https://your-domain.com")

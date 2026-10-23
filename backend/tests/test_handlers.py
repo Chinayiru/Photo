@@ -12,7 +12,9 @@ mock 掉之后测的就只是"我自己的 mock 被调用过"，而真正的 bug
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1375,3 +1377,199 @@ def test_every_item_endpoint_rejects_non_integer_media_id(
     r = _call(st, "GET", f"/api/items/..%2f..%2fsecret.txt{suffix}")
     assert r.status == 400
     assert _json(r)["error"]["code"] == "E1001"
+
+
+# --------------------------------------------------------------------------
+# 缩略图缓存统计：一次遍历 + 60 秒 memo（ISSUE-034 ①）
+# --------------------------------------------------------------------------
+
+
+def _seed_thumb_cache(st: AppState, count: int, *, size: int = 512) -> int:
+    """在缩略图缓存目录里放 `count` 个 `.webp`，返回它们的总字节数。
+
+    多层子目录是刻意的：真实布局是 `<thumbs>/<root_id>/<两级散列>/<尺寸>.webp`，
+    只平铺一层的话"没递归进去"这种 bug 测不出来。
+    """
+    root = st.cfg.data_path("thumbs")
+    for i in range(count):
+        p = root / f"aa{i % 3:02x}" / f"bb{i % 5:02x}" / f"cc{i:04d}.webp"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"\0" * size)
+    return count * size
+
+
+def test_system_info_reports_thumb_cache_bytes_and_files(
+    tmp_path: Path, library: Path
+) -> None:
+    """`/api/system/info` 的两个缓存数字必须与磁盘一致（合并遍历后没算错）。
+
+    合并成一次遍历时最容易犯的错是"把缓存目录里的**文件数**写成**目录数**"
+    或"只数了第一层" —— 数值本身不对，但请求照样 200，不写这条就没人发现。
+    """
+    st = _state(tmp_path, library)
+    total = _seed_thumb_cache(st, 7, size=100)
+
+    info = _json(_call(st, "GET", "/api/system/info"))
+    assert info["thumbs"]["cache_files"] == 7
+    assert info["thumbs"]["cache_bytes"] == total
+
+    # stats 用的是同一个统计，数字必须一致（它们是同一个 memo 的两列）
+    stats_payload = _json(_call(st, "GET", "/api/system/stats"))
+    assert stats_payload["thumbs"]["cache_files"] == 7
+    assert stats_payload["thumbs"]["cache_bytes"] == total
+
+
+def test_thumb_cache_scan_happens_once_per_ttl(
+    tmp_path: Path, library: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TTL 内第二次请求不允许再遍历目录。
+
+    这就是这条审计项的核心：原本 `info` 与 `stats` 每次各跑两遍
+    `rglob + stat`，10 万张照片 = 一次请求 40 万次系统调用，而且全在
+    事件循环里。判据不看实现：数"磁盘遍历发生了几次"。
+    """
+    st = _state(tmp_path, library)
+    _seed_thumb_cache(st, 4, size=50)
+
+    walks: list[str] = []
+    real_scan = system._scan_thumb_cache
+
+    def _spy(root: Path) -> tuple[int, int]:
+        walks.append(str(root))
+        return real_scan(root)
+
+    monkeypatch.setattr(system, "_scan_thumb_cache", _spy)
+
+    for _ in range(3):
+        _json(_call(st, "GET", "/api/system/info"))
+    _json(_call(st, "GET", "/api/system/stats"))
+    assert len(walks) == 1, f"60 秒内应该只遍历一次，实际 {len(walks)} 次"
+
+    # 过期后必须重算（memo 不能变成"永远不再更新"的假数据）
+    monkeypatch.setattr(system, "_THUMB_CACHE_TTL", 0.0)
+    _json(_call(st, "GET", "/api/system/info"))
+    assert len(walks) == 2
+
+
+def test_thumb_cache_scan_is_shared_by_concurrent_requests(
+    tmp_path: Path, library: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """并发请求不能各自跑一遍遍历。
+
+    memo 只挡"算完之后"的重复调用；冷启动时同时涌入的 N 个请求会**同时**
+    发现 memo 为空 —— 没有锁的话它们各跑一遍（正是要消除的放大效应）。
+    这里放 8 个并发，要求磁盘遍历仍然只发生 1 次。
+    """
+    st = _state(tmp_path, library)
+    _seed_thumb_cache(st, 3, size=64)
+
+    walks: list[str] = []
+    real_scan = system._scan_thumb_cache
+
+    def _spy(root: Path) -> tuple[int, int]:
+        walks.append(str(root))
+        time.sleep(0.01)          # 放大竞态窗口：不睡的话第一个可能已经算完了
+        return real_scan(root)
+
+    monkeypatch.setattr(system, "_scan_thumb_cache", _spy)
+
+    async def _fan_out() -> list[dict]:
+        ctxs = [_ctx(st, "GET", "/api/system/info") for _ in range(8)]
+        replies = await asyncio.gather(*(system.info(c) for c in ctxs))
+        return [_json(r) for r in replies]
+
+    payloads = asyncio.run(_fan_out())
+    assert len(walks) == 1, f"8 个并发请求应该只遍历一次，实际 {len(walks)} 次"
+    assert all(p["thumbs"]["cache_files"] == 3 for p in payloads)
+
+
+# --------------------------------------------------------------------------
+# 缩略图兜底路径：单边上限 + 全局串行（ISSUE-034）
+# --------------------------------------------------------------------------
+
+
+def test_oversized_thumb_is_marked_failed_without_decoding(
+    tmp_path: Path, library: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """单边超 20000 像素的图：标 `failed` + 回占位图，而不是硬解码。
+
+    判据是**行为**而不是异常类型：请求本身必须成功拿到一张图（占位图），
+    库里这一行必须变成 `failed`，而且下一次请求不能再尝试解码 —— 否则
+    用户每刷新一次列表就会重新吃一遍峰值内存。
+    """
+    from app import thumbs as thumbs_mod
+
+    st = _state(tmp_path, library)          # thumbs=None ⇒ 走兜底生成路径
+    _img(library / "wide.png", size=(thumbs_mod.MAX_IMAGE_EDGE + 1, 8), fmt="PNG")
+    asyncio.run(_index_all(st))
+    mid = int(st.db.scalar("SELECT id FROM media WHERE file_name = ?", ("wide.png",)))
+
+    calls: list[Path] = []
+    real_call = browse._call_generate
+
+    def _spy(src, dst, size, orientation):
+        calls.append(Path(dst))
+        return real_call(src, dst, size, orientation)
+
+    monkeypatch.setattr(browse, "_call_generate", _spy)
+
+    first = _call(st, "GET", f"/api/items/{mid}/thumb")
+    assert first.status == 200
+    assert first.headers["Content-Type"] == "image/webp"
+    # 占位图不缓存：用户修好文件后刷新就能看到真图
+    assert first.headers["Cache-Control"] == "no-store"
+    assert len(_body(first)) > 0
+
+    assert st.db.scalar("SELECT thumb_state FROM media WHERE id = ?", (mid,)) == "failed"
+    assert len(calls) == 1, f"超限图应该只尝试一次，实际 {len(calls)} 次"
+
+    # 第二次请求：不再解码，直接报"这张图无法生成缩略图"
+    second = _call(st, "GET", f"/api/items/{mid}/thumb")
+    assert second.status == 500
+    assert _json(second)["error"]["code"] == "E3004"
+    assert len(calls) == 1, f"已判失败的图不能再解码，实际 {len(calls)} 次"
+
+
+def test_fallback_thumb_generation_is_serialized(
+    tmp_path: Path, library: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """兜底路径的解码必须**全局串行**，不能绕开 4 并发闸。
+
+    原来这里走的是 `run_in_executor(None, ...)`（asyncio 默认线程池，
+    `min(32, cpu+4)` 个线程），与 `ThumbEngine._sem` 的 4 并发完全无关 ——
+    4 个引擎任务 + N 个兜底任务可以同时解码，一张 48MP 图解码后是 150MB，
+    几路并发就能把家用小主机拖进 swap。判据：同时在解码的峰值必须是 1。
+    """
+    st = _state(tmp_path, library)
+    _seed_three(st, library)
+    ids = [int(r["id"]) for r in st.db.query("SELECT id FROM media ORDER BY id")]
+
+    active: list[int] = []
+    peak = [0]
+    real_call = browse._call_generate
+
+    def _slow(src, dst, size, orientation):
+        active.append(1)
+        peak[0] = max(peak[0], len(active))
+        try:
+            time.sleep(0.05)      # 放大窗口：不睡的话第一个可能已经跑完了
+            return real_call(src, dst, size, orientation)
+        finally:
+            active.pop()
+
+    monkeypatch.setattr(browse, "_call_generate", _slow)
+
+    async def _fan_out() -> list:
+        ctxs = [_ctx(st, "GET", f"/api/items/{mid}/thumb",
+                     params={"media_id": str(mid)}) for mid in ids]
+        return await asyncio.gather(*(browse.get_thumb(c) for c in ctxs))
+
+    replies = asyncio.run(_fan_out())
+    assert [r.status for r in replies] == [200] * len(ids)
+    assert peak[0] == 1, f"兜底解码必须串行，实际峰值 {peak[0]} 路并发"
+
+
+async def _index_all(st: AppState) -> None:
+    from app.indexer import Indexer
+
+    await Indexer(st.cfg, st.db).scan_root(st.cfg.root_by_id("library"))

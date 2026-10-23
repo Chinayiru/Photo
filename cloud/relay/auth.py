@@ -32,7 +32,7 @@ from typing import Any
 from starlette.requests import Request
 from starlette.responses import Response
 
-from ..relay import security
+from ..relay import netutil, security
 from ..relay.db import CloudDB
 from ..relay.limiter import RateLimiter
 from ..relay.reply import json_error, json_reply, no_content
@@ -53,8 +53,21 @@ ACCOUNT_TOKEN_TTL_DAYS: int = 7
 _LOGIN_LIMIT: int = 10
 _LOGIN_WINDOW: float = 600.0
 
+#: 单邮箱连续失败 5 次后锁 15 分钟（`docs/11` ISSUE-031）。
+#:
+#: 为什么除了按 IP 限流还要按**账号**计数：按 IP 的桶永远能被"换 IP"绕开，
+#: 而一个账号的口令空间是固定的。反过来，按账号计数会带来"攻击者故意输错
+#: 把主人锁在门外"的风险 —— 所以锁定时间取短（15 分钟）且**响应与密码错误
+#: 完全一致**（E2005），不泄露"这个邮箱存在且被锁了"。
+_ACCOUNT_MAX_FAILS: int = 5
+_ACCOUNT_LOCK_SECONDS: float = 900.0
+
 #: 进程内登录限流器。多 worker 部署会各自计数 ⇒ 必须单进程（见 main.py）。
 _login_limiter = RateLimiter(_LOGIN_LIMIT, _LOGIN_WINDOW)
+
+#: 按邮箱的限流器。与 `_login_limiter` 是**两个独立桶**：IP 桶防"一个来源
+#: 猛撞"，邮箱桶防"一堆来源撞同一个账号"。
+_email_limiter = RateLimiter(_LOGIN_LIMIT, _LOGIN_WINDOW)
 
 
 def account_tokens_table() -> str:
@@ -137,17 +150,38 @@ async def login(request: Request, db: CloudDB) -> Response:
         return json_error("E1001", message="密码长度不正确",
                           request_id=_rid(request))
 
+    # 按邮箱的第二道桶。放在字段校验之后、查库之前：它统计的是"对某个
+    # 账号的尝试次数"，不含畸形请求。
+    allowed_email, retry_email = _email_limiter.hit(email)
+    if not allowed_email:
+        return json_error("E4001", request_id=_rid(request),
+                          retry_after=max(1, int(retry_email)))
+
     row = db.query_one(
-        "SELECT id, email, pass_hash, created_at, plan, last_login "
-        "FROM accounts WHERE email = ?", (email,))
+        "SELECT id, email, pass_hash, created_at, plan, last_login, "
+        "failed_count, locked_until FROM accounts WHERE email = ?", (email,))
     # ★ 账号不存在与密码错误必须走同一个分支，且耗时相近。
     # `verify_password` 在 stored 非法时立刻返回 False（微秒级），而正常
     # 校验要 30-80ms —— 直接对比会暴露"这个邮箱存在"。所以这里用一段
     # 固定的假哈希把时间对齐。
     stored = row["pass_hash"] if row is not None else _FAKE_HASH
     ok = security.verify_password(password, stored)
-    if row is None or not ok:
+    now = time.time()
+    locked_until = float(row["locked_until"] or 0.0) if row is not None else 0.0
+    if row is not None and locked_until > now:
+        # 锁定期间**照样校验口令**（上面的 `ok` 已经算过），但一律按失败
+        # 处理：既不让锁定期变成"口令正确就能进"，也不让响应形态与
+        # "密码错"有区别。
         return json_error("E2005", request_id=_rid(request))
+    if row is None or not ok:
+        if row is not None:
+            _note_login_failure(db, str(row["id"]),
+                                int(row["failed_count"] or 0), now)
+        return json_error("E2005", request_id=_rid(request))
+
+    if int(row["failed_count"] or 0) or locked_until:
+        db.execute("UPDATE accounts SET failed_count = 0, locked_until = NULL "
+                   "WHERE id = ?", (str(row["id"]),))
 
     account_id = str(row["id"])
     label = body.get("client_label")
@@ -246,13 +280,30 @@ def _rid(request: Request) -> str:
 def _client_ip(request: Request) -> str:
     """取客户端 IP。
 
-    ★ **不信任 `X-Forwarded-For`**，除非部署时明确配置了可信代理。
-    这里退回 `request.client.host`：单层 Caddy 反代会覆盖成真实地址，
-    而多层/直连时伪造 `X-Forwarded-For` 只能换到一个假的限流 key——
-    那本身就是攻击者的目标（把自己伪装成一千个 IP 绕过 10 次/10 分钟）。
+    ★ 判据全在 `netutil`：只有当**直连对端**落在 `PB_CLOUD_TRUSTED_PROXIES`
+    里时才看 `X-Forwarded-For`。部署拓扑是 `公网 → cloudflared / 80 端口
+    转发 → 127.0.0.1:8000`，若一律取 `request.client.host`，所有手机都会
+    共用 `127.0.0.1` 一个限流桶（`docs/11` ISSUE-030：攻击者每分钟 10 个假
+    登录就能把主人锁在门外）；若一律信 `X-Forwarded-For`，攻击者换个头发
+    一个假 IP 就能把 10 次/10 分钟变成无限次。
     """
-    client = request.client
-    return (client.host if client is not None else "") or "unknown"
+    return netutil.client_ip(request)
+
+
+def _note_login_failure(db: CloudDB, account_id: str, failed: int,
+                        now: float) -> None:
+    """记一次口令错误；达到阈值就把账号锁一段时间。
+
+    `failed_count` 在锁定时清零：否则"锁定到期后再错一次"会立刻重新触发
+    锁定，账号会变成永久锁死（用户唯一的自救办法是改库）。
+    """
+    failed += 1
+    if failed >= _ACCOUNT_MAX_FAILS:
+        db.execute("UPDATE accounts SET failed_count = 0, locked_until = ? "
+                   "WHERE id = ?", (now + _ACCOUNT_LOCK_SECONDS, account_id))
+        return
+    db.execute("UPDATE accounts SET failed_count = ? WHERE id = ?",
+               (failed, account_id))
 
 
 async def _json_object(request: Request) -> dict[str, Any] | None:

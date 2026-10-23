@@ -24,7 +24,7 @@
 from __future__ import annotations
 
 import mimetypes
-from typing import Protocol, runtime_checkable
+from typing import ClassVar, Protocol, runtime_checkable
 
 from ..core import Ctx, Reply
 
@@ -41,6 +41,11 @@ __all__ = [
 
 class RangeNotSatisfiable(Exception):
     """Range 头无法满足（越界或格式非法）→ 调用方应回 416。"""
+
+    #: 调用方统一用的 HTTP 状态码。`backend/app/handlers/browse.py` 里
+    #: `except RangeNotSatisfiable: return _reply(416, ...)`，测试也读这个属性；
+    #: 写在一处，避免"改了一边忘了另一边"。
+    status: ClassVar[int] = 416
 
     def __init__(self, size: int) -> None:
         super().__init__(f"range not satisfiable for size {size}")
@@ -103,6 +108,22 @@ def content_type_for(ext: str) -> str:
     return DEFAULT_MIME
 
 
+def _is_ascii_digits(value: str) -> bool:
+    """是否全是 **ASCII** 数字。
+
+    ★ 不能只用 `str.isdigit()`：它对 Unicode 数字同样返回 True ——
+    `"²".isdigit()`、全角 `"１２３".isdigit()`、`"٣".isdigit()` 都是 True，
+    但 `int("²")` 会抛 `ValueError`。于是 `Range: bytes=²-` 不再是
+    "格式不合法 → 416"，而是 `ValueError` 逃出 handler → **500**。
+
+    这类 500 比看上去严重：它不需要任何凭证之外的东西，一个 `curl`
+    就能稳定复现，而且 `/api/items/{id}/raw` 是每个图片请求都会走的路径。
+    RFC 7233 的 range 语法里只允许 DIGIT（0x30-0x39），`isascii()` 恰好
+    表达的正是这个约束。
+    """
+    return value.isascii() and value.isdigit()
+
+
 def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
     """解析 `Range: bytes=...`，返回**闭区间** (start, end)；无 Range 返回 None。
 
@@ -136,7 +157,7 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
     if not first:
         # `-500`：最后 500 字节。
         # 这是最容易写错的分支：把 "-500" 当成 0..500 是经典 bug。
-        if not last.isdigit():
+        if not _is_ascii_digits(last):
             raise RangeNotSatisfiable(size)
         n = int(last)
         if n <= 0:
@@ -146,7 +167,7 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
             raise RangeNotSatisfiable(size)
         return size - n, size - 1
 
-    if not first.isdigit():
+    if not _is_ascii_digits(first):
         raise RangeNotSatisfiable(size)
     start = int(first)
     if start >= size:
@@ -154,7 +175,7 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
 
     if not last:
         return start, size - 1
-    if not last.isdigit():
+    if not _is_ascii_digits(last):
         raise RangeNotSatisfiable(size)
     end = int(last)
     if end < start:

@@ -475,15 +475,32 @@ def consume_pair_code(
         if cur.rowcount != 1:
             raise AppError(E1005, "pair code lost the race")
 
+        # ISSUE-034 ③：第一台完成配对的设备成为 owner，其后都是 viewer。
+        #
+        # 为什么这样分：配对码只能在本机面板上生成（`panel_pair_code` 只接受
+        # 回环请求），所以"拿得到码"本身就等于"站在电脑前的人授权了这台设备"。
+        # 第一台就是用户自己那部手机；以后再配的（家人的手机、临时设备）
+        # 没有理由能吊销别人 —— 一台手机丢了，攻击者能做的应该止于
+        # "删自己这台"，而不是把全家设备一次性踢下线（那需要用户跑到电脑前重配）。
+        #
+        # 判"有没有 owner"时带上 `revoked = 0`：owner 被吊销后必须有人能
+        # 重新当 owner，否则"移除设备"这个功能会永久锁死。
+        # 查询放在事务里，避免两个并发配对都判成"还没有 owner"。
+        has_owner = db.query_one(
+            "SELECT 1 AS present FROM devices WHERE role = 'owner' AND revoked = 0"
+            " LIMIT 1"
+        ) is not None
+        role = "viewer" if has_owner else "owner"
+
         db.execute(
             "INSERT INTO devices(id, name, token_hash, last_seen, created_at,"
-            "                    revoked, expires_at)"
-            " VALUES (?, ?, ?, ?, ?, 0, ?)",
+            "                    revoked, expires_at, role)"
+            " VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
             (client_id, device_name or "未命名手机", hash_token(token), now, now,
-             expires_at),
+             expires_at, role),
         )
 
-    log.info("配对成功 client_id=%s name=%s", client_id, device_name)
+    log.info("配对成功 client_id=%s name=%s role=%s", client_id, device_name, role)
     return client_id, token
 
 
@@ -526,9 +543,13 @@ def purge_expired_codes(db: Any) -> int:
 # --------------------------------------------------------------------------
 
 def _lookup_device(db: Any, token: str) -> Any:
-    """按 token 查设备行。查不到返回 None。"""
+    """按 token 查设备行。查不到返回 None。
+
+    带 `role` 是 ISSUE-034 ③ 的需要：权限判断不能只看"是不是已配对"，
+    还要看这台设备能不能执行不可逆操作（吊销别的设备）。
+    """
     return db.query_one(
-        "SELECT id, name, revoked, created_at, last_seen, expires_at"
+        "SELECT id, name, revoked, created_at, last_seen, expires_at, role"
         "  FROM devices WHERE token_hash = ?",
         (hash_token(token),),
     )
@@ -787,7 +808,7 @@ def require_client(ctx: Ctx) -> dict[str, Any]:
         ctx.set_cookies.append(
             (CLIENT_COOKIE, token, cookie_max_age(row)))
 
-    info = {"id": row["id"], "name": row["name"]}
+    info = {"id": row["id"], "name": row["name"], "role": row["role"] or "viewer"}
     ctx.state["client"] = info
     ctx.state["via_cookie"] = not via_header
     _touch(st, row["id"])

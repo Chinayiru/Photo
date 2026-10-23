@@ -2,7 +2,7 @@
 
 重点覆盖三类最容易出错的地方：
   1. EXIF Orientation 的**方向**（搞反了照片就是倒的，且不容易发现）
-  2. 大图内存控制（100MP 图 4 并发 = 1.1GB，会 OOM）
+  2. 大图内存控制（48MP 图 4 并发 = 600MB，越大越会 OOM）
   3. 缓存失效与原子落盘（半截 WebP 被浏览器永久缓存是最恶心的 bug）
 """
 from __future__ import annotations
@@ -346,17 +346,23 @@ def test_open_downscaled_small_image_untouched(tmp_path: Path) -> None:
         assert im.size == (100, 80)
 
 
-def test_100mp_image_generates_without_oom(tmp_path: Path) -> None:
-    """1 亿像素（12000x8000）的图必须能生成缩略图而不是 OOM。
+def test_48mp_image_generates_without_oom(tmp_path: Path) -> None:
+    """48MP（8192x6144）的图必须能生成缩略图而不是 OOM。
 
-    裸解码是 12000*8000*3 = 288MB RGB；4 个 worker 并发就是 1.1GB。
+    裸解码是 8192*6144*3 = 151MB RGB；4 个 worker 并发就是 600MB。
     draft/reduce 把它压到可接受范围。这里只验证单张能过 ——
     并发的内存峰值由 worker 信号量（默认 4）约束。
+
+    ★ 这个尺寸是**刻意**选的：它是真实相机的挂机上限（48MP = 8192×6144
+    = 5033 万像素），也是 `MAX_IMAGE_PIXELS` 的下界来源。原来这里用的是
+    12000×8000（9600 万像素），按 ISSUE-034 收紧后的上限，那种图会被
+    Pillow 判成解压炸弹（见 test_max_image_pixels_caps_bomb_memory）——
+    也就是说它根本进不到解码这一步，测不到 draft/reduce 的效果。
     """
-    src = _make_image(tmp_path / "100mp.png", (12000, 8000))
-    out = tmp_path / "100mp.webp"
+    src = _make_image(tmp_path / "48mp.png", (8192, 6144))
+    out = tmp_path / "48mp.webp"
     w, h = generate_thumb(src, out, 320)
-    assert (w, h) == (320, 213)
+    assert (w, h) == (320, 240)
 
 
 def test_very_large_image_targets_both_sizes(tmp_path: Path) -> None:
@@ -933,3 +939,89 @@ def test_heic_orientation_is_not_applied_twice(tmp_path: Path) -> None:
     w, h = generate_thumb(src, out_path, 320,
                           orientation=exif_mod.extract_sync(src).orientation)
     assert h > w, f"竖拍 HEIC 被转成了横的：{(w, h)}"
+
+
+# --------------------------------------------------------------------------
+# 单边尺寸上限（ISSUE-034）
+# --------------------------------------------------------------------------
+#
+# `MAX_IMAGE_PIXELS` 只挡住"宽×高"很大的一类；`200000×10` 这种**单边**超长
+# 的图能过像素数检查，但 Pillow 解码时按行累积，照样把内存吃满。
+# 判据放在 `Image.open()` 之后、任何解码动作之前：`im.size` 来自文件头，
+# 读它不分配像素缓冲。
+
+
+def _oversized_png(path: Path, *, width: int = None, height: int = None) -> Path:
+    """造一张单边超限的 PNG（只 2 像素高，文件很小）。"""
+    w = width if width is not None else thumbs.MAX_IMAGE_EDGE + 1
+    h = height if height is not None else 2
+    Image.new("RGB", (w, h), (10, 120, 200)).save(path)
+    return path
+
+
+def test_open_downscaled_rejects_too_wide_image(tmp_path: Path) -> None:
+    """单边超上限 → 抛异常，不进解码。"""
+    path = _oversized_png(tmp_path / "wide.png")
+    with pytest.raises(thumbs.OversizedImageError):
+        _open_downscaled(path, 320)
+
+
+def test_open_downscaled_rejects_too_tall_image(tmp_path: Path) -> None:
+    """高也同样要挡（竖长图同样能撑爆内存）。"""
+    path = _oversized_png(tmp_path / "tall.png", width=2,
+                          height=thumbs.MAX_IMAGE_EDGE + 1)
+    with pytest.raises(thumbs.OversizedImageError):
+        _open_downscaled(path, 320)
+
+
+def test_open_downscaled_accepts_normal_image(tmp_path: Path) -> None:
+    """正常照片不受影响（防止把上限写反成"一律拒绝"）。"""
+    path = _make_image(tmp_path / "ok.jpg", (800, 600))
+    im = _open_downscaled(path, 320)
+    try:
+        assert im.width == 800 and im.height == 600
+    finally:
+        im.close()
+
+
+def test_generate_thumb_propagates_oversized_error(tmp_path: Path) -> None:
+    """`generate_thumb` 不能把 OversizedImageError 吞掉或转成别的异常类型。
+
+    调用方（ThumbEngine / browse 兜底）靠这个类型决定"直接判失败、不重试"，
+    一旦被包成 `Exception` 就退回"重试三次、每次占满一个解码闸门"。
+    """
+    path = _oversized_png(tmp_path / "wide2.png")
+    with pytest.raises(thumbs.OversizedImageError):
+        generate_thumb(path, tmp_path / "out.webp", 320)
+
+
+def test_engine_marks_oversized_image_failed_without_retry(tmp_path: Path,
+                                                           monkeypatch) -> None:
+    """超大图进 `failed` 终态，且**不进**退避重试队列。
+
+    重试对它是纯浪费：结果永远一样，而每次重试都要占一个解码闸门（只有 4 个）。
+    几张超大图就能把整个缩略图队列堵住 5 分钟以上，表现成"新照片的缩略图
+    一直不出"。
+    """
+    src = _oversized_png(tmp_path / "big.png")
+    st = src.stat()
+    rows = [{"id": 5, "root_id": "library", "rel_path": "big.png",
+             "mtime": st.st_mtime, "size": st.st_size, "orientation": 1,
+             "thumb_state": "pending", "thumb_etag": None, "missing": 0}]
+    eng, cfg, db = _engine_fixture(tmp_path, monkeypatch, rows)
+
+    async def main() -> None:
+        eng.start()
+        eng.enqueue(5)
+        await eng.queue.join()
+        await eng.stop()
+
+    asyncio.run(main())
+
+    assert db.rows[5]["thumb_state"] == "failed"
+    assert eng.done == 0
+    # 没有重试排入：队列空
+    assert eng.queue_depth() == 0
+    # 一个缩略图文件都不该被写出来
+    assert not any(thumb_path(cfg, "library", "big.png", s).exists()
+                   for s in THUMB_SIZES)

@@ -159,6 +159,18 @@ CREATE TABLE IF NOT EXISTS upload_sessions (
   media_id      INTEGER,                         -- complete 后的 media.id
   dedup         INTEGER CHECK (dedup IS NULL OR dedup IN (0,1)),
   completed_at  REAL,
+  -- ★ 会话归属的客户端（devices.id = client_id）。见 ISSUE-034 ②。
+  --
+  -- 这一列不是"锦上添花的元数据"，而是会话复用的**身份**部分：
+  -- 复用条件原来只有 root_id + 文件名 + 总大小 + sha256，而两台手机
+  -- 传同名同大小文件是完全正常的事（连拍导出、微信同名图）。少了
+  -- client_id，第二台手机的 init 会拿到第一台的 upload_id，继续往
+  -- 别人的半成品临时文件里写 —— 结果是**静默的数据损坏**：两边都
+  -- 以为成功了，归档出来是一个字节都不对的混合文件。
+  --
+  -- 允许 NULL 是给升级前遗留的会话用的（它们本来就没有归属信息，
+  -- 只能按"谁都不可复用"处理，见 uploads.create_session）。
+  client_id     TEXT,
   CHECK (received <= total_size),
   CHECK (length(id) = 32)
 );
@@ -206,7 +218,19 @@ CREATE TABLE IF NOT EXISTS devices (
   -- token 的绝对过期时刻（AC-5.10）。NULL 表示"永不过期" ——
   -- 老库升级上来的行就是 NULL，强行给它们安一个过期时间会让所有
   -- 已配对的手机在某天突然集体掉线，那是比"永不发过期"更糟的故障。
-  expires_at REAL
+  expires_at REAL,
+  -- ★ 设备角色：owner 可以吊销任意设备，viewer 只能看到（脱敏后的）
+  -- 设备列表、只能吊销自己。见 ISSUE-034 ③。
+  --
+  -- 为什么需要它：`/api/devices` 原来对**任何**已配对设备开放，
+  -- 包括 DELETE。于是"捡到/泄露一部手机"就等于拿到了全家的设备
+  -- 开关 —— 攻击者可以一键把桌上电脑、其他人的手机全部踢下线，
+  -- 而重新配对必须有人站在电脑前点配对码。这是不可逆的破坏，
+  -- 比"看到设备列表"严重一个量级，所以必须区分权限。
+  --
+  -- 默认 viewer（最小权限）：新列在 `CREATE TABLE IF NOT EXISTS` 里
+  -- 只对新库生效，老库由 _migrate() 补列 + 回填。
+  role TEXT NOT NULL DEFAULT 'viewer' CHECK (role IN ('owner','viewer'))
 );
 
 -- ⚠️ 不能在这里建 idx_devices_expires。老库的 devices 表还没有
@@ -449,6 +473,35 @@ class Database:
             conn.execute("ALTER TABLE devices ADD COLUMN expires_at REAL")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_devices_expires ON devices(expires_at)")
+
+        # --- devices：补 role 列（ISSUE-034 ③）---
+        #
+        # `ADD COLUMN ... NOT NULL DEFAULT 'viewer'` 是 SQLite 允许的
+        # （带非 NULL 默认值即可），老库原有的设备行会被填成 viewer。
+        # 但**只填 viewer 是不够的**：家里可能已经配对了好几台设备，
+        # 升级后没有任何一台是 owner，于是"吊销设备"这个功能对所有人
+        # 都失效了 —— 包括那台站在电脑前、理应拥有权限的机器。
+        # 所以补列后要把最早配对、且未被吊销的那台回填成 owner：
+        # 它按定义就是"第一次在电脑前配对的那部手机"。
+        if cols and "role" not in cols:
+            log.info("迁移 devices：新增 role 列（最早配对的设备回填为 owner）")
+            conn.execute(
+                "ALTER TABLE devices ADD COLUMN role TEXT NOT NULL DEFAULT 'viewer'")
+            conn.execute(
+                "UPDATE devices SET role = 'owner' WHERE id = ("
+                "  SELECT id FROM devices WHERE revoked = 0"
+                "   ORDER BY created_at ASC, id ASC LIMIT 1)")
+
+        # --- upload_sessions：补 client_id 列（ISSUE-034 ②）---
+        #
+        # 补出来是 NULL，语义是"归属未知"。这类历史会话不可被任何
+        # 客户端复用（见 uploads.create_session）：既然搞不清它是谁的，
+        # 就别把它交给别人 —— 宁可多花一次上传，也不能拼出一个混合文件。
+        # 未完成的旧会话会自然过期（session_ttl_hours），不需要主动清理。
+        up_cols = {r[1] for r in conn.execute("PRAGMA table_info(upload_sessions)")}
+        if up_cols and "client_id" not in up_cols:
+            log.info("迁移 upload_sessions：新增 client_id 列")
+            conn.execute("ALTER TABLE upload_sessions ADD COLUMN client_id TEXT")
 
         # --- audit_log：补齐 pair/revoke/upload_reject 动作 ---
         row = conn.execute(

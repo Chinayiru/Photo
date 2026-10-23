@@ -36,7 +36,7 @@ from typing import Any
 from starlette.requests import Request
 from starlette.responses import Response
 
-from ..relay import security
+from ..relay import netutil, security
 from ..relay.auth import require_account
 from ..relay.db import CloudDB
 from ..relay.devices import find_device_by_agent_token
@@ -339,8 +339,13 @@ def _device_by_agent(request: Request, db: CloudDB) -> Any:
 
 
 def _client_ip(request: Request) -> str:
-    client = request.client
-    return (client.host if client is not None else "") or "unknown"
+    """配对码的"每 IP 20 次"按真实客户端计。判据见 `netutil`。
+
+    这里用错的后果比限流更重：配对码是 6 位、TTL 300 秒，如果所有手机
+    共用 `127.0.0.1` 一个桶，攻击者刷满 20 次就让主人自己也配不上对
+    （`docs/11` ISSUE-030）。
+    """
+    return netutil.client_ip(request)
 
 
 def _rid(request: Request) -> str:

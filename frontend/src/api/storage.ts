@@ -247,33 +247,59 @@ export const COOKIE_NAME = "pb_token";
  *   - Service Worker 加头：SW 是 **secure context** 专属 API，
  *     `http://192.168.x.x` 上根本注册不了。
  *
- * ⚠️ 不设 `Secure`：局域网是明文 HTTP，带 Secure 的 cookie 会被
- * 浏览器**直接丢弃**，症状是"改了代码但缩略图仍然 401"。
- * ⚠️ 不设 `SameSite=Strict`：那会让用户从别的 App 点分享链接进来时
- * 不携带 cookie，显示未配对。`Lax` 与后端下发的值保持一致。
+ * ⚠️ `Secure` **跟着页面协议走**，不能写死也不该干脆不写（ISSUE-033）：
+ *
+ *   - 写死 `; Secure`：局域网是明文 HTTP（`http://192.168.x.x:8787`），
+ *     浏览器会**直接丢弃**这条 cookie，症状是"改了代码但缩略图仍然 401"；
+ *   - 完全不写：用户从云端（`https://域名/d/<id>/`）打开时，这枚 90 天的
+ *     长期令牌就可能被明文链路回传（用户手输 `http://` 打开、或中间代理
+ *     降级），而 cookie 一旦标了 `Secure`，浏览器就不会在 http 请求里带它。
+ *
+ * 所以这里的取值是"云端严格、局域网仍可用"：https 页面加 `Secure`，
+ * http 页面不加 —— 两边都不会把一张照片弄成灰块。
+ * ⚠️ `SameSite` 不能用 `Strict`：那会让用户从别的 App 点分享链接进来时
+ * 不携带 cookie，显示未配对。`Lax` 足够 —— 缩略图（`<img>`）与 SSE
+ * （`GET /api/events`）都是同源 GET，Lax 一样会带上 cookie。
  */
 /**
- * ★ 为什么 `Max-Age` 传 400 天而不是 90 天：
+ * ★ 为什么 `Max-Age` 是 90 天而不是原来的 400 天（ISSUE-033）：
  *
- * cookie 的寿命**必须不短于**服务端 token 的寿命。两个方向都会出错：
+ * 90 天是**令牌自己的真实寿命**：`cloud/relay/security.py:
+ * CLIENT_TOKEN_TTL_DAYS = 90`，后端 `auth.token_ttl_days` 的默认值也是 90
+ * （`backend/app/config.py`）。而 400 天只是 RFC 6265bis 的浏览器上限，
+ * 只有在"token 永不过期"（`token_ttl_days = 0`）时才说得通。
  *
- *   - cookie 活得比 token 长 → 浏览器一直带着一枚服务端必然拒绝的凭证，
- *     每次请求都是 401 再清掉，用户看到缩略图间歇性变灰块；
- *   - cookie 短于 token → 到第 90 天 `<img>` 突然全部灰掉，而 JS 请求
- *     靠 Bearer 头一切正常。
+ * 写长 310 天**不会**多给任何权限，只会让浏览器在令牌死后继续留着一枚
+ * 死凭据：每次 `<img>` 都带着它去撞 401，用户看到缩略图间歇性变灰块，
+ * 排查时还会误以为"cookie 与令牌是对得上的"。安全审计 ISSUE-033 的
+ * 结论就是：cookie 的寿命应当等于令牌的寿命，而不是"看起来足够长"。
  *
- * 服务端才是真正的权威：`auth.token_ttl_days` 可配置（`0` = 永不过期），
- * 前端**读不到**这个配置，所以这里用一个「足够长」的值，
- * 让服务端的判定永远先于 cookie 的自然过期生效。
- * 400 天是 RFC 6265bis 建议的浏览器上限（超过会被静默夹到 400 天），
- * 与 `backend/app/auth.py: COOKIE_MAX_AGE` 一致。
+ * 那 `token_ttl_days = 0`（永不过期）的部署怎么办？`client.ts` 有自愈：
+ * 每个 JS 请求前 `hasTokenCookie()` 发现 cookie 没了就补写一次
+ * （第 347 行），后端在收到 `Authorization` 头时也会回 `Set-Cookie`。
+ * 所以 cookie 先到期的代价只是"某些 `<img>` 可能灰一轮，下次 JS 请求即修复"，
+ * 远比留一枚 400 天的死凭据划算。
  */
+const TOKEN_COOKIE_MAX_AGE_SEC = 90 * 86400;
+
+/**
+ * cookie 的收尾属性（`Path` 之外的 `Secure` / `SameSite`）。
+ *
+ * 抽出来是因为写入与删除**必须用同一套属性**：删除靠的是
+ * （name, domain, path）三元组匹配，`Secure` / `SameSite` 虽不参与匹配，
+ * 但两条路径分头拼字符串迟早会漂移出一个"删不掉的 cookie"。
+ */
+function cookieAttrs(): string {
+  const secure = window.location.protocol === "https:" ? "; Secure" : "";
+  return `${secure}; SameSite=Lax`;
+}
+
 export function setTokenCookie(token: string): void {
   if (!token) return clearTokenCookie();
   try {
     document.cookie =
       `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; ` +
-      `Max-Age=${400 * 86400}; SameSite=Lax`;
+      `Max-Age=${TOKEN_COOKIE_MAX_AGE_SEC}${cookieAttrs()}`;
   } catch {
     /* 禁用 cookie 时静默失败：JS 请求仍走 Authorization 头 */
   }
@@ -281,7 +307,7 @@ export function setTokenCookie(token: string): void {
 
 export function clearTokenCookie(): void {
   try {
-    document.cookie = `${COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax`;
+    document.cookie = `${COOKIE_NAME}=; Path=/; Max-Age=0${cookieAttrs()}`;
   } catch {
     /* 同上 */
   }

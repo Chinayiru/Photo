@@ -127,14 +127,24 @@ def _looks_like_a_file(rel: str) -> bool:
     最先打的东西，一旦被单页回退吃成 200 + HTML，`docs/11` 里"兜底不能
     返回 200"那条就形同废纸。
 
-    判据：最后一段是否含点（`.env` 含、`foo` 不含、`index-abc.js` 含）。
+    判据：**任意一段**以点开头（`.env`、`.git/config`、`.well-known/foo`），
+    或最后一段含点（`index-abc.js`、`foo.txt`）。
+
+    ★ 2026-10-23 修：原先只看**最后一段**是否含点，于是 `/.git/config`
+    的最后一段是 `config` —— 判成"页面路由"→ 返回 `index.html` 200。
+    实测确认（`build/_sec_probe.py`）。这比它看起来更严重：扫描器把
+    "200 且带 HTML"记成"这个路径存在"，而我们的本意是 404。
 
     ★ 这里刻意不用 `rel.replace("\\\\", "/")`：`backend/tests/test_cloud_deploy.py`
     用 AST 把 `cloud/**` 里所有 `.replace()` 调用当成写文件（`os.replace`）
     一并禁掉 —— 那条规则是"只读根"的前提条件，宁可误伤也不能放过一个。
-    于是改用 `rsplit("/")` + 单独判反斜杠：URL 里不该出现 `\\`，出现就是想穿越。
+    于是改用 `split("/")` + 单独判反斜杠：URL 里不该出现 `\\`，出现就是想穿越。
     """
-    name = rel.rsplit("/", 1)[-1]
+    segments = rel.split("/")
+    for seg in segments:
+        if seg.startswith(".") and seg not in ("", ".", ".."):
+            return True
+    name = segments[-1]
     if "\\" in name:
         return True
     return "." in name

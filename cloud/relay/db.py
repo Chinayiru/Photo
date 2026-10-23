@@ -80,7 +80,11 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at  REAL NOT NULL,
     plan        TEXT NOT NULL DEFAULT 'personal'
                 CHECK (plan IN ('personal')),
-    last_login  REAL
+    last_login  REAL,
+    -- 连续登录失败次数与锁定到期时刻（`docs/11` ISSUE-031）。
+    -- 老库没有这两列，由 `_migrate()` 的 ALTER 补上；新库直接建好。
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    locked_until REAL
 );
 
 CREATE TABLE IF NOT EXISTS devices (
@@ -152,6 +156,18 @@ CREATE INDEX IF NOT EXISTS idx_account_tokens_expires
 """
 
 
+#: `SCHEMA` 之后追加的列：(表, 列名, 列定义)。
+#:
+#: `CREATE TABLE IF NOT EXISTS` 改不了已存在的表，所以"给表加一列"必须
+#: 单独走 `ALTER TABLE`。清单只增不改（改已在线上跑的列要的是数据迁移，
+#: 不是这里的事）。测试 `test_cloud_schema_columns.py` 会断言"SCHEMA 里
+#: 声明的列"与"清单补上的列"没有重叠、且都能在新建的库里查到。
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("accounts", "failed_count", "failed_count INTEGER NOT NULL DEFAULT 0"),
+    ("accounts", "locked_until", "locked_until REAL"),
+)
+
+
 class CloudDB:
     """云端库的薄封装。
 
@@ -208,6 +224,7 @@ class CloudDB:
         with self._lock:
             conn = self._conn()
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             row = conn.execute(
                 "SELECT version FROM schema_version ORDER BY version DESC "
                 "LIMIT 1").fetchone()
@@ -219,6 +236,30 @@ class CloudDB:
             elif int(row["version"]) != SCHEMA_VERSION:
                 log.warning("云端库版本 %s ≠ 代码 %s，请检查迁移",
                             row["version"], SCHEMA_VERSION)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """把老库补到当前结构。
+
+        为什么需要它：`SCHEMA` 里的表全是 `CREATE TABLE IF NOT EXISTS`，
+        对**已经存在**的表它一个字节都不改 —— 于是"给 `accounts` 加一列"
+        在开发机（新库，列都在）上绿、在线上（老库，列不在）上炸。
+        `docs/11` ISSUE-031 之前 `auth.py` 的注释引用过一个并不存在的
+        `_migrate()`，正是这个洞。
+
+        SQLite 的 `ALTER TABLE ... ADD COLUMN` 只能加列，不能改约束，
+        所以这里只做"缺什么补什么"，够用且不需要停机迁数据。
+        """
+        for table, column, ddl in _ADDED_COLUMNS:
+            have = {str(r["name"]) for r in
+                    conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if not have:
+                # 表都没有：`executescript(SCHEMA)` 本该建好它。走到这里
+                # 说明 SCHEMA 与这份清单不一致，宁可跳过也不要在启动时抛。
+                continue
+            if column in have:
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+            log.info("云端库迁移：%s 加列 %s", table, column)
 
     def tables(self) -> set[str]:
         """当前库里所有用户表的名字（测试用来断言"恰好五张业务表"）。"""

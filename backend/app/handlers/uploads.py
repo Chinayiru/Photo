@@ -47,6 +47,30 @@ def _upload_id(ctx: Ctx) -> str:
     return uid
 
 
+def _client_id(ctx: Ctx) -> str:
+    """当前请求的设备身份（`devices.id`），用于绑定上传会话（ISSUE-034 ②）。
+
+    来源是中间件里 `auth.require_client()` 写进 `ctx.state["client"]` 的
+    结果 —— 那是本项目里"一个客户端身份"唯一的权威来源（`devices.id`，
+    也就是客户端看到的 `client_id`）。这里**不**新造标识（比如从 User-Agent
+    或 IP 推）：UA 可随便改、IP 会随 DHCP/切网变，用它们做归属判断
+    会在"手机换了 Wi-Fi"时把用户自己的会话判成别人的。
+
+    取不到（直接调 handler 的单元测试、`require_pairing=false` 的本机
+    调试模式）时返回空串表示"未知归属"：这种调用方只在同样未知归属的
+    会话之间复用，绝不会碰到真实设备的会话。
+    """
+    info = ctx.state.get("client")
+    if isinstance(info, dict):
+        return str(info.get("id") or "")
+    return ""
+
+
+def _owned_session(st: Any, uid: str, ctx: Ctx) -> dict[str, Any]:
+    """按"属于当前设备"取会话；不属于时是 404（不是 403，见 `get_session`）。"""
+    return uploads.get_session(st.db, uid, client_id=_client_id(ctx))
+
+
 async def init_upload(ctx: Ctx) -> Reply:
     """`POST /api/uploads/init` —— 创建会话或命中秒传。
 
@@ -76,6 +100,7 @@ async def init_upload(ctx: Ctx) -> Reply:
         target_dir=_opt_str(body.get("target_dir")),
         declared_taken_at=_opt_float(body.get("declared_taken_at") or body.get("taken_at")),
         client_chunk_size=body.get("client_chunk_size"),
+        client_id=_client_id(ctx),
     )
 
     payload: dict[str, Any] = {
@@ -113,7 +138,7 @@ async def patch_upload(ctx: Ctx) -> Reply:
     # 边读边判长度上限：读完再判的话，一个声明 2 GB 的分片会先
     # 把内存吃满。分片上限取"配置分片大小 + 1 字节"，多出来的
     # 那一点留给客户端在最后一片上略微超出。
-    sess = uploads.get_session(st.db, uid)
+    sess = _owned_session(st, uid, ctx)
     limit = int(sess["chunk_size"]) + 1024
     try:
         data = await ctx.body_bytes(limit=limit)
@@ -156,7 +181,7 @@ async def get_upload(ctx: Ctx) -> Reply:
     """
     st = _state(ctx)
     uid = _upload_id(ctx)
-    sess = uploads.get_session(st.db, uid)
+    sess = _owned_session(st, uid, ctx)
     received = uploads._reconcile_offset(st.db, sess)
     total = int(sess["total_size"])
     return json_reply({
@@ -181,6 +206,12 @@ async def complete_upload(ctx: Ctx) -> Reply:
     """`POST /api/uploads/{upload_id}/complete` —— 校验、归档、索引。"""
     st = _state(ctx)
     uid = _upload_id(ctx)
+
+    # 归属校验放在最前面：`complete_session_async` 内部还会按 upload_id
+    # 取一次会话，但那时已经开始校验/归档了 —— 别人的 uid 必须在
+    # 任何副作用之前就变成 404，否则"能 complete 别人的会话"就等于
+    # 能把别人传了一半的文件提前归档进库。
+    _owned_session(st, uid, ctx)
 
     body: dict[str, Any] = {}
     if ctx.header("content-length") not in (None, "0"):
@@ -241,6 +272,9 @@ async def abort_upload(ctx: Ctx) -> Reply:
     """`DELETE /api/uploads/{upload_id}` —— 取消上传。"""
     st = _state(ctx)
     uid = _upload_id(ctx)
+    # 同 complete：先判归属。否则一台设备可以把别人的在传会话删掉，
+    # 对端表现为"传了一半突然 409/419"，而服务端没有任何越权痕迹。
+    _owned_session(st, uid, ctx)
     uploads.abort_session(st.db, st.cfg, uid)
     return json_reply({"upload_id": uid, "aborted": True})
 

@@ -39,6 +39,7 @@ from starlette.responses import Response, StreamingResponse
 from shared.mux import MuxClosed
 from shared.protocol import HEAD_TIMEOUT, TOTAL_TIMEOUT
 
+from ..relay import netutil
 from ..relay.devices import (
     DeviceRegistry,
     TunnelConnection,
@@ -688,14 +689,14 @@ def _is_pair(request: Request) -> bool:
 def _client_ip(request: Request) -> str:
     """限流用的来源标识。
 
-    不信任 `X-Forwarded-For`：云端前面是 Caddy，真值由 Caddy 覆写；
-    而这个值在这里唯一的用途是"别让一个 IP 把匿名探活打成洪水"，
-    伪造它只能让自己和别的伪造者挤在同一个桶里，最坏结果是他们互相
-    限流——不构成对正常用户的影响。
+    判据在 `netutil`：只有当**直连对端**落在 `PB_CLOUD_TRUSTED_PROXIES`
+    里时才采信 `X-Forwarded-For`。这个值同时喂两处 —— `public_rate` /
+    `pair_rate` 的桶，以及塞进隧道帧的 `Ctx.client_ip`。二者都必须是真实
+    客户端：对端若是 `127.0.0.1`（cloudflared / 80 端口转发）而这里直接
+    取 `request.client.host`，全世界的手机就共用同一个桶，一台手机发几次
+    请求就能让所有手机的探活一起 429（`docs/11` ISSUE-030）。
     """
-    client = request.client
-    host = getattr(client, "host", "") or ""
-    return host.strip() or "unknown"
+    return netutil.client_ip(request)
 
 
 def _safe_int(raw: Any, default: int) -> int:

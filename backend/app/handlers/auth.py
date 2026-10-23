@@ -50,7 +50,7 @@ from ..auth import (
     store_pair_code,
 )
 from ..core import Ctx, Reply, empty_reply, json_reply
-from ..errors import E1001, E1015, E4001, AppError, NotFound, Unauthorized
+from ..errors import E1001, E1015, E2003, E4001, AppError, NotFound, Unauthorized
 
 log = logging.getLogger(__name__)
 
@@ -186,22 +186,41 @@ async def me(ctx: Ctx) -> Reply:
 # --------------------------------------------------------------------------
 
 async def list_devices(ctx: Ctx) -> Reply:
-    """`GET /api/devices` —— 已配对的手机列表。"""
+    """`GET /api/devices` —— 已配对的手机列表。
+
+    ISSUE-034 ③：**任何**已配对设备都能看到列表（手机端要能回答"这台是我吗、
+    家里还有哪些设备连着"，这既是配对确认也是排障信息），但 `viewer` 拿到
+    的是**脱敏**版本：
+
+      * 不含 `role`：否则拿到列表的人可以直接知道哪台是 owner，
+        从而知道该重点偷哪台 —— 权限信息不该描述别的设备；
+      * 不含 `created_at`（配对时刻）：那是对端设备的运维细节，
+        只对"管理"这件事有用，而管理是本机面板/owner 的事。
+
+    权衡说明：保留 `name` 与 `last_seen` 是有意的 —— 没有它们列表就没法用
+    （用户看"这台小米14是上周配的，那台叫iPhone的是我老婆的"），而且
+    这些信息对攻击者的价值远低于"能一键吊销全部设备"。
+    """
     st = _st(ctx)
-    require_client(ctx)
+    me = require_client(ctx)
+    is_owner = me.get("role") == "owner"
     rows = st.db.query(
-        "SELECT id, name, created_at, last_seen, revoked FROM devices"
+        "SELECT id, name, created_at, last_seen, revoked, role FROM devices"
         " ORDER BY created_at DESC"
     )
-    return json_reply({
-        "items": [{
+    items = []
+    for r in rows:
+        item: dict[str, Any] = {
             "client_id": r["id"],
             "name": r["name"],
-            "created_at": r["created_at"],
             "last_seen": r["last_seen"],
             "revoked": bool(r["revoked"]),
-        } for r in rows],
-    })
+        }
+        if is_owner:
+            item["created_at"] = r["created_at"]
+            item["role"] = r["role"] or "viewer"
+        items.append(item)
+    return json_reply({"items": items})
 
 
 async def revoke_device(ctx: Ctx) -> Reply:
@@ -209,10 +228,25 @@ async def revoke_device(ctx: Ctx) -> Reply:
 
     ⚠️ 不删行，只置 `revoked=1`。删行会让 `audit_log.client_id` 变成
     指向不存在记录的悬空引用，事后追查"是谁删了这张照片"就断了线索。
+
+    ★ ISSUE-034 ③：只允许 owner 或本机回环调用。吊销是**不可逆**操作 ——
+    被吊销的设备必须有人亲自走到电脑前重新生成配对码，所以"任何一台
+    手机令牌泄露就能把全家设备踢下线"是不可接受的破坏面。
+
+    允许设备吊销**自己**是刻意保留的：那是"退出登录/移除本机"的语义，
+    最坏结果不过是它自己失去访问权，没有可被滥用的方向
+    （而且用户换手机时正需要它）。非 owner 想吊销别人则是 403 E2003，
+    不是 404：目标 uid 是由调用方给出的，回 404 并不能隐藏什么，
+    反而会让真正的权限问题表现成"设备不见了"这种误导性症状。
     """
     st = _st(ctx)
     me = require_client(ctx)
     client_id = ctx.params["client_id"]
+
+    is_self = client_id == me["id"]
+    if not is_self and me.get("role") != "owner" and not is_loopback(ctx):
+        log.warning("拒绝越权吊销：client_id=%s role=%s", me["id"], me.get("role"))
+        raise AppError(E2003, "只有本机或主设备可以移除其它设备")
 
     row = st.db.query_one("SELECT id FROM devices WHERE id = ?", (client_id,))
     if row is None:

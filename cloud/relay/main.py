@@ -63,6 +63,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route, WebSocketRoute
@@ -79,7 +80,9 @@ from ..relay.devices_api import (
     list_devices,
     revoked_clients,
 )
+from ..relay import netutil
 from ..relay.forward import Forwarder
+from ..relay.headers import AccessLogMiddleware, SecurityHeadersMiddleware
 from ..relay.pages import StaticPages
 from ..relay.pairing import issue_pair_code, purge_expired_codes, redeem_pair_code
 from ..relay.reply import json_error, json_reply, no_content, text_reply
@@ -252,6 +255,15 @@ def create_app(db: CloudDB | None = None, *,
         if not _hosts():
             log.warning("PB_CLOUD_HOSTS 未设置：Host 头不做校验。"
                         "生产部署**必须**设成自己的域名")
+        # 受信代理没配 = 所有人共用 `127.0.0.1` 一个限流桶（cloudflared
+        # 与 80 端口转发都从回环连入）。这个失败模式不会报错，只会让
+        # "一个人刷满登录次数 → 所有人登不上"，所以必须在启动时说一次。
+        if not netutil.trusted_networks():
+            log.warning("PB_CLOUD_TRUSTED_PROXIES 未设置：%s 里所有请求"
+                        "共用同一个限流桶（登录 10 次/10 分钟、匿名 "
+                        "300 次/秒）。前面有 cloudflared 时**必须**设成 "
+                        "`127.0.0.1/32` —— 见 docs/11 ISSUE-030",
+                        netutil.TRUSTED_ENV)
         task = asyncio.create_task(_housekeeping(database, forwarder),
                                    name="cloud-housekeeping")
         try:
@@ -265,7 +277,16 @@ def create_app(db: CloudDB | None = None, *,
             forwarder.meter.flush()
             database.close_all()
 
-    return Starlette(routes=routes, lifespan=lifespan)
+    # 中间件顺序 = 从外到内。`AccessLogMiddleware` 在最外层才能记到
+    # "整个请求花了多久"，`SecurityHeadersMiddleware` 必需在最外层之内
+    # 但早于业务：它要改写 `http.response.start`，而任何内层中间件都可能
+    # 提前结束响应（例如 CORS 预检的 204）。
+    middleware = [
+        Middleware(AccessLogMiddleware),
+        Middleware(SecurityHeadersMiddleware),
+    ]
+
+    return Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
 
 def _bind(fn: Any, *deps: Any) -> Any:
@@ -440,17 +461,37 @@ def main() -> None:
     # ★ 必须单进程（`workers=1`）：设备注册表是**内存 map**，多 worker
     # 会让"电脑连在 worker A、手机请求打到 worker B"变成常态，表现是
     # 随机 503。真要横向扩展，注册表得换 Redis，那是另一个设计。
-    # `--forwarded-allow-ips` 的默认值是 127.0.0.1，那是"前面没有代理"
-    # 的假设。云端部署里前面一定是 Caddy（另一台容器、172.x 网段），
-    # 用默认值会让**所有手机共用 Caddy 那一个 IP**：限流桶变成全局的
-    # ——一个人刷 120 次/秒，所有人一起 429。这里的默认值只信 Docker
-    # 私网段；直连 8000 的外部地址不在其中，所以「真有人绕过 Caddy」
-    # 时反而不会信他们伪造的 X-Forwarded-For。
-    forwarded = os.environ.get("PB_CLOUD_FORWARDED_ALLOW_IPS",
-                               "172.16.0.0/12").strip()
+    # ★ 受信代理**默认空**（谁都不信），并且 uvicorn 自己的
+    # `--proxy-headers` 一律**关掉**。
+    #
+    # 旧默认值是 `172.16.0.0/12`（假设前面是 Docker 里的 Caddy）。实际部署
+    # 是 Windows + Cloudflare quick tunnel + 80 端口转发，两者都从
+    # `127.0.0.1` 连入 —— 那个默认值让 uvicorn **丢弃**真实的
+    # `X-Forwarded-For`，于是所有手机共用 `127.0.0.1` 一个限流桶：
+    # 一个人刷 10 次假登录，主人自己也登不上（10 次/10 分钟）。
+    #
+    # 反过来把默认值改成 127.0.0.1「看起来」能修好，但那会让**任何能
+    # 直连 8000 的人**伪造 X-Forwarded-For 绕开全部限流。
+    #
+    # 所以判据统一收到 `netutil`：它先看**直连对端**（不可伪造），只有
+    # 对端落在 `PB_CLOUD_TRUSTED_PROXIES` 里才去读 XFF，并且从右往左
+    # 跳过受信跳。uvicorn 的 ProxyHeadersMiddleware 会**改写
+    # `scope["client"]`**，那会让 `netutil` 再也看不到真实对端（也就
+    # 无从判断"这一跳该不该信"），所以这里必须关掉它，只留一条判据。
+    #
+    # ★ 顺序陷阱：把 `PB_CLOUD_TRUSTED_PROXIES` 设成 127.0.0.1 **同时**
+    #   还让 8000 直接对外（绕过 cloudflared）＝ 任何人都能伪造。
+    #   正确做法是先只留隧道，再设受信代理。
     uvicorn.run(create_app(open_db(db_path or None)), host=host, port=port,
-                log_level="info", ws="websockets", proxy_headers=True,
-                forwarded_allow_ips=forwarded)
+                log_level="info", ws="websockets",
+                proxy_headers=False,
+                # **不**回 `Server: uvicorn`：这条指纹告诉扫描器"这里是个
+                # 现成的 Python 服务"，配合版本差异就是一份漏洞清单。
+                server_header=False,
+                # 访问日志由 `AccessLogMiddleware` 接管：uvicorn 的 access
+                # log 会把 `?code=NNNNNN`（一次性配对凭据）和用户搜索词
+                # 原样写进 `relay.log`（`docs/11` ISSUE-032）。
+                access_log=False)
 
 
 if __name__ == "__main__":

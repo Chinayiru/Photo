@@ -47,6 +47,33 @@ THUMB_SIZES: Final[tuple[int, ...]] = (320, 1600)
 #: WebP 质量。78 是实测的拐点：再高体积线性涨而肉眼无差别。
 THUMB_QUALITY: Final[int] = 78
 
+#: 单边像素上限。宽或高超过它就用**文件头里声明的尺寸**直接判缩略图失败，
+#: 连解码都不进（见 `_open_downscaled`）。
+#:
+#: ★ 为什么单边还要单独设一档，`exif.MAX_IMAGE_PIXELS`（总像素）不够吗？
+#: 因为两者挡的不是同一类图：总像素管的是"总量"（40000×5000 = 2 亿要挡），
+#: 单边管的是"退化长宽比"（20001×2 只有 4 万像素，总量检查完全放行，
+#: 但 Pillow 在 PNG/HEIC 这类无法 draft 的格式上仍要按声明尺寸分配行缓冲，
+#: 而某些解码器会按 `宽 × 高 × 通道` 一次性预分配 —— 宽度 10 万像素的
+#: 病态图能在这里把内存顶穿）。20000 这个数取自"真实全景图最长边"的
+#: 上限（手机全景最高约 15000 像素），留了 1/3 余量。
+MAX_IMAGE_EDGE: Final[int] = 20_000
+
+
+class OversizedImageError(RuntimeError):
+    """声明尺寸超过 `MAX_IMAGE_EDGE`，拒绝解码。
+
+    单独一个异常类型（而不是复用 `AppError`）是因为它要在**业务层**被
+    认出来并走"永久失败"分支：这类图重试一万次也是同样结果，走
+    `RETRY_BACKOFF` 只会白白占用 4 个解码闸门的位置（每张卡 5 分钟）。
+    """
+
+    def __init__(self, width: int, height: int) -> None:
+        super().__init__(f"图片尺寸过大：{width}×{height}（单边上限 {MAX_IMAGE_EDGE}）")
+        self.width = width
+        self.height = height
+
+
 #: 解码时先缩到这个尺寸以内，再精缩到目标尺寸。
 DRAFT_MAX: Final[int] = 2048
 
@@ -131,19 +158,31 @@ def _apply_orientation(im: Image.Image, orientation: int | None) -> Image.Image:
 def _open_downscaled(path: str | Path, target: int) -> Image.Image:
     """打开图片并尽量在解码阶段就缩小，控制峰值内存。
 
-    三层防护：
+    四层防护：
       ① JPEG draft —— 让 libjpeg 直接按 1/2、1/4、1/8 输出，内存降到 1/64。
-         对 PNG/HEIC 无效（Pillow 自动忽略），所以还需要 ②③。
+         对 PNG/HEIC 无效（Pillow 自动忽略），所以还需要 ②③④。
       ② MAX_IMAGE_PIXELS —— 拒绝声明超大尺寸的恶意图（见 exif.py）。
-      ③ reduce() —— 先整数倍降采样再精缩，大倍率缩放的峰值内存与耗时都更低。
+      ③ MAX_IMAGE_EDGE —— 单边超 20000 像素直接拒。`open()` 只读文件头、
+         不分配像素缓冲，所以这一判是在**任何解码动作之前**完成的：
+         `im.size` 是 Pillow 从文件头里读出来的声明值，读它不花内存。
+      ④ reduce() —— 先整数倍降采样再精缩，大倍率缩放的峰值内存与耗时都更低。
+
+    ⚠️ ③ 必须放在 draft/reduce **之前**，且不能被下面那个 `except Exception`
+    吞掉 —— 它一旦被吞，超大图就会继续走到 `im.reduce()`/`im.load()`，
+    正好绕开了这道防护。
     """
     im = Image.open(path)
     try:
+        if im.width > MAX_IMAGE_EDGE or im.height > MAX_IMAGE_EDGE:
+            raise OversizedImageError(im.width, im.height)
         if im.format == "JPEG":
             im.draft("RGB", (DRAFT_MAX, DRAFT_MAX))
         factor = max(1, min(im.width, im.height) // (target * 2))
         if factor >= 2:
             im = im.reduce(factor)
+    except OversizedImageError:
+        im.close()
+        raise
     except Exception:  # noqa: BLE001 —— 优化失败不影响正确性，继续用原图
         log.debug("downscale shortcut failed for %s", path, exc_info=True)
     return im
@@ -425,10 +464,26 @@ class ThumbEngine:
             for size, dst in paths.items():
                 if _fresh(dst):
                     continue
-                await loop.run_in_executor(
-                    self._pool, _generate_thumb_kw,
-                    str(src), dst, size, THUMB_QUALITY, row["orientation"],
-                )
+                try:
+                    await loop.run_in_executor(
+                        self._pool, _generate_thumb_kw,
+                        str(src), dst, size, THUMB_QUALITY, row["orientation"],
+                    )
+                except OversizedImageError as exc:
+                    # 声明尺寸超单边上限：重试一万次也是同样结果，所以**不进**
+                    # `_on_failure` 的退避重试，直接判永久失败（仍走同一个
+                    # `thumb_state='failed'` 状态，前端/兜底路径无需区分）。
+                    #
+                    # 必须在 `self._sem` 里就地处理：若让它抛到 `_worker`
+                    # 的通用 except，这张图会被重排 3 次（5s/30s/300s），
+                    # 每次都占满一个解码闸门，而闸门只有 4 个 —— 几张
+                    # 超大图就能把整个缩略图队列堵死 5 分钟以上。
+                    # 计数器不动：`stats()` 按 DB 里的 `thumb_state` 统计，
+                    # 这里再自增一次会让"失败数"翻倍。
+                    self._set_state(media_id, "failed", None)
+                    log.warning("thumb skipped (image too large) media_id=%s: %s",
+                                media_id, exc)
+                    return False
         self._set_state(media_id, "ok", source_signature(src_mtime, row["size"]))
         # 只报"还剩多少"，不报"刚生成了哪张" —— 后者会让手机端
         # 为每一张图重排一次时间线，4915 张下来页面直接卡死。
@@ -552,7 +607,9 @@ def placeholder_webp(size: int) -> bytes:
 
 __all__ = [
     "DRAFT_MAX",
+    "MAX_IMAGE_EDGE",
     "ORIENTATION_OPS",
+    "OversizedImageError",
     "RETRY_BACKOFF",
     "THUMB_QUALITY",
     "THUMB_SIZES",

@@ -77,10 +77,18 @@ function onHostBlur(): void {
   }
 }
 
-async function submit(): Promise<void> {
+/**
+ * 真正发配对请求（两条入口共用）。
+ *
+ * 收的是**完整基址字符串**而不是读数 ref：粘贴链接时那个基址的协议与端口
+ * 已经在 `parsePairInput()` 里按白名单规则定好了（ISSUE-033），再用
+ * `buildBase(host, port)` 重拼一遍就会把 https 降级成 http。
+ */
+async function runPair(target: string): Promise<void> {
   if (busy.value) return;
   error.value = "";
-  if (!cloudPage.value && !host.value.trim()) {
+  // 云端页面上没有"电脑地址"可填：基址由 `location` 决定（见 `pair()`）
+  if (!target && !cloudPage.value) {
     error.value = "请填写电脑的 IP 地址";
     return;
   }
@@ -90,7 +98,7 @@ async function submit(): Promise<void> {
   }
   busy.value = true;
   try {
-    const r = await pair(base.value, code.value, expectedDid.value);
+    const r = await pair(target, code.value, expectedDid.value);
     toastOk(`已连接到 ${r.device_name}`);
   } catch (e) {
     error.value = e instanceof ApiError
@@ -101,21 +109,34 @@ async function submit(): Promise<void> {
   }
 }
 
+async function submit(): Promise<void> {
+  await runPair(base.value);
+}
+
 /** 粘贴整条 URL / "IP 码" 文本。 */
 async function submitPaste(): Promise<void> {
-  const parsed = parsePairInput(pasteText.value);
+  let parsed: { base: string; code: string; did: string } | null;
+  try {
+    parsed = parsePairInput(pasteText.value);
+  } catch (e) {
+    // ★ 识别出来了但主机不在白名单（ISSUE-033）：要把拒绝理由说清楚，
+    //   否则用户会以为"没粘对"，把同一段攻击者链接再粘一次。
+    toastError(e instanceof ApiError ? (e.userHint || e.friendly) : "这段内容不能用来配对");
+    return;
+  }
   if (!parsed) {
     toastError("没认出这段内容，请粘贴电脑上显示的链接，或手动填写地址与配对码");
     return;
   }
+  // 回填输入框只是让用户看到"打到了哪儿"，实际用的是 `parsed.base`
   const u = safeUrl(parsed.base);
   if (u) {
     host.value = u.hostname;
-    port.value = u.port || "8787";
+    port.value = u.port || (u.protocol === "https:" ? "" : "8787");
   }
   code.value = parsed.code;
   expectedDid.value = parsed.did;
-  await submit();
+  await runPair(parsed.base);
 }
 
 function onCodeInput(e: Event): void {
