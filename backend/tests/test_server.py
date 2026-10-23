@@ -574,7 +574,9 @@ def test_system_info_and_stats(env):
         assert info["host_app"]["autostart"]["expected"] is None
     assert info["thumbs"]["sizes"] == [320, 1600]
     assert info["limits"]["max_file_bytes"] == 2048 * 1024 * 1024
-    assert info["server"]["bind_scope"] == "private"
+    # SEC-17：这里由 `server.host` 推导。测试环境绑的是 127.0.0.1，
+    # 所以是 loopback —— 之前那条 `== "private"` 断言的正是那个硬编码常量。
+    assert info["server"]["bind_scope"] == "loopback"
     assert info["time"]["tz_offset_minutes"] is not None
 
     r = env.get("/api/system/stats", token=token)
@@ -995,3 +997,30 @@ def test_startup_purge_runs_before_transport_listens() -> None:
     assert listen is not None, "serve() 里找不到 transport.start()"
     assert purge < listen, (
         f"启动清理（第 {purge} 行）应在 transport.start()（第 {listen} 行）之前")
+
+
+# --------------------------------------------------- bind_scope 的推导（SEC-17）
+
+
+def test_bind_scope_follows_the_real_listen_address() -> None:
+    """`bind_scope` 必须由 `server.host` 推导（SEC-17）。
+
+    之前它是个硬编码常量 `"private"`：把 `server.host` 改成 `0.0.0.0` 之后
+    设置页仍然显示"仅私有网络"，等于告诉用户"没有对外开放"——恰好说反了。
+    """
+    from backend.app.handlers.system import _bind_scope
+
+    assert _bind_scope("127.0.0.1") == "loopback"
+    assert _bind_scope("::1") == "loopback"
+    assert _bind_scope("[::1]") == "loopback"
+    assert _bind_scope("localhost") == "loopback"
+    assert _bind_scope("") == "loopback"
+    assert _bind_scope("0.0.0.0") == "any"
+    assert _bind_scope("::") == "any"
+    assert _bind_scope("192.0.2.10") == "private"
+    assert _bind_scope("10.1.2.3") == "private"
+    assert _bind_scope("100.64.0.9") == "private"      # CGNAT
+    assert _bind_scope("fd00::1") == "private"         # IPv6 ULA
+    assert _bind_scope("8.8.8.8") == "public"
+    # 认不出的写法不猜
+    assert _bind_scope("my-pc.local") == "custom"
