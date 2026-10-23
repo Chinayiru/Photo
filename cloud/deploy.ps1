@@ -235,14 +235,28 @@ try {
 # ── 8. 开机自启 ───────────────────────────────────────────────────────────
 Step 8 "注册开机自启"
 $taskName = "PhotoBridge Cloud Relay"
-schtasks /Delete /TN $taskName /F 2>$null | Out-Null
 # ★ 不叫 $args：那是 PowerShell 的自动变量（脚本参数），赋值会静默失败。
 $stArgs = @(
     "/Create", "/TN", $taskName, "/SC", "ONSTART", "/RU", "SYSTEM", "/RL", "HIGHEST",
     "/TR", "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$runScript`"", "/F"
 )
-schtasks @stArgs | Out-Null
-if ($LASTEXITCODE -ne 0) { Warn "注册计划任务失败，可手工在「任务计划程序」里加一条：powershell -File $runScript" }
+# ★ 外部命令 + `$ErrorActionPreference = "Stop"` 是个坑（实测踩到，2026-10-23）：
+#   首次部署时任务还不存在，`schtasks /Delete` 会把
+#   "ERROR: The system cannot find the file specified." 写到 stderr；
+#   PowerShell 5.1 会把它升级成**终止性** NativeCommandError，`2>$null`
+#   拦不住。症状：前 7 步全绿、第 8 步直接中断，开机自启没注册，
+#   第 9 步的交付信息也不打印。
+#   这里临时降回 Continue，并用 `*>&1` 把各个流合进成功流。
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    schtasks /Delete /TN $taskName /F *>&1 | Out-Null
+    schtasks @stArgs *>&1 | Out-Null
+    $taskRc = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $prevEap
+}
+if ($taskRc -ne 0) { Warn "注册计划任务失败（退出码 $taskRc），可手工在「任务计划程序」里加一条：powershell -File $runScript" }
 else { Ok "已注册计划任务「$taskName」（开机自动运行）" }
 
 # ── 9. 交付信息 ───────────────────────────────────────────────────────────

@@ -348,6 +348,27 @@ def test_windows_deploy_script_kills_by_port_not_by_process_name() -> None:
     text = _deploy_ps1().decode("utf-8-sig")
     assert "Get-NetTCPConnection" in text
     assert "Stop-Process -Name" not in text
+
+
+def test_windows_deploy_script_survives_schtasks_stderr_on_first_run() -> None:
+    """首次部署时 `schtasks /Delete` 报"任务不存在"不能中断脚本。
+
+    实测踩到（2026-10-23，203.0.113.10 首次部署）：deploy.ps1 全程设了
+    `$ErrorActionPreference = "Stop"`，而外部命令写 stderr 在 PowerShell
+    5.1 里会被升级成**终止性**的 NativeCommandError，`2>$null` 拦不住。
+    于是第 8 步第一次 `schtasks /Delete`（任务还不存在）就把脚本打断：
+    前 7 步全绿、开机自启没注册、第 9 步的交付信息（含健康检查地址）
+    一行都没打印——而退出码看起来只是失败，很容易被当成网络问题。
+    """
+    text = _deploy_ps1().decode("utf-8-sig")
+    # 旧写法：裸调 schtasks，依赖 2>$null 压制 stderr。
+    assert "schtasks /Delete /TN $taskName /F 2>$null" not in text
+    # 新写法：临时降级 EAP，并把各流合并进成功流。
+    assert "schtasks /Delete /TN $taskName /F *>&1" in text
+    assert "schtasks @stArgs *>&1" in text
+    assert "$ErrorActionPreference = \"Continue\"" in text
+    # 失败时要靠退出码判定，而不是被异常提前打断。
+    assert "$taskRc = $LASTEXITCODE" in text
     assert "Stop-Process -Id" in text
 
 
