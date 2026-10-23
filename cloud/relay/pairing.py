@@ -174,11 +174,25 @@ async def redeem_pair_code(request: Request, db: CloudDB,
         return json_error("E1002", message="配对码不存在",
                           request_id=_rid(request))
     if str(row["device_id"]) != did:
-        # 码是真的，但不是这台电脑的。不回 404 而回 403 —— 用户手里
-        # 那个码确实存在，让他去"另一台电脑上重新生成"，而不是以为打错了。
         _note_code_failure(db, code.strip())
         _bump_failure(db, did, ip)
-        return json_error("E1016", message="该配对码属于另一台电脑",
+        # 码是真的、但不是这台电脑的，分两种情形：
+        #
+        # ① 属于**我这个账号的另一台电脑** —— 用户自己搞混了，回 403 并
+        #    说清楚"去那台电脑上重新生成"，这是有用信息，且只泄露给
+        #    码的所有者本人，不构成 oracle。
+        # ② 属于**别人的账号** —— 一律回"配对码不存在"，与真不存在的码
+        #    完全一致。否则任何有账号的人都能拿 6 位码空间当预言机：
+        #    403 说明这个码此刻有效，400 说明无效，配合 300 秒 TTL 就能
+        #    把"某一刻有哪些码是活的"扫出来（`docs/11` SEC-10a）。
+        owner = db.query_one(
+            "SELECT account_id FROM devices WHERE id = ?",
+            (str(row["device_id"]),))
+        if owner is not None and str(owner["account_id"]) == str(account["id"]):
+            return json_error("E1016",
+                              message="该配对码属于你的另一台电脑",
+                              request_id=_rid(request))
+        return json_error("E1002", message="配对码不存在",
                           request_id=_rid(request))
     if row["used_at"] is not None:
         _note_code_failure(db, code.strip())

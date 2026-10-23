@@ -681,3 +681,72 @@ def test_the_pair_code_row_is_the_first_gate(tmp_path: Path) -> None:
     blocked = _pair(client, device_id, token, code=code)
     assert blocked.status_code == 429
     assert blocked.json()["error"]["code"] == "E4004"
+
+
+# ------------------------- ⑦ 配对码存在性 oracle（SEC-10a）
+
+
+def _insert_device_for(path: Path, email: str, *, name: str) -> str:
+    database = cloud_db.CloudDB(str(path / "cloud.db"))
+    account = database.query_one(
+        "SELECT id FROM accounts WHERE email = ?", (email,))
+    device_id = security.new_device_id()
+    database.execute(
+        "INSERT INTO devices(id, account_id, name, agent_token, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (device_id, account["id"], name, security.new_token(), time.time()))
+    return device_id
+
+
+def _insert_code(path: Path, device_id: str, code: str) -> None:
+    database = cloud_db.CloudDB(str(path / "cloud.db"))
+    database.execute(
+        "INSERT INTO pair_codes(code, device_id, expires_at, created_at) "
+        "VALUES (?, ?, ?, ?)", (code, device_id, time.time() + 300,
+                                time.time()))
+
+
+def test_another_accounts_code_is_indistinguishable_from_a_missing_one(
+        tmp_path: Path) -> None:
+    """`E1016` 只对"我自己的另一台电脑"发；别人的码一律按不存在处理。
+
+    修之前：任何有账号的人，把任意 6 位数字打到自己设备的配对接口，
+    403 `E1016` 意味着"这个码此刻有效"，400 `E1002` 意味着无效 —— 一个
+    现成的码存在性预言机。码空间 100 万、TTL 300 秒，配上它就不再是
+    "猜"了。
+    """
+    _make_account(tmp_path)
+    database = cloud_db.CloudDB(str(tmp_path / "cloud.db"))
+    cloud_auth.create_account(database, "other@example.com", "Other-Horse-9")
+
+    client = TestClient(_app(tmp_path, dist=_dist(tmp_path)),
+                        client=("203.0.113.61", 5000))
+    token = _account_token(client, "owner@example.com")
+    mine = _insert_device_for(tmp_path, "owner@example.com", name="我的电脑")
+    theirs = _insert_device_for(tmp_path, "other@example.com", name="别人的电脑")
+    _insert_code(tmp_path, theirs, "777777")
+
+    live = _pair(client, mine, token, code="777777")
+    dead = _pair(client, mine, token, code="000001")
+
+    assert live.status_code == 400, live.text
+    assert dead.status_code == 400, dead.text
+    assert live.json()["error"]["code"] == "E1002"
+    # 两边的 error 对象必须一模一样 —— 差一个字段就是 oracle
+    assert live.json()["error"] == dead.json()["error"]
+
+
+def test_my_other_computers_code_still_says_so(tmp_path: Path) -> None:
+    """同一个账号下的两台电脑之间搞混，仍然给明确提示（这是可用性，不是泄露）。"""
+    _make_account(tmp_path)
+    client = TestClient(_app(tmp_path, dist=_dist(tmp_path)),
+                        client=("203.0.113.62", 5000))
+    token = _account_token(client, "owner@example.com")
+    first = _insert_device_for(tmp_path, "owner@example.com", name="客厅电脑")
+    second = _insert_device_for(tmp_path, "owner@example.com", name="书房电脑")
+    _insert_code(tmp_path, second, "888888")
+
+    mixed_up = _pair(client, first, token, code="888888")
+    assert mixed_up.status_code == 403
+    assert mixed_up.json()["error"]["code"] == "E1016"
+    assert "另一台电脑" in mixed_up.json()["error"]["message"]
