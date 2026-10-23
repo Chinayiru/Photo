@@ -567,6 +567,11 @@ def test_system_info_and_stats(env):
     assert info["tunnel"]["mode"] == "offline"      # 一期无云端
     assert info["roots"][0]["id"] == "library"
     assert info["roots"][0]["count"] == 4
+    assert info["roots"][0]["path"] != str(env.library)
+    assert info["roots"][0]["path"].endswith("\\lib") or info["roots"][0]["path"].endswith("/lib")
+    if "host_app" in info:
+        assert info["host_app"]["autostart"]["command"] is None
+        assert info["host_app"]["autostart"]["expected"] is None
     assert info["thumbs"]["sizes"] == [320, 1600]
     assert info["limits"]["max_file_bytes"] == 2048 * 1024 * 1024
     assert info["server"]["bind_scope"] == "private"

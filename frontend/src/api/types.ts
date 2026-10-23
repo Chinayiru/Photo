@@ -55,6 +55,7 @@ export interface PingResponse {
 export interface RootInfo {
   id: string;
   label: string;
+  /** 脱敏路径提示（盘符 + 末级目录），不是主机上的完整路径。 */
   path: string;
   /** "readonly" | "readwrite" */
   mode: string;
@@ -170,9 +171,9 @@ export interface SystemInfo {
     autostart: {
       supported: boolean;
       enabled: boolean;
-      /** 注册表里当前登记的命令行。 */
+      /** 手机端不返回注册表命令行，固定为 null。 */
       command: string | null;
-      /** 当前程序**应该**登记的命令行。 */
+      /** 手机端不返回程序完整路径，固定为 null。 */
       expected: string | null;
       /** command 与 expected 不一致 —— 说明程序被移动过，自启会静默失效。 */
       stale: boolean;

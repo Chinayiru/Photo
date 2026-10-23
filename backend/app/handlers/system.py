@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import ntpath
 import time
 from typing import Any
 
@@ -15,6 +16,20 @@ from ..state import AppState
 log = logging.getLogger(__name__)
 
 __all__ = ["ping", "info", "stats"]
+
+
+def _masked_path(value: object) -> str:
+    """Keep a directory hint without exposing the complete host path."""
+    raw = str(value or "").replace("/", "\\")
+    drive, tail = ntpath.splitdrive(raw)
+    # A UNC share name is sensitive too; only preserve a local drive letter.
+    if len(drive) != 2 or drive[1] != ":":
+        drive = ""
+    parts = [part for part in tail.split("\\") if part]
+    if not parts:
+        return drive or "..."
+    leaf = parts[-1]
+    return f"{drive}\\...\\{leaf}" if drive else f"...\\{leaf}"
 
 
 def _state(ctx: Ctx) -> AppState:
@@ -133,7 +148,10 @@ async def info(ctx: Ctx) -> Reply:
             "device_id": st.device_id,
             "device_name": st.device_name,
         },
-        "roots": st.roots_info(),
+        "roots": [
+            {**root, "path": _masked_path(root.get("path"))}
+            for root in st.roots_info()
+        ],
         "index": st.index_info(),
         "watch": st.watch_info(),
         "thumbs": {
@@ -267,7 +285,11 @@ def _host_app_info() -> dict[str, Any]:
     try:
         from ..autostart import status as autostart_status
 
-        out["autostart"] = autostart_status()
+        status = autostart_status()
+        # Command lines may contain the Windows user name and full executable path.
+        status["command"] = None
+        status["expected"] = None
+        out["autostart"] = status
     except Exception:       # noqa: BLE001
         pass
     try:
