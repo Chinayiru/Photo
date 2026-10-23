@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import ipaddress
+
 import asyncio
 import logging
 import ntpath
@@ -131,10 +133,48 @@ def _tunnel_info(cfg: Any) -> dict[str, Any]:
     return st
 
 
+def _bind_scope(host: str) -> str:
+    """从**实际监听地址**推导绑定范围。
+
+    之前这里是一个硬编码的字符串 `"private"`，与 `server.host` 毫无关系：
+    用户为了手机能连上把 `server.host` 改成 `0.0.0.0`，设置页照样显示
+    "仅私有网络" —— 这是把"已经对外开放"说成"没对外开放"，正好反了。
+    反向也一样糟：绑在 `127.0.0.1` 时不说清"只有本机能连"，用户会一直
+    怀疑手机或防火墙有问题（`docs/11` SEC-17）。
+
+    取值：
+
+    * `loopback` —— 只有本机能连（`127.0.0.1` / `::1` / `localhost`）
+    * `private`  —— 私有网段与"公网不可达"的段（RFC1918 / CGNAT / 链路本地 /
+      IPv6 ULA / 保留段）
+    * `public`   —— 某个具体公网地址
+    * `any`      —— `0.0.0.0` / `::`，所有网卡
+    * `custom`   —— 认不出的写法（主机名等），不做猜测
+    """
+    value = (host or "").strip().strip("[]").lower()
+    if value in ("", "localhost", "127.0.0.1", "::1"):
+        return "loopback"
+    if value in ("0.0.0.0", "::", "*"):
+        return "any"
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return "custom"
+    if ip.is_loopback:
+        return "loopback"
+    # `is_private` 在 3.12 里不覆盖 100.64.0.0/10（CGNAT）这类"不可全局路由"
+    # 的段，而它们恰恰是运营商大内网 —— 手机看到的网段就在这里。用
+    # `not is_global` 兜住：只要是"公网到不了"的地址，就按私有处理。
+    if ip.is_private or ip.is_link_local or not ip.is_global:
+        return "private"
+    return "public"
+
+
 async def info(ctx: Ctx) -> Reply:
     """手机端首页所需的全部元信息（一次请求拿全，减少弱网往返）。"""
     st = _state(ctx)
     cfg = st.cfg
+    host = str(cfg.get("server.host", "127.0.0.1"))
     sizes = st.thumb_sizes()
     cache_files, cache_bytes = await _thumb_cache_stats(st)
 
@@ -167,10 +207,11 @@ async def info(ctx: Ctx) -> Reply:
             "format": str(cfg.get("thumbs.format", "webp")),
         },
         "server": {
-            "host": str(cfg.get("server.host", "127.0.0.1")),
+            "host": host,
             "port": int(cfg.get("server.port", 8787)),
             "lan_ips": _lan_ips(),
-            "bind_scope": "private",
+            # 由实际监听地址推导，不是常量（SEC-17）
+            "bind_scope": _bind_scope(host),
         },
         "limits": st.limits_info(),
         # 电脑端外壳的状态。手机端在"设置 → 电脑端"里展示，
