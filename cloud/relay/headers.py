@@ -36,6 +36,8 @@ Cloudflare quick tunnel（`docs/11` ISSUE-028）之后，Caddy 就不在请求�
 """
 from __future__ import annotations
 
+from . import netutil
+
 import logging
 import time
 from typing import Any
@@ -56,6 +58,52 @@ __all__ = [
 log = logging.getLogger("pb.cloud.access")
 
 
+class _Peer:
+    """`netutil` 只读 `request.client.host`，这里给个最小替身。"""
+
+    __slots__ = ("host",)
+
+    def __init__(self, host: str) -> None:
+        self.host = host
+
+
+class _ScopeView:
+    """把 ASGI scope 包成 `netutil` 认识的 request。
+
+    中间件跑在路由之前，手上只有 scope，拿不到 Starlette 的 `Request`；
+    而 `netutil` 只用到 `.client` 与 `.headers` 两个属性，所以用鸭子类型
+    适配，不去伪造一个带 receive 的 Request。
+    """
+
+    __slots__ = ("client", "headers")
+
+    def __init__(self, scope: dict) -> None:
+        peer = scope.get("client")
+        self.client = _Peer(str(peer[0]) if peer else "")
+        self.headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in (scope.get("headers") or [])
+        }
+
+
+def _is_https(scope: dict) -> bool:
+    """这次请求是不是 HTTPS。
+
+    只看 `scope["scheme"]` 不够：`uvicorn.run(proxy_headers=False)` 之后，
+    经 cloudflared 进来的请求**永远**是 `http`，于是 HSTS 一次都发不出去
+    （2026-10-23 线上实测就是这个症状：https 首页也没有 HSTS）。所以要读
+    `x-forwarded-proto`，但**只在对面是我们自己的代理时**才读 —— 否则
+    任何人加一个头就能让明文连接被 HSTS 记住，把用户锁在 https 上。
+    """
+    if scope.get("scheme") == "https":
+        return True
+    view = _ScopeView(scope)
+    if not netutil.is_trusted_proxy(view):
+        return False
+    proto = (view.headers.get("x-forwarded-proto") or "").split(",")[0]
+    return proto.strip().lower() == "https"
+
+
 class SecurityHeadersMiddleware:
     """给每个 HTTP 响应补安全头；HTTPS 请求额外补 HSTS。
 
@@ -71,7 +119,7 @@ class SecurityHeadersMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        is_https = scope.get("scheme") == "https"
+        is_https = _is_https(scope)
 
         async def _send(message: dict) -> None:
             if message["type"] == "http.response.start":

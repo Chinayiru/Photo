@@ -167,6 +167,17 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("accounts", "locked_until", "locked_until REAL"),
 )
 
+#: 只能用索引表达的约束。`ALTER TABLE` 改不了约束，只能建索引。
+#: `token_hash` 唯一的意义：两行同哈希意味着两个客户端共用同一个令牌，
+#: 撤销其中一个就把另一个也废了（反之亦然）。老库里若已有重复，建索引会
+#: 抛 `IntegrityError` —— 这里记 ERROR 而不中断启动，但**必须**让它可见：
+#: 静默跳过等于假装没有这个约束。
+_ADDED_INDEXES: tuple[tuple[str, str], ...] = (
+    ("idx_clients_token_hash",
+     "CREATE UNIQUE INDEX IF NOT EXISTS idx_clients_token_hash "
+     "ON clients(token_hash)"),
+)
+
 
 class CloudDB:
     """云端库的薄封装。
@@ -260,6 +271,12 @@ class CloudDB:
                 continue
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
             log.info("云端库迁移：%s 加列 %s", table, column)
+
+        for name, ddl in _ADDED_INDEXES:
+            try:
+                conn.execute(ddl)
+            except sqlite3.IntegrityError:
+                log.error("索引 %s 建不起来：表里已有重复数据，需人工清理", name)
 
     def tables(self) -> set[str]:
         """当前库里所有用户表的名字（测试用来断言"恰好五张业务表"）。"""

@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import logging
+import pathlib
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -337,3 +338,121 @@ def test_access_log_never_records_the_query_string(
     # 但路径本身要留下（不然日志就没用了）
     assert f"/d/{device}" in text
     assert "api/search" in text
+
+
+# ---------------------------------------------------------------------------
+# 第二轮（SEC-06 / SEC-10 / HSTS 真实生效）
+#
+# 前一轮留下的三条"登记未修"，修完各配一条判据。共同点是：**它们的失败
+# 方式都是静默的** —— HSTS 发不出去没人报错，索引没建起来没人报错，
+# 限速顺序写反了也没人报错（功能完全正常）。所以只能靠测试钉住。
+# ---------------------------------------------------------------------------
+
+
+def _drive_headers_middleware(scope_extra: dict, *, html: bool = True) -> dict:
+    """直接驱动 `SecurityHeadersMiddleware`，返回它发出的响应头。"""
+    import asyncio
+
+    from cloud.relay.headers import SecurityHeadersMiddleware
+
+    sent: list[dict] = []
+
+    async def app(scope, receive, send):                 # noqa: ANN001
+        ctype = b"text/html; charset=utf-8" if html else b"application/json"
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", ctype)]})
+        await send({"type": "http.response.body", "body": b"x"})
+
+    scope = {
+        "type": "http", "method": "GET", "path": "/", "scheme": "http",
+        "headers": [], "client": ("127.0.0.1", 50000),
+        "server": ("relay", 8000), "query_string": b"",
+    }
+    scope.update(scope_extra)
+
+    async def send(message):                              # noqa: ANN001
+        sent.append(message)
+
+    async def receive():                                  # noqa: ANN202
+        return {"type": "http.request"}
+
+    asyncio.run(SecurityHeadersMiddleware(app)(scope, receive, send))
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    return {k.decode("latin-1").lower(): v.decode("latin-1")
+            for k, v in start["headers"]}
+
+
+def test_hsts_follows_x_forwarded_proto_only_from_a_trusted_proxy(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """https 首页必须带 HSTS —— 哪怕 uvicorn 认为这次请求是 http。
+
+    事故现场：`uvicorn.run(proxy_headers=False)` + cloudflared 之后，
+    `scope["scheme"]` 永远是 `http`，于是 `Strict-Transport-Security`
+    一次都没发出去（2026-10-23 线上实测：https 首页无 HSTS）。但补上
+    "读 X-Forwarded-Proto"之后必须**只对受信代理**生效，否则任何人一个
+    头就能让明文连接被 HSTS 记住，把用户锁在一个连不上的 https 上。
+    """
+    monkeypatch.setenv(netutil.TRUSTED_ENV, "127.0.0.1")
+
+    h = _drive_headers_middleware({"headers": [(b"x-forwarded-proto", b"https")]})
+    assert h["strict-transport-security"] == "max-age=15552000"
+
+    # 没有 XFP ⇒ 明文，绝不发 HSTS
+    h = _drive_headers_middleware({})
+    assert "strict-transport-security" not in h
+
+    # 对端不是我们的代理 ⇒ XFP 是攻击者写的，忽略
+    monkeypatch.delenv(netutil.TRUSTED_ENV, raising=False)
+    h = _drive_headers_middleware({"headers": [(b"x-forwarded-proto", b"https")]})
+    assert "strict-transport-security" not in h
+
+
+def test_migration_adds_a_unique_index_on_clients_token_hash(
+        tmp_path: Path) -> None:
+    """老库启动时要补上 `clients(token_hash)` 的唯一索引。
+
+    `SCHEMA` 全是 `CREATE TABLE IF NOT EXISTS`，对已存在的表一个字节都不改，
+    所以"加约束"只能靠 `_migrate` 建索引。这条如果失效，两行同 `token_hash`
+    就会共存：撤销其中一个客户端会把另一个也废掉（两者共用一份令牌）。
+    """
+    import sqlite3
+
+    path = tmp_path / "cloud.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(cloud_db.SCHEMA)
+    conn.execute("DROP INDEX IF EXISTS idx_clients_token_hash")
+    conn.commit()
+    conn.close()
+
+    db = cloud_db.CloudDB(path)
+    db.init()
+
+    idx = db._conn().execute("PRAGMA index_list(clients)").fetchall()
+    assert any(str(r["name"]) == "idx_clients_token_hash"
+               and int(r["unique"]) == 1 for r in idx), "唯一索引没建起来"
+
+
+def test_agent_ws_handshake_is_rate_limited_before_the_token_lookup() -> None:
+    """`/agent/ws` 的限速必须排在令牌校验之前（SEC-06）。
+
+    顺序反过来等于没加：攻击者仍然是"每次尝试只花一个 TCP 握手"，只是
+    每分钟能试的次数不变。这条用源码顺序钉住 —— 行为上很难测（要造 60 条
+    真连接），而"限速在令牌校验前面"正是这一条的**全部**内容。
+    """
+    from cloud.relay import tunnel
+
+    src = pathlib.Path(tunnel.__file__).read_text(encoding="utf-8")
+    body = src.split("async def handle_agent", 1)[1]
+    assert body.index("_WS_HANDSHAKE.hit(") < body.index(
+        "find_device_by_agent_token("), "限速被放到了令牌校验之后"
+
+    # 桶的语义顺带钉住：第 limit 次放行，第 limit+1 次拒绝并给 Retry-After。
+    from cloud.relay.limiter import RateLimiter
+
+    lim = RateLimiter(tunnel.WS_HANDSHAKE_LIMIT, tunnel.WS_HANDSHAKE_WINDOW)
+    for _ in range(tunnel.WS_HANDSHAKE_LIMIT):
+        assert lim.hit("1.2.3.4")[0] is True
+    allowed, retry_after = lim.hit("1.2.3.4")
+    assert allowed is False and retry_after > 0
+    # 换一个 IP 不受影响 —— 否则一个被打满的地址会牵连所有人
+    assert lim.hit("5.6.7.8")[0] is True
