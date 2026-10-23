@@ -43,7 +43,13 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 Ok "管理员权限"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-Ok "脚本目录 $here"
+# 脚本通常在包根目录下运行（把 deploy.ps1 拷到根，然后右键“以管理员身份运行”）。
+# 但也允许留在 cloud\ 里跑（.\cloud\deploy.ps1），这里统一回退到包根。
+if (-not (Test-Path (Join-Path $here "cloud\relay\main.py"))) {
+    $up = Split-Path -Parent $here
+    if (Test-Path (Join-Path $up "cloud\relay\main.py")) { $here = $up }
+}
+Ok "包根目录 $here"
 foreach ($need in @("cloud\relay\main.py", "shared\mux.py", "scripts\cloud_init.py", "frontend\dist\index.html")) {
     if (-not (Test-Path (Join-Path $here $need))) { Fail "缺少文件 $need —— 解压不完整？" }
 }
