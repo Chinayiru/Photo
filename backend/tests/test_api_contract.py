@@ -433,6 +433,36 @@ def test_upload_status_and_complete_match_types(srv) -> None:
                               where="POST /api/uploads/{id}/complete")
 
 
+def test_oversized_chunk_reports_chunk_error_not_file_too_large(srv) -> None:
+    """超过服务端分片大小的 PATCH 必须报 E1007「分片过大」。
+
+    2026-10-23 云隧道实测：2 MB 分片多带 8 KB，客户端收到的是
+    **E1006「文件超过 2 GB 上限」**（`ctx.body_bytes` 的上限是按分片算的，
+    抛的却是文件级的错误码）。客户端看到 E1006 会以为整个文件超限、
+    直接放弃上传，而实际只超了一片、切小一点就能过。
+    """
+    tok = _token(srv)
+    total = 10 * 1024 * 1024
+    init = srv.request("POST", "/api/uploads/init", token=tok,
+                       body={"name": "big.jpg", "size": total}).json()
+    uid = init["upload_id"]
+    chunk = int(init["chunk_size"])
+
+    over = b"x" * (chunk + 2048)          # 越过 `chunk_size + 1024` 的容差
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{srv.port}/api/uploads/{uid}",
+        data=over, method="PATCH",
+        headers={"Authorization": f"Bearer {tok}",
+                 "Content-Range": f"bytes 0-{len(over) - 1}/{total}"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as ei:
+        urllib.request.urlopen(req, timeout=30)
+    assert ei.value.code == 413
+    body = json.loads(ei.value.read().decode())
+    assert body["error"]["code"] == "E1007", body
+    assert "2 GB" not in body["error"].get("user_hint", ""), body
+
+
 def test_error_envelope_matches_types(srv) -> None:
     body = srv.request("GET", "/api/timeline").json()      # 无 token
     _assert_fields(body, "ApiErrorEnvelope", where="401 错误体")

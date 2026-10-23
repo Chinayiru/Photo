@@ -25,7 +25,7 @@ from typing import Any
 from .. import archive, uploads
 from . import common
 from ..core import Ctx, Reply, json_reply
-from ..errors import AppError, BadRequest, E1001, E1010, E1012, NotFound
+from ..errors import AppError, BadRequest, E1001, E1007, E1010, E1012, NotFound
 from ..transports.base import parse_range, RangeNotSatisfiable
 
 log = logging.getLogger(__name__)
@@ -115,7 +115,18 @@ async def patch_upload(ctx: Ctx) -> Reply:
     # 那一点留给客户端在最后一片上略微超出。
     sess = uploads.get_session(st.db, uid)
     limit = int(sess["chunk_size"]) + 1024
-    data = await ctx.body_bytes(limit=limit)
+    try:
+        data = await ctx.body_bytes(limit=limit)
+    except AppError as exc:
+        # `body_bytes` 只有「超过 limit」一种失败，但它抛的是 **E1006
+        # 「文件超过 2 GB 上限」** —— 对分片上传是彻底的误导：客户端会以为
+        # 整个文件超限而直接放弃，而真正超的只是这一片。
+        # `uploads.append_chunk` 里同类越界报的是 E1007「分片过大」，
+        # 这里把 handler 层提前撞上的那种也转成同一条（2026-10-23 云隧道实测：
+        # 2 MB 分片多带 8 KB，回的是 E1006/「2 GB 上限」）。
+        if exc.code == "E1006":
+            raise AppError(E1007, f"分片超过 {sess['chunk_size']} 字节上限") from exc
+        raise
 
     # ⚠️ 不要在 handler 里再取一次 session_lock：append_chunk 内部已经
     # 加了同一把锁，而 threading.Lock **不可重入** —— 重复获取会自我死锁，
