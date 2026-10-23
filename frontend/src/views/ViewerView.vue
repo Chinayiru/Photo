@@ -35,6 +35,7 @@ import {
   viewerStore,
 } from "../stores/viewer";
 import { toastError, toastOk, toastWarn } from "../stores/toast";
+import { safeUrl } from "../lib/safeUrl";
 
 const s = viewerStore.state;
 const isOpen = computed(() => s.open);
@@ -666,7 +667,7 @@ async function doDelete(): Promise<void> {
             v-if="!s.imageReady && currentThumbUrl"
             key="thumb"
             class="v-img thumb"
-            :src="currentThumbUrl"
+            :src="safeUrl(currentThumbUrl)"
             alt=""
             decoding="async"
           />
@@ -677,7 +678,7 @@ async function doDelete(): Promise<void> {
             class="v-img main"
             :class="[{ drag: dragging }, slideClass]"
             :style="imageTransform ? { transform: imageTransform } : undefined"
-            :src="mainSrc"
+            :src="safeUrl(mainSrc)"
             :alt="detail.name"
             decoding="async"
             @load="s.imageReady = true"
@@ -696,7 +697,7 @@ async function doDelete(): Promise<void> {
             class="v-img raw"
             :class="{ drag: dragging }"
             :style="imageTransform ? { transform: imageTransform } : undefined"
-            :src="rawSrc"
+            :src="safeUrl(rawSrc)"
             alt=""
             decoding="async"
             @error="rawFailed = true"
@@ -756,7 +757,7 @@ async function doDelete(): Promise<void> {
                 <dd>
                   <a
                     class="geo"
-                    :href="gpsMapUrl"
+                    :href="safeUrl(gpsMapUrl)"
                     target="_blank"
                     rel="noopener noreferrer"
                   >{{ gpsText }}</a>

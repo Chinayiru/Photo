@@ -48,7 +48,7 @@ onMounted(() => {
   // 扫码进来时 URL 里已经带好了参数，别让用户再输一遍
   const p = pairParamsFromLocation();
   if (p) {
-    const u = safeUrl(p.base);
+    const u = parseBaseUrl(p.base);
     if (u) {
       host.value = u.hostname;
       port.value = u.port || "8787";
@@ -59,7 +59,14 @@ onMounted(() => {
   }
 });
 
-function safeUrl(b: string): URL | null {
+/**
+ * 把粘贴来的基址解析成 `URL`，解析不了返回 `null`。
+ *
+ * 名字不再叫 `safeUrl`：`docs/07` TC-XSS-SEC-007 要求 `safeUrl()` 返回
+ * **空串**（那是绑到 `:src`/`:href` 的守卫，见 `utils/safeUrl.ts`），
+ * 两个语义用一个名字会让判据与人同时糊涂（SEC-24）。
+ */
+function parseBaseUrl(b: string): URL | null {
   try {
     return new URL(b);
   } catch {
@@ -129,7 +136,7 @@ async function submitPaste(): Promise<void> {
     return;
   }
   // 回填输入框只是让用户看到"打到了哪儿"，实际用的是 `parsed.base`
-  const u = safeUrl(parsed.base);
+  const u = parseBaseUrl(parsed.base);
   if (u) {
     host.value = u.hostname;
     port.value = u.port || (u.protocol === "https:" ? "" : "8787");
