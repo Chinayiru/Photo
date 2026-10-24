@@ -155,3 +155,41 @@ def test_the_linter_is_installed_and_forbids_v_html() -> None:
     assert '"vue/no-v-html": "error"' in cfg, "v-html 没被禁成 error"
     assert '"no-eval": "error"' in cfg
 
+
+# ---------------------------------------------------------------- ISSUE-041
+def test_relay_root_account_login_sources() -> None:
+    """中继首页（`https://域名/`）必须能账号登录，且不出现局域网控件。
+
+    真机那次「变回了局域网连接、页面没有账号登录」是这么来的：
+    `cloudPage` 由 `cloudBaseFromLocation()` 推出，只有 `/d/<32hex>/` 匹配；
+    首页匹配不上就把隧道域名当"电脑地址"预填成局域网页。
+    """
+    storage = (REPO / "frontend" / "src" / "api" / "storage.ts").read_text(
+        encoding="utf-8")
+    auth = (REPO / "frontend" / "src" / "stores" / "auth.ts").read_text(
+        encoding="utf-8")
+    view = (REPO / "frontend" / "src" / "views" / "PairView.vue").read_text(
+        encoding="utf-8")
+
+    # 1) 中继首页的判据：公网主机 + 不是设备页
+    assert "export function relayRootBase" in storage
+    assert "export function isLanHost" in storage
+    root_fn = storage[storage.index("export function relayRootBase"):]
+    assert "/^\\/d\\/[0-9a-fA-F]{32}" in root_fn, "设备页必须排除"
+    assert "isLanHost(hostname)" in root_fn, "私有网段必须排除"
+
+    # 2) 登录与配对分开：首页拿设备清单，配对才落盘
+    assert "export async function loginAccount" in auth
+    assert "export async function pairAccountDevice" in auth
+    pair_fn = auth[auth.index("export async function pairAccountDevice"):]
+    assert "auto: true" in pair_fn
+    assert "applyPaired(r, `${origin}/d/${deviceId}`)" in pair_fn, (
+        "首页配完要把基址锚到设备页，否则刷新后设备 id 丢了")
+
+    # 3) 视图：账号区按 showAccount 显示；配对码与"连接电脑"只在设备页
+    assert "const showAccount = computed(() => cloudPage.value || relayRoot.value)" in view
+    assert '<template v-if="showAccount">' in view
+    assert '<label v-if="!relayRoot" class="field">' in view
+    assert 'v-if="!relayRoot"\n        class="btn primary block lg"' in view
+    assert 'v-if="relayRoot && accountDevices.length"' in view, "首页要能列电脑"
+    assert "pairAccountDevice(id, accountToken.value)" in view

@@ -9,8 +9,16 @@
  */
 import { computed, onMounted, ref } from "vue";
 import { ApiError } from "../api/client";
-import { buildBase, cloudBaseFromLocation } from "../api/storage";
-import { pair, pairParamsFromLocation, pairWithAccount, parsePairInput } from "../stores/auth";
+import { buildBase, cloudBaseFromLocation, relayRootBase } from "../api/storage";
+import type { AccountDevice } from "../stores/auth";
+import {
+  loginAccount,
+  pair,
+  pairAccountDevice,
+  pairParamsFromLocation,
+  pairWithAccount,
+  parsePairInput,
+} from "../stores/auth";
 import { toastError, toastOk } from "../stores/toast";
 
 /**
@@ -50,6 +58,18 @@ const email = ref("");
 const password = ref("");
 const accountBusy = ref(false);
 const accountError = ref("");
+
+/**
+ * 中继**首页**（`https://域名/`）：URL 里没有设备 id，既没有"电脑地址"
+ * 也没有 6 位码可用 —— 只能账号登录 + 选电脑。真机上从聊天窗直接打开域名
+ * 走的就是这条分支（ISSUE-041）。
+ */
+const relayRoot = computed(() => relayRootBase() !== "");
+/** 账号登录区：设备页（`/d/<id>/`）与中继首页都显示。 */
+const showAccount = computed(() => cloudPage.value || relayRoot.value);
+/** 首页登录后拿到的电脑清单。 */
+const accountDevices = ref<AccountDevice[]>([]);
+const accountToken = ref("");
 const canSubmitAccount = computed(() =>
   email.value.trim().length > 3 && password.value.length > 0 && !accountBusy.value);
 
@@ -75,7 +95,8 @@ onMounted(() => {
   // 局域网页是从电脑自己身上打开的，地址就是当前 location——
   // 让用户手输一遍 IP 只会多一个出错点（ISSUE-040：真机上按钮"点不动"
   // 的一种情形就是地址栏空着、按钮又是灰的，谁也说不清缺什么）。
-  if (!cloudPage.value && !host.value.trim() && window.location.hostname) {
+  if (!cloudPage.value && !relayRoot.value
+      && !host.value.trim() && window.location.hostname) {
     host.value = window.location.hostname;
     port.value = window.location.port || "8787";
   }
@@ -184,13 +205,49 @@ async function submitAccount(): Promise<void> {
   }
   accountBusy.value = true;
   try {
-    const r = await pairWithAccount(email.value, password.value);
+    // 设备页：URL 已经指明是哪台电脑，一步到位
+    if (cloudPage.value) {
+      const r = await pairWithAccount(email.value, password.value);
+      password.value = "";
+      toastOk(`已连接到 ${r.device_name}`);
+      return;
+    }
+    // 中继首页：先登录，再看这个账号下有几台电脑
+    const { token, devices } = await loginAccount(email.value, password.value);
     password.value = "";
-    toastOk(`已连接到 ${r.device_name}`);
+    accountToken.value = token;
+    accountDevices.value = devices;
+    if (devices.length === 0) {
+      accountError.value = "这个账号下还没有电脑，请先在电脑上登录同一个账号";
+      return;
+    }
+    if (devices.length === 1) {
+      const r = await pairAccountDevice(devices[0]!.id, token);
+      accountDevices.value = [];
+      toastOk(`已连接到 ${r.device_name}`);
+    }
   } catch (e) {
     accountError.value = e instanceof ApiError
       ? (e.userHint || e.friendly)
       : "登录失败，请检查邮箱与密码";
+  } finally {
+    accountBusy.value = false;
+  }
+}
+
+/** 首页多台电脑时选一台。 */
+async function chooseAccountDevice(id: string): Promise<void> {
+  if (accountBusy.value || !accountToken.value) return;
+  accountError.value = "";
+  accountBusy.value = true;
+  try {
+    const r = await pairAccountDevice(id, accountToken.value);
+    accountDevices.value = [];
+    toastOk(`已连接到 ${r.device_name}`);
+  } catch (e) {
+    accountError.value = e instanceof ApiError
+      ? (e.userHint || e.friendly)
+      : "连接失败，请再试一次";
   } finally {
     accountBusy.value = false;
   }
@@ -215,7 +272,7 @@ function onCodeInput(e: Event): void {
     </div>
 
     <div class="card">
-      <label v-if="!cloudPage" class="field">
+      <label v-if="!cloudPage && !relayRoot" class="field">
         <span class="lbl">电脑地址</span>
         <div class="addr">
           <input
@@ -241,10 +298,12 @@ function onCodeInput(e: Event): void {
         <span class="hint">电脑上打开 PhotoBridge 就能看到这个地址</span>
       </label>
       <p v-else class="cloud-note">
-        正在通过中继连接家里的电脑。输入电脑上显示的配对码即可。
+        {{ relayRoot
+          ? "登录你的账号，选一台电脑连上。照片不经过中继保存，只在传输时路过。"
+          : "正在通过中继连接家里的电脑。输入电脑上显示的配对码即可。" }}
       </p>
 
-      <template v-if="cloudPage">
+      <template v-if="showAccount">
         <label class="field">
           <span class="lbl">账号邮箱</span>
           <input
@@ -269,7 +328,11 @@ function onCodeInput(e: Event): void {
             placeholder="登录密码"
             @keyup.enter="submitAccount"
           />
-          <span class="hint">登录后自动匹配这台电脑，不必再输配对码</span>
+          <span class="hint">
+            {{ relayRoot
+              ? "登录后列出这个账号下的电脑"
+              : "登录后自动匹配这台电脑，不必再输配对码" }}
+          </span>
         </label>
 
         <p v-if="accountError" class="err">{{ accountError }}</p>
@@ -285,10 +348,26 @@ function onCodeInput(e: Event): void {
           {{ accountBusy ? "正在登录…" : "登录并连接" }}
         </button>
 
-        <div class="or-line"><span>或输入电脑上显示的配对码</span></div>
+        <div v-if="relayRoot && accountDevices.length" class="dev-list">
+          <button
+            v-for="d in accountDevices"
+            :key="d.id"
+            class="dev-item"
+            type="button"
+            @click="chooseAccountDevice(d.id)"
+          >
+            <span class="dev-name">{{ d.name }}</span>
+            <span class="dev-state" :class="{ on: d.online }">
+              {{ d.online ? "在线" : "离线" }}
+            </span>
+          </button>
+          <span class="hint">点一台电脑完成配对</span>
+        </div>
+
+        <div v-if="cloudPage" class="or-line"><span>或输入电脑上显示的配对码</span></div>
       </template>
 
-      <label class="field">
+      <label v-if="!relayRoot" class="field">
         <span class="lbl">配对码</span>
         <input
           class="input-lg code"
@@ -306,6 +385,7 @@ function onCodeInput(e: Event): void {
       <p v-if="error" class="err">{{ error }}</p>
 
       <button
+        v-if="!relayRoot"
         class="btn primary block lg"
         type="button"
         :disabled="busy"
@@ -334,7 +414,10 @@ function onCodeInput(e: Event): void {
     </details>
 
     <p class="foot-note">
-      <template v-if="cloudPage">
+      <template v-if="relayRoot">
+        电脑要开着 PhotoBridge 并连着网。照片不经过中继保存，只在传输时路过。
+      </template>
+      <template v-else-if="cloudPage">
         配对码由电脑上的 PhotoBridge 显示。照片不经过中继保存，只在传输时路过。
       </template>
       <template v-else>
@@ -518,5 +601,47 @@ function onCodeInput(e: Event): void {
  */
 .btn.dim {
   opacity: 0.55;
+}
+
+/* 中继首页：账号登录后列出的电脑 */
+.dev-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0 4px;
+}
+.dev-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 52px;
+  padding: 0 14px;
+  border: 1px solid var(--line, rgba(127, 127, 127, 0.25));
+  border-radius: 12px;
+  background: var(--bg-2, var(--bg-1));
+  color: var(--fg-1);
+  font-size: 15px;
+  text-align: left;
+}
+.dev-item:active {
+  transform: scale(0.99);
+}
+.dev-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dev-state {
+  flex: none;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(127, 127, 127, 0.18);
+  color: var(--fg-2);
+}
+.dev-state.on {
+  background: rgba(38, 166, 91, 0.16);
+  color: #26a65b;
 }
 </style>
