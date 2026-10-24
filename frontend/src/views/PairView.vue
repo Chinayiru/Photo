@@ -87,8 +87,13 @@ const entry = ref<"lan" | "cloud">(
 /** 云端入口能拿到"设备页"吗：设备页才有 6 位码这条路。 */
 const codeAvailable = computed(() =>
   !relayRoot.value && (entry.value === "lan" || cloudPage.value));
-/** 账号登录只在云端入口出现（账号是中继侧的东西）。 */
-const accountAvailable = computed(() => entry.value === "cloud");
+/**
+ * 账号登录**两种入口都给**。
+ *
+ * 账号本身是中继侧的，但局域网页也能用它（打的是"服务器地址"里的中继根）——
+ * 用户明确要求局域网入口同样有登录，别让人为了登录再切一次开关。
+ */
+const accountAvailable = computed(() => true);
 
 /**
  * 账号登录要打的中继根。
@@ -98,8 +103,7 @@ const accountAvailable = computed(() => entry.value === "cloud");
  * 不是 `/d/<id>`。
  */
 const accountBase = ref<string>(readAccountBase());
-const needsAccountBase = computed(() =>
-  entry.value === "cloud" && !cloudPage.value && !relayRoot.value);
+const needsAccountBase = computed(() => !cloudPage.value && !relayRoot.value);
 const resolvedAccountBase = computed(() => {
   if (relayRoot.value) return window.location.origin;
   if (cloudPage.value) {
@@ -495,7 +499,7 @@ function onCodeInput(e: Event): void {
           role="tab"
           :aria-selected="entry === 'lan'"
           :class="{ on: entry === 'lan' }"
-          @click="entry = 'lan'; mode = 'code'"
+          @click="entry = 'lan'; if (!codeAvailable) mode = 'account'"
         >局域网</button>
         <button
           class="tab"
@@ -503,7 +507,7 @@ function onCodeInput(e: Event): void {
           role="tab"
           :aria-selected="entry === 'cloud'"
           :class="{ on: entry === 'cloud' }"
-          @click="entry = 'cloud'; mode = 'account'"
+          @click="entry = 'cloud'; if (!codeAvailable) mode = 'account'"
         >云端</button>
       </div>
       <span class="hint">
