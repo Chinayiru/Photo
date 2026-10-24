@@ -149,20 +149,24 @@ class TunnelServer:
             await _deny(ws, 403, "host_not_allowed")
             return
         token = _bearer(ws.headers.get("authorization"))
-        if not token:
-            await _deny(ws, 401, "missing_agent_token")
-            return
-        row = find_device_by_agent_token(self.db, token)
+        row = find_device_by_agent_token(self.db, token) if token else None
         if row is None:
-            await _deny(ws, 401, "invalid_agent_token")
+            # SEC-06：缺令牌、令牌错、令牌已撤销，三种情形**必须**回
+            # 同一个响应。早先这里分 `missing_agent_token` / 
+            # `invalid_agent_token` / 403 `device_revoked`，差别本身就是
+            # 情报：攻击者拿到一串"曾经有效"的令牌，403 会告他这串东西
+            # 真签发过，爆破于是从"找 token"退化成"确认 token"。
+            # 撤销状态记在服务端日志里，不再回给对端；设备主人看云端
+            # 设备页，那里有明确的"已撤销"。
+            await _deny(ws, 401, "agent_token_rejected")
             return
         device_id = str(row["id"])
         account_id = str(row["account_id"])
         if int(row["revoked"] or 0) != 0:
-            # 升级已经发生（或即将发生）也要立刻说清楚：AC-5.8 要求
-            # 被撤销的设备**不能**建隧道。这里回 403 而不是直接 close，
-            # 因为电脑端会重连，close 1008 在它的日志里只是一行"断开"。
-            await _deny(ws, 403, "device_revoked")
+            # AC-5.8 要求被撤销的设备不能建隧道：这里拒掉，但对端看到的
+            # 仍然是上面那个 401 —— 见上面的注释。
+            log.warning("设备 %s 的 agent 令牌已被撤销，拒绝建隧道", device_id)
+            await _deny(ws, 401, "agent_token_rejected")
             return
 
         await ws.accept()
