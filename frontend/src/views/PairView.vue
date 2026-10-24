@@ -65,8 +65,38 @@ const accountError = ref("");
  * 走的就是这条分支（ISSUE-041）。
  */
 const relayRoot = computed(() => relayRootBase() !== "");
-/** 账号登录区：设备页（`/d/<id>/`）与中继首页都显示。 */
-const showAccount = computed(() => cloudPage.value || relayRoot.value);
+/**
+ * 登录方式：**配对码** 与 **账号登录** 二选一，用顶部切换，不并排堆在一屏。
+ *
+ * 以前两者是上下叠着的（云端页把账号登录放在配对码上方，中间一条「或」），
+ * 手机上要滚很久才能看到配对码，用户分不清"我该用哪个"。切换式的好处是
+ * 同一时刻只有一个动作区域，屏幕小也不挤。
+ */
+const mode = ref<"code" | "account">("code");
+
+/**
+ * 账号登录要打的中继根。
+ *
+ * 云端页与中继首页都有 `location` 可依；**局域网页没有** —— 家里电脑的云端
+ * 地址只有它自己知道，所以让用户填一次并记住。填的是中继根（`https://xxx`），
+ * 不是 `/d/<id>`。
+ */
+const accountBase = ref<string>(readAccountBase());
+const needsAccountBase = computed(() => !cloudPage.value && !relayRoot.value);
+const resolvedAccountBase = computed(() => {
+  if (relayRoot.value) return window.location.origin;
+  if (cloudPage.value) {
+    try { return new URL(window.location.href).origin; } catch { return ""; }
+  }
+  return accountBase.value.trim().replace(/\/+$/, "");
+});
+
+function readAccountBase(): string {
+  try { return localStorage.getItem("photobridge.accountBase") || ""; } catch { return ""; }
+}
+function saveAccountBase(v: string): void {
+  try { localStorage.setItem("photobridge.accountBase", v); } catch { /* 隐私模式会抛 */ }
+}
 /** 首页登录后拿到的电脑清单。 */
 const accountDevices = ref<AccountDevice[]>([]);
 const accountToken = ref("");
@@ -95,6 +125,8 @@ onMounted(() => {
   // 局域网页是从电脑自己身上打开的，地址就是当前 location——
   // 让用户手输一遍 IP 只会多一个出错点（ISSUE-040：真机上按钮"点不动"
   // 的一种情形就是地址栏空着、按钮又是灰的，谁也说不清缺什么）。
+  // 中继首页没有配对码可输，直接落在账号登录上
+  if (relayRoot.value) mode.value = "account";
   if (!cloudPage.value && !relayRoot.value
       && !host.value.trim() && window.location.hostname) {
     host.value = window.location.hostname;
@@ -212,8 +244,14 @@ async function submitAccount(): Promise<void> {
       toastOk(`已连接到 ${r.device_name}`);
       return;
     }
-    // 中继首页：先登录，再看这个账号下有几台电脑
-    const { token, devices } = await loginAccount(email.value, password.value);
+    // 局域网页 / 中继首页：先登录，再看这个账号下有几台电脑
+    const base = resolvedAccountBase.value;
+    if (!base) {
+      accountError.value = "请先填写电脑连着的云端地址（形如 https://xxx.trycloudflare.com）";
+      return;
+    }
+    const { token, devices } = await loginAccount(email.value, password.value, base);
+    saveAccountBase(base);
     password.value = "";
     accountToken.value = token;
     accountDevices.value = devices;
@@ -222,7 +260,7 @@ async function submitAccount(): Promise<void> {
       return;
     }
     if (devices.length === 1) {
-      const r = await pairAccountDevice(devices[0]!.id, token);
+      const r = await pairAccountDevice(devices[0]!.id, token, base);
       accountDevices.value = [];
       toastOk(`已连接到 ${r.device_name}`);
     }
@@ -241,7 +279,7 @@ async function chooseAccountDevice(id: string): Promise<void> {
   accountError.value = "";
   accountBusy.value = true;
   try {
-    const r = await pairAccountDevice(id, accountToken.value);
+    const r = await pairAccountDevice(id, accountToken.value, resolvedAccountBase.value);
     accountDevices.value = [];
     toastOk(`已连接到 ${r.device_name}`);
   } catch (e) {
@@ -272,7 +310,27 @@ function onCodeInput(e: Event): void {
     </div>
 
     <div class="card">
-      <label v-if="!cloudPage && !relayRoot" class="field">
+      <div class="tabs" role="tablist" aria-label="登录方式">
+        <button
+          v-if="!relayRoot"
+          class="tab"
+          type="button"
+          role="tab"
+          :aria-selected="mode === 'code'"
+          :class="{ on: mode === 'code' }"
+          @click="mode = 'code'"
+        >配对码</button>
+        <button
+          class="tab"
+          type="button"
+          role="tab"
+          :aria-selected="mode === 'account'"
+          :class="{ on: mode === 'account' }"
+          @click="mode = 'account'"
+        >账号登录</button>
+      </div>
+
+      <label v-if="mode === 'code' && !cloudPage && !relayRoot" class="field">
         <span class="lbl">电脑地址</span>
         <div class="addr">
           <input
@@ -297,13 +355,28 @@ function onCodeInput(e: Event): void {
         </div>
         <span class="hint">电脑上打开 PhotoBridge 就能看到这个地址</span>
       </label>
-      <p v-else class="cloud-note">
+      <p v-else-if="mode === 'code'" class="cloud-note">
         {{ relayRoot
           ? "登录你的账号，选一台电脑连上。照片不经过中继保存，只在传输时路过。"
           : "正在通过中继连接家里的电脑。输入电脑上显示的配对码即可。" }}
       </p>
 
-      <template v-if="showAccount">
+      <template v-if="mode === 'account'">
+        <label v-if="needsAccountBase" class="field">
+          <span class="lbl">服务器地址</span>
+          <input
+            v-model="accountBase"
+            class="input-lg"
+            type="url"
+            inputmode="url"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck="false"
+            placeholder="https://xxx.trycloudflare.com"
+            @blur="saveAccountBase(accountBase.trim())"
+          />
+          <span class="hint">电脑上 PhotoBridge 连着的云端地址，填一次会记住</span>
+        </label>
         <label class="field">
           <span class="lbl">账号邮箱</span>
           <input
@@ -364,10 +437,9 @@ function onCodeInput(e: Event): void {
           <span class="hint">点一台电脑完成配对</span>
         </div>
 
-        <div v-if="cloudPage" class="or-line"><span>或输入电脑上显示的配对码</span></div>
       </template>
 
-      <label v-if="!relayRoot" class="field">
+      <label v-if="mode === 'code' && !relayRoot" class="field">
         <span class="lbl">配对码</span>
         <input
           class="input-lg code"
@@ -385,7 +457,7 @@ function onCodeInput(e: Event): void {
       <p v-if="error" class="err">{{ error }}</p>
 
       <button
-        v-if="!relayRoot"
+        v-if="mode === 'code' && !relayRoot"
         class="btn primary block lg"
         type="button"
         :disabled="busy"
@@ -571,7 +643,31 @@ function onCodeInput(e: Event): void {
   padding: 10px 12px;
 }
 
-/* 「或」分隔线：两条配对路径并列时的视觉切换（云端页才有） */
+/* 登录方式切换：分段控件（同一时刻只有一个动作区域） */
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 999px;
+  background: var(--bg-2, rgba(127, 127, 127, 0.12));
+}
+.tab {
+  flex: 1 1 0;
+  min-height: 40px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg-2);
+  font-size: 14px;
+  font-weight: 500;
+}
+.tab.on {
+  background: var(--bg-1, #fff);
+  color: var(--fg);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+
+/* 「或」分隔线：两条配对路径并列时的视觉切换（已改为切换式，保留备用） */
 .or-line {
   display: flex;
   align-items: center;

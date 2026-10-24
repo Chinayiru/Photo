@@ -441,14 +441,15 @@ function applyPaired(r: PairResponse, base: string): void {
 export async function loginAccount(
   email: string,
   password: string,
+  baseOverride?: string,
 ): Promise<{ token: string; devices: AccountDevice[] }> {
-  const base = relayRootBase();
+  const base = (baseOverride || relayRootBase()).replace(/\/+$/, "");
   if (!base) {
     throw new ApiError({
       status: 0,
       code: "E1001",
-      message: "这个页面不支持账号登录",
-      userHint: "当前是局域网直连页面，请用电脑上显示的 6 位配对码",
+      message: "没有可用的服务器地址",
+      userHint: "请填写电脑连着的云端地址，或改用电脑上显示的 6 位配对码",
     });
   }
   const mail = email.trim();
@@ -490,8 +491,9 @@ export async function loginAccount(
 export async function pairAccountDevice(
   deviceId: string,
   token: string,
+  baseOverride?: string,
 ): Promise<PairResponse> {
-  const origin = relayRootBase();
+  const origin = (baseOverride || relayRootBase()).replace(/\/+$/, "");
   if (!origin) {
     throw new ApiError({
       status: 0, code: "E1001", message: "这个页面不支持账号登录",
