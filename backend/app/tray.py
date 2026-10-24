@@ -171,6 +171,17 @@ def _qr_pil_image(data: str, *, box: int = 8, border: int = 3) -> Any:
     return qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
 
+#: 同一时刻只允许一个二维码窗口。
+#:
+#: 用户连点两次"显示配对二维码"会起两个线程、两套 Tk 解释器；而
+#: `tkinter._default_root` 是个进程级全局，第二个窗口的 `PhotoImage` 会挂到
+#: 第一个解释器上，于是第二个窗口弹不出来、日志里是
+#: `TclError: image "pyimage2" doesn't exist`（2026-10-24 实测）。
+#: 与其在 Tk 层面绕，不如直接让第二次点击什么也不做 —— 第一个窗口本来
+#: 就在屏幕上等着。
+_QR_OPEN = threading.Event()
+
+
 def _show_qr_window(title: str, url: str, code: str, ips: list[str],
                     alt_urls: list[str] | None = None) -> None:
     """弹出一个二维码窗口（阻塞直到用户关闭）。
@@ -212,7 +223,13 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str],
             root.attributes("-topmost", True)
 
             img = _qr_pil_image(url)
-            photo = ImageTk.PhotoImage(img)
+            # ★ 必须显式给 `master`：不给的话 `ImageTk.PhotoImage` 会挂到
+            # `tkinter._default_root` 上，而那个全局变量指向上一次创建的
+            # 那个 Tk 解释器 —— 用户关掉二维码窗口再点一次时，它指向的是
+            # 已经 `destroy()` 的解释器，于是 Label 引用一张"别的解释器里的
+            # 图片"，抛 `TclError: image "pyimage2" doesn't exist`，窗口弹不
+            # 出来（2026-10-24 实测：连点两次必现）。
+            photo = ImageTk.PhotoImage(img, master=root)
 
             tk.Label(root, image=photo).pack(padx=16, pady=(16, 8))
             # 保持引用：PhotoImage 被 GC 后窗口里就是一片空白
@@ -270,7 +287,12 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str],
                 root.destroy()
             except Exception:       # noqa: BLE001
                 pass
+            _QR_OPEN.clear()
 
+    if _QR_OPEN.is_set():
+        log.info("二维码窗口已经开着，忽略这次点击")
+        return
+    _QR_OPEN.set()
     threading.Thread(target=_run, name="photobridge-qr", daemon=True).start()
 
 
@@ -439,7 +461,10 @@ class TrayController:
         base = self._cloud_entry() or lan_base
         if base != lan_base:
             log.info("二维码指向云端入口 %s（局域网 %s 作为备选）", base, lan_base)
-        log.info("托盘生成配对码，%d 秒内有效", int(PAIR_CODE_TTL))
+        # ★ 配对码同时写进日志：窗口是"额外能力"（无桌面会话、Tk 异常、
+        # 连点冲突都可能让窗口弹不出来），而配对码本身是当次交互的一次性
+        # 凭据、5 分钟后失效 —— 写下来比"用户看不到码、以为程序坏了"划算。
+        log.info("托盘生成配对码 %s（%d 秒内有效）", code, int(PAIR_CODE_TTL))
         return code, pair_qr_url(base, code, st.device_id), ips
 
     def _port(self) -> int:
@@ -467,6 +492,12 @@ class TrayController:
         return out
 
     def _on_show_qr(self, *_: Any) -> None:
+        # ★ 先看窗口闸门**再**生成配对码：反过来的话，用户连点两次会先
+        # 用掉一个码（让屏幕上正显示的那个失效）、然后什么也不显示 ——
+        # 用户拿到的码和屏幕上的不一致，只会更难排查。
+        if _QR_OPEN.is_set():
+            log.info("二维码窗口已经开着，忽略这次点击（沿用屏幕上那个码）")
+            return
         got = self._new_pair_code()
         if got is None:
             notify_error("生成配对码失败，详见 data/logs/agent.log")

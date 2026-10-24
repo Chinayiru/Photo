@@ -44,6 +44,7 @@ import {
   getDeviceId,
   getDeviceName,
   getToken,
+  isLocalIPv4,
   normalizeBase,
   relayRootBase,
   savePairing,
@@ -570,36 +571,18 @@ export function unpair(): void {
  * ------------------------------------------------------------------ */
 
 /**
- * 「像局域网的地址」：私有网段 / 回环 / 常见组网（VPN）网段。
+ * 「像局域网的地址」——**判定只有一份**，在 `api/storage.ts: isLocalIPv4()`。
  *
- * ## 为什么把组网网段也算进来
- *
- * 手机装一个组网客户端（Tailscale、Radmin、Hamachi）之后，它就是通过一个
- * 非 RFC1918 的地址访问电脑的：Tailscale 用 `100.64/10`（CGNAT 段），
- * Radmin 用 `26/8`，Hamachi 用 `25/8`。这些地址在**语义上**和局域网等价
- * —— 都是"只有自己设备能到的链路"，明文 http、无证书。
- *
- * 不把它们算进来会出两种别扭：
- *   1. 用户把 `http://100.x.y.z:8799` 粘进输入框，`schemeFor()` 会判定
- *      "这不是局域网"，补成 `https://`，于是连不上（本机根本没有证书）；
- *   2. 用户看到一条明明是自己的地址，却被「地址不被接受」拒掉。
- *
- * 注意它**只影响**协议补全与"是否按局域网对待"，不放宽配对目标的信任边界：
- * 真正的白名单在 `isPairHostAllowed()`，那条路径还有"当前页面源"这一条。
+ * 这里保留这个名字是为了让调用点读起来仍然是"这是不是一台局域网机器"，
+ * 实现直接委托过去。曾经这里和 `isLanHost()` 各写了一份私有网段判断，
+ * 两份都只认 RFC1918 —— 于是 Tailscale 的 `100.x` 地址在一处被当成公网
+ * （`schemeFor()` 补 https，连不上）、在另一处被当成中继首页
+ * （`relayRootBase()` 不为空，配对页渲染成"账号登录"，还去找电脑上并不
+ * 存在的 `/api/auth/login`，报"内容不存在或已被删除"）。两份判断分开写，
+ * 就必然会在某天只修好其中一份。
  */
 function isPrivateIPv4(host: string): boolean {
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
-  if (!m) return false;
-  const a = Number(m[1]);
-  const b = Number(m[2]);
-  if (a > 255 || b > 255 || Number(m[3]) > 255 || Number(m[4]) > 255) return false;
-  return a === 10                              // 10.0.0.0/8
-    || a === 127                               // 127.0.0.0/8（自测 / 模拟器）
-    || (a === 172 && b >= 16 && b <= 31)       // 172.16.0.0/12
-    || (a === 192 && b === 168)                // 192.168.0.0/16
-    || (a === 100 && b >= 64 && b <= 127)      // 100.64.0.0/10（Tailscale/CGNAT）
-    || a === 26                                // 26.0.0.0/8（Radmin VPN）
-    || a === 25;                               // 25.0.0.0/8（Hamachi）
+  return isLocalIPv4(host);
 }
 
 /** 用户**已经配对过**的 base 主机（`pb.base` / `pb.cloud` 里那两个）。 */

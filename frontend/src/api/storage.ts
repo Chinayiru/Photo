@@ -362,23 +362,46 @@ export function buildBase(host: string, port: string): string {
  * 故意**不**用 `location.port` 判断：云端也可能挂在 8000 端口上（裸 IP 直连
  * 那套），靠端口分会把两种拓扑认错。
  */
+/**
+ * 「像本机/局域网的地址」：私有网段、回环、链路本地，以及常见组网网段。
+ *
+ * ## 为什么组网网段必须算进来
+ *
+ * 用户装一个组网客户端（Tailscale / Radmin / Hamachi）之后，手机就是用
+ * 一个非 RFC1918 的地址访问电脑的：Tailscale 是 `100.64/10`（CGNAT 段），
+ * Radmin 是 `26/8`，Hamachi 是 `25/8`。语义上和局域网完全一样 —— 只有
+ * 自己设备能到、明文 http、没有证书。
+ *
+ * 不认它们的后果不是"慢一点"，而是**页面认错身份**：`isLanHost()` 返回
+ * false ⇒ `relayRootBase()` 认为这是"中继首页" ⇒ 配对页渲染成"账号登录 +
+ * 设备列表"那一套，而 `/api/auth/login` 只存在于云端中继、电脑上根本没有。
+ * 实测症状：手机打开 `http://100.x.y.z:8799/`，登录时提示"内容不存在或
+ * 已被删除"（那是电脑端 404 E1004 的文案），而且**找不到输入 6 位配对码
+ * 的地方**（那个输入框带 `v-if="!relayRoot"`）。
+ */
+export function isLocalIPv4(host: string): boolean {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host.trim());
+  if (!m) return false;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  if (a > 255 || b > 255 || Number(m[3]) > 255 || Number(m[4]) > 255) return false;
+  return a === 10                              // 10.0.0.0/8
+    || a === 127                               // 127.0.0.0/8
+    || (a === 172 && b >= 16 && b <= 31)       // 172.16.0.0/12
+    || (a === 192 && b === 168)                // 192.168.0.0/16
+    || (a === 169 && b === 254)                // 169.254.0.0/16 链路本地
+    || (a === 100 && b >= 64 && b <= 127)      // 100.64.0.0/10 CGNAT（Tailscale）
+    || a === 26                                // 26.0.0.0/8 Radmin VPN
+    || a === 25;                               // 25.0.0.0/8 Hamachi
+}
+
 export function isLanHost(hostname: string): boolean {
   const h = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
   if (!h) return true;
   if (h === "::1") return true;
   if (h === "localhost" || h.endsWith(".local") || h.endsWith(".lan")) return true;
   if (!h.includes(".") && !h.includes(":")) return true;
-  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
-  if (v4) {
-    const a = Number(v4[1]);
-    const b = Number(v4[2]);
-    if (a === 10 || a === 127) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 169 && b === 254) return true;
-    return false;
-  }
-  return false;
+  return isLocalIPv4(h);
 }
 
 /**
