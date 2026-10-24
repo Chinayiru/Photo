@@ -70,6 +70,14 @@ onMounted(() => {
     code.value = p.code;
     expectedDid.value = p.did;
     void submit();
+    return;
+  }
+  // 局域网页是从电脑自己身上打开的，地址就是当前 location——
+  // 让用户手输一遍 IP 只会多一个出错点（ISSUE-040：真机上按钮"点不动"
+  // 的一种情形就是地址栏空着、按钮又是灰的，谁也说不清缺什么）。
+  if (!cloudPage.value && !host.value.trim() && window.location.hostname) {
+    host.value = window.location.hostname;
+    port.value = window.location.port || "8787";
   }
 });
 
@@ -269,7 +277,8 @@ function onCodeInput(e: Event): void {
         <button
           class="btn primary block lg"
           type="button"
-          :disabled="!canSubmitAccount"
+          :disabled="accountBusy"
+          :class="{ dim: !canSubmitAccount }"
           @click="submitAccount"
         >
           <span v-if="accountBusy" class="spinner" />
@@ -299,7 +308,8 @@ function onCodeInput(e: Event): void {
       <button
         class="btn primary block lg"
         type="button"
-        :disabled="!canSubmit"
+        :disabled="busy"
+        :class="{ dim: !canSubmit }"
         @click="submit"
       >
         <span v-if="busy" class="spinner" />
@@ -498,5 +508,15 @@ function onCodeInput(e: Event): void {
 
 .or-line span {
   white-space: nowrap;
+}
+
+/*
+ * 条件不足时按钮仍然可点（`disabled` 只留给"请求进行中"）。
+ * 灰掉但点不动的按钮在手机上毫无解释力——用户只会反复戳，然后报
+ * "按钮点不上"（ISSUE-040）。这里只降低不透明度做提示，点下去由
+ * `submit()` / `submitAccount()` 把缺什么用文字说出来。
+ */
+.btn.dim {
+  opacity: 0.55;
 }
 </style>
