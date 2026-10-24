@@ -750,3 +750,52 @@ def test_my_other_computers_code_still_says_so(tmp_path: Path) -> None:
     assert mixed_up.status_code == 403
     assert mixed_up.json()["error"]["code"] == "E1016"
     assert "另一台电脑" in mixed_up.json()["error"]["message"]
+
+
+def test_a_revoked_agent_token_looks_exactly_like_an_unknown_one() -> None:
+    """被撤销与不存在必须回同一个响应（SEC-06）。
+
+    差别就是情报：攻击者拿到一串「曾经有效」的令牌，403 与 401 的不同会
+    告他这串东西真签发过，于是爆破从「找 token」退化成「确认 token」。
+    这里用假 ws 跑真正的方法，避免起 uvicorn。
+    """
+    import asyncio
+    import types
+
+    from cloud.relay import tunnel
+
+    class _WS:
+        def __init__(self) -> None:
+            self.headers = {
+                "host": "relay.example",
+                "authorization": "Bearer whatever",
+            }
+            self.client = types.SimpleNamespace(host="203.0.113.9")
+            self.denied: tuple[int, str] | None = None
+
+        async def send_denial_response(self, response) -> None:
+            self.denied = (response.status_code,
+                           response.body.decode("utf-8"))
+
+        async def accept(self) -> None:      # 不该走到这里
+            raise AssertionError("被拒绝的连接不该被 accept")
+
+    relay = types.SimpleNamespace(db=None, check_host=lambda host: True)
+
+    def _run(row: dict | None) -> tuple[int, str]:
+        original = tunnel.find_device_by_agent_token
+        tunnel.find_device_by_agent_token = lambda db, token: row
+        try:
+            ws = _WS()
+            asyncio.run(tunnel.TunnelServer.handle_agent(relay, ws))
+            assert ws.denied is not None, "连接既没被拒绝也没被接受"
+            return ws.denied
+        finally:
+            tunnel.find_device_by_agent_token = original
+
+    revoked = _run({"id": "d1", "account_id": "a1", "revoked": 1})
+    unknown = _run(None)
+    assert revoked == unknown, f"撤销与不存在可区分：{revoked} vs {unknown}"
+    assert revoked[0] == 401, f"撤销应为 401（与不存在一致），实际 {revoked[0]}"
+
+

@@ -478,7 +478,8 @@ def test_agent_ws_rejects_bad_credentials(rig_factory) -> None:
 
     TC-TUNNEL-SEC-001 无 `Authorization` → 401 `missing_agent_token`
     TC-TUNNEL-SEC-002 `Bearer wrong-token` → 401 `invalid_agent_token`
-    TC-TUNNEL-SEC-003 已撤销的 agent_token → 403 `device_revoked`
+    TC-TUNNEL-SEC-003 已撤销的 agent_token → 401 `agent_token_rejected`
+        （与「令牌不认识」完全一致：差别本身就是情报，见 SEC-06）
     TC-TUNNEL-SEC-004 `Basic <tok>`（错误 scheme）→ 401
     TC-TUNNEL-SEC-006 令牌放查询串 `?token=` → 401（只读 header）
 
@@ -529,8 +530,8 @@ def test_agent_ws_rejects_bad_credentials(rig_factory) -> None:
     assert "401" in out["wrong_token"], out
     # `Basic xxx` 不是 Bearer，等同无令牌 → 401（不能因为"有 Authorization 头"放行）
     assert "401" in out["basic_scheme"], out
-    # 已撤销的设备用 403（凭据有效但被拒），与"令牌不认识"的 401 区分开
-    assert "403" in out["revoked"], out
+    # 已撤销不再是 403：必须与"令牌不认识"完全一致（SEC-06）
+    assert "401" in out["revoked"], out
     # ★ 查询串里的令牌不算数
     assert "401" in out["query_token"], out
 
