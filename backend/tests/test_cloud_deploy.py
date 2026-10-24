@@ -667,3 +667,25 @@ def test_windows_deploy_script_only_asks_for_the_password_when_it_registers() ->
     call = code.index("$Password = Resolve-Password")
     assert prev < call, "调用点排在重装检测之前：无人值守升级会先被卡住"
     assert call < init, "口令必须在 cloud_init 之前拿到"
+
+
+def test_windows_deploy_script_lets_extra_hosts_into_the_allowlist() -> None:
+    """隧道 / 域名场景：对外主机名必须能进 `PB_CLOUD_HOSTS`（ISSUE-039）。
+
+    实测踩到（2026-10-24）：relay 走 Cloudflare 隧道时，电脑端握手带的
+    `Host` 是**隧道域名**，而生成的 `run_relay.ps1` 里 `PB_CLOUD_HOSTS`
+    只有 `-BaseUrl` 的 Host（当时是 IP）。`/agent/ws` 的 Host 校验于是把
+    每一次握手都 403 掉 —— 手机能开页面、看健康检查，但**电脑永远不在线**，
+    现场表现是"自动配对返回 503 电脑不在线"。
+
+    判据按"生成的那一行"钉住：白名单必须由 `$hostsValue`（主机名 + `-ExtraHosts`）
+    拼出来，而不只是 `$hostName`。
+    """
+    code = _deploy_ps1().decode("utf-8-sig")
+
+    assert "[string]$ExtraHosts" in code, "缺少 -ExtraHosts 参数，隧道域名无处可写"
+    assert "$hostsValue" in code, "没有把主机名与额外分配拼成一个值"
+    assert 'PB_CLOUD_HOSTS    = "$hostsValue"' in code, \
+        "run_relay.ps1 的 PB_CLOUD_HOSTS 必须用 $hostsValue"
+    assert 'PB_CLOUD_HOSTS    = "$hostName"' not in code, \
+        "只写 $hostName 会把隧道域名 / 域名丢掉，/agent/ws 必然 403"

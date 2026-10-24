@@ -31,7 +31,13 @@ param(
     # 受信代理：只有从这些地址连进来的请求，其 `X-Forwarded-For` 才采信。
     # cloudflared（以及旧方案的 80 端口转发）都从回环连入，所以默认回环。
     # ★ 设了它就必须保证 8000 不再直接对公网开放，否则任何人都能伪造来源。
-    [string]$TrustedProxies = "127.0.0.1,::1"
+    [string]$TrustedProxies = "127.0.0.1,::1",
+    # 额外允许的 Host（逗号分隔）。relay 的 `/agent/ws` 会校验 Host 头
+    # （防 DNS rebinding），而"对外主机名"与"监听地址"是两件事：走
+    # Cloudflare 隧道 / 反向代理 / 自有域名时，电脑端握手带的是**公网主机名**，
+    # 不在白名单里就会被 403 拒掉，现象是"手机能开页面、电脑永远不在线"。
+    # 例：-ExtraHosts "pb.example.com,xxx.trycloudflare.com"
+    [string]$ExtraHosts = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -268,6 +274,13 @@ $runScript = Join-Path $InstallDir "run_relay.ps1"
 $logDir    = Join-Path $InstallDir "logs"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 $hostName = ([uri]$BaseUrl).Host
+# 对外主机名 = 监听主机 + 额外分配（去重、保序）
+$allHosts = @($hostName)
+foreach ($h in ($ExtraHosts -split ",")) {
+    $h = $h.Trim()
+    if ($h) { $allHosts += $h }
+}
+$hostsValue = (($allHosts | Select-Object -Unique) -join ",")
 
 $runBody = @"
 # PhotoBridge 云端中继 —— 由 deploy.ps1 生成。
@@ -276,7 +289,7 @@ $runBody = @"
 `$env:PB_CLOUD_DB       = "$dataDir\cloud.db"
 `$env:PB_CLOUD_HOST     = "0.0.0.0"
 `$env:PB_CLOUD_PORT     = "$Port"
-`$env:PB_CLOUD_HOSTS    = "$hostName"
+`$env:PB_CLOUD_HOSTS    = "$hostsValue"
 `$env:PB_CLOUD_WEB_DIR  = "$InstallDir\frontend\dist"
 # 受信代理：cloudflared 从回环连入，只有它写的 X-Forwarded-For 才采信。
 # 不设的后果是"所有手机共用 127.0.0.1 一个限流桶"——一个人刷满登录次数，
