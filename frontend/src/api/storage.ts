@@ -351,3 +351,50 @@ export function buildBase(host: string, port: string): string {
   if (/:\d+$/.test(h)) return normalizeBase(h); // 用户把端口写在 host 里了
   return normalizeBase(`${h}:${p || "8787"}`);
 }
+
+
+/**
+ * 这个主机名像不像"家里那台电脑"。
+ *
+ * 用途：区分"页面是电脑伺服的"和"页面是中继伺服的"。局域网一定是私有网段
+ * （或单标签主机名），中继一定是公网域名/IP。
+ *
+ * 故意**不**用 `location.port` 判断：云端也可能挂在 8000 端口上（裸 IP 直连
+ * 那套），靠端口分会把两种拓扑认错。
+ */
+export function isLanHost(hostname: string): boolean {
+  const h = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (!h) return true;
+  if (h === "::1") return true;
+  if (h === "localhost" || h.endsWith(".local") || h.endsWith(".lan")) return true;
+  if (!h.includes(".") && !h.includes(":")) return true;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (v4) {
+    const a = Number(v4[1]);
+    const b = Number(v4[2]);
+    if (a === 10 || a === 127) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 169 && b === 254) return true;
+    return false;
+  }
+  return false;
+}
+
+/**
+ * 中继首页基址：`https://域名/` 这种"没说哪台电脑"的页面。
+ *
+ * 设备页（`/d/<32hex>/`）返回空串 —— 那种页面由 `cloudBaseFromLocation()`
+ * 负责，它带着设备 id，能直接自动配对，不需要列设备。
+ */
+export function relayRootBase(): string {
+  try {
+    const { protocol, host, hostname, pathname } = window.location;
+    if (protocol !== "https:" && protocol !== "http:") return "";
+    if (isLanHost(hostname)) return "";
+    if (/^\/d\/[0-9a-fA-F]{32}(?:\/|$)/.test(pathname)) return "";
+    return `${protocol}//${host}`;
+  } catch {
+    return "";
+  }
+}

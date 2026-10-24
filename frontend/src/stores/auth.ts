@@ -45,6 +45,7 @@ import {
   getDeviceName,
   getToken,
   normalizeBase,
+  relayRootBase,
   savePairing,
 } from "../api/storage";
 import {
@@ -388,25 +389,126 @@ export async function pairWithAccount(
       },
     );
 
-    savePairing({
-      token: r.client_token,
-      deviceId: r.device_id,
-      deviceName: r.device_name,
-      // 落的是云端基址：以后每次请求都走中继，家里的 IP 变了也不影响。
-      base: here,
-      cloudBase: here,
-    });
-    s.serverDeviceId = r.device_id;
-    s.deviceName = r.device_name;
-    s.deviceMismatch = false;
-    s.lastError = "";
-    scrubPairQuery();
-    s.conn = "CLOUD";
-    s.lastOkAt = Date.now();
+    applyPaired(r, here);
     return r;
   } finally {
     s.probing = false;
   }
+}
+
+
+/** 中继首页列出来的那台电脑。 */
+export interface AccountDevice {
+  id: string;
+  name: string;
+  online: boolean;
+}
+
+/**
+ * 配对成功后的统一收尾：两条账号入口（设备页 / 中继首页）共用。
+ *
+ * 必须落 `cloudBase` 并且把 `conn` 直接标成 `"CLOUD"`：页面由中继伺服时
+ * 请求本来就一直走中继，写 `"lan"` 会让状态条显示"局域网直连"，
+ * 而家里的 `192.168.x.x` 在 4G 上根本不可达。
+ */
+function applyPaired(r: PairResponse, base: string): void {
+  const s = authStore.state;
+  savePairing({
+    token: r.client_token,
+    deviceId: r.device_id,
+    deviceName: r.device_name,
+    // 落的是云端基址：以后每次请求都走中继，家里的 IP 变了也不影响。
+    base,
+    cloudBase: base,
+  });
+  s.serverDeviceId = r.device_id;
+  s.deviceName = r.device_name;
+  s.deviceMismatch = false;
+  s.lastError = "";
+  scrubPairQuery();
+  s.conn = "CLOUD";
+  s.lastOkAt = Date.now();
+}
+
+/**
+ * 中继**首页**（`https://域名/`）上的账号登录：URL 里没有设备 id，
+ * 所以登录后要把这个账号下的电脑列出来。
+ *
+ * 返回值故意把 `token` 也交给调用方：多台电脑时用户还要再点一次，
+ * 不应该让他重新登录一遍（口令已经在这里用完就该从内存里消失）。
+ */
+export async function loginAccount(
+  email: string,
+  password: string,
+): Promise<{ token: string; devices: AccountDevice[] }> {
+  const base = relayRootBase();
+  if (!base) {
+    throw new ApiError({
+      status: 0,
+      code: "E1001",
+      message: "这个页面不支持账号登录",
+      userHint: "当前是局域网直连页面，请用电脑上显示的 6 位配对码",
+    });
+  }
+  const mail = email.trim();
+  if (!mail || !password) {
+    throw new ApiError({
+      status: 0, code: "E1001", message: "请填写邮箱和密码",
+      userHint: "请填写 PhotoBridge 账号的邮箱与密码",
+    });
+  }
+  const login = await api.post<{ account_token?: string }>(
+    "/api/auth/login",
+    { email: mail, password },
+    { base, skipAuthLost: true, timeoutMs: 15_000 },
+  );
+  const token = String(login.account_token || "");
+  if (!token) {
+    throw new ApiError({
+      status: 0, code: "E2005", message: "登录失败",
+      userHint: "邮箱或密码不正确",
+    });
+  }
+  const list = await api.get<{
+    devices?: Array<{ id?: string; name?: string; online?: boolean }>;
+  }>("/api/devices", {
+    base,
+    skipAuthLost: true,
+    timeoutMs: 15_000,
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const devices: AccountDevice[] = (list.devices || []).map((d) => ({
+    id: String(d.id || ""),
+    name: String(d.name || "未命名电脑"),
+    online: !!d.online,
+  })).filter((d) => d.id.length > 0);
+  return { token, devices };
+}
+
+/** 首页选完电脑之后，用账号令牌直接配（`auto:true`，不需要 6 位码）。 */
+export async function pairAccountDevice(
+  deviceId: string,
+  token: string,
+): Promise<PairResponse> {
+  const origin = relayRootBase();
+  if (!origin) {
+    throw new ApiError({
+      status: 0, code: "E1001", message: "这个页面不支持账号登录",
+      userHint: "请刷新页面后重试",
+    });
+  }
+  const r = await api.post<PairResponse>(
+    `/api/devices/${deviceId}/pair`,
+    { auto: true, client_name: clientName() },
+    {
+      base: origin,
+      skipAuthLost: true,
+      timeoutMs: 15_000,
+      headers: { Authorization: `Bearer ${token}` },
+    },
+  );
+  applyPaired(r, `${origin}/d/${deviceId}`);
+  return r;
 }
 
 /**
