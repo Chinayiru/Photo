@@ -47,6 +47,14 @@ __all__ = [
 #: 单个订阅者的待发事件上限。满了丢最旧的（进度事件天然可丢）。
 QUEUE_MAX: int = 256
 
+#: 同时在线的订阅者上限（每个订阅者占一条长连接 + 一个队列）。
+#:
+#: 不设上限时，任意一个拿到令牌的客户端都能用几十个 `/api/events`
+#: 连接把工作线程与内存吃光（压测实测：64 条并发长连接即让 2000 次
+#: 轻请求的 p50 从 30 ms 抬到 242 ms）。32 远超真实使用（一个人最多
+#: 两三个页面），又远低于能拖垮进程的量级。
+MAX_SUBSCRIBERS: int = 32
+
 #: 心跳间隔。必须小于常见中间设备的空闲超时（多数是 60 秒）。
 HEARTBEAT_SEC: float = 25.0
 
@@ -184,6 +192,18 @@ def get_bus() -> EventBus:
     if _bus is None:
         _bus = EventBus()
     return _bus
+
+
+def ensure_capacity(bus: EventBus) -> None:
+    """订阅数已达上限时抛 `E4006`（429）。
+
+    放在**开流之前**判断：流一旦开始写响应头，状态码就已经是 200，
+    再想报 429 只能中止连接，客户端看到的是一次莫名的"断线"。
+    """
+    if bus.subscribers >= MAX_SUBSCRIBERS:
+        from .errors import E4006, AppError
+
+        raise AppError(E4006, f"同时在线的页面已达上限（{MAX_SUBSCRIBERS}）")
 
 
 def set_bus(bus: EventBus | None) -> None:

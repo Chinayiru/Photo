@@ -92,6 +92,11 @@ E4002: Final = ErrorSpec("E4002", 429, "too_many_uploads", "同时上传的任�
 E4003: Final = ErrorSpec("E4003", 429, "too_many_tunnel_requests", "请求太密集，请稍后再试", retryable=True)
 E4004: Final = ErrorSpec("E4004", 429, "pair_code_tries_exceeded", "尝试次数过多，请 10 分钟后再试", retryable=True)
 E4005: Final = ErrorSpec("E4005", 429, "quota_exceeded", "本月流量已用完")
+E4006: Final = ErrorSpec(
+    "E4006", 429, "too_many_subscribers",
+    "同时在看的页面太多，请先关掉一些再试",
+    retryable=True,
+)
 
 # --- E5xxx 隧道协议类（不直接暴露给手机） -----------------------------------
 E5001: Final = ErrorSpec("E5001", 400, "bad_frame", "内部协议错误")
@@ -115,7 +120,7 @@ SPECS: Final[dict[str, ErrorSpec]] = {
         E2001, E2002, E2003, E2004, E2005, E2006,
         E3001, E3002, E3003, E3004, E3005, E3006, E3007, E3008, E3009,
         E3010, E3011, E3012,
-        E4001, E4002, E4003, E4004, E4005,
+        E4001, E4002, E4003, E4004, E4005, E4006,
         E5001, E5002, E5003, E5004, E5005, E5006, E5007, E5008, E5009,
         E5010, E5011, E5012,
     )

@@ -443,3 +443,23 @@ def _gen(data: bytes):
         if data:
             yield data
     return _it()
+
+def test_subscriber_cap_reports_e4006_before_streaming():
+    """订阅数满时必须**在开流之前**报 429，而不是让第 33 条连接把线程耗光。
+
+    真实故障场景有三种：手机浏览器切后台重连、用户开了很多标签页、有人
+    拿脚本刷 `/api/events`。前两种要给出可读的原因，第三种必须挡住。
+    """
+    from backend.app.errors import AppError
+    from backend.app.events import MAX_SUBSCRIBERS, ensure_capacity
+
+    bus = EventBus()
+    subs = [bus.subscribe() for _ in range(MAX_SUBSCRIBERS)]
+
+    with pytest.raises(AppError) as ei:
+        ensure_capacity(bus)
+    assert ei.value.spec.code == "E4006"
+
+    # 腾出一个名额就应当立刻恢复可用
+    bus.unsubscribe(subs.pop())
+    ensure_capacity(bus)

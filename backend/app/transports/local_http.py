@@ -240,6 +240,10 @@ class LocalHttpTransport(ServerTransport):
             # 关闭 uvicorn 自己的 access log：我们已有统一的结构化日志，
             # 两份日志会让人分不清哪份是权威。
             access_log=False,
+            # 不回 `Server: uvicorn`：这条响应头等于对外宣告技术栈与版
+            # 本代际，用来挑针对性的漏洞利用最省事。安全测试里它是唯一
+            # 自报家门的指纹。
+            server_header=False,
             # 不用 uvicorn 的 reload/workers —— 我们是单进程带托盘的程序，
             # 多 worker 会让内存里的索引器状态分裂成多份。
             lifespan="off",
