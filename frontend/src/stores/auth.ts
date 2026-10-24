@@ -314,6 +314,119 @@ export async function pair(base: string, code: string,
 }
 
 /**
+ * 账号登录自动配对（`docs/04` §3.5「自动配对」）。
+ *
+ * ## 为什么需要它
+ *
+ * 家里那台电脑的托盘显示 6 位码 → 手机照抄，这条路要求"人此刻就在电脑
+ * 旁边"。人在外面（正是云端通路存在的理由）时根本看不到那 6 位数字，
+ * 于是"能不能配对上"取决于有没有人帮他念码。
+ *
+ * 自动配对把这一步换成**登录账号**：账号名下就这几台电脑，云端自己就能
+ * 判断"这台是不是你的"，配对码对它没有任何额外信息量。
+ *
+ * ## 为什么必须打到 `origin` 根，而不是 `here`
+ *
+ * `here` 是 `https://域名/d/<32hex>`（设备前缀）。`/api/auth/login` 与
+ * `/api/devices/{id}/pair` 都是**中继根**上的接口，拼在 `/d/<id>` 后面
+ * 会被当成"转发给电脑的请求"，落到电脑端 404。
+ *
+ * ## 为什么登录与配对是两次请求
+ *
+ * 中继的 `account_token` 有 7 天寿命、可撤销（`cloud/relay/auth.py`）。
+ * 把它换成一次性的配对动作之后就不必留在手机上——只落盘 `client_token`
+ * （90 天、可按设备撤销）。少存一枚凭据，泄露面就少一层。
+ */
+export async function pairWithAccount(
+  email: string,
+  password: string,
+): Promise<PairResponse> {
+  const s = authStore.state;
+  const here = cloudBaseFromLocation();
+  if (!here) {
+    throw new ApiError({
+      status: 0,
+      code: "E1001",
+      message: "这个页面不支持账号登录",
+      userHint: "当前是局域网直连页面，请用电脑上显示的 6 位配对码",
+    });
+  }
+  const mail = email.trim();
+  if (!mail || !password) {
+    throw new ApiError({
+      status: 0, code: "E1001", message: "请填写邮箱和密码",
+      userHint: "请填写 PhotoBridge 账号的邮箱与密码",
+    });
+  }
+  // `here` 形如 `https://域名/d/<32hex>`，最后一段就是设备 id
+  const did = here.slice(here.lastIndexOf("/") + 1);
+  const origin = new URL(here).origin;
+
+  s.probing = true;
+  try {
+    const login = await api.post<{ account_token?: string }>(
+      "/api/auth/login",
+      { email: mail, password },
+      { base: origin, skipAuthLost: true, timeoutMs: 15_000 },
+    );
+    const accountToken = String(login.account_token || "");
+    if (!accountToken) {
+      throw new ApiError({
+        status: 0, code: "E2005", message: "登录失败",
+        userHint: "邮箱或密码不正确",
+      });
+    }
+
+    const r = await api.post<PairResponse>(
+      `/api/devices/${did}/pair`,
+      { auto: true, client_name: clientName() },
+      {
+        base: origin,
+        skipAuthLost: true,
+        timeoutMs: 15_000,
+        headers: { Authorization: `Bearer ${accountToken}` },
+      },
+    );
+
+    savePairing({
+      token: r.client_token,
+      deviceId: r.device_id,
+      deviceName: r.device_name,
+      // 落的是云端基址：以后每次请求都走中继，家里的 IP 变了也不影响。
+      base: here,
+      cloudBase: here,
+    });
+    s.serverDeviceId = r.device_id;
+    s.deviceName = r.device_name;
+    s.deviceMismatch = false;
+    s.lastError = "";
+    scrubPairQuery();
+    s.conn = "CLOUD";
+    s.lastOkAt = Date.now();
+    return r;
+  } finally {
+    s.probing = false;
+  }
+}
+
+/**
+ * 给云端看的设备名（会出现在「设备管理」里，用户靠它认出该撤销哪一台）。
+ *
+ * `navigator.userAgent` 只用来**分档**，不原样上报：一长串 UA 在设备列表
+ * 里会把名字撑爆，而用户需要的是"这是哪台手机"。
+ */
+function clientName(): string {
+  const ua = navigator.userAgent;
+  const name = /iPhone/.test(ua) ? "iPhone 浏览器"
+    : /iPad/.test(ua) ? "iPad 浏览器"
+      : /Android/.test(ua) ? "Android 手机"
+        : /Windows/.test(ua) ? "Windows 浏览器"
+          : /Macintosh/.test(ua) ? "Mac 浏览器"
+            : "网页浏览器";
+  return name.slice(0, 64);
+}
+
+/**
  * 配对成功后把 URL 上的 `?code=` / `?did=` 抹掉（ISSUE-033）。
  *
  * ## 为什么必须抹

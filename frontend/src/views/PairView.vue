@@ -10,7 +10,7 @@
 import { computed, onMounted, ref } from "vue";
 import { ApiError } from "../api/client";
 import { buildBase, cloudBaseFromLocation } from "../api/storage";
-import { pair, pairParamsFromLocation, parsePairInput } from "../stores/auth";
+import { pair, pairParamsFromLocation, pairWithAccount, parsePairInput } from "../stores/auth";
 import { toastError, toastOk } from "../stores/toast";
 
 /**
@@ -38,6 +38,20 @@ const error = ref("");
  * 还会把对方的照片显示出来。
  */
 const expectedDid = ref("");
+
+/**
+ * 账号登录（云端页的**第二条**配对路径，`docs/04` §3.5「自动配对」）。
+ *
+ * 只在云端页显示：局域网直连时请求打的是家里电脑，而登录/自动配对打的是
+ * **中继根**上的 `/api/auth/login` 与 `/api/devices/{id}/pair`，那条路上
+ * 没有这台电脑的位置。把它放在局域网页只会让用户点了报错。
+ */
+const email = ref("");
+const password = ref("");
+const accountBusy = ref(false);
+const accountError = ref("");
+const canSubmitAccount = computed(() =>
+  email.value.trim().length > 3 && password.value.length > 0 && !accountBusy.value);
 
 const base = computed(() => buildBase(host.value, port.value));
 const canSubmit = computed(() =>
@@ -146,6 +160,34 @@ async function submitPaste(): Promise<void> {
   await runPair(parsed.base);
 }
 
+/**
+ * 账号登录 → 自动配对（云端页专用）。
+ *
+ * 与 `runPair()` 的区别：这条路上没有 6 位码，也没有"电脑地址"——身份由
+ * 账号证明，设备由 URL 里的 `/d/<id>` 决定。所以错误发生在**登录**阶段，
+ * 文案要说"邮箱或密码"，说"配对码错了"会把人引向错误的排查方向。
+ */
+async function submitAccount(): Promise<void> {
+  if (accountBusy.value) return;
+  accountError.value = "";
+  if (!canSubmitAccount.value) {
+    accountError.value = "请填写账号邮箱与密码";
+    return;
+  }
+  accountBusy.value = true;
+  try {
+    const r = await pairWithAccount(email.value, password.value);
+    password.value = "";
+    toastOk(`已连接到 ${r.device_name}`);
+  } catch (e) {
+    accountError.value = e instanceof ApiError
+      ? (e.userHint || e.friendly)
+      : "登录失败，请检查邮箱与密码";
+  } finally {
+    accountBusy.value = false;
+  }
+}
+
 function onCodeInput(e: Event): void {
   const el = e.target as HTMLInputElement;
   // 只留数字，最长 6 位 —— 手机上打字容易多按，直接吃掉多余字符
@@ -193,6 +235,49 @@ function onCodeInput(e: Event): void {
       <p v-else class="cloud-note">
         正在通过中继连接家里的电脑。输入电脑上显示的配对码即可。
       </p>
+
+      <template v-if="cloudPage">
+        <label class="field">
+          <span class="lbl">账号邮箱</span>
+          <input
+            v-model="email"
+            class="input-lg"
+            type="email"
+            inputmode="email"
+            autocomplete="username"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck="false"
+            placeholder="you@example.com"
+          />
+        </label>
+        <label class="field">
+          <span class="lbl">密码</span>
+          <input
+            v-model="password"
+            class="input-lg"
+            type="password"
+            autocomplete="current-password"
+            placeholder="登录密码"
+            @keyup.enter="submitAccount"
+          />
+          <span class="hint">登录后自动匹配这台电脑，不必再输配对码</span>
+        </label>
+
+        <p v-if="accountError" class="err">{{ accountError }}</p>
+
+        <button
+          class="btn primary block lg"
+          type="button"
+          :disabled="!canSubmitAccount"
+          @click="submitAccount"
+        >
+          <span v-if="accountBusy" class="spinner" />
+          {{ accountBusy ? "正在登录…" : "登录并连接" }}
+        </button>
+
+        <div class="or-line"><span>或输入电脑上显示的配对码</span></div>
+      </template>
 
       <label class="field">
         <span class="lbl">配对码</span>
@@ -391,5 +476,27 @@ function onCodeInput(e: Event): void {
   background: var(--bg-2, var(--bg-1));
   border-radius: var(--radius-sm);
   padding: 10px 12px;
+}
+
+/* 「或」分隔线：两条配对路径并列时的视觉切换（云端页才有） */
+.or-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 0 4px;
+  font-size: 12px;
+  color: var(--fg-3);
+}
+
+.or-line::before,
+.or-line::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line, var(--bg-2, #ddd));
+}
+
+.or-line span {
+  white-space: nowrap;
 }
 </style>

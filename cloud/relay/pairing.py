@@ -26,6 +26,28 @@
 的理由与电脑端一致：一家人共用一个出口 IP，一个人输错三次就锁住
 全家说不过去；4 倍阈值仍然把爆破速率压到 20 次/10 分钟。
 
+## 账号登录自动配对（`auto: true`）
+
+用户在手机上登录**云端账号**后，不必再看电脑屏幕输 6 位码：只要这台电脑
+属于这个账号，云端直接签发 `client_token`（`docs/04` §3.5「自动配对」）。
+
+为什么这件事在云端做得到：`client_token` 是 `HMAC(sha256(agent_token))`
+签出来的（`shared/client_token.py`），而 `devices.agent_token` 就在云端库里
+——云端不需要问过电脑就能签出电脑认得的令牌。
+
+代价必须写清楚：**账号口令从此等于照片访问权**。原来那 6 位码是"你就在
+电脑旁边"的证据，自动配对把这一条换成了"你知道账号密码"。所以：
+
+| 约束 | 取值 | 为什么 |
+|---|---|---|
+| 必须已登录账号 | `require_account` | 未登录无从谈"属于我" |
+| 设备必须**在线** | `registry.get(device_id)` | 离线的电脑签出来的令牌暂时没用，还容易掩盖"电脑根本没起来" |
+| 每账号 + 每 IP | 5 次 / 分钟 | 账号口令泄露时，限制攻击者建立大量令牌 |
+| 只对**本人**设备 | `devices.account_id == account.id` | 别人的设备一律 404，与码路径同一口径 |
+
+关掉的办法：电脑端托盘「云端」面板撤掉该客户端令牌即可（`clients` 行），
+与码路径配出来的令牌同权。
+
 ## 为什么码用 `secrets` 而不是 `random`
 
 配对码是**唯一**能换来 90 天照片访问权的东西。`random` 的 Mersenne
@@ -35,6 +57,7 @@ Twister 在观察到 624 个输出后可以完全预测；而攻击者能观察�
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from typing import Any
@@ -48,6 +71,8 @@ from ..relay.db import CloudDB
 from ..relay.devices import find_device_by_agent_token
 from ..relay.reply import json_error, json_reply
 from shared import client_token as shared_token
+
+log = logging.getLogger("pb.cloud.pairing")
 
 __all__ = [
     "PAIR_LOCK_SECONDS",
@@ -63,6 +88,12 @@ PAIR_LOCK_SECONDS: float = security.PAIR_LOCK_SECONDS
 _DEVICE_MAX_TRIES: int = security.PAIR_MAX_TRIES
 #: 每 IP 阈值放宽 4 倍（一家人共用出口 IP）。
 _IP_MAX_TRIES: int = security.PAIR_MAX_TRIES * 4
+#: 自动配对（账号登录）的频率：每账号 + 每 IP 每分钟 5 次。
+_AUTO_PER_WINDOW: int = 5
+_AUTO_WINDOW: float = 60.0
+#: `(account_id, ip) -> [window_start, count]`。
+_AUTO_ATTEMPTS: dict[tuple[str, str], list[float]] = {}
+
 #: 进程内的**按 IP** 尝试计数：`(kind, key) -> [count, locked_until]`。
 #: 按设备的计数在 `devices.pair_fails` 里（见模块文档第 2 条）。
 _ATTEMPTS: dict[tuple[str, str], list[float]] = {}
@@ -129,8 +160,22 @@ def _new_unique_code(db: CloudDB) -> str:
 
 
 async def redeem_pair_code(request: Request, db: CloudDB,
-                           device_id: str) -> Response:
-    """`POST /api/devices/{id}/pair`（`docs/04` §3.5）。"""
+                           registry: Any = None,
+                           device_id: str = "") -> Response:
+    """`POST /api/devices/{id}/pair`（`docs/04` §3.5）。
+
+    ★ 参数顺序是 `(request, db, registry, device_id)`：`_bind()` 把依赖**按位置**
+    传进来、`device_id` 走关键字。写成 `(request, db, device_id, registry)`
+    会让 `registry` 被当成 `device_id`，症状是
+    `TypeError: redeem_pair_code() got multiple values for argument 'device_id'`
+    —— 只有真跑路由才发现（直接 `await` 的单测看不见）。
+
+    两种换令牌方式，同一个端点：
+
+    * `{"code": "123456", "client_name": "..."}` —— 看电脑屏幕输码（原路径）；
+    * `{"auto": true, "client_name": "..."}` —— 账号登录后自动配对，要求
+      设备在线且属于本账号（见模块文档「账号登录自动配对」）。
+    """
     account = require_account(request, db)
     if account is None:
         return json_error("E2001", request_id=_rid(request))
@@ -149,15 +194,22 @@ async def redeem_pair_code(request: Request, db: CloudDB,
     if body is None:
         return json_error("E1001", message="请求体必须是 JSON 对象",
                           request_id=_rid(request))
+    auto = body.get("auto") is True
     code = body.get("code")
     client_name = body.get("client_name")
-    if not isinstance(code, str) or not security.is_valid_pair_code(code):
-        return json_error("E1001", message="配对码必须是 6 位数字",
-                          request_id=_rid(request))
     if not isinstance(client_name, str) or not (1 <= len(client_name.strip()) <= 64):
         return json_error("E1001", message="手机名称需为 1-64 字符",
                           request_id=_rid(request))
     client_name = client_name.strip()
+
+    # 自动配对：不看码，看「你是谁 + 这台电脑是不是你的 + 它现在在不在线」。
+    if auto:
+        return _auto_pair(request, db, registry, account, device, did,
+                          client_name)
+
+    if not isinstance(code, str) or not security.is_valid_pair_code(code):
+        return json_error("E1001", message="配对码必须是 6 位数字",
+                          request_id=_rid(request))
 
     ip = _client_ip(request)
     locked = _check_locked(db, did, ip)
@@ -212,8 +264,6 @@ async def redeem_pair_code(request: Request, db: CloudDB,
     # 走到这里就成功。**先用条件 UPDATE 抢下这个码**，再签发令牌：
     # 两条并发请求同时通过上面的检查是可能的（同一个码在两台手机上
     # 同时点），条件 UPDATE 的影响行数就是那把锁。
-    client_id = security.new_device_id()
-    expires_at = now + security.CLIENT_TOKEN_TTL_DAYS * 86400
     with db.transaction() as conn:
         cur = conn.execute(
             "UPDATE pair_codes SET used_at = ? WHERE code = ? "
@@ -221,16 +271,32 @@ async def redeem_pair_code(request: Request, db: CloudDB,
         if cur.rowcount != 1:
             return json_error("E1005", message="配对码已被使用",
                               request_id=_rid(request))
-        token = _issue_client_token(device, client_id, client_name, now,
-                                    expires_at)
-        conn.execute(
-            "INSERT INTO clients(id, device_id, name, token_hash, "
-            "last_seen, created_at, revoked, expires_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
-            (client_id, did, client_name, security.hash_token(token),
-             now, now, expires_at))
+        return _mint_client(conn, db, device, did, client_name, now, ip,
+                            via="配对码", request=request)
+
+
+def _mint_client(conn: Any, db: CloudDB, device: Any, did: str,
+                 client_name: str, now: float, ip: str, *,
+                 via: str, request: Request) -> Response:
+    """写 `clients` 行并返回令牌响应；**必须在调用方的事务里跑**。
+
+    码路径把它塞进「条件 UPDATE 抢码」那同一个事务（抢码和写令牌要么都成，
+    要么都不成）；自动配对路径另开一个事务。两条路都在这里收口，是为了
+    避免出现「码路径修了令牌过期时间、自动配对忘了修」这种分叉。
+    """
+    client_id = security.new_device_id()
+    expires_at = now + security.CLIENT_TOKEN_TTL_DAYS * 86400
+    token = _issue_client_token(device, client_id, client_name, now,
+                                expires_at)
+    conn.execute(
+        "INSERT INTO clients(id, device_id, name, token_hash, "
+        "last_seen, created_at, revoked, expires_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+        (client_id, did, client_name, security.hash_token(token),
+         now, now, expires_at))
 
     _clear_failures(db, did, ip)
+    log.info("配对成功 device=%s client=%s 方式=%s", did, client_id, via)
     import json as _json
     try:
         lan_ips = _json.loads(device["last_lan"] or "[]")
@@ -301,6 +367,61 @@ def purge_expired_codes(db: CloudDB, *, older_than: float = 86400.0) -> int:
             "DELETE FROM pair_codes WHERE expires_at < ?", (cutoff,))
     except sqlite3.Error:       # pragma: no cover —— 清理失败不影响发码
         return 0
+
+
+# ---------------------------------------------------------------------------
+# 账号登录自动配对
+# ---------------------------------------------------------------------------
+
+
+def _auto_pair(request: Request, db: CloudDB, registry: Any, account: Any,
+               device: Any, did: str, client_name: str) -> Response:
+    """`{"auto": true}` 分支：账号已验明，只差「这台电脑在不在线」。"""
+    account_id = str(account["id"])
+    ip = _client_ip(request)
+    retry_after = _auto_limited(account_id, ip)
+    if retry_after is not None:
+        return json_error("E4004", request_id=_rid(request),
+                          retry_after=max(1, int(retry_after)))
+    # 离线不给签：签了也用不上，而"自动配对成功但一张图都打不开"这种
+    # 症状会被用户当成"配对坏了"，排查成本远高于直接说清楚。
+    if registry is None or registry.get(did) is None:
+        return json_error("E2007",
+                          message="电脑当前不在线，请确认电脑开着并已联网",
+                          request_id=_rid(request))
+    _note_auto(account_id, ip)
+    now = time.time()
+    with db.transaction() as conn:
+        return _mint_client(conn, db, device, did, client_name, now, ip,
+                            via="账号登录", request=request)
+
+
+def _auto_limited(account_id: str, ip: str) -> float | None:
+    """返回剩余秒数（还锁着）或 None（放行）。"""
+    now = time.time()
+    slot = _AUTO_ATTEMPTS.get((account_id, ip))
+    if slot is None:
+        return None
+    if now - slot[0] > _AUTO_WINDOW:
+        _AUTO_ATTEMPTS.pop((account_id, ip), None)
+        return None
+    if slot[1] >= _AUTO_PER_WINDOW:
+        return _AUTO_WINDOW - (now - slot[0])
+    return None
+
+
+def _note_auto(account_id: str, ip: str) -> None:
+    now = time.time()
+    key = (account_id, ip)
+    slot = _AUTO_ATTEMPTS.get(key)
+    if slot is None or now - slot[0] > _AUTO_WINDOW:
+        _AUTO_ATTEMPTS[key] = [now, 1.0]
+    else:
+        slot[1] += 1
+    if len(_AUTO_ATTEMPTS) > 512:      # 防内存被无上限的账号/IP 组合撑爆
+        for k in [k for k, v in _AUTO_ATTEMPTS.items()
+                  if now - v[0] > _AUTO_WINDOW]:
+            _AUTO_ATTEMPTS.pop(k, None)
 
 
 # ---------------------------------------------------------------------------
