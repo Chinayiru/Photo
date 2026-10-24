@@ -8,16 +8,30 @@ PhotoBridge 云端中继（relay）部署脚本 —— Windows Server 单机版
 
 用法（在解压后的目录里，管理员 PowerShell）：
     .\deploy.ps1
-    .\deploy.ps1 -BaseUrl "http://203.0.113.10:8000" -Email "me@example.com" -Password "..." -DeviceName "家里的电脑"
+    .\deploy.ps1 -BaseUrl "https://你的域名" -Email "you@example.com" -DeviceName "家里的电脑"
+
+口令不写在命令行上：脚本会用 `Read-Host -AsSecureString` 交互式问一次，
+再经 stdin 交给 `cloud_init.py`（写进命令行会被进程列表和 PSReadLine
+历史双双记下 —— 见 docs/11 ISSUE-032）。
 #>
 [CmdletBinding()]
 param(
     [string]$BaseUrl    = "http://203.0.113.10:8000",
     [string]$Email      = "me@example.com",
-    [string]$Password   = "PbCloud2026!",
+    # ★ 口令**没有默认值**。曾经这里是 `"PbCloud2026!"`，而它同时是线上
+    #   云账号的真实口令 —— 等于把凭据写进仓库，还被一条测试钉住了
+    #   （`test_windows_deploy_script_does_not_hardcode_a_password` 的断言
+    #   却是"必须等于这个硬编码值"，名字与断言相反，与 ISSUE-018 同型）。
+    #   现在留空则交互式询问（`Read-Host -AsSecureString`），口令只经
+    #   stdin 交给 `cloud_init.py`，不进 argv、不进命令历史。
+    [string]$Password   = "",
     [string]$DeviceName = "家里的电脑",
     [string]$Port       = "8000",
-    [string]$InstallDir = "C:\PhotoBridgeCloud"
+    [string]$InstallDir = "C:\PhotoBridgeCloud",
+    # 受信代理：只有从这些地址连进来的请求，其 `X-Forwarded-For` 才采信。
+    # cloudflared（以及旧方案的 80 端口转发）都从回环连入，所以默认回环。
+    # ★ 设了它就必须保证 8000 不再直接对公网开放，否则任何人都能伪造来源。
+    [string]$TrustedProxies = "127.0.0.1,::1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,6 +56,31 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     Fail "请以【管理员】身份运行 PowerShell（右键 → 以管理员身份运行）"
 }
 Ok "管理员权限"
+
+# ── 口令：不落命令行 ─────────────────────────────────────────────────────
+# `-Password` 仍然接受（无人值守场景），但默认走交互式输入。清掉变量里
+# 的明文痕迹是做不到的（.NET 字符串不可变），能做的是**不让它出现在
+# 任何会被记录的地方**：argv、事件 4688、PSReadLine 历史。
+if (-not $Password) {
+    # 无人值守（SSH / 计划任务）时没有交互式控制台，`Read-Host -AsSecureString`
+    # 会直接挂住或抛错。这条路留给编排用：口令放在调用方进程的环境变量里，
+    # 不进 argv、不进脚本、不进 PSReadLine 历史。
+    if ($env:PB_DEPLOY_PASSWORD) {
+        $Password = $env:PB_DEPLOY_PASSWORD
+        Remove-Item Env:\PB_DEPLOY_PASSWORD -ErrorAction SilentlyContinue
+    }
+}
+if (-not $Password) {
+    $sec = Read-Host -AsSecureString "请输入云端账号口令（输入不回显）"
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+    try {
+        $Password = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    } finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+    if (-not $Password) { Fail "口令为空" }
+}
+Ok "口令已就绪（未写入命令行）"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 # 脚本通常在包根目录下运行（把 deploy.ps1 拷到根，然后右键“以管理员身份运行”）。
 # 但也允许留在 cloud\ 里跑（.\cloud\deploy.ps1），这里统一回退到包根。
@@ -50,7 +89,7 @@ if (-not (Test-Path (Join-Path $here "cloud\relay\main.py"))) {
     if (Test-Path (Join-Path $up "cloud\relay\main.py")) { $here = $up }
 }
 Ok "包根目录 $here"
-foreach ($need in @("cloud\relay\main.py", "shared\mux.py", "scripts\cloud_init.py", "frontend\dist\index.html")) {
+foreach ($need in @("cloud\relay\main.py", "shared\mux.py", "scripts\cloud_init.py", "scripts\cloud_run.py", "frontend\dist\index.html")) {
     if (-not (Test-Path (Join-Path $here $need))) { Fail "缺少文件 $need —— 解压不完整？" }
 }
 Ok "代码与前端产物齐全"
@@ -107,6 +146,26 @@ if ($here -ne $InstallDir) {
 }
 Ok "代码已就位"
 
+# ── 2b. 收紧目录权限 ──────────────────────────────────────────────────────
+Step "2b" "收紧 $InstallDir 的 ACL"
+# ★ 为什么必须做：`C:\` 的默认继承把 `BUILTIN\Users:(RX)` 带到每个子目录
+#   上，于是**本机任何账号**都能读 `data\cloud.db`（账号口令 hash、全部
+#   设备与客户端记录）和 `logs\relay.log`（配对码、搜索词）。SYSTEM 身份
+#   跑的计划任务 + 一个全机可读的目录 = 提权链条的第二跳。
+#   实证：2026-10-23 在服务器上 `icacls C:\PhotoBridgeCloud` 看到
+#   `BUILTIN\Users:(RX)(AD)(WD)`（docs/11 ISSUE-032）。
+#   用 SID 而不是 `SYSTEM`/`Administrators` 字面量：中文/英文系统的组名
+#   不一样，SID 一样。
+$aclOk = $true
+try {
+    icacls "$InstallDir" /inheritance:r `
+        /grant:r "*S-1-5-18:(OI)(CI)F" `
+        /grant:r "*S-1-5-32-544:(OI)(CI)F" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { $aclOk = $false }
+} catch { $aclOk = $false }
+if ($aclOk) { Ok "只有 SYSTEM 与 Administrators 可访问" }
+else { Warn "ACL 没收紧成功，请手工执行：icacls `"$InstallDir`" /inheritance:r /grant:r `"*S-1-5-18:(OI)(CI)F`" /grant:r `"*S-1-5-32-544:(OI)(CI)F`"" }
+
 # ── 3. 依赖 ───────────────────────────────────────────────────────────────
 Step 3 "安装依赖（relay 只需要 3 个包）"
 & $py -m pip install --quiet --disable-pip-version-check `
@@ -123,33 +182,71 @@ $dataDir = Join-Path $InstallDir "data"
 if (-not (Test-Path $dataDir)) { New-Item -ItemType Directory -Path $dataDir -Force | Out-Null }
 $env:PB_CLOUD_DB = Join-Path $dataDir "cloud.db"
 
-Push-Location $InstallDir
-try {
-    $out = & $py "scripts\cloud_init.py" "init" `
-        "--email" $Email "--password" $Password `
-        "--device-name" $DeviceName "--base-url" $BaseUrl 2>&1
-    $code = $LASTEXITCODE
-} finally { Pop-Location }
-
-if ($code -ne 0) {
-    Write-Host $out
-    Fail "cloud_init 失败（退出码 $code）"
+# ★ 重装/升级：已有安装里有现成的 device_id 与 agent_token，必须**沿用**。
+#   否则 `cloud_init init` 撞上"账号已存在"直接退出，整个部署在第 4 步断掉 ——
+#   这是升级路径上最典型的一次失败：第一次安装很顺，第二次永远装不上。
+#   （agent_token 在库中只存 sha256，拿不回来，所以只能从上次生成的启动器里读。）
+$reuseDid = ""
+$reuseTok = ""
+$prevRun  = Join-Path $InstallDir "run_relay.ps1"
+if (Test-Path $prevRun) {
+    $prevText = Get-Content $prevRun -Raw -Encoding UTF8
+    $reuseDid = ([regex]::Match($prevText, 'PB_CLOUD_DEVICE_ID"\s*=\s*"([0-9a-f]{32})"')).Groups[1].Value
+    $reuseTok = ([regex]::Match($prevText, 'PB_CLOUD_AGENT_TOKEN"\s*=\s*"([A-Za-z0-9_\-]+)"')).Groups[1].Value
 }
-$text = ($out | Out-String)
+$dbExists = Test-Path $env:PB_CLOUD_DB
+if ($reuseDid -and $reuseTok) {
+    Ok "检测到已有安装，沿用 device_id = $reuseDid（不重新登记设备）"
+    $deviceId = $reuseDid
+    $agentTok = $reuseTok
+} elseif ($dbExists) {
+    # ★ 升级路径上最典型的一次失败就在这里：第一次安装很顺，第二次永远装不上。
+    #   库已经存在说明账号与设备都已登记（agent_token 在库里只存 sha256，
+    #   本来就取不回来），此时再跑 `cloud_init init` 只会撞「账号已存在」。
+    #   中继进程本身不需要 device_id/agent_token —— 令牌是家用 agent 端持有的。
+    Ok "检测到已有云端库：沿用库中设备，不重新登记"
+    $deviceId = "(沿用库中已有设备)"
+    $agentTok = "(不重发；新增设备请手工运行 scripts\cloud_init.py init ...)"
+} else {
 
-# 从 JSON 里抠出两个值（不用 ConvertFrom-Json：输出前面还有一行中文日志）
-$deviceId  = ([regex]::Match($text, '"device_id"\s*:\s*"([0-9a-f]{32})"')).Groups[1].Value
-$agentTok  = ([regex]::Match($text, '"agent_token"\s*:\s*"([A-Za-z0-9_\-]+)"')).Groups[1].Value
-
-if (-not $deviceId) {
-    # 设备已存在时 cloud_init 会走「账号已存在」分支；重新登记一台即可
-    Warn "没拿到新设备，可能已登记过。下面列出已有设备："
     Push-Location $InstallDir
-    try { & $py "scripts\cloud_init.py" "list" } finally { Pop-Location }
-    Fail "请手工执行：python scripts\cloud_init.py init --email ... --password ... --device-name ... 来新增设备"
+    $prevEap4 = $ErrorActionPreference
+    # ★ `$ErrorActionPreference = "Stop"` 下，**原生命令往 stderr 写一行**就会
+    #   变成 terminating NativeCommandError（同样的事故见 docs/11 ISSUE-027）。
+    #   cloud_init 的正常提示（例如「账号已存在」）走 stderr，所以这一小段单独放宽。
+    $ErrorActionPreference = "Continue"
+    try {
+        # ★ 口令走 stdin（`--password-stdin`），不进 argv：进程命令行对
+        #   本机任何用户可见，而这条命令会活几秒钟（`docs/11` ISSUE-032）。
+        $out = $Password | & $py "scripts\cloud_init.py" "init" `
+            "--email" $Email "--password-stdin" `
+            "--device-name" $DeviceName "--base-url" $BaseUrl 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        Pop-Location
+        $ErrorActionPreference = $prevEap4
+    }
+
+    if ($code -ne 0) {
+        Write-Host $out
+        Fail "cloud_init 失败（退出码 $code）"
+    }
+    $text = ($out | Out-String)
+
+    # 从 JSON 里抠出两个值（不用 ConvertFrom-Json：输出前面还有一行中文日志）
+    $deviceId  = ([regex]::Match($text, '"device_id"\s*:\s*"([0-9a-f]{32})"')).Groups[1].Value
+    $agentTok  = ([regex]::Match($text, '"agent_token"\s*:\s*"([A-Za-z0-9_\-]+)"')).Groups[1].Value
+
+    if (-not $deviceId) {
+        # 设备已存在时 cloud_init 会走「账号已存在」分支；重新登记一台即可
+        Warn "没拿到新设备，可能已登记过。下面列出已有设备："
+        Push-Location $InstallDir
+        try { & $py "scripts\cloud_init.py" "list" } finally { Pop-Location }
+        Fail "库已存在但没拿到新设备。新增设备请手工执行：python scripts\cloud_init.py init --email ... --password-stdin --device-name ..."
+    }
+    Ok "device_id   = $deviceId"
+    Ok "agent_token = $agentTok"
 }
-Ok "device_id   = $deviceId"
-Ok "agent_token = $agentTok"
 
 # ── 5. 启动配置（含环境变量）───────────────────────────────────────────────
 Step 5 "写启动脚本"
@@ -172,29 +269,59 @@ $runBody = @"
 `$env:PB_CLOUD_PORT     = "$Port"
 `$env:PB_CLOUD_HOSTS    = "$hostName"
 `$env:PB_CLOUD_WEB_DIR  = "$InstallDir\frontend\dist"
+# 受信代理：cloudflared 从回环连入，只有它写的 X-Forwarded-For 才采信。
+# 不设的后果是"所有手机共用 127.0.0.1 一个限流桶"——一个人刷满登录次数，
+# 主人自己也登不上（docs/11 ISSUE-030）。
+`$env:PB_CLOUD_TRUSTED_PROXIES = "$TrustedProxies"
+# `-m` 会把当前目录放进 sys.path[0]：能在 `$InstallDir` 里写文件的人就能
+# 用同名模块劫持 SYSTEM 进程。关掉隐式 CWD，改用显式 PYTHONPATH。
+`$env:PYTHONSAFEPATH   = "1"
+`$env:PYTHONPATH       = "$InstallDir"
 Set-Location "$InstallDir"
-& "$py" -m uvicorn cloud.relay.main:create_app --factory --host 0.0.0.0 --port $Port --workers 1 --ws websockets *>> "$logDir\relay.log"
+# ★ 入口是 `scripts\cloud_run.py`（脚本文件），不是 `-m cloud.relay.main`：
+#   embeddable 版 Python 的 `python312._pth` 会让 `PYTHONPATH` 整条失效，
+#   此时 `-m` 找不到 `cloud` 包（实测 `ModuleNotFoundError: No module named
+#   'cloud'`，2026-10-23）。脚本文件形式自带 `__file__`，自己把包根塞进
+#   `sys.path`，MSI / embeddable 两种发行都成立。
+#   同理**不能**退回 `-m uvicorn …:create_app --factory`：uvicorn 的命令行
+#   入口默认 `--proxy-headers` + `forwarded_allow_ips=127.0.0.1`（把
+#   `scope["client"]` 改写成可伪造的 XFF）、access log 全开（把
+#   `?code=NNNNNN` 写进日志）、并回 `Server: uvicorn`。这些只能在 `main()`
+#   里一次设对（`docs/11` ISSUE-030 / ISSUE-032）。
+& "$py" "$InstallDir\scripts\cloud_run.py" *>> "$logDir\relay.log"
 "@
 Set-Content -Path $runScript -Value $runBody -Encoding UTF8
 Ok "$runScript"
 
 # ── 6. 防火墙 ─────────────────────────────────────────────────────────────
-Step 6 "防火墙放行 TCP $Port"
+# ★ 只在本机**直接**对外提供 HTTP 时才开入站口。
+#   `-BaseUrl` 是 https 时，说明公网入口是隧道（cloudflared 出站长连接），
+#   本机不需要任何入站放行 —— 那正是我们要的状态：安全审计里 8000 明文
+#   入口与 80 转发器都因为"多开了一个口"而变成了攻击面。
 $ruleName = "PhotoBridge relay $Port"
-$fwOk = $false
-if (Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue) {
+if ($BaseUrl -match '^https://') {
+    Step 6 "防火墙：入口是隧道（https），本机不放行任何入站端口"
     Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue |
         Remove-NetFirewallRule -ErrorAction SilentlyContinue
-    New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP `
-        -LocalPort $Port -Action Allow -Profile Any | Out-Null
-    $fwOk = $true
+    netsh advfirewall firewall delete rule name="$ruleName" 2>&1 | Out-Null
+    Ok "未改动入站规则（中继只需出站）"
 } else {
-    # Server 2008/2012 早期版本没有 NetSecurity 模块，退回 netsh
-    netsh advfirewall firewall delete rule name="$ruleName" | Out-Null
-    netsh advfirewall firewall add rule name="$ruleName" dir=in action=allow protocol=TCP localport=$Port | Out-Null
-    if ($LASTEXITCODE -eq 0) { $fwOk = $true }
+    Step 6 "防火墙放行 TCP $Port"
+    $fwOk = $false
+    if (Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue) {
+        Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP `
+            -LocalPort $Port -Action Allow -Profile Any | Out-Null
+        $fwOk = $true
+    } else {
+        # Server 2008/2012 早期版本没有 NetSecurity 模块，退回 netsh
+        netsh advfirewall firewall delete rule name="$ruleName" | Out-Null
+        netsh advfirewall firewall add rule name="$ruleName" dir=in action=allow protocol=TCP localport=$Port | Out-Null
+        if ($LASTEXITCODE -eq 0) { $fwOk = $true }
+    }
+    if ($fwOk) { Ok "已放行 $Port" } else { Warn "防火墙规则没加成，请手工放行 TCP $Port" }
 }
-if ($fwOk) { Ok "已放行 $Port" } else { Warn "防火墙规则没加成，请手工放行 TCP $Port" }
 
 # ── 7. 试跑并自检 ─────────────────────────────────────────────────────────
 Step 7 "试跑并自检"
@@ -258,6 +385,94 @@ try {
 }
 if ($taskRc -ne 0) { Warn "注册计划任务失败（退出码 $taskRc），可手工在「任务计划程序」里加一条：powershell -File $runScript" }
 else { Ok "已注册计划任务「$taskName」（开机自动运行）" }
+
+# ★ 注册完必须**真的启动**，并再验一次健康 —— 否则会出现「部署 9 步全绿、
+#   过一会儿外网全 502」：第 7 步那个试跑进程是本脚本的子进程，SSH 会话
+#   一断就被一起带走；而任务只被 `/Create` 过，从未 `/Run`
+#   （实测 `Last Result` 停在 267011 = SCHED_S_TASK_HAS_NOT_RUN，
+#   2026-10-23）。
+#   还要先按端口杀掉旧进程：任务里的新实例撞上 10048 会立刻退出，
+#   而表面上「任务已经跑过了」。
+$startOk = $false
+foreach ($attempt in 1..2) {
+    $owners2 = @()
+    try {
+        $owners2 = (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty OwningProcess -Unique)
+    } catch { }
+    foreach ($procId in $owners2) {
+        if ($procId) { Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue }
+    }
+    Start-Sleep -Milliseconds 600
+    $prevEap3 = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        schtasks /Run /TN $taskName *>&1 | Out-Null
+        $runRc = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap3
+    }
+    foreach ($i in 1..20) {
+        Start-Sleep -Milliseconds 800
+        try {
+            $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 3 -UseBasicParsing
+            if ($r.StatusCode -eq 200) { $startOk = $true; break }
+        } catch { }
+    }
+    if ($startOk) { break }
+    Warn "第 $attempt 次启动没起来（schtasks 退出码 $runRc），重试"
+}
+if ($startOk) {
+    Ok "计划任务已启动，/api/health 200（SSH 断开后仍继续跑）"
+} else {
+    Warn "任务没起来，日志最后 20 行："
+    if (Test-Path "$logDir\relay.log") { Get-Content "$logDir\relay.log" -Tail 20 }
+    Fail "开机自启已注册，但没启动成功"
+}
+
+# ── 8b. 日志轮转 ──────────────────────────────────────────────────────────
+Step "8b" "注册日志轮转（每天 03:30，超过 20 MB 才转）"
+# ★ 为什么必须做：`*>> relay.log` 是**裸追加**，没有上限。1 vCPU / 小盘
+#   实例上，访问日志迟早把盘写满 —— 那时 relay 不会报错，只会静默挂掉
+#   （`docs/08` §4.1.2 只给了 Docker 的 `daemon.json` 方案，Windows 这条路
+#   一直没有对应物）。实证见 `docs/11` ISSUE-032。
+# ★ Windows 的 `*>>` 会**占住文件句柄**，运行中改名必然失败（不像 Linux
+#   可以先 rename 再 reopen）。所以只能「停 → 转 → 启」，代价是每天凌晨
+#   约 2 秒的不可用。
+$rotateScript = Join-Path $InstallDir "rotate-relay.ps1"
+$rotateBody = @"
+# PhotoBridge 云端中继日志轮转 —— 由 deploy.ps1 生成。
+`$ErrorActionPreference = "Continue"
+`$logFile = "$logDir\relay.log"
+if (Test-Path `$logFile) {
+    `$sizeMb = [math]::Round((Get-Item `$logFile).Length / 1MB, 1)
+    if (`$sizeMb -ge 20) {
+        schtasks /End /TN "$taskName" *>&1 | Out-Null
+        Start-Sleep -Seconds 2
+        `$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        Move-Item -Force `$logFile "$logDir\relay-`$stamp.log"
+        Get-ChildItem "$logDir\relay-*.log" |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -Skip 7 |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        schtasks /Run /TN "$taskName" *>&1 | Out-Null
+    }
+}
+"@
+Set-Content -Path $rotateScript -Value $rotateBody -Encoding UTF8
+$prevEap2 = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    schtasks /Create /TN "PhotoBridge Rotate Logs" /SC DAILY /ST 03:30 `
+        /RU SYSTEM /RL HIGHEST `
+        /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$rotateScript`"" `
+        /F *>&1 | Out-Null
+    $rotRc = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $prevEap2
+}
+if ($rotRc -eq 0) { Ok "已注册计划任务「PhotoBridge Rotate Logs」" }
+else { Warn "日志轮转任务没注册上（退出码 $rotRc），可手工加：powershell -File $rotateScript" }
 
 # ── 9. 交付信息 ───────────────────────────────────────────────────────────
 Write-Host "`n============================================================" -ForegroundColor Green

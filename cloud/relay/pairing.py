@@ -10,11 +10,17 @@
 
 ## 两道独立的闸门
 
-1. **每码 5 次**（`pair_codes.tries` + `locked_until`）——防止有人在
-   5 分钟窗口内枚举那 100 万个组合。
-2. **每设备 5 次 / 每 IP 20 次**（进程内）——因为攻击者可以不断请求
-   新码来重置第 1 道闸门。第 1 道只保护"这一个码"，第 2 道保护"这台
-   设备"。
+1. **每码 5 次**（`pair_codes.tries` + `locked_until`，写库）——防止有人
+   对同一枚码反复试。
+2. **每设备 5 次**（`devices.pair_fails` + `pair_locked_until`，写库）——
+   攻击者可以不断请求新码来重置第 1 道，这一道按"设备"算，换码绕不过。
+3. **每 IP 20 次**（进程内）——保护"这个出口"。它只放内存是权衡：
+   家里的手机共用一个出口 IP，重启清零对正常用户无害，而靠它挡住
+   6 位码空间本来也不现实（那是第 1、2 道的活）。
+
+第 1、2 道**必须**落库。曾经两道的计数都只活在进程内存里，
+`pair_codes.tries` / `locked_until` 是读都没人读的死列 —— 一次部署就
+把额度清零一遍（`docs/11` SEC-09）。
 
 两道都要，少一道就有一条现成的绕过路径。选 20 而不是 5（IP 维度）
 的理由与电脑端一致：一家人共用一个出口 IP，一个人输错三次就锁住
@@ -36,7 +42,7 @@ from typing import Any
 from starlette.requests import Request
 from starlette.responses import Response
 
-from ..relay import security
+from ..relay import netutil, security
 from ..relay.auth import require_account
 from ..relay.db import CloudDB
 from ..relay.devices import find_device_by_agent_token
@@ -57,7 +63,8 @@ PAIR_LOCK_SECONDS: float = security.PAIR_LOCK_SECONDS
 _DEVICE_MAX_TRIES: int = security.PAIR_MAX_TRIES
 #: 每 IP 阈值放宽 4 倍（一家人共用出口 IP）。
 _IP_MAX_TRIES: int = security.PAIR_MAX_TRIES * 4
-#: 进程内尝试计数。`(kind, key) -> [count, locked_until]`
+#: 进程内的**按 IP** 尝试计数：`(kind, key) -> [count, locked_until]`。
+#: 按设备的计数在 `devices.pair_fails` 里（见模块文档第 2 条）。
 _ATTEMPTS: dict[tuple[str, str], list[float]] = {}
 
 
@@ -153,7 +160,7 @@ async def redeem_pair_code(request: Request, db: CloudDB,
     client_name = client_name.strip()
 
     ip = _client_ip(request)
-    locked = _check_locked(did, ip)
+    locked = _check_locked(db, did, ip)
     if locked is not None:
         return json_error("E4004", request_id=_rid(request),
                           retry_after=max(1, int(locked)))
@@ -163,17 +170,33 @@ async def redeem_pair_code(request: Request, db: CloudDB,
         "SELECT code, device_id, expires_at, tries, locked_until, used_at "
         "FROM pair_codes WHERE code = ?", (code.strip(),))
     if row is None:
-        _bump_failure(did, ip)
+        _bump_failure(db, did, ip)
         return json_error("E1002", message="配对码不存在",
                           request_id=_rid(request))
     if str(row["device_id"]) != did:
-        # 码是真的，但不是这台电脑的。不回 404 而回 403 —— 用户手里
-        # 那个码确实存在，让他去"另一台电脑上重新生成"，而不是以为打错了。
-        _bump_failure(did, ip)
-        return json_error("E1016", message="该配对码属于另一台电脑",
+        _note_code_failure(db, code.strip())
+        _bump_failure(db, did, ip)
+        # 码是真的、但不是这台电脑的，分两种情形：
+        #
+        # ① 属于**我这个账号的另一台电脑** —— 用户自己搞混了，回 403 并
+        #    说清楚"去那台电脑上重新生成"，这是有用信息，且只泄露给
+        #    码的所有者本人，不构成 oracle。
+        # ② 属于**别人的账号** —— 一律回"配对码不存在"，与真不存在的码
+        #    完全一致。否则任何有账号的人都能拿 6 位码空间当预言机：
+        #    403 说明这个码此刻有效，400 说明无效，配合 300 秒 TTL 就能
+        #    把"某一刻有哪些码是活的"扫出来（`docs/11` SEC-10a）。
+        owner = db.query_one(
+            "SELECT account_id FROM devices WHERE id = ?",
+            (str(row["device_id"]),))
+        if owner is not None and str(owner["account_id"]) == str(account["id"]):
+            return json_error("E1016",
+                              message="该配对码属于你的另一台电脑",
+                              request_id=_rid(request))
+        return json_error("E1002", message="配对码不存在",
                           request_id=_rid(request))
     if row["used_at"] is not None:
-        _bump_failure(did, ip)
+        _note_code_failure(db, code.strip())
+        _bump_failure(db, did, ip)
         return json_error("E1005", message="配对码已被使用",
                           request_id=_rid(request))
     lock_until = row["locked_until"]
@@ -181,7 +204,8 @@ async def redeem_pair_code(request: Request, db: CloudDB,
         return json_error("E4004", request_id=_rid(request),
                           retry_after=int(float(lock_until) - now) + 1)
     if float(row["expires_at"]) <= now:
-        _bump_failure(did, ip)
+        _note_code_failure(db, code.strip())
+        _bump_failure(db, did, ip)
         return json_error("E1003", message="配对码已过期",
                           request_id=_rid(request))
 
@@ -206,7 +230,7 @@ async def redeem_pair_code(request: Request, db: CloudDB,
             (client_id, did, client_name, security.hash_token(token),
              now, now, expires_at))
 
-    _clear_failures(did, ip)
+    _clear_failures(db, did, ip)
     import json as _json
     try:
         lan_ips = _json.loads(device["last_lan"] or "[]")
@@ -284,19 +308,68 @@ def purge_expired_codes(db: CloudDB, *, older_than: float = 86400.0) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _check_locked(device_id: str, ip: str) -> float | None:
+def _check_locked(db: CloudDB, device_id: str, ip: str) -> float | None:
+    """设备锁（库）与 IP 锁（内存）里，哪个还在生效就返回剩余秒数。
+
+    先查库：设备锁是真正能挡住"换码重试"的那一道。
+    """
     now = time.time()
-    for key in (("dev", device_id), ("ip", ip)):
-        slot = _ATTEMPTS.get(key)
-        if slot is not None and slot[1] > now:
-            return slot[1] - now
+    row = db.query_one(
+        "SELECT pair_locked_until FROM devices WHERE id = ?", (device_id,))
+    if row is not None:
+        until = row["pair_locked_until"]
+        if until is not None and float(until) > now:
+            return float(until) - now
+    slot = _ATTEMPTS.get(("ip", ip))
+    if slot is not None and slot[1] > now:
+        return slot[1] - now
     return None
 
 
-def _bump_failure(device_id: str, ip: str) -> None:
+def _bump_failure(db: CloudDB, device_id: str, ip: str) -> None:
     now = time.time()
-    _bump(("dev", device_id), _DEVICE_MAX_TRIES, now)
+    _note_device_failure(db, device_id, now)
     _bump(("ip", ip), _IP_MAX_TRIES, now)
+
+
+def _note_device_failure(db: CloudDB, device_id: str, now: float) -> None:
+    """设备失败计数 +1；到阈值就上锁。一条 UPDATE 完成，无读改写竞态。
+
+    窗口语义：`pair_window` 记本轮计数的起点，超过 `PAIR_LOCK_SECONDS`
+    没有新失败就重新从 1 数起 —— 与旧的内存实现一致，避免"半年里错 5 次
+    就被锁"。
+
+    SQLite 的 `SET` 表达式一律读**旧**行值，所以三列可以互相引用而不用
+    关心书写顺序；但这也意味着"新值"要自己算两遍（`pair_fails + 1`）。
+    """
+    window_start = now - PAIR_LOCK_SECONDS
+    db.execute(
+        "UPDATE devices SET "
+        "  pair_fails = CASE WHEN pair_window IS NULL OR pair_window <= ? "
+        "                    THEN 1 ELSE pair_fails + 1 END, "
+        "  pair_window = CASE WHEN pair_window IS NULL OR pair_window <= ? "
+        "                     THEN ? ELSE pair_window END, "
+        "  pair_locked_until = CASE "
+        "    WHEN (CASE WHEN pair_window IS NULL OR pair_window <= ? THEN 1 "
+        "               ELSE pair_fails + 1 END) >= ? "
+        "    THEN ? ELSE pair_locked_until END "
+        "WHERE id = ?",
+        (window_start, window_start, now, window_start, _DEVICE_MAX_TRIES,
+         now + PAIR_LOCK_SECONDS, device_id))
+
+
+def _note_code_failure(db: CloudDB, code: str) -> None:
+    """给**某一枚码**记一次失败；满 5 次就把这枚码锁 10 分钟。
+
+    只对"码真实存在、但这次用不成"（属于别的电脑 / 已被用 / 已过期）
+    记账 —— 猜一个不存在的码没有行可记，那种爆破靠设备和 IP 两道挡。
+    """
+    db.execute(
+        "UPDATE pair_codes SET tries = tries + 1, "
+        "  locked_until = CASE WHEN tries + 1 >= ? THEN ? "
+        "                     ELSE locked_until END "
+        "WHERE code = ? AND used_at IS NULL",
+        (_DEVICE_MAX_TRIES, time.time() + PAIR_LOCK_SECONDS, code))
 
 
 def _bump(key: tuple[str, str], limit: int, now: float) -> None:
@@ -311,8 +384,11 @@ def _bump(key: tuple[str, str], limit: int, now: float) -> None:
         _gc_attempts(now)
 
 
-def _clear_failures(device_id: str, ip: str) -> None:
-    _ATTEMPTS.pop(("dev", device_id), None)
+def _clear_failures(db: CloudDB, device_id: str, ip: str) -> None:
+    """配对成功后把两处计数都清零（不清就等于留着一次"免费再错 5 次"）。"""
+    db.execute(
+        "UPDATE devices SET pair_fails = 0, pair_window = NULL, "
+        "pair_locked_until = NULL WHERE id = ?", (device_id,))
     _ATTEMPTS.pop(("ip", ip), None)
 
 
@@ -339,8 +415,13 @@ def _device_by_agent(request: Request, db: CloudDB) -> Any:
 
 
 def _client_ip(request: Request) -> str:
-    client = request.client
-    return (client.host if client is not None else "") or "unknown"
+    """配对码的"每 IP 20 次"按真实客户端计。判据见 `netutil`。
+
+    这里用错的后果比限流更重：配对码是 6 位、TTL 300 秒，如果所有手机
+    共用 `127.0.0.1` 一个桶，攻击者刷满 20 次就让主人自己也配不上对
+    （`docs/11` ISSUE-030）。
+    """
+    return netutil.client_ip(request)
 
 
 def _rid(request: Request) -> str:

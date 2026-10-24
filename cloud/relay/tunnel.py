@@ -51,7 +51,8 @@ from shared.protocol import (
     wants_credit_v2,
 )
 
-from ..relay import security
+from ..relay import netutil, security
+from ..relay.limiter import RateLimiter
 from ..relay.db import CloudDB
 from ..relay.devices import (
     DeviceRegistry,
@@ -67,6 +68,14 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+
+#: `/agent/ws` 握手限速（SEC-06）：每客户端 IP 每分钟 60 次建连尝试。
+#: 正常的电脑端只在网络抖动时重连，一分钟 60 次已经宽到不像限制；但足以
+#: 把"在线爆破 agent_token"从"无限次"压到"每分钟 60 次"。桶按真实客户端
+#: IP 分（`netutil.rate_key`），所以一个被打满的 IP 不会牵连别的设备。
+WS_HANDSHAKE_LIMIT = 60
+WS_HANDSHAKE_WINDOW = 60.0
+_WS_HANDSHAKE = RateLimiter(WS_HANDSHAKE_LIMIT, WS_HANDSHAKE_WINDOW)
 
 #: 支持的最低/最高协议版本（`docs/04` §2.4）。
 PROTO_VERSION: int = 1
@@ -126,6 +135,16 @@ class TunnelServer:
 
     async def handle_agent(self, ws: Any) -> None:
         """一条电脑端隧道的完整生命周期。"""
+        # SEC-06：限速必须排在**令牌校验之前**。没有这一层，`/agent/ws`
+        # 就是一台免费的令牌爆破机 —— 每次尝试只花一个 TCP 握手，而
+        # `invalid_agent_token` 与 `device_revoked` 的差别还顺带告诉
+        # 攻击者"这个 token 曾经有效"。
+        key = netutil.rate_key(ws)
+        allowed, retry_after = _WS_HANDSHAKE.hit(key)
+        if not allowed:
+            log.warning("拒绝建连：%s 握手过频", key)
+            await _deny(ws, 429, "too_many_attempts")
+            return
         if not self.check_host(ws.headers.get("host")):
             await _deny(ws, 403, "host_not_allowed")
             return

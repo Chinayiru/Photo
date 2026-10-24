@@ -29,6 +29,7 @@ import logging
 import mimetypes
 import os
 from pathlib import Path
+from shared.security_headers import headers_for
 from .core import Ctx, Reply, empty_reply, file_reply
 from .errors import E1004, AppError
 from .handlers.common import etag_matches, iter_file
@@ -94,6 +95,19 @@ def _apply_cache(reply: Reply, rel: str, *, is_index: bool) -> None:
         reply.set_cache(31536000, immutable=True)
     else:
         reply.set_cache(3600)
+
+
+def _apply_security(reply: Reply, path: Path) -> Reply:
+    """贴上安全响应头，并把同一个 `reply` 返回（便于 `return _apply_security(…)`）。
+
+    头本身定义在 `shared/security_headers.py`，云端伺服
+    （`cloud/relay/pages.py`）发的是同一套 —— 因为这是**同一个页面**的
+    两条路径。修之前这里一个头都没有（连 `nosniff` 都没有），而手机在
+    家里 Wi-Fi 下走的正是这条路径。
+    """
+    for key, value in headers_for(_content_type(path)):
+        reply.set(key, value)
+    return reply
 
 
 class StaticFiles:
@@ -185,7 +199,7 @@ class StaticFiles:
             r = empty_reply(304)
             r.set_etag(etag)
             _apply_cache(r, rel, is_index=path == self.index)
-            return r
+            return _apply_security(r, path)
 
         if path == self.index:
             # 外壳不缓存（见模块文档第 3 点）。
@@ -196,12 +210,12 @@ class StaticFiles:
             )
             _apply_cache(reply, rel, is_index=True)
             reply.set_etag(etag)
-            return reply
+            return _apply_security(reply, path)
 
         reply = file_reply(iter_file(path), _content_type(path), st.st_size)
         reply.set_etag(etag)
         _apply_cache(reply, rel, is_index=False)
-        return reply
+        return _apply_security(reply, path)
 
     def __repr__(self) -> str:
         return f"StaticFiles(root={self.root!r}, enabled={self.enabled})"

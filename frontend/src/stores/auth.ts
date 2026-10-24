@@ -45,7 +45,6 @@ import {
   getDeviceName,
   getToken,
   normalizeBase,
-  saveBase,
   savePairing,
 } from "../api/storage";
 import {
@@ -243,9 +242,14 @@ export async function pair(base: string, code: string,
     });
   }
 
-  // ★ 先把 base 落到 localStorage，再发请求 —— client.ts 的 baseUrl 是
-  //   每次读 localStorage 的 getter，不写进去就发到了旧地址
-  saveBase(cleanBase);
+  // ★ 这里**不能**先把 base 写进 localStorage。
+  //   之前是"先落盘再请求"，于是用户填错一次地址、或者电脑没开，
+  //   那个连不上的地址就长期留在 localStorage 里：下次冷启动所有请求都
+  //   打到那儿，连"重新配对"的页面都得等它超时；而 `PairView` 每次挂载
+  //   都会自动 `submit()`，失败一次就多攒一次限速额度，用户自己把自己
+  //   锁在门外（`docs/11` SEC-23）。
+  //   改法：基址只随这个请求走（`base` 选项），成功之后由 `savePairing()`
+  //   一并落盘。
 
   // ★ 二维码校验必须在**消费配对码之前**。若先 POST /api/pair 再发现
   //   device_id 不对，服务端已经把那一枚码用掉了（`used_at` 已写），
@@ -255,7 +259,7 @@ export async function pair(base: string, code: string,
     let actual = "";
     try {
       const ping = await api.get<PingResponse>("/api/system/ping", {
-        timeoutMs: 5000, skipAuthLost: true,
+        timeoutMs: 5000, skipAuthLost: true, base: cleanBase,
       });
       actual = ping.device_id;
     } catch {
@@ -279,6 +283,8 @@ export async function pair(base: string, code: string,
       // 配对本身是未鉴权的，不要因为它 401 就触发"配对失效"逻辑
       skipAuthLost: true,
       timeoutMs: 15_000,
+      // 候选地址只走这一次请求；落盘在下面 `savePairing()` 里发生
+      base: cleanBase,
     });
     savePairing({
       token: r.client_token,
@@ -293,12 +299,47 @@ export async function pair(base: string, code: string,
     s.deviceName = r.device_name;
     s.deviceMismatch = false;
     s.lastError = "";
+    // ★ 配对成功 ⇒ 立刻把 `?code=` / `?did=` 从地址栏与历史记录里抹掉
+    //   （ISSUE-033）。配对码 300 秒内可重放，而 URL 会留在浏览器历史、
+    //   用户截屏、Cloudflare 访问日志里 —— 抹掉是唯一能同时清掉这三处
+    //   的办法。失败路径不走这里：用户要能拿着同一段 URL 重试。
+    scrubPairQuery();
     // 页面由云端伺服时走的是中继，状态条不能显示"局域网直连"。
     s.conn = here ? "CLOUD" : "DIRECT";
     s.lastOkAt = Date.now();
     return r;
   } finally {
     s.probing = false;
+  }
+}
+
+/**
+ * 配对成功后把 URL 上的 `?code=` / `?did=` 抹掉（ISSUE-033）。
+ *
+ * ## 为什么必须抹
+ *
+ * 配对码的 TTL 是 300 秒（`backend/app/handlers/auth.py`）。配对成功之后
+ * 这段 query 仍然留在浏览器历史、用户屏幕截图、以及 Cloudflare 的访问
+ * 日志里 —— 三条都是**攻击者拿得到**的地方。5 分钟窗口内任何人重放一次
+ * 就能拿到一枚自己的 client_token。（服务端侧"一码一用"只挡住同一枚码
+ * 的第二次消费，挡不住这枚码在另一个浏览器里的第一次消费。）
+ *
+ * ## 为什么只动 query
+ *
+ * 保留 `pathname` 与 `hash`：路由用的是 hash（`#/pair?code=...`）时把
+ * hash 一起抹掉会把用户从当前页弹回首页；`pathname` 是云端 `/d/<id>/`
+ * 那种部署的基址来源（`cloudBaseFromLocation`），抹掉它等于把 App 自己
+ * 弄丢。`replaceState` 而不是 `pushState`：不能在历史里留一条"返回键
+ * 一按就回到带配对码的页面"的记录。
+ *
+ * 失败时不调用（`pair()` 抛异常就直接返回了）：用户要能拿着同一段 URL
+ * 重试 —— 配对码没被消费时抹掉 URL 只会逼他重新扫码。
+ */
+function scrubPairQuery(): void {
+  try {
+    window.history.replaceState(null, "", window.location.pathname + window.location.hash);
+  } catch {
+    /* 极少数内嵌 WebView 禁用 replaceState：抹不掉也不能让配对算失败 */
   }
 }
 
@@ -309,6 +350,116 @@ export function unpair(): void {
   authStore.state.conn = "IDLE";
 }
 
+/* ------------------------------------------------------------------ *
+ * 配对输入的可信主机判定（ISSUE-033）
+ * ------------------------------------------------------------------ */
+
+/** 私有网段 / 回环 IPv4：局域网直连只可能落在这些地址上。 */
+function isPrivateIPv4(host: string): boolean {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!m) return false;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  if (a > 255 || b > 255 || Number(m[3]) > 255 || Number(m[4]) > 255) return false;
+  return a === 10                              // 10.0.0.0/8
+    || a === 127                               // 127.0.0.0/8（自测 / 模拟器）
+    || (a === 172 && b >= 16 && b <= 31)       // 172.16.0.0/12
+    || (a === 192 && b === 168);               // 192.168.0.0/16
+}
+
+/** 用户**已经配对过**的 base 主机（`pb.base` / `pb.cloud` 里那两个）。 */
+function pairedHosts(): Set<string> {
+  const out = new Set<string>();
+  for (const b of [getBase(), getCloudBase()]) {
+    if (!b) continue;
+    try {
+      out.add(new URL(b).hostname.toLowerCase());
+    } catch {
+      // 落盘值畸形（用户手改过 localStorage）就不进白名单：
+      // 白名单只能收窄，不能因为一条脏数据把门开大
+    }
+  }
+  return out;
+}
+
+/**
+ * 这个主机能不能当配对目标（ISSUE-033）。
+ *
+ * ## 为什么要有白名单
+ *
+ * 配对 = 把手机上的 client_token 交给这个地址，之后**所有照片**都从它那里
+ * 取。所以"接受任意主机"等于"社工一条链接就能把相册指向攻击者服务器"，
+ * 而且攻击者可以顺手拿到配对码。收窄成"只可能是自己电脑的地址"之后，
+ * 一条贴进聊天窗口的链接就不再是攻击面。
+ *
+ * 允许的四类（外加"当前页面的源"）：
+ *   - 私有网段 / 回环 IPv4 —— 局域网直连；
+ *   - `localhost` —— 真机调试；
+ *   - `*.trycloudflare.com` —— 一期推荐的云端隧道；
+ *   - 用户自己配对过的主机 —— 自建域名、固定公网 IP、或换过端口的同一台；
+ *   - 当前页面自己的 hostname —— 用户已经打开了这个源上的 App，配对目标
+ *     本来就被它决定了；自建域名的部署也只能靠这一条把"只输 6 位码"留住。
+ */
+function isPairHostAllowed(host: string): boolean {
+  const h = host.trim().toLowerCase();
+  if (!h) return false;
+  if (h === "localhost" || h.endsWith(".localhost")) return true;
+  if (h.endsWith(".trycloudflare.com")) return true;
+  if (isPrivateIPv4(h)) return true;
+  if (pairedHosts().has(h)) return true;
+  try {
+    if (h === window.location.hostname.toLowerCase()) return true;
+  } catch {
+    /* 拿不到 location（极少数内嵌 WebView）就当没这条，按拒绝处理 */
+  }
+  return false;
+}
+
+/**
+ * 拼 base 用哪个协议（ISSUE-033）。
+ *
+ * 两条硬规则：
+ *   - 用户写了 `https://` 就**绝不**降级成 `http://`（明文降级等于把令牌
+ *     和照片放到同 Wi-Fi 的可嗅探链路上）；
+ *   - 没写 scheme 时按主机补：私有网段补 `http://`（局域网直连是明文，
+ *     补 https 会直接连不上），其他一律补 `https://`。
+ *
+ * 用户明确写了 `http://` 时保留明文，但只限局域网主机 —— 公网主机上写
+ * `http://` 基本等于把明文协议写进链接，升级成 https 不会有任何损失。
+ */
+function schemeFor(host: string, rawScheme: string): string {
+  const h = host.trim().toLowerCase();
+  if (rawScheme === "https") return "https";
+  const lan = isPrivateIPv4(h) || h === "localhost" || h.endsWith(".localhost");
+  return lan ? "http" : "https";
+}
+
+/** 用 host + port 拼出基址（`host` 只放主机名，端口单独给）。 */
+function pairBase(host: string, port: string, rawScheme: string): string {
+  const h = host.trim().replace(/\/+$/, "");
+  const p = port.trim();
+  const withPort = /:\d+$/.test(h) ? h : (p ? `${h}:${p}` : h);
+  return normalizeBase(`${schemeFor(h, rawScheme)}://${withPort}`);
+}
+
+/**
+ * 拒绝一个配对目标时的错误（ISSUE-033）。
+ *
+ * ★ 不能返回 null 让调用方显示"没认出这段内容"：那样用户只会重试同一段
+ * 链接。这里要说清楚"地址不被接受"，并指向正确入口（扫二维码 / 粘贴电脑
+ * 给出的链接），否则一个自建了域名却还没配对过的用户会以为 App 坏了。
+ */
+function rejectPairHost(host: string): ApiError {
+  const shown = host || "（空地址）";
+  return new ApiError({
+    status: 0,
+    code: "E1001",
+    message: `不接受的配对地址：${shown}`,
+    userHint: `没有把「${shown}」当作电脑地址：它不在局域网里，也不像自己的云端。`
+      + "请扫描电脑上显示的二维码，或粘贴电脑给出的那条链接",
+  });
+}
+
 /**
  * 用带参数的 URL 直接配对（托盘二维码扫出来就是这种链接）。
  *
@@ -317,6 +468,10 @@ export function unpair(): void {
  *   `http://192.0.2.10:8787/#/pair?code=123456`
  *   `http://192.0.2.10:8787/pair?c=123456&h=192.0.2.10&p=8787`
  * 也接受直接粘贴 `192.0.2.10:8787 123456` 这种"地址 + 码"。
+ *
+ * ★ 解析不出内容返回 `null`（调用方提示"没认出这段内容"）；**识别出来了
+ *   但主机不可信**则抛 `ApiError`（ISSUE-033）—— 两者是不同的处境，
+ *   混成同一个 null 会让"被拒绝"看起来像"没看懂"。
  */
 export function parsePairInput(raw: string):
 { base: string; code: string; did: string } | null {
@@ -325,17 +480,26 @@ export function parsePairInput(raw: string):
 
   // ① 形如 URL：从中抠 code 与 host
   if (/^(https?:\/\/)?[\d.a-zA-Z-]+(:\d+)?(\/|$)/.test(text) && /[?&#]/.test(text)) {
+    const rawScheme = /^https:\/\//i.test(text) ? "https"
+      : /^http:\/\//i.test(text) ? "http" : "";
     try {
       const u = new URL(/^https?:\/\//i.test(text) ? text : `http://${text}`);
       const code = u.searchParams.get("code")
         || u.searchParams.get("c")
         || u.searchParams.get("pair")
         || "";
-      const host = u.searchParams.get("h") || u.hostname;
-      const port = u.searchParams.get("p") || u.port || "8787";
+      const host = (u.searchParams.get("h") || u.hostname).trim();
+      const explicitPort = u.searchParams.get("p") || u.port;
       if (code) {
+        // ★ 主机白名单必须在**返回之前**过一遍（ISSUE-033）：这条路径
+        //   原本接受任意主机，于是一条社工链接就能把相册指向别处。
+        if (!isPairHostAllowed(host)) throw rejectPairHost(host);
+        const scheme = schemeFor(host, rawScheme);
+        // 端口缺省只在明文（局域网）下补 8787；https 走默认 443，
+        // 补上 `:8787` 会把云端链接打到中继根本不监听的口上。
+        const port = explicitPort || (scheme === "http" ? "8787" : "");
         return {
-          base: normalizeBase(`${host}:${port}`),
+          base: pairBase(host, port, rawScheme),
           code: code.replace(/[\s-]/g, ""),
           // 粘贴整条链接时也带上（`#/pair?code=..&did=..` 形式从 hash 里找）
           did: (u.searchParams.get("did")
@@ -343,21 +507,30 @@ export function parsePairInput(raw: string):
             || "").trim(),
         };
       }
-    } catch {
-      /* 落到下面的文本解析 */
+    } catch (e) {
+      // ★ 白名单拒绝的 ApiError 必须原样抛出：被这个"落到文本解析"的
+      //   catch 吞掉，就等于静默接受了攻击者给的主机（ISSUE-033 的原症状）。
+      if (e instanceof ApiError) throw e;
+      /* 解析不出 URL：落到下面的文本解析 */
     }
   }
 
   // ② 形如 "192.0.2.10:8787 123456" / "192.0.2.10 123456"
   const m = text.match(/(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?[\s,，]+(\d{6})/);
   if (m) {
-    return { base: normalizeBase(`${m[1]}:${m[2] || "8787"}`), code: m[3]!, did: "" };
+    const host = m[1]!;
+    // 这种形态的地址只可能是局域网电脑：公网 IP 一律拒绝
+    if (!isPrivateIPv4(host)) throw rejectPairHost(host);
+    return { base: pairBase(host, m[2] || "8787", ""), code: m[3]!, did: "" };
   }
 
   // ③ 只有 6 位码（地址用当前页面的 host）
   if (/^\d{6}$/.test(text.replace(/[\s-]/g, ""))) {
+    const host = window.location.hostname;
+    if (!isPairHostAllowed(host)) throw rejectPairHost(host);
     return {
-      base: normalizeBase(window.location.host || ""),
+      base: pairBase(host, window.location.port,
+                     window.location.protocol === "https:" ? "https" : "http"),
       code: text.replace(/[\s-]/g, ""),
       did: "",
     };

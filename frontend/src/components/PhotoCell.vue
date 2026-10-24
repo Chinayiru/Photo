@@ -20,6 +20,7 @@
 import { computed, onBeforeUnmount, ref } from "vue";
 import type { MediaItem } from "../api/types";
 import { thumbUrl } from "../api/client";
+import { safeUrl } from "../lib/safeUrl";
 
 const props = defineProps<{
   item: MediaItem;
@@ -161,7 +162,7 @@ function onLoad(): void {
 
     <img
       v-else
-      :src="src"
+      :src="safeUrl(src)"
       :alt="item.name"
       class="img"
       :class="{ in: loaded }"

@@ -214,3 +214,40 @@ def test_router_405_wins_over_fallback(tmp_path) -> None:
     resp = asyncio.run(r.dispatch(_ctx("/api/uploads/init")))
     assert resp.status == 405
     assert "POST" in resp.headers["Allow"]
+
+
+# --------------------------------------------------- 安全响应头（2026-10-23）
+
+def test_html_gets_csp_and_framing_headers(tmp_path) -> None:
+    """局域网伺服的页面必须带同一套头。
+
+    修之前 `backend/app/static.py` 一个头都没有：手机在家里 Wi-Fi 下走的
+    正是这条路径，而云端那条路径的头当时只写在 `cloud/Caddyfile` 里 ——
+    两条路径同时裸奔。头现在定义在 `shared/security_headers.py`，两条
+    路径共用。
+    """
+    s = StaticFiles(_dist(tmp_path))
+    r = _run(s, _ctx("/"))
+    assert r.headers["content-type"].startswith("text/html")
+    assert "default-src 'none'" in r.headers["content-security-policy"]
+    assert r.headers["x-frame-options"] == "DENY"
+    assert r.headers["x-content-type-options"] == "nosniff"
+    assert r.headers["referrer-policy"] == "no-referrer"
+
+
+def test_assets_get_nosniff_but_no_csp(tmp_path) -> None:
+    """静态资源不需要 CSP（CSP 只管文档），但 `nosniff` 必须有。"""
+    s = StaticFiles(_dist(tmp_path))
+    r = _run(s, _ctx("/assets/index-abc123.js"))
+    assert r.headers["x-content-type-options"] == "nosniff"
+    assert "content-security-policy" not in r.headers
+
+
+def test_304_keeps_the_security_headers(tmp_path) -> None:
+    """304 也要带头：浏览器缓存的可能是**没有头**的那一版。"""
+    s = StaticFiles(_dist(tmp_path))
+    first = _run(s, _ctx("/assets/index-abc123.css"))
+    again = _run(s, _ctx("/assets/index-abc123.css",
+                        headers={"If-None-Match": first.headers["ETag"]}))
+    assert again.status == 304
+    assert again.headers["x-content-type-options"] == "nosniff"

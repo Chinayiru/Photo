@@ -100,6 +100,37 @@ def test_parse_range_zero_size_file() -> None:
         parse_range("bytes=0-", 0)
 
 
+@pytest.mark.parametrize("header", [
+    "bytes=²-",            # U+00B2 SUPERSCRIPT TWO：isdigit() 为真
+    "bytes=²-³",
+    "bytes=0-²",
+    "bytes=１２３-",        # 全角数字：isdigit() 为真
+    "bytes=０-９",
+    "bytes=٣-",             # 阿拉伯-印度数字：isdigit() 为真
+    "bytes=Ⅳ-",             # 罗马数字（isnumeric 真 / isdigit 假，留个对照）
+])
+def test_parse_range_unicode_digits_are_416_not_500(header: str) -> None:
+    """Unicode 数字必须是 416，不能是 500（2026-10-23 审计）。
+
+    `str.isdigit()` 对 `²`、全角 `１２３`、`٣` 都返回 True，但 `int()` 只认
+    ASCII 数字 —— 于是 `int(first)` 抛 `ValueError`，一路冒到 500。
+    一条 `curl -H 'Range: bytes=²-'` 就能打出来，是"低成本触发 500 +
+    异常日志刷屏"的面；日志里打满栈，真正的问题会被埋掉。
+
+    判据必须是 `isascii() and isdigit()`：两个条件缺一不可，
+    只用 `isdecimal()` 也不行（它对全角数字仍然为真）。
+    """
+    with pytest.raises(RangeNotSatisfiable):
+        parse_range(header, 1000)
+
+
+def test_parse_range_unicode_digit_maps_to_416_status() -> None:
+    """确认异常携带的状态码是 416（而不是被改成 400 或 500）。"""
+    with pytest.raises(RangeNotSatisfiable) as ei:
+        parse_range("bytes=²-", 1000)
+    assert ei.value.status == 416
+
+
 def test_range_helpers() -> None:
     assert range_length((0, 999)) == 1000
     assert range_length((500, 500)) == 1

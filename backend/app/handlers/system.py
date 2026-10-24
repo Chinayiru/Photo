@@ -4,11 +4,18 @@
 """
 from __future__ import annotations
 
+import ipaddress
+
+import asyncio
 import logging
 import ntpath
+import os
+import threading
 import time
-from typing import Any
+from pathlib import Path
+from typing import Any, Final
 
+from ..config import WILDCARD_HOSTS
 from ..core import Ctx, Reply, json_reply
 from ..errors import E1001, BadRequest
 from ..state import AppState
@@ -127,11 +134,54 @@ def _tunnel_info(cfg: Any) -> dict[str, Any]:
     return st
 
 
+def _bind_scope(host: str) -> str:
+    """从**实际监听地址**推导绑定范围。
+
+    之前这里是一个硬编码的字符串 `"private"`，与 `server.host` 毫无关系：
+    用户为了手机能连上把 `server.host` 改成 `0.0.0.0`，设置页照样显示
+    "仅私有网络" —— 这是把"已经对外开放"说成"没对外开放"，正好反了。
+    反向也一样糟：绑在 `127.0.0.1` 时不说清"只有本机能连"，用户会一直
+    怀疑手机或防火墙有问题（`docs/11` SEC-17）。
+
+    取值：
+
+    * `loopback` —— 只有本机能连（`127.0.0.1` / `::1` / `localhost`）
+    * `private`  —— 私有网段与"公网不可达"的段（RFC1918 / CGNAT / 链路本地 /
+      IPv6 ULA / 保留段）
+    * `public`   —— 某个具体公网地址
+    * `any`      —— `0.0.0.0` / `::`，所有网卡
+    * `custom`   —— 认不出的写法（主机名等），不做猜测
+    """
+    value = (host or "").strip().strip("[]").lower()
+    if value in ("", "localhost", "127.0.0.1", "::1"):
+        return "loopback"
+    # 字面量只准出现在 `config.WILDCARD_HOSTS`（规则 18 的门控放行处）：
+    # 这里写成 `in WILDCARD_HOSTS` 而不是再抄一遍 "0.0.0.0"/"::"，否则
+    # `scripts/check_lint.py` 的规则 18 会判"绑定地址出现在 _bind_scope()"，
+    # 而这不是绑定，只是分类。
+    if value in WILDCARD_HOSTS:
+        return "any"
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return "custom"
+    if ip.is_loopback:
+        return "loopback"
+    # `is_private` 在 3.12 里不覆盖 100.64.0.0/10（CGNAT）这类"不可全局路由"
+    # 的段，而它们恰恰是运营商大内网 —— 手机看到的网段就在这里。用
+    # `not is_global` 兜住：只要是"公网到不了"的地址，就按私有处理。
+    if ip.is_private or ip.is_link_local or not ip.is_global:
+        return "private"
+    return "public"
+
+
 async def info(ctx: Ctx) -> Reply:
     """手机端首页所需的全部元信息（一次请求拿全，减少弱网往返）。"""
     st = _state(ctx)
     cfg = st.cfg
+    host = str(cfg.get("server.host", "127.0.0.1"))
     sizes = st.thumb_sizes()
+    cache_files, cache_bytes = await _thumb_cache_stats(st)
 
     return json_reply({
         "app": {
@@ -155,17 +205,18 @@ async def info(ctx: Ctx) -> Reply:
         "index": st.index_info(),
         "watch": st.watch_info(),
         "thumbs": {
-            "cache_bytes": _thumb_cache_bytes(st),
-            "cache_files": _thumb_cache_files(st),
+            "cache_bytes": cache_bytes,
+            "cache_files": cache_files,
             "sizes": list(sizes),
             "quality": int(cfg.get("thumbs.quality", 78)),
             "format": str(cfg.get("thumbs.format", "webp")),
         },
         "server": {
-            "host": str(cfg.get("server.host", "127.0.0.1")),
+            "host": host,
             "port": int(cfg.get("server.port", 8787)),
             "lan_ips": _lan_ips(),
-            "bind_scope": "private",
+            # 由实际监听地址推导，不是常量（SEC-17）
+            "bind_scope": _bind_scope(host),
         },
         "limits": st.limits_info(),
         # 电脑端外壳的状态。手机端在"设置 → 电脑端"里展示，
@@ -194,6 +245,7 @@ async def stats(ctx: Ctx) -> Reply:
     failed = _count("SELECT COUNT(*) FROM media WHERE thumb_state='failed' AND missing=0")
     open_uploads = _count(
         "SELECT COUNT(*) FROM upload_sessions WHERE status IN ('open','uploading')")
+    cache_files, cache_bytes = await _thumb_cache_stats(st)
 
     return json_reply({
         "media": {
@@ -207,8 +259,8 @@ async def stats(ctx: Ctx) -> Reply:
             "pending": pending,
             "ok": ok,
             "failed": failed,
-            "cache_bytes": _thumb_cache_bytes(st),
-            "cache_files": _thumb_cache_files(st),
+            "cache_bytes": cache_bytes,
+            "cache_files": cache_files,
         },
         "db": _db_stats(st),
         "uploads": {
@@ -226,27 +278,117 @@ async def stats(ctx: Ctx) -> Reply:
 # --------------------------------------------------------------------------
 
 def _thumb_cache_bytes(st: AppState) -> int:
-    """缩略图缓存占用。用户会关心它涨到多大（可以安全删除，会自动重建）。"""
-    total = 0
-    root = st.cfg.data_path("thumbs")
-    if not root.exists():
-        return 0
-    for p in root.rglob("*.webp"):
-        try:
-            total += p.stat().st_size
-        except OSError:
-            continue
-    return total
+    """缩略图缓存占用。用户会关心它涨到多大（可以安全删除，会自动重建）。
+
+    ⚠️ 已不再直接遍历目录，改由 `_thumb_cache_stats()` 一次算出两列。
+    保留这个函数只为兼容（它现在走同一份 memo，不会再多跑一遍遍历）。
+    """
+    return _thumb_cache_stats_sync(st)[1]
 
 
 def _thumb_cache_files(st: AppState) -> int:
+    """缓存文件数。同上：与 `_thumb_cache_bytes` 共用同一次遍历。"""
+    return _thumb_cache_stats_sync(st)[0]
+
+
+#: 缓存统计的 memo 有效期（秒）。
+#:
+#: 60 秒的依据：这个数字是给"设置 → 存储"看的趋势量，用户不会指望它
+#: 秒级精确；而它背后是**整目录遍历**，代价与照片数量线性相关。
+_THUMB_CACHE_TTL: Final[float] = 60.0
+
+#: `(算出的 monotonic 时刻, 文件数, 总字节)`，None 表示还没算过。
+#: 模块级而不是挂在 `AppState` 上：它是纯展示用的派生数据，丢了只是重算
+#: 一次；挂到 AppState 会让它跟着状态对象的生命周期走，反而要处理"配置/库根
+#: 换了之后 memo 失效"的问题。
+_thumb_cache_memo: tuple[str, float, int, int] | None = None
+
+#: 保证同一时刻只有**一个**线程在遍历目录。
+#:
+#: ★ memo 之外还必须有一把锁：memo 只挡"算完之后"的重复调用，
+#: 挡不住"冷启动瞬间涌入的一批请求" —— 它们会各自发现 memo 为空，
+#: 然后各跑一遍遍历（5 个并发 = 5 倍系统调用，正是要消除的那个问题）。
+#: 第一个线程持锁算，其余线程在锁上等，等到时 memo 已就绪直接返回。
+_thumb_cache_lock = threading.Lock()
+
+
+def _scan_thumb_cache(root: Path) -> tuple[int, int]:
+    """一次遍历同时算出 `(文件数, 总字节)`。
+
+    用 `os.scandir` 递归而不是两次 `rglob("*.webp")`：
+      * 原来 `cache_bytes` 与 `cache_files` 各跑一次 rglob + 逐文件 stat，
+        等于把同一棵树遍历两遍、把同一个 stat 做两遍。10 万张照片（两级
+        尺寸 = 20 万个文件）时一次请求就是 40 万次系统调用，而这两个数字
+        只是"设置"页的一行展示 —— 手机端点开该页即可把事件循环占满，
+        连 SSE 推送都停摆（自我 DoS）。
+      * `scandir` 的 `DirEntry.stat()` 在 Windows 上直接取自
+        `FindFirstFile`/`FindNextFile` 已经返回的数据，不需要额外 syscall；
+        `rglob` + `Path.stat()` 每条要单独再问一次文件系统。
+    """
+    files = 0
+    total = 0
+    stack = [str(root)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif (entry.name.lower().endswith(".webp")
+                              and entry.is_file(follow_symlinks=False)):
+                            files += 1
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        # 单个文件被删/被占用不该让整次统计失败
+                        continue
+        except OSError:
+            continue
+    return files, total
+
+
+def _thumb_cache_stats_sync(st: AppState) -> tuple[int, int]:
+    """带 60 秒 TTL 的 `(文件数, 总字节)`。阻塞调用，只能在 executor 里跑。"""
+    global _thumb_cache_memo
+
+    # ★ memo 的键必须包含 root。只按时间缓存的话，同一进程里换了库
+    # （测试换 tmp 目录、或用户改了 data 目录）会把**另一个目录**的
+    # 数字当成自己的返回，而且 60 秒内都错 —— 表现是"缓存文件数是 0"。
     root = st.cfg.data_path("thumbs")
-    if not root.exists():
-        return 0
-    n = 0
-    for _ in root.rglob("*.webp"):
-        n += 1
-    return n
+    key = str(root)
+
+    now = time.monotonic()
+    memo = _thumb_cache_memo
+    if memo is not None and memo[0] == key and now - memo[1] < _THUMB_CACHE_TTL:
+        return memo[2], memo[3]
+
+    with _thumb_cache_lock:
+        # 二次检查：等锁期间别的线程可能已经算完了
+        now = time.monotonic()
+        memo = _thumb_cache_memo
+        if (memo is not None and memo[0] == key
+                and now - memo[1] < _THUMB_CACHE_TTL):
+            return memo[2], memo[3]
+
+        files, total = _scan_thumb_cache(root) if root.exists() else (0, 0)
+        _thumb_cache_memo = (key, time.monotonic(), files, total)
+        return files, total
+
+
+async def _thumb_cache_stats(st: AppState) -> tuple[int, int]:
+    """`(文件数, 总字节)` —— 遍历放 executor，不占事件循环。
+
+    返回顺序与 `_thumb_cache_stats_sync` 一致：**先文件数、后总字节**。
+    这两个值类型都是 int，调用处解包反了不会报错，只会让"设置 → 存储"里
+    的两行数字互换（而且请求照样 200）—— 所以顺序写在这里当契约。
+
+    即便命中 memo，走的也是 executor：这个函数在 `info` / `stats` 的
+    返回组装路径上，而 memo 过期的那一次调用仍然是**几万次系统调用**，
+    直接在协程里跑会把整个事件循环（含 SSE 心跳）卡住若干秒。
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _thumb_cache_stats_sync, st)
 
 
 def _db_stats(st: AppState) -> dict[str, Any]:

@@ -123,10 +123,26 @@ def _drop_lock(upload_id: str) -> None:
 # --------------------------------------------------------------------------
 
 
-def get_session(db: Database, upload_id: str) -> dict[str, Any]:
-    """取会话，不存在/已过期/状态不对时抛对应错误。"""
+def get_session(db: Database, upload_id: str, *, client_id: str | None = None) -> dict[str, Any]:
+    """取会话，不存在/已过期/状态不对时抛对应错误。
+
+    ★ 给了 `client_id` 就校验归属（ISSUE-034 ②）。别人的会话一律当作
+    **不存在**（404 E1004），而不是 403 —— 403 等于告诉对方
+    "这个 upload_id 是真的"，而 `GET /api/uploads/{uid}` 会回
+    `declared_name`：确认存在之后，剩下的就是猜大小/猜名字。
+    `upload_id` 是 32 位 hex，本来无法枚举，不能用 403 把它变成可探测的。
+
+    历史行（`client_id IS NULL`）按"未知归属"处理：只有同样未知归属的
+    调用方（直接调 handler 的测试、`require_pairing=false` 的本机调试）
+    能碰到它们，真实设备一律 404。
+    """
     row = db.query_one("SELECT * FROM upload_sessions WHERE id = ?", (upload_id,))
     if row is None:
+        raise NotFound("上传会话不存在或已清理")
+    if client_id is not None and (row["client_id"] or "") != client_id:
+        # 不把 upload_id 写进日志：它是 URL 里来的任意字符串，
+        # 带换行就能伪造日志行（与同一批审计的文件名清洗同因）。
+        log.warning("拒绝跨客户端续传：会话属于另一台设备")
         raise NotFound("上传会话不存在或已清理")
     sess = dict(row)
     if sess["status"] == "expired" or sess["expires_at"] < time.time():
@@ -443,6 +459,70 @@ def check_magic(cfg: Config, name: str, head: bytes) -> str:
     return ext
 
 
+#: 声明文件名里必须剔除的字符（2026-10-23 审计）：
+#: C0 控制符（含 `\r` `\n` `\0` `\t`）+ DEL + 双向文本控制符。
+#:
+#: 只剔除"控制/不可见"这一类，不碰中文、空格、`emoji`、`%`、`#` 这些
+#: 合法且真实存在的名字（用户相机导出的名字里确实会出现它们，擅自
+#: 替换成 `_` 会让"同名去重"和用户预期对不上）。
+_NAME_STRIP_CHARS: Final[frozenset[str]] = frozenset(
+    [chr(c) for c in range(0x00, 0x20)]
+    + [chr(0x7F)]
+    # U+202A–U+202E：LRE/RLE/PDF/LRO/RLO —— 能整体翻转后面的显示顺序
+    + [chr(c) for c in range(0x202A, 0x202F)]
+    # U+2066–U+2069：LRI/RLI/FSI/PDI —— 隔离区，同样用于伪装
+    + [chr(c) for c in range(0x2066, 0x206A)]
+)
+
+#: Windows 设备保留名（含带扩展名形式，判的是第一个点之前的部分）。
+_WIN_RESERVED_NAMES: Final[frozenset[str]] = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def _sanitize_declared_name(name: str) -> str:
+    """清洗客户端声明的文件名（2026-10-23 审计）。
+
+    这些字符留在 `declared_name` 里有两个真实后果，都不是"洁癖"问题：
+
+    1. **日志注入**：`\\r\\n` 让一条用户可控的字符串在
+       `data/audit.log`、`audit_log` 表、以及 `log.info("新建上传会话 %s")`
+       里伪造出完整的假日志行 —— 事后追查"谁传了什么"时读到的
+       可以是攻击者编的东西。安全审计日志被伪造，等于审计链断掉。
+    2. **显示欺骗（BIDI）**：U+202E 之类的双向覆盖能让
+       `gpj.exe` 在界面上**渲染**成 `gpj.txt`。文件名后面还要进时间线、
+       上传列表、电脑端托盘通知，每一处都依赖"看到的名字可信"。
+
+    另外去掉首尾空白与**结尾**的点：Win32 在创建文件时会静默吞掉它们，
+    于是 `photo.jpg.` 落盘成 `photo.jpg`、`a .txt` 落盘成 `a .txt` 之外的
+    形态 —— 声明名与真实名不一致，去重与"同名冲突"判断都会失准。
+    首尾的点只去尾部：`.hidden.jpg` 是合法且常见的名字。
+
+    保留名（CON/NUL/COM1…）不在这里处理，见 `_check_win_reserved`：
+    那是"拒绝"而不是"清洗"，因为猜用户想叫什么名字不如让他重命名。
+    """
+    cleaned = "".join(ch for ch in name if ch not in _NAME_STRIP_CHARS)
+    return cleaned.strip().rstrip(" .")
+
+
+def _check_win_reserved(name: str) -> None:
+    """拒绝 Windows 设备保留名（2026-10-23 审计）。
+
+    `CON`/`PRN`/`AUX`/`NUL`/`COM1-9`/`LPT1-9` 在 Win32 层是**设备**而不是
+    文件名，带扩展名也一样（`CON.txt` 同样指向控制台）。这类名字进了
+    `declared_name` 之后一旦有哪条路径把它当作落盘名（现在的归档会重命名，
+    但 `declared_name` 就在手边），轻则创建失败、重则往设备里写数据。
+
+    判的是**第一个点之前**的部分：`CON.txt`、`con.tar.jpg` 都要挡，
+    而 `console.jpg`、`NULLA.jpg` 不能误伤（所以只比整套名字，不判前缀）。
+    """
+    stem = name.split(".", 1)[0].strip().upper()
+    if stem in _WIN_RESERVED_NAMES:
+        raise BadRequest("文件名是系统保留名，请重命名后再上传")
+
+
 def create_session(
     db: Database,
     cfg: Config,
@@ -455,6 +535,7 @@ def create_session(
     target_dir: str | None = None,
     declared_taken_at: float | None = None,
     client_chunk_size: int | None = None,
+    client_id: str = "",
 ) -> dict[str, Any]:
     """创建或复用上传会话。
 
@@ -463,7 +544,12 @@ def create_session(
     """
     if not isinstance(name, str) or not name.strip():
         raise BadRequest("缺少文件名")
-    name = name.strip()
+    name = _sanitize_declared_name(name)
+    if not name:
+        # 整个名字都是控制字符/空白/结尾的点 —— 清洗后什么都不剩。
+        # 放它过去只会得到一条 `declared_name=''` 的会话：归档时没法命名，
+        # 时间线上显示为空标题，用户完全不知道哪个文件出了问题。
+        raise BadRequest("文件名清洗后为空")
     if len(name) > 255:
         raise BadRequest("文件名过长")
     # ★ 审计 F19：`docs/04:3131` 的请求体字段表明写 `name` "不接受路径，
@@ -481,6 +567,7 @@ def create_session(
     # 所以真实前端一个字节都不用改。
     if "/" in name or "\\" in name:
         raise BadRequest("文件名不能包含路径分隔符")
+    _check_win_reserved(name)
     if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
         raise BadRequest("文件大小必须为正整数")
     max_bytes = int(cfg.upload["max_file_mb"]) * 1024 * 1024
@@ -536,12 +623,26 @@ def create_session(
         }
 
     # --- 2) 同一文件的重复 init：复用会话，不重置已收字节 ---
+    #
+    # ★ 必须带 `client_id`（ISSUE-034 ②）。原来的条件只有
+    # 根目录 + 文件名 + 总大小 + sha256，而两台手机传同名同大小文件
+    # 是完全正常的事（连拍导出、微信同名图、两个人的 `IMG_0001.jpg`）。
+    # 少了归属条件，第二台手机会拿到第一台的 `upload_id` 并从它的
+    # `offset` 继续往后写 —— **静默的数据损坏**：两边都收到成功，
+    # 归档出来是一个由两个文件的前后半段拼起来的混合体，
+    # 而且 sha256 校验还能通过（它校验的是拼接后的临时文件）。
+    #
+    # `client_id` 为空串（未知来源，例如直接调 handler 的测试、
+    # 或 `require_pairing=false` 的本机调试模式）时仍然只在"同样未知"
+    # 的会话之间复用，不会跨到某个真实设备上去。
+    # 升级前的历史行 `client_id IS NULL` 永远匹配不上任何值，即
+    # "谁的都不是" —— 宁可让客户端重传一次，也不能让它写进别人的半成品。
     existing = db.query_one(
         "SELECT * FROM upload_sessions WHERE status = 'open' AND expires_at > ? "
         "AND root_id = ? AND declared_name = ? AND total_size = ? "
-        "AND (sha256 IS ? OR sha256 = ?) "
+        "AND (sha256 IS ? OR sha256 = ?) AND client_id = ? "
         "ORDER BY created_at DESC LIMIT 1",
-        (time.time(), root.id, name, size, sha256, sha256),
+        (time.time(), root.id, name, size, sha256, sha256, client_id),
     )
     if existing is not None:
         sess = dict(existing)
@@ -594,11 +695,11 @@ def create_session(
     db.execute(
         "INSERT INTO upload_sessions(id, root_id, target_rel, final_rel, temp_path, "
         " total_size, received, chunk_size, sha256, declared_name, taken_at, "
-        " created_at, expires_at, status, media_id, dedup, completed_at) "
-        "VALUES (?, ?, ?, NULL, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, NULL)",
+        " created_at, expires_at, status, media_id, dedup, completed_at, client_id) "
+        "VALUES (?, ?, ?, NULL, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, NULL, ?)",
         (
             upload_id, root.id, subdir, str(temp), size, chunk,
-            sha256, name, declared_taken_at, now, now + ttl,
+            sha256, name, declared_taken_at, now, now + ttl, client_id,
         ),
     )
     log.info("新建上传会话 %s：%s（%d 字节）", upload_id, name, size)

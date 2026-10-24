@@ -315,12 +315,28 @@ def test_windows_deploy_script_uses_lf_only() -> None:
     assert b"\r\n" not in raw, "deploy.ps1 里出现了 CRLF"
 
 
-def test_windows_deploy_script_runs_single_worker() -> None:
-    """单进程：注册表是内存 map（与 Dockerfile 同理）。"""
+def test_windows_deploy_script_runs_the_entry_module_not_uvicorn_cli() -> None:
+    """单进程 + 走 `main()`，不走 uvicorn 的命令行入口。
+
+    两条理由都不允许退回 CLI：
+
+    1. **单进程**：设备注册表是内存 map（同 Dockerfile），`--workers>1`
+       会让"电脑连在 worker A、手机打 worker B"变成常态。
+    2. **CLI 的默认开关是错的**：`python -m uvicorn` 默认
+       `--proxy-headers` + `forwarded_allow_ips=127.0.0.1`（把
+       `scope["client"]` 改写成可伪造的 XFF）、access log 全开（把
+       `?code=NNNNNN` 写进日志）、并回 `Server: uvicorn`。这些只能在
+       `main()` 里一次设对（`docs/11` ISSUE-030 / 032）。
+    """
     text = _deploy_ps1().decode("utf-8-sig")
-    assert "--workers 1" in text
-    assert "cloud.relay.main:create_app" in text
-    assert "--factory" in text
+    # 只看非注释行：注释里要解释"为什么不能用 uvicorn CLI"，必然出现
+    # `-m uvicorn` 字面量。
+    code = "\n".join(ln for ln in text.splitlines()
+                     if not ln.lstrip().startswith("#"))
+    assert "scripts\\cloud_run.py" in code
+    assert "-m cloud.relay.main" not in code
+    assert "-m uvicorn" not in code
+    assert "--workers" not in code
 
 
 def test_windows_deploy_script_points_the_web_dir_at_the_bundled_dist() -> None:
@@ -372,15 +388,24 @@ def test_windows_deploy_script_survives_schtasks_stderr_on_first_run() -> None:
     assert "Stop-Process -Id" in text
 
 
-def test_windows_deploy_script_does_not_hardcode_a_password() -> None:
-    """默认口令不能是能直接用上线的值。
+def test_windows_deploy_script_has_no_literal_password_assignment() -> None:
+    """`deploy.ps1` 里不允许出现任何"字面量口令"赋值。
 
-    脚本本身会被拷到服务器上，它的默认参数等于公开凭据。要求默认值
-    里带明显的"占位"标记，运行时必须由使用者覆盖。
+    ★ 这条用例的前身断言的是 `'Password   = "PbCloud2026!"' in text`
+    —— 名字叫「不许硬编码口令」，断言却是「必须等于这个硬编码值」，把
+    线上真实口令钉成了契约（与 ISSUE-018 同型，`docs/11` ISSUE-032）。
+    改成**负向**判据：任何形如 `$X = "<非空字面量>"` 的赋值都算违规，
+    口令只能来自 `Read-Host` 或 stdin。
     """
+    import re
+
     text = _deploy_ps1().decode("utf-8-sig")
-    assert 'Password   = "PbCloud2026!"' in text, (
-        "默认口令变了？请确认它仍是**占位值**而不是某个真实口令")
+    bad = [ln.strip() for ln in text.splitlines()
+           if re.search(r'\$(?:Password|Pass|Pwd)\w*\s*=\s*"[^"]+"', ln)]
+    assert not bad, f"deploy.ps1 里出现了字面量口令：{bad}"
+    # 口令必须真的经 stdin 送进 cloud_init（不然交互式输入就白问了）
+    assert "--password-stdin" in text
+    assert "Read-Host -AsSecureString" in text
 
 
 # ---------------------------------------------------------------- 入口行为
@@ -412,23 +437,30 @@ def test_open_db_honours_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
         os.environ.pop("PB_CLOUD_DB", None)
 
 
-def test_cloud_entry_trusts_forwarded_only_from_docker_ranges() -> None:
-    """`main()` 里 forwarded_allow_ips 的默认值。
+def test_cloud_entry_never_lets_uvicorn_rewrite_the_client_ip() -> None:
+    """`main()` 里 uvicorn 的 proxy headers 必须**关着**。
 
-    用 uvicorn 的默认值（127.0.0.1）会让 Caddy 那一跳被当成"没有代理"，
-    所有手机共用 Caddy 容器 IP。
+    历史：2026-10-23 之前默认 `forwarded_allow_ips="172.16.0.0/12"`（假设
+    前面是 Docker 里的 Caddy）。实际部署是 Windows + cloudflared，从
+    `127.0.0.1` 连入 —— 于是真实的 XFF 被**丢弃**，所有手机共用
+    `127.0.0.1` 一个限流桶，一个人刷 10 个假登录就能把主人锁在门外
+    （`docs/11` ISSUE-030）。
+
+    ★ 判据不能是"某个具体网段字面量"：上一个版本的这条用例断言的就是
+    `"172.16.0.0/12" in src`，把一个**错误的拓扑假设**钉成了契约，改对了
+    反而变红（与 ISSUE-018 同型）。现在的契约是"谁都不许改写
+    `scope['client']`"，来源判定统一走 `netutil`。
     """
     from cloud.relay import main as cloud_main
 
     src = Path(cloud_main.__file__).read_text(encoding="utf-8")
-    assert "forwarded_allow_ips=forwarded" in src
-    assert "PB_CLOUD_FORWARDED_ALLOW_IPS" in src
-    # 不许信任一切：默认值必须是具体网段。直接读那行赋值，避免被
-    # 文档字符串里讨论 `["*"]` 的文字干扰。
-    default_line = next(ln for ln in src.splitlines()
-                        if "PB_CLOUD_FORWARDED_ALLOW_IPS" in ln)
-    assert '"*"' not in default_line, default_line
-    assert "172.16.0.0/12" in src
+    # 只看代码行：注释里要**解释**那段历史，必然会出现旧网段与旧参数名，
+    # 拿整份源码当判据会把「解释为什么改」判成「没改」。
+    code = "\n".join(ln for ln in src.splitlines()
+                     if not ln.lstrip().startswith("#"))
+    assert "proxy_headers=False" in code
+    assert "forwarded_allow_ips" not in code
+    assert "172.16.0.0/12" not in code
 
 
 # ---------------------------------------------------- TC-CLOUD-SEC-004 / 009
@@ -565,3 +597,42 @@ def test_cloud_code_never_writes_files_except_sqlite() -> None:
                     "TemporaryDirectory", "TemporaryFile"):
                 bad.append(f"{rel}:{node.lineno} tempfile.{node.attr}")
     assert bad == [], bad
+
+
+def test_windows_deploy_script_starts_the_task_it_registers() -> None:
+    """注册完计划任务必须 `/Run` 它，并在启动后再验一次健康。
+
+    实测踩到（2026-10-23）：脚本只 `/Create` 从不 `/Run`，而第 7 步的试跑
+    进程是 deploy.ps1 的子进程、SSH 会话一断就被带走 ⇒ 表面上「9 步全绿」，
+    过一会儿外网全 502，任务 `Last Result` 停在 267011
+    （`SCHED_S_TASK_HAS_NOT_RUN`）。
+    """
+    text = _deploy_ps1().decode("utf-8-sig")
+    code = "\n".join(ln for ln in text.splitlines()
+                     if not ln.lstrip().startswith("#"))
+    assert "schtasks /Run /TN $taskName" in code
+    after = code.split("schtasks /Run /TN $taskName", 1)[1]
+    assert "/api/health" in after
+
+
+def test_cloud_run_entry_is_a_file_so_embeddable_python_can_find_the_package() -> None:
+    """启动入口必须是**脚本文件**，不能靠 `-m cloud.relay.main`。
+
+    embeddable 版 Python 的 `python312._pth` 一旦存在，CPython 只按它组装
+    `sys.path`，`PYTHONPATH` 被**整条忽略**（实测 `sys.path[:3]` 只剩
+    `python312.zip` / 安装目录 / `Lib\\site-packages`），于是
+    `-m cloud.relay.main` 报 `ModuleNotFoundError: No module named 'cloud'`
+    （2026-10-23 在服务器上踩到，部署第 7 步自检直接失败）。
+
+    脚本文件（`python scripts/cloud_run.py`）自带 `__file__`，自己把包根
+    塞进 `sys.path`，MSI / embeddable 两种发行都成立。
+    """
+    import ast
+
+    src = (CLOUD.parent / "scripts" / "cloud_run.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    names = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+    assert {"bootstrap", "main"} <= names
+    assert "__file__" in src
+    assert "sys.path" in src
+    assert "cloud.relay.main" in src

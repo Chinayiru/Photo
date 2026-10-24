@@ -1166,3 +1166,132 @@ def test_panel_is_unreachable_when_client_ip_is_unknown(tmp_path: Path, db: Data
     st = _state(tmp_path, db)
     r = _call(st, "/panel/pair-code", method="POST", client_ip="")
     assert r.status == 404, f"空 client_ip 竟然能签发配对码：{r.status}"
+
+
+# --------------------------------------------------------------------------
+# 设备角色：owner / viewer（ISSUE-034 ③）
+# --------------------------------------------------------------------------
+#
+# 威胁模型：手机令牌是最容易泄露的东西（PWA 缓存、维修时临时借出、丢手机），
+# 而"吊销"是**不可逆**操作 —— 被吊销的设备必须有人走到电脑前重新生成配对码。
+# 所以在"列表可见"和"能吊销别人"之间必须切开，否则一个令牌泄露就能让
+# 全家设备下线，用户却完全看不出发生过什么。
+
+def _pair_new_device(st: AppState, db: Database, ua: str = "Unknown") -> tuple[str, str]:
+    """走完整 HTTP 配对，返回 `(client_id, client_token)`。"""
+    code = _make_code(db)
+    r = _call(st, "/api/pair", method="POST",
+              body=f'{{"code":"{code}"}}'.encode(),
+              headers={"User-Agent": f"Mozilla/5.0 ({ua})"})
+    assert r.status == 201, _body(r)
+    b = _json(r)
+    return b["client_id"], b["client_token"]
+
+
+def test_first_paired_device_is_owner_and_rest_are_viewers(tmp_path: Path,
+                                                           db: Database) -> None:
+    """第一个配对成功的设备是 owner，之后的所有设备都是 viewer。
+
+    为什么是"第一个"而不是"回环的"：配对动作本身发生在电脑上（配对码
+    只显示在电脑屏幕上），执行的却是手机 —— 请求来源永远不是回环。
+    所以"第一台"是唯一可用的判据：那台通常就是用户自己的手机,
+    而它恰恰最需要在换手机/丢手机时把别的设备踢掉。
+    """
+    st = _state(tmp_path, db)
+    first_id, _ = _pair_new_device(st, db, "iPhone")
+    second_id, _ = _pair_new_device(st, db, "xiaomi")
+
+    roles = {r["id"]: r["role"] for r in db.query("SELECT id, role FROM devices")}
+    assert roles[first_id] == "owner"
+    assert roles[second_id] == "viewer"
+
+
+def test_viewer_cannot_revoke_other_device(tmp_path: Path, db: Database) -> None:
+    """viewer 令牌不能吊销别的设备 —— 回 403 E2003，且对方毫发无伤。
+
+    403 而不是 404：目标 `client_id` 是调用方自己给的，回 404 隐藏不了
+    任何信息，只会让真正的权限问题表现成"设备不见了"这种误导性症状。
+    """
+    st = _state(tmp_path, db)
+    owner_id, _owner_token = _pair_new_device(st, db, "iPhone")
+    _viewer_id, viewer_token = _pair_new_device(st, db, "xiaomi")
+
+    r = _call(st, f"/api/devices/{owner_id}", method="DELETE",
+              headers={"Authorization": f"Bearer {viewer_token}"},
+              params={"client_id": owner_id})
+    assert r.status == 403
+    assert _json(r)["error"]["code"] == "E2003"
+    row = db.query_one("SELECT revoked FROM devices WHERE id = ?", (owner_id,))
+    assert row["revoked"] == 0, "越权吊销竟然真的把 owner 踢下线了"
+
+
+def test_owner_can_revoke_viewer(tmp_path: Path, db: Database) -> None:
+    """owner 仍然能吊销别的设备（丢手机时的主路径不能被打断）。"""
+    st = _state(tmp_path, db)
+    _owner_id, owner_token = _pair_new_device(st, db, "iPhone")
+    viewer_id, _ = _pair_new_device(st, db, "xiaomi")
+
+    r = _call(st, f"/api/devices/{viewer_id}", method="DELETE",
+              headers={"Authorization": f"Bearer {owner_token}"},
+              params={"client_id": viewer_id})
+    assert r.status == 204
+    row = db.query_one("SELECT revoked FROM devices WHERE id = ?", (viewer_id,))
+    assert row["revoked"] == 1
+
+
+def test_viewer_can_still_revoke_itself(tmp_path: Path, db: Database) -> None:
+    """"退出登录/移除本机"必须还能用：最坏结果只是它自己失去访问权。"""
+    st = _state(tmp_path, db)
+    _pair_new_device(st, db, "iPhone")
+    viewer_id, viewer_token = _pair_new_device(st, db, "xiaomi")
+
+    r = _call(st, f"/api/devices/{viewer_id}", method="DELETE",
+              headers={"Authorization": f"Bearer {viewer_token}"},
+              params={"client_id": viewer_id})
+    assert r.status == 204
+    r = _call(st, "/api/clients/me", headers={"Authorization": f"Bearer {viewer_token}"})
+    assert r.status == 403
+
+
+def test_viewer_device_list_hides_privileged_fields(tmp_path: Path, db: Database) -> None:
+    """viewer 仍能看列表（要能回答"这台是我吗"），但看不到管理字段。
+
+    权衡：列表本身对攻击者的价值远低于"能一键吊销全部设备"，所以保留；
+    但 `role`（哪台是 owner = 该偷哪台）、`created_at`（对端运维细节）
+    与任何令牌/路径字段都不属于"我是不是这台"这个用途，一律不给。
+    """
+    st = _state(tmp_path, db)
+    _pair_new_device(st, db, "iPhone")
+    _viewer_id, viewer_token = _pair_new_device(st, db, "xiaomi")
+
+    r = _call(st, "/api/devices", headers={"Authorization": f"Bearer {viewer_token}"})
+    assert r.status == 200
+    items = _json(r)["items"]
+    assert len(items) == 2
+    for item in items:
+        # 列表还得有用
+        for k in ("client_id", "name", "last_seen", "revoked"):
+            assert k in item
+        # 但不能有管理/敏感字段
+        for k in ("role", "created_at", "token", "token_hash", "agent_token",
+                  "path", "temp_path"):
+            assert k not in item, f"viewer 的设备列表里泄露了 {k}"
+    # 整个响应体里不能出现任何令牌串（令牌只在配对那一次下发）
+    raw = _body(r).decode("utf-8")
+    assert "token" not in raw
+    assert '"path"' not in raw
+    assert '"temp_path"' not in raw
+
+
+def test_owner_device_list_includes_role(tmp_path: Path, db: Database) -> None:
+    """owner 的列表要能分辨谁是 owner（管理界面需要，且只有它需要）。"""
+    st = _state(tmp_path, db)
+    owner_id, owner_token = _pair_new_device(st, db, "iPhone")
+    _pair_new_device(st, db, "xiaomi")
+
+    r = _call(st, "/api/devices", headers={"Authorization": f"Bearer {owner_token}"})
+    assert r.status == 200
+    items = _json(r)["items"]
+    assert all("role" in it and "created_at" in it for it in items)
+    owners = [it["client_id"] for it in items if it["role"] == "owner"]
+    assert owners == [owner_id]

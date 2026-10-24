@@ -429,7 +429,21 @@ def test_max_image_pixels_allows_48mp() -> None:
     50331648 像素的照片。这个测试锁住这个教训。
     """
     assert 8192 * 6144 <= MAX_IMAGE_PIXELS
-    # 2 亿像素（当前手机最高规格）也要能过
-    assert 200_000_000 <= MAX_IMAGE_PIXELS
     # 但仍要远小于"声明 4×10^10 像素"这类攻击值
     assert MAX_IMAGE_PIXELS < 4_000_000_000
+
+
+def test_max_image_pixels_caps_bomb_memory() -> None:
+    """上限本身不能太大（ISSUE-034）。
+
+    曾经是 2 亿（"当前手机最高规格也要能过"）。但 2 亿像素解到 RGB 是
+    600 MB，Pillow 解码时还有 32 位累积的中间缓冲，峰值到 GB 级；家用
+    小主机常见的 4–8 GB 内存被一张这样的 PNG 就拖进 swap，表现成
+    "整站卡死"。所以上限要收到"真实相机量级"：真实的挂机上限是 48MP，
+    即 8192×6144 = 5033 万像素，取 5200 万留一点余量。
+
+    下界由 test_max_image_pixels_allows_48mp 锁住，两条一起才能防止
+    要么"防不住炸弹"、要么"把真实照片判成炸弹"。
+    """
+    assert MAX_IMAGE_PIXELS <= 60_000_000
+    assert MAX_IMAGE_PIXELS > 8192 * 6144

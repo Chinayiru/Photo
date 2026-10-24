@@ -961,3 +961,243 @@ def test_unknown_root_is_a_distinct_exception(tmp_path, library):
 def test_root_by_id_none_uses_default(tmp_path, library):
     cfg = _cfg(tmp_path, library)
     assert cfg.root_by_id(None).id == "library"
+
+
+# --------------------------------------------------------------------------
+# 会话归属：client_id（ISSUE-034 ②）
+# --------------------------------------------------------------------------
+#
+# 危害不是"多一条会话"，而是**静默数据损坏**：两台手机传同名同大小文件
+# （连拍导出、微信同名图、两个人的 IMG_0001.jpg）时，第二台会接到第一台
+# 的会话上，从它的 offset 继续往后写。两边都收到"成功"，归档出来的却是
+# 两个文件前后半段拼接成的混合体 —— 而且 sha256 还能对上（它校验的是
+# 拼接后的临时文件）。
+
+
+def test_two_clients_do_not_share_a_session(tmp_path, library, db):
+    """同签名（名+大小+sha256）但不同设备 → 必须是两条独立会话。"""
+    cfg = _cfg(tmp_path, library)
+    data = _img(b"same bytes")
+    a = _make(db, cfg, data=data, name="IMG_0001.jpg",
+              sha256=hashlib.sha256(data).hexdigest(), client_id="phoneA")
+    b = _make(db, cfg, data=data, name="IMG_0001.jpg",
+              sha256=hashlib.sha256(data).hexdigest(), client_id="phoneB")
+
+    assert a["created"] is True
+    assert b["created"] is True, "两台设备复用了同一个上传会话"
+    assert a["upload_id"] != b["upload_id"]
+    # 各自有独立的临时文件：不会互相覆盖
+    sa = uploads.get_session(db, a["upload_id"], client_id="phoneA")
+    sb = uploads.get_session(db, b["upload_id"], client_id="phoneB")
+    assert sa["temp_path"] != sb["temp_path"]
+    assert db.scalar("SELECT COUNT(*) FROM upload_sessions") == 2
+
+
+def test_same_client_reuses_its_own_session(tmp_path, library, db):
+    """同一台设备重发 init（弱网重试）仍然复用 —— 这是原功能，别改坏。"""
+    cfg = _cfg(tmp_path, library)
+    data = _img(b"retry")
+    a = _make(db, cfg, data=data, name="a.jpg", client_id="phoneA")
+    _send(db, cfg, a["upload_id"], data[:5])
+    b = _make(db, cfg, data=data, name="a.jpg", client_id="phoneA")
+
+    assert b["created"] is False
+    assert b["upload_id"] == a["upload_id"]
+    assert b["offset"] == 5, "复用会话时不能重置已收字节"
+
+
+def test_other_client_session_is_404_not_403(tmp_path, library, db):
+    """拿到别人的 upload_id → 404。
+
+    403 等于确认"这个 uid 真的存在"，而 `GET /api/uploads/{uid}` 会回
+    `declared_name` —— 确认存在之后剩下的就是猜大小、猜文件名。
+    upload_id 是 32 位 hex，本来无法枚举，不能用 403 把它变成可探测的。
+    """
+    cfg = _cfg(tmp_path, library)
+    r = _make(db, cfg, data=_img(b"x"), name="a.jpg", client_id="phoneA")
+
+    with pytest.raises(AppError) as ei:
+        uploads.get_session(db, r["upload_id"], client_id="phoneB")
+    assert ei.value.status == 404
+    # 自己的仍然拿得到
+    assert uploads.get_session(db, r["upload_id"], client_id="phoneA")["id"] == r["upload_id"]
+
+
+def test_legacy_session_without_client_id_is_nobodys(tmp_path, library, db):
+    """升级前的历史行（client_id IS NULL）谁的都不是 —— 宁可让人重传。
+
+    让它匹配上空 client_id 才是危险的：那等于"身份未知的调用方可以写进
+    任意历史会话"，而这正是要修的洞。
+    """
+    cfg = _cfg(tmp_path, library)
+    r = _make(db, cfg, data=_img(b"legacy"), name="old.jpg", client_id="phoneA")
+    db.execute("UPDATE upload_sessions SET client_id = NULL WHERE id = ?",
+               (r["upload_id"],))
+
+    with pytest.raises(AppError) as ei:
+        uploads.get_session(db, r["upload_id"], client_id="phoneA")
+    assert ei.value.status == 404
+    # 也不会被"未知归属"的 init 复用（否则两台手机都能抢到它）
+    again = _make(db, cfg, data=_img(b"legacy"), name="old.jpg")
+    assert again["created"] is True
+
+
+def _ctx_for(st, uid: str, client_id: str, *, method: str = "GET",
+             headers: dict | None = None, body: bytes | None = None):
+    """构造一个只带 `ctx.state["client"]` 的 Ctx。
+
+    正常请求里这个键由 `auth.require_client()` 在中间件里写入 ——
+    测试直接塞进去，等价于"这台设备已经通过鉴权"。
+    """
+    from backend.app.core import Ctx
+
+    async def _stream():
+        if body:
+            yield body
+
+    ctx = Ctx(method=method, path=f"/api/uploads/{uid}",
+              headers=headers or {}, params={"upload_id": uid}, app=st,
+              body=_stream() if body is not None else None)
+    ctx.state["client"] = {"id": client_id, "name": "test", "role": "viewer"}
+    return ctx
+
+
+def test_http_resume_of_foreign_session_is_404(tmp_path, library, db):
+    """PATCH/GET 别人的 uid → 404（不是 403、更不是 500）。"""
+    import asyncio
+
+    from backend.app.handlers import uploads as uh
+    from backend.app.state import AppState
+
+    cfg = _cfg(tmp_path, library)
+    st = AppState(cfg, db)
+    r = _make(db, cfg, data=_img(b"secret"), name="a.jpg", client_id="phoneA")
+    uid = r["upload_id"]
+
+    with pytest.raises(AppError) as ei:
+        asyncio.run(uh.get_upload(_ctx_for(st, uid, "phoneB")))
+    assert ei.value.status == 404
+
+    with pytest.raises(AppError) as ei:
+        asyncio.run(uh.patch_upload(_ctx_for(
+            st, uid, "phoneB", method="PATCH",
+            headers={"content-range": "bytes 0-5/12"}, body=b"abcdef",
+        )))
+    assert ei.value.status == 404
+
+    # 自己的请求照常
+    reply = asyncio.run(uh.get_upload(_ctx_for(st, uid, "phoneA")))
+    assert reply.status == 200
+
+
+# --------------------------------------------------------------------------
+# 文件名清洗（2026-10-23 审计）
+# --------------------------------------------------------------------------
+#
+# `declared_name` 会被写进 `audit_log` 表、`data/audit.log`、以及
+# `log.info("新建上传会话 %s")` —— 一条带 \r\n 的文件名就能伪造出完整的
+# 假日志行，把"谁传了什么"这条追查线索变成攻击者可写的文本。
+
+
+def _stored_name(db, uid: str) -> str:
+    return db.query_one("SELECT declared_name FROM upload_sessions WHERE id = ?",
+                        (uid,))["declared_name"]
+
+
+def test_declared_name_crlf_is_cleaned(tmp_path, library, db, caplog):
+    """CRLF 不能进库、也不能进日志。"""
+    cfg = _cfg(tmp_path, library)
+    # 伪造行的位置刻意放在中间：这样清洗后仍是合法文件名，
+    # 能证明"只是去掉了危险字符"而不是"整条被拒"。
+    tainted = "evil\r\n2026-10-23 INFO 新建上传会话 admin：删库成功.jpg"
+    with caplog.at_level("INFO"):
+        r = _make(db, cfg, data=_img(b"crlf"), name=tainted)
+
+    stored = _stored_name(db, r["upload_id"])
+    assert "\r" not in stored and "\n" not in stored
+    # 日志同样必须是**单行**：一条带换行的文件名会伪造出完整的假日志行
+    logged = [rec.getMessage() for rec in caplog.records]
+    assert logged, "没有记录新建会话的日志"
+    for line in logged:
+        assert "\r" not in line and "\n" not in line, f"日志被换行注入了：{line!r}"
+    assert stored.startswith("evil") and stored.endswith(".jpg")
+
+
+def test_declared_name_control_chars_are_cleaned(tmp_path, library, db):
+    """NUL / DEL / 其他 C0 控制符一律去掉。"""
+    cfg = _cfg(tmp_path, library)
+    weird = "ph\x00oto\x1f.jpg\x7f"
+    r = _make(db, cfg, data=_img(b"ctl"), name=weird)
+    stored = _stored_name(db, r["upload_id"])
+    assert stored == "photo.jpg"
+
+
+@pytest.mark.parametrize("bidi", ["\u202a", "\u202e", "\u2066", "\u2069"])
+def test_declared_name_bidi_is_cleaned(tmp_path, library, db, bidi):
+    """BIDI 控制符能让扩展名在界面上"看起来"是另一个。
+
+    U+202E（RLO）之后的一段会被反向渲染：`photo\u202eexe.jpg` 在界面上
+    显示的结尾是 `jpg`，而真实文件名结尾是 `jpg`、中间夹着 `exe` ——
+    用户以为自己拿到一张图，实际看到的名字与他以为的不是同一个字符串。
+    文件名后面还要进时间线、上传列表、电脑端托盘通知，每一处都依赖
+    "看到的名字可信"，所以控制符必须在入库前就消失。
+    （扩展名本身还有 `check_extension` 白名单兜着，BIDI 骗不了落盘，
+    但骗得了**人**。）
+    """
+    cfg = _cfg(tmp_path, library)
+    r = _make(db, cfg, data=_img(b"bidi"), name=f"IMG{bidi}_0001.jpg")
+    stored = _stored_name(db, r["upload_id"])
+    assert bidi not in stored
+    assert stored == "IMG_0001.jpg", "显示出来的名字必须与实际名字一致"
+
+
+def test_declared_name_trailing_dots_and_spaces_are_cleaned(tmp_path, library, db):
+    """Win32 建文件会静默吞掉结尾的点/空格，声明名与真实名就会不一致。"""
+    cfg = _cfg(tmp_path, library)
+    r = _make(db, cfg, data=_img(b"dots"), name="  photo.jpg .  ")
+    assert _stored_name(db, r["upload_id"]) == "photo.jpg"
+
+
+def test_leading_dot_file_name_is_kept(tmp_path, library, db):
+    """只去尾部的点：`.hidden.jpg` 是合法且常见的名字，不能一起砍掉。"""
+    cfg = _cfg(tmp_path, library)
+    r = _make(db, cfg, data=_img(b"hidden"), name=".hidden.jpg")
+    assert _stored_name(db, r["upload_id"]) == ".hidden.jpg"
+
+
+@pytest.mark.parametrize("name", [
+    "CON", "con.txt", "CON.tar.jpg", "NUL.jpg", "aux.JPG",
+    "COM1.jpg", "com9.png", "LPT1", "lpt9.jpg",
+])
+def test_windows_reserved_names_are_rejected(tmp_path, library, db, name):
+    """Windows 设备保留名必须拒绝（E1001/400），而不是"清洗成别的名字"。
+
+    猜用户想叫什么名字不如让他重命名：`CON.jpg` 清洗成 `_CON.jpg` 之后，
+    用户看到的是一个他没起过的名字，问题被藏起来了。
+    """
+    cfg = _cfg(tmp_path, library)
+    with pytest.raises(AppError) as ei:
+        _make(db, cfg, data=_img(b"reserved"), name=name)
+    assert ei.value.status == 400
+    assert ei.value.code == "E1001"
+    assert db.scalar("SELECT COUNT(*) FROM upload_sessions") == 0
+
+
+def test_reserved_lookalike_names_are_allowed(tmp_path, library, db):
+    """`console.jpg` / `NULLA.jpg` 不能被误伤（只比整套名字，不判前缀）。"""
+    cfg = _cfg(tmp_path, library)
+    for name in ("console.jpg", "NULLA.jpg", "auxiliary.jpg", "lpt10.jpg"):
+        r = _make(db, cfg, data=_img(b"ok"), name=name)
+        assert _stored_name(db, r["upload_id"]) == name
+        # MAX_OPEN_SESSIONS 只有 3：逐个结束，避免撞上并发上限
+        uploads.abort_session(db, cfg, r["upload_id"])
+
+
+def test_name_that_cleans_to_nothing_is_rejected(tmp_path, library, db):
+    """整串都是控制字符/空白 → 400，而不是建一条空名字的会话。"""
+    cfg = _cfg(tmp_path, library)
+    for name in ("\x00\x01\x1f", "\u202e\u202a", "   ", " .. "):
+        with pytest.raises(AppError) as ei:
+            _make(db, cfg, data=_img(b"empty"), name=name)
+        assert ei.value.status == 400, name
+    assert db.scalar("SELECT COUNT(*) FROM upload_sessions") == 0

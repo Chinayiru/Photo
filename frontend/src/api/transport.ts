@@ -244,6 +244,65 @@ export async function testBase(base: string): Promise<PingResponse> {
 /** 问电脑端"我的云端基址"的最小间隔（会话内）。 */
 const CLOUD_BASE_ASK_INTERVAL_MS = 5 * 60 * 1000;
 
+/** 核对候选云端基址的超时：一次 ping 的隧道往返，给 3 秒。 */
+const CLOUD_VERIFY_TIMEOUT_MS = 3000;
+
+/**
+ * 核对一个"学来的"云端基址是不是**这台电脑**的（ISSUE-033）。
+ *
+ * ## 为什么必须核对
+ *
+ * `tunnel.public_base` 是局域网 `GET /api/system/info` 返回的普通字段，
+ * 而这个请求跑在**明文 HTTP** 上。同一 Wi-Fi 下的 MitM、假热点、或把
+ * `192.168.0.1` 冒充成电脑的设备，只要回一个 JSON 就能把手机端的云端
+ * 基址永久改成攻击者的服务器 —— 之后用户每次打开 App 都把 token 发过去。
+ * 落盘前必须自己验一遍：候选基址上的 ping 报出的 `device_id` 是不是本机
+ * 配对时记下的那一台（与 `stores/auth.ts: pair()` 里的二维码校验同一个判据）。
+ *
+ * ## 为什么用 `/api/system/ping`
+ *
+ * 它在 `backend/app/auth.py: PUBLIC_PATHS` 里，匿名可访问且不需要 cookie
+ * （`credentials: "omit"`），所以这次核对不会把令牌交到候选服务器手上 ——
+ * 真被投毒时泄漏的是一个公开的 `device_id`，而不是 90 天的 client_token。
+ *
+ * ## 失败为什么一律丢弃
+ *
+ * 核对不通过 = "要么它是一台别的电脑，要么它根本不是电脑"。两种情况下
+ * 落盘都会让用户永久连到错误地址，而这一次询问 5 分钟后还会重来 —— 丢掉
+ * 的代价只是这次没学到，报错的代价是状态条上一个用户看不懂的红色。
+ *
+ * ## 局限（别把它当根治）
+ *
+ * 同网段的 MitM 本来就能自己去问真机（ping 是匿名接口），所以它也能替
+ * 真机应答这次核对。这条校验挡的是"随便回一个 JSON 就把基址改掉"的伪造，
+ * 挡不住一个愿意长期在链路中间代理的攻击者 —— 后者需要云端配对响应也
+ * 带签名才能治，那属于后端/云端侧的改造，不在本文件范围内。
+ */
+async function verifyCloudCandidate(candidate: string,
+                                    expectDid: string): Promise<boolean> {
+  // 没记过本机 device_id 就无从核对：宁可不落盘（ISSUE-033 要求"默认拒绝"）
+  if (!expectDid) return false;
+  const ctrl = new AbortController();
+  const timer = window.setTimeout(() => ctrl.abort(), CLOUD_VERIFY_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${candidate}/api/system/ping`, {
+      method: "GET",
+      // 与 `probeAt()` 同理：探活不带凭据，也不能被缓存成一个假的"在线"
+      cache: "no-store",
+      credentials: "omit",
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return false;
+    const ping = (await res.json()) as PingResponse;
+    return ping?.device_id === expectDid;
+  } catch {
+    // 超时 / 跨域被拒 / JSON 畸形 —— 都是"验不了"，按不通过处理
+    return false;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 /**
  * 走局域网问一次电脑端：我在云端的基址是什么（`tunnel.public_base`）。
  *
@@ -285,9 +344,16 @@ async function learnCloudBase(lanBase: string): Promise<void> {
     if (!res.ok) return;
     const info = (await res.json()) as SystemInfo;
     const base = String(info.tunnel?.public_base || "").trim();
-    if (base) saveCloudBase(base);
+    if (!base) return;
+    // ★ 学到 ≠ 可信（ISSUE-033）：`public_base` 是明文 HTTP 响应里的一个
+    //   普通字段，MitM 伪造一次应答就能把云端基址永久改到攻击者服务器，
+    //   之后每次打开都把 token 发过去。落盘前先 ping 一遍候选基址，核对
+    //   它报出的 device_id 是不是本机配对的那台电脑，对不上就丢掉这次结果
+    //   （5 分钟后还能再问，代价远小于绑错地址）。
+    if (!(await verifyCloudCandidate(base, getDeviceId()))) return;
+    saveCloudBase(base);
   } catch {
-    // 静默：探测失败/未配置云端都不影响局域网使用
+    // 静默：探测失败/未配置云端/核对不通过都不影响局域网使用
   } finally {
     window.clearTimeout(timer);
   }

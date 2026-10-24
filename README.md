@@ -73,7 +73,7 @@
 
 ## 当前状态
 
-**一期已完成；二期 P1 云端隧道代码与测试已完成，并已部署到阿里云服务器、端到端打通**（1399 条自动化测试 + 真实库端到端冒烟 35 项全绿）：
+**一期已完成；二期 P1 云端隧道代码与测试已完成，并已部署到阿里云服务器、端到端打通**（1476 条自动化测试 + 真实库端到端冒烟 35 项全绿）：
 
 | 模块 | 状态 | 关键实测数据 |
 |---|---|---|
@@ -261,7 +261,7 @@ python -m backend.app.main --version
 ```bash
 .venv/Scripts/python.exe -m pip install -r requirements-dev.txt
 
-# 单元 + 集成测试（约 2 分钟，1399 条）
+# 单元 + 集成测试（约 2 分钟，1476 条）
 .venv/Scripts/python.exe -m pytest backend/tests/
 
 # 路径沙箱专项（41 条手工演练；pytest 侧 96 条见 backend/tests/test_sandbox.py）
