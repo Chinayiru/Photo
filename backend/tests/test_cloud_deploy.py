@@ -636,3 +636,34 @@ def test_cloud_run_entry_is_a_file_so_embeddable_python_can_find_the_package() -
     assert "__file__" in src
     assert "sys.path" in src
     assert "cloud.relay.main" in src
+
+
+def test_windows_deploy_script_only_asks_for_the_password_when_it_registers() -> None:
+    """口令询问必须落在「真要登记新设备」的那一刻（`docs/11` ISSUE-037）。
+
+    早先这段在脚本开头无条件执行：无人值守升级（SSH / 计划任务 / 没有
+    控制台）会卡在 `Read-Host -AsSecureString` 上，脚本连第 1 步都进不去。
+    这条按**行号顺序**钉住：提问必须排在重装检测与库检测之后、`cloud_init`
+    之前 —— 也就是说，升级路径上根本走不到它。
+    """
+    import re
+
+    src = (CLOUD / "deploy.ps1").read_text(encoding="utf-8-sig")
+    # 帮助块（`<# ... #>`）与行注释里也写着这两个字面量，先清掉再数
+    code = re.sub(r"<#.*?#>", "", src, flags=re.S)
+    code = "\n".join(line for line in code.splitlines()
+                      if not line.lstrip().startswith("#"))
+
+    assert code.count("Read-Host -AsSecureString") == 1, "口令提问出现了不止一次"
+    ask = code.index("Read-Host -AsSecureString")
+    func = code.index("function Resolve-Password")
+    prev = code.index("$prevRun  = Join-Path")
+    init = code.index('& $py "scripts\\cloud_init.py" "init"')
+
+    assert func < ask, "Read-Host 跑到了 Resolve-Password 外面"
+    # 调用点只有一个，并且排在重装检测之后、cloud_init 之前：升级路径上
+    # （`$prevRun` 命中或库已存在）根本走不到它，这才是这条修复的全部内容。
+    assert code.count("$Password = Resolve-Password") == 1, "调用点不止一个"
+    call = code.index("$Password = Resolve-Password")
+    assert prev < call, "调用点排在重装检测之前：无人值守升级会先被卡住"
+    assert call < init, "口令必须在 cloud_init 之前拿到"
