@@ -75,6 +75,22 @@ const relayRoot = computed(() => relayRootBase() !== "");
 const mode = ref<"code" | "account">("code");
 
 /**
+ * **进入方式**：局域网直连 还是 走云端中继。
+ *
+ * 以前它是由"页面从哪来"隐式决定的（局域网地址就只能局域网、`/d/<id>/` 就只能
+ * 云端），用户没法在同一处切换。现在显式给一个开关，并且两种入口共用同一个
+ * 登录卡片 —— 局域网入口只给配对码，云端入口给账号登录（设备页另有配对码）。
+ */
+const entry = ref<"lan" | "cloud">(
+  (cloudPage.value || relayRoot.value) ? "cloud" : "lan",
+);
+/** 云端入口能拿到"设备页"吗：设备页才有 6 位码这条路。 */
+const codeAvailable = computed(() =>
+  !relayRoot.value && (entry.value === "lan" || cloudPage.value));
+/** 账号登录只在云端入口出现（账号是中继侧的东西）。 */
+const accountAvailable = computed(() => entry.value === "cloud");
+
+/**
  * 账号登录要打的中继根。
  *
  * 云端页与中继首页都有 `location` 可依；**局域网页没有** —— 家里电脑的云端
@@ -82,7 +98,8 @@ const mode = ref<"code" | "account">("code");
  * 不是 `/d/<id>`。
  */
 const accountBase = ref<string>(readAccountBase());
-const needsAccountBase = computed(() => !cloudPage.value && !relayRoot.value);
+const needsAccountBase = computed(() =>
+  entry.value === "cloud" && !cloudPage.value && !relayRoot.value);
 const resolvedAccountBase = computed(() => {
   if (relayRoot.value) return window.location.origin;
   if (cloudPage.value) {
@@ -310,7 +327,7 @@ function onCodeInput(e: Event): void {
     </div>
 
     <div class="card">
-      <div class="tabs" role="tablist" aria-label="登录方式">
+      <div v-if="codeAvailable && accountAvailable" class="tabs" role="tablist" aria-label="登录方式">
         <button
           v-if="!relayRoot"
           class="tab"
@@ -330,7 +347,7 @@ function onCodeInput(e: Event): void {
         >账号登录</button>
       </div>
 
-      <label v-if="mode === 'code' && !cloudPage && !relayRoot" class="field">
+      <label v-if="codeAvailable && mode === 'code' && !cloudPage && !relayRoot" class="field">
         <span class="lbl">电脑地址</span>
         <div class="addr">
           <input
@@ -355,13 +372,13 @@ function onCodeInput(e: Event): void {
         </div>
         <span class="hint">电脑上打开 PhotoBridge 就能看到这个地址</span>
       </label>
-      <p v-else-if="mode === 'code'" class="cloud-note">
+      <p v-else-if="codeAvailable && mode === 'code'" class="cloud-note">
         {{ relayRoot
           ? "登录你的账号，选一台电脑连上。照片不经过中继保存，只在传输时路过。"
           : "正在通过中继连接家里的电脑。输入电脑上显示的配对码即可。" }}
       </p>
 
-      <template v-if="mode === 'account'">
+      <template v-if="accountAvailable && mode === 'account'">
         <label v-if="needsAccountBase" class="field">
           <span class="lbl">服务器地址</span>
           <input
@@ -439,7 +456,7 @@ function onCodeInput(e: Event): void {
 
       </template>
 
-      <label v-if="mode === 'code' && !relayRoot" class="field">
+      <label v-if="codeAvailable && mode === 'code'" class="field">
         <span class="lbl">配对码</span>
         <input
           class="input-lg code"
@@ -457,7 +474,7 @@ function onCodeInput(e: Event): void {
       <p v-if="error" class="err">{{ error }}</p>
 
       <button
-        v-if="mode === 'code' && !relayRoot"
+        v-if="codeAvailable && mode === 'code'"
         class="btn primary block lg"
         type="button"
         :disabled="busy"
@@ -467,6 +484,33 @@ function onCodeInput(e: Event): void {
         <span v-if="busy" class="spinner" />
         {{ busy ? "正在连接…" : "连接电脑" }}
       </button>
+    </div>
+
+    <div class="entry-switch">
+      <span class="entry-lbl">进入方式</span>
+      <div class="tabs entry" role="tablist" aria-label="进入方式">
+        <button
+          class="tab"
+          type="button"
+          role="tab"
+          :aria-selected="entry === 'lan'"
+          :class="{ on: entry === 'lan' }"
+          @click="entry = 'lan'; mode = 'code'"
+        >局域网</button>
+        <button
+          class="tab"
+          type="button"
+          role="tab"
+          :aria-selected="entry === 'cloud'"
+          :class="{ on: entry === 'cloud' }"
+          @click="entry = 'cloud'; mode = 'account'"
+        >云端</button>
+      </div>
+      <span class="hint">
+        {{ entry === 'lan'
+          ? "手机和电脑在同一个 Wi-Fi，直接连电脑"
+          : "人在外面，经服务器中继连到家里电脑" }}
+      </span>
     </div>
 
     <details class="paste">
@@ -641,6 +685,18 @@ function onCodeInput(e: Event): void {
   background: var(--bg-2, var(--bg-1));
   border-radius: var(--radius-sm);
   padding: 10px 12px;
+}
+
+/* 进入方式切换：放在登录卡片下面，明确"我在走哪条路" */
+.entry-switch {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.entry-lbl {
+  font-size: 13px;
+  color: var(--fg-2);
+  text-align: center;
 }
 
 /* 登录方式切换：分段控件（同一时刻只有一个动作区域） */
