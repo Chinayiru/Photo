@@ -13,13 +13,21 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 
+from .autostart import ensure_enabled as ensure_autostart
 from .config import get as get_config
 from .config import load as load_config
 from .server import run
+from .single_instance import acquire as acquire_instance
+from .single_instance import release as release_instance
 
 __all__ = ["main"]
+
+#: 日志在 `run()` 里才配置（`setup_logging`）。这里只取模块 logger：
+#: 早于配置的日志会被 `logging.lastResort` 打到 stderr，前台运行正好能看见。
+log = logging.getLogger(__name__)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -73,7 +81,33 @@ def main(argv: list[str] | None = None) -> int:
     if args.tray:
         tray = True
 
-    return run(cfg, tray=tray)
+    # ---- 单实例 ------------------------------------------------------
+    # 同一个数据目录只允许一个进程在跑。第二个实例**安静退出**（退出码 0）：
+    # 用户双击第二次图标时，他期待的是"叫出已经开着的那个"，不是一个错误框，
+    # 更不是又一个看不见的后台进程（那正是"托盘退出后残留 python"的来源）。
+    got, running = acquire_instance(cfg)
+    if not got:
+        url = str(running.get("url") if running else "")
+        print(f"PhotoBridge 已在运行（{url}），本次启动已忽略")
+        return 0
+
+    # ---- 开机自启 ----------------------------------------------------
+    # ★ 只在托盘模式下写：`--no-tray`/前台运行是开发与排障场景，不该动注册表。
+    # 写失败不拦截启动（自启是便利功能），但要留下日志。
+    if tray:
+        try:
+            st_auto = ensure_autostart(cfg.app.get("autostart", True))
+            if st_auto.get("enabled"):
+                log.info("开机自启已就绪：%s", st_auto.get("command"))
+            elif st_auto.get("supported"):
+                log.warning("开机自启未能写入注册表")
+        except Exception:       # noqa: BLE001
+            log.exception("设置开机自启失败（不影响本次启动）")
+
+    try:
+        return run(cfg, tray=tray)
+    finally:
+        release_instance(cfg)
 
 
 if __name__ == "__main__":

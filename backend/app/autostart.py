@@ -30,7 +30,7 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 __all__ = ["RUN_KEY", "VALUE_NAME", "autostart_command", "is_enabled",
-           "set_autostart", "disable_autostart", "status"]
+           "set_autostart", "disable_autostart", "ensure_enabled", "status"]
 
 #: 每用户生效，不需要管理员权限。
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -57,18 +57,26 @@ def _pythonw() -> str:
 def autostart_command() -> str:
     """生成写进注册表的那条命令行。
 
-    * 冻结（打包成 exe）→ `"C:\\...\\PhotoBridge.exe"`
-    * 开发态 → `"C:\\...\\pythonw.exe" -m backend.app.main --tray`
+    * 冻结（打包成 exe）→ `"C:\\...\\PhotoBridge.exe" --tray`
+    * 开发态 → `"C:\\...\\pythonw.exe" "D:\\Photos\\scripts\\run_tray.py"`
 
-    两者都带 `--tray`：开机自启的场景下用户不会盯着控制台，
-    托盘图标是他唯一能看到程序在跑的证据。
+    ## 为什么开发态不再是 `-m backend.app.main`
+
+    ★ 注册表 `Run` 键**没有"起始位置"这一栏**：Windows 拉起它时工作目录是
+    `C:\\Windows\\System32`。而 `python -m backend.app.main` 依赖
+    `sys.path[0] = 当前目录` —— 在 System32 里根本没有 `backend` 包，
+    结果是"命令被执行了、进程立刻退出"，注册表里看着一切正常，自启却永不生效。
+
+    所以这里改成指向 `scripts/run_tray.py`：它自己把仓库根插进 `sys.path`，
+    与工作目录彻底解耦（`scripts/cloud_run.py` 在云端是同一套路子）。
     """
     if getattr(sys, "frozen", False):
         exe = Path(sys.executable).resolve()
         return f'"{exe}" --tray'
 
     repo = Path(__file__).resolve().parents[2]
-    return f'"{_pythonw()}" -m backend.app.main --tray'
+    entry = repo / "scripts" / "run_tray.py"
+    return f'"{_pythonw()}" "{entry}"'
 
 
 def _winreg():
@@ -165,6 +173,36 @@ def status() -> dict[str, object]:
         "expected": autostart_command(),
         "stale": bool(value) and value != autostart_command(),
     }
+
+
+def ensure_enabled(want: bool | None = None) -> dict[str, object]:
+    """启动时把自启**写成当前该有的样子**，返回最新状态。
+
+    ## 为什么需要"每次启动都写一遍"
+
+    ★ 这条链路上原来缺的正是"谁来写"：`set_autostart()` 存在，但全仓没有
+    任何调用点（只有 `status()` 被 `/api/system/info` 用来显示）。结果是
+    注册表里从来没有 `PhotoBridge` 这一项 —— 用户在任务管理器里找不到它，
+    开机自然也不会启动。
+
+    ★ 顺便自愈：用户把程序从"开发态"换成打包版、或移动了目录之后，
+    注册表里那条旧命令会指向不存在的路径。每次启动都按当前形态重写一遍，
+    这类"以前能自启、现在不行"的故障就不会再发生。
+
+    `want=None` 时取默认行为（开启）。Windows 之外、或注册表不可读写时
+    只返回状态，不报错 —— 自启失败不该阻止程序启动。
+    """
+    if _winreg() is None:
+        return status()
+    if want is None:
+        want = True
+    if want:
+        if not is_enabled() or _current_value() != autostart_command():
+            set_autostart(True)
+    else:
+        if is_enabled():
+            disable_autostart()
+    return status()
 
 
 def start_menu_shortcut() -> bool:

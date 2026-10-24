@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Any
@@ -41,6 +42,31 @@ __all__ = ["TrayController", "notify_error", "build_icon_image", "pair_qr_url",
 #: 当前活着的托盘控制器（进程内最多一个）。
 #: 用模块级引用而不是让 `system.py` 去 import `server`（那会形成环）。
 _active: "TrayController | None" = None
+
+
+#: 点"退出"后最多再等这么久就强退（秒）。见 `TrayController._on_quit`。
+_QUIT_WATCHDOG_SECONDS = 15.0
+
+
+def _autostart_on() -> bool:
+    """自启当前是否已开（给菜单勾选状态用）。非 Windows 恒为 False。"""
+    try:
+        from .autostart import is_enabled       # noqa: PLC0415
+
+        return bool(is_enabled())
+    except Exception:       # noqa: BLE001 —— 菜单绘制不能因为读注册表失败而崩
+        return False
+
+
+def _force_exit() -> None:
+    """看门狗：优雅收尾超时后强退。"""
+    log.warning("优雅退出超过 %.0f 秒，强制结束进程", _QUIT_WATCHDOG_SECONDS)
+    for handler in logging.getLogger().handlers:
+        try:
+            handler.flush()
+        except Exception:       # noqa: BLE001
+            pass
+    os._exit(0)                 # noqa: SLF001 —— 这里要的就是绕过一切清理
 
 
 def is_tray_running() -> bool:
@@ -304,6 +330,8 @@ class TrayController:
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("设备列表", self._on_devices),
                 pystray.MenuItem("重新扫描照片库", self._on_rescan),
+                pystray.MenuItem("开机自启", self._on_toggle_autostart,
+                                 checked=lambda _item: _autostart_on()),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("退出", self._on_quit),
             )
@@ -593,6 +621,25 @@ class TrayController:
                          daemon=True).start()
         self._notify("重新扫描", "已开始，完成后会通知你")
 
+    def _on_toggle_autostart(self, *_: Any) -> None:
+        """菜单里的「开机自启」：勾上写入注册表 Run 键，取消则删除。"""
+        from .autostart import is_enabled, set_autostart       # noqa: PLC0415
+
+        want = not is_enabled()
+        ok = set_autostart(want)
+        icon = self._icon
+        if icon is not None:
+            try:
+                icon.update_menu()
+            except Exception:   # noqa: BLE001
+                pass
+        if ok:
+            self._notify("开机自启",
+                         "已开启：下次登录 Windows 会自动在后台启动" if want
+                         else "已关闭：开机不再自动启动")
+        else:
+            self._notify("开机自启", "设置失败，详见日志")
+
     def _on_quit(self, *_: Any) -> None:
         log.info("托盘请求退出")
         loop, stop = self._loop, self._stop
@@ -602,6 +649,19 @@ class TrayController:
             except Exception:       # noqa: BLE001
                 log.warning("通知服务停止失败", exc_info=True)
         self._stop_icon()
+        # ★ 兜底：优雅收尾卡住时也要让进程真的消失。
+        #
+        # 优雅路径 = `stop.set()` → `serve()` 退出 → `_shutdown()`（停监听、
+        # 关监听线程、drain 缩略图队列最多 20 秒、checkpoint WAL）。绝大多数
+        # 情况它几十毫秒就结束。但托盘程序是 pythonw 启动的**没有控制台**，
+        # 一旦某一步卡住，用户看到的就是"点了退出、图标不见了、任务管理器里
+        # 还躺着一个 python"——他没有任何办法判断该不该强杀。
+        # 所以这里挂一个 15 秒的看门狗：超时直接 `os._exit(0)`。
+        # WAL 是 SQLite 崩溃安全格式，强退最坏丢的是"这一次运行的最后几笔"
+        # （缩略图缓存与索引都可由重扫重建），比"进程永远残留"好得多。
+        timer = threading.Timer(_QUIT_WATCHDOG_SECONDS, _force_exit)
+        timer.daemon = True
+        timer.start()
 
     def _stop_icon(self) -> None:
         global _active
