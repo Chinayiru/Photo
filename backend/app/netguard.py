@@ -76,6 +76,69 @@ DEFAULT_TRUSTED_HOSTS: Final[frozenset[str]] = frozenset({
     "[::1]",
 })
 
+#: 「像本机地址」的网段。命中这些的 Host 直接放行。
+#:
+#: ## 为什么按网段判，而不是只认 `local_ipv4_addresses()` 枚举的结果
+#:
+#: `config.local_ipv4_addresses()` 的职责是回答**另一个问题**："哪个地址
+#: 值得印到二维码里让手机去连"。为了不把 VMware/WSL 那类手机永远路由不到
+#: 的地址显示给用户，它主动滤掉了虚拟网卡 —— 连 Radmin/Tailscale 这类
+#: **用户确实要用的**组网网卡也一起滤掉了（它们的地址段不是 RFC1918）。
+#:
+#: 但 Host 校验要回答的是"这个 Host 是不是本机自己"：手机经 Radmin 访问
+#: `26.26.192.40:8799` 时，Host 就是那个组网地址，它确实是本机地址。
+#: 两个问题混用同一个枚举，结果就是首页能打开（静态资源不校验 Host）、
+#: 而所有 `/api/*` 一律 404 —— 实测日志原文：
+#:
+#:     GET /api/system/ping 被 Host 校验拒绝：Host 头 '26.26.192.40'
+#:     不属于本机（防 DNS rebinding）
+#:
+#: ## 为什么放宽到整个网段也不会削弱防护
+#:
+#: DNS rebinding 的攻击形态是"**用攻击者的域名**做 Host，让请求落到
+#: 127.0.0.1"。域名永远不可能是这些网段的字面量，所以放行字面量对那条
+#: 攻击路径零影响；而攻击者若直接拿 `26.1.2.3` 当 Host，他连的就是那台
+#: 机器，跟我们无关。
+_LOCAL_LITERAL_NETWORKS: Final[tuple] = (
+    ("10.0.0.0", 8),          # RFC1918
+    ("127.0.0.0", 8),         # 回环
+    ("169.254.0.0", 16),      # 链路本地
+    ("172.16.0.0", 12),       # RFC1918
+    ("192.168.0.0", 16),      # RFC1918
+    ("25.0.0.0", 8),          # Hamachi / LogMeIn
+    ("26.0.0.0", 8),          # Radmin VPN
+    ("100.64.0.0", 10),       # CGNAT：Tailscale / ZeroTier 常用
+)
+
+
+def _is_local_literal(host: str) -> bool:
+    """Host 是不是「本机地址」的字面量（IPv4 私网/组网段，或 IPv6 回环/ULA）。"""
+    h = (host or "").strip().strip("[]").lower()
+    if not h:
+        return False
+    if ":" in h:                       # IPv6 字面量
+        return (h == "::1"
+                or h.startswith("fe80:")      # 链路本地
+                or h.startswith("fc")         # ULA fc00::/7
+                or h.startswith("fd"))
+    parts = h.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        nums = [int(p, 10) for p in parts]
+    except ValueError:
+        return False
+    if any(n < 0 or n > 255 for n in nums):
+        return False
+    value = (nums[0] << 24) | (nums[1] << 16) | (nums[2] << 8) | nums[3]
+    for base, prefix in _LOCAL_LITERAL_NETWORKS:
+        b = [int(x) for x in base.split(".")]
+        base_value = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]
+        mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+        if (value & mask) == (base_value & mask):
+            return True
+    return False
+
 
 def host_of(raw: str | None) -> str:
     """从 Host 头里取出主机名，丢掉端口与 IPv6 方括号。
@@ -167,7 +230,10 @@ def is_host_allowed(raw: str | None, cfg: "Config | None" = None) -> bool:
     h = host_of(raw)
     if not h:
         return False
-    return h in allowed_hosts(cfg)
+    if h in allowed_hosts(cfg):
+        return True
+    # 私网/组网网段的字面量：手机经 Radmin/Tailscale 直连时 Host 就是它。
+    return _is_local_literal(h)
 
 
 def check_host(raw: str | None, cfg: "Config | None" = None) -> str | None:
