@@ -156,6 +156,35 @@ def test_the_linter_is_installed_and_forbids_v_html() -> None:
     assert '"no-eval": "error"' in cfg
 
 
+# ---------------------------------------------------------------- ISSUE-044
+def test_raw_prefetch_waits_for_the_preview_and_has_a_size_cap() -> None:
+    """原图预取必须晚于预览，且有硬上限（ISSUE-044 / docs/08 附录 B.10）。
+
+    这条判据的由来：预取由"查看器打开"直接触发时，一张 22 MB 的原图会和
+    用户正等着的 411 KB 预览抢同一条上行，慢链路上表现为"点进去十几秒"。
+    只断言"存在某个函数"没有意义，所以这里钉住三条**因果**：
+      ① 预览没画完（`previewLoadedId !== id`）就直接返回；
+      ② 上限是 8 MB，且收字节前先看 `content-length`；
+      ③ 视图层在主图 `@load` 里调用 `markPreviewLoaded`。
+    """
+    viewer = _read("frontend/src/stores/viewer.ts")
+    head, _, tail = viewer.partition("export function schedulePrefetchRaw")
+    assert head.strip(), "schedulePrefetchRaw 不见了"
+    body = tail.split("\n}\n", 1)[0]
+    assert "if (previewLoadedId !== id) return;" in body, (
+        "预取没有等预览：慢链路上原图会抢掉预览的带宽")
+    assert "const RAW_PREFETCH_MAX_BYTES = 8 * 1024 * 1024;" in viewer
+    assert "export function markPreviewLoaded" in viewer
+    fetched = viewer.split("async function prefetchRaw", 1)[1]
+    assert 'res.headers.get("content-length")' in fetched, (
+        "下载前不看声明长度，22 MB 的原图会被收完之后才丢掉")
+    assert "RAW_PREFETCH_MAX_BYTES) return;" in fetched
+
+    view = _read("frontend/src/views/ViewerView.vue")
+    assert '@load="onMainLoad"' in view
+    assert "markPreviewLoaded(s.id)" in view
+
+
 # ---------------------------------------------------------------- ISSUE-041
 def test_relay_root_account_login_sources() -> None:
     """中继首页（`https://域名/`）必须能账号登录，且不出现局域网控件。

@@ -82,7 +82,7 @@ const RAW_KEEP = 3;
  * 手机与相机的绝大多数 JPEG（iPhone 48MP ProRAW 转出的 JPEG 约 5–10 MB）；
  * 更大的图仍然能看、能放大，只是走一次网络而已。
  */
-const RAW_PREFETCH_MAX_BYTES = 24 * 1024 * 1024;
+const RAW_PREFETCH_MAX_BYTES = 8 * 1024 * 1024;
 const rawBlobs = new Map<number, string>();
 /** 正在预取的那一张的 id（0 = 空闲）。同时只允许一个。 */
 let rawFetching = 0;
@@ -90,12 +90,48 @@ let rawController: AbortController | null = null;
 /** 预取任务的序号：fetch 回来时若已不是最新任务就丢弃。 */
 let rawSeq = 0;
 
+/**
+ * 最近一次「主图（1600px 预览）已经画出来」的那张 id。
+ *
+ * ★ 预取原图必须等它 —— 这是 `docs/08` 附录 B.12 记的教训：
+ *   打开大图时如果立刻在后台拉原图（8192×6144 的 JPEG 有 22 MB），
+ *   它会和**用户正等着看的预览**抢同一条上行；家宽/中继链路上
+ *   预览从 1 秒变成 10 秒，用户看到的就是「点进去加载大图太慢」。
+ *   先让预览落地，再预取原图，用户的等待只由预览的 400 KB 决定。
+ */
+let previewLoadedId = 0;
+
+/** 原图预取是否值得做：省流量模式下、或明确是慢网时直接放弃。 */
+function prefetchWorthIt(): boolean {
+  const c = (navigator as unknown as {
+    connection?: { saveData?: boolean; effectiveType?: string };
+  }).connection;
+  if (!c) return true;                      // Safari/Firefox 没有这个 API
+  if (c.saveData === true) return false;    // 用户开了省流量
+  const t = c.effectiveType ?? "";
+  return !(t === "slow-2g" || t === "2g" || t === "3g");
+}
+
 /** 预取入口：切图后调用，内部自行空闲调度。 */
 export function schedulePrefetchRaw(id: number): void {
   if (!id) return;
+  // ★ 两条前置判据（顺序即语义）：预览还没画出来就不抢带宽；
+  //   `markPreviewLoaded()` 会在预览 onload 后回头再调一次。
+  if (previewLoadedId !== id) return;
+  if (!prefetchWorthIt()) return;
   if (rawBlobs.has(id) || rawFetching === id) return;
   if (typeof URL.createObjectURL !== "function") return;  // 极老的浏览器
   idle(() => void prefetchRaw(id));
+}
+
+/**
+ * 预览图画完之后由视图层调用：登记"这张的主图已经在屏幕上了"，
+ * 并回头触发一次被上面判据挡住的预取。
+ */
+export function markPreviewLoaded(id: number): void {
+  if (!id) return;
+  previewLoadedId = id;
+  schedulePrefetchRaw(id);
 }
 
 /** 空闲调度：优先 requestIdleCallback，退回 300ms 定时器。 */
@@ -129,6 +165,11 @@ async function prefetchRaw(id: number): Promise<void> {
       signal: ctrl.signal,
     });
     if (!res.ok) return;
+    // ★ 先看声明的长度再决定要不要把字节收下来：8 MB 以上直接放弃。
+    //   没有这一步时，一张 22 MB 的原图会被完整下载、再在 `blob.size`
+    //   处被丢弃 —— 流量已经花掉了。
+    const declared = Number(res.headers.get("content-length") ?? "0");
+    if (declared > RAW_PREFETCH_MAX_BYTES) return;
     // ★ 检查 Content-Type：某些错误页（如反代返回的 HTML 502）也是 200，
     //   把它当原图存下来会让放大后显示一坨乱码 —— 那种失败比"没预取"更糟。
     const ct = res.headers.get("content-type") ?? "";

@@ -27,6 +27,7 @@ import {
   goPrev,
   gpsMapUrl,
   gpsText,
+  markPreviewLoaded,
   moveCurrent,
   rawSrcFor,
   renameCurrent,
@@ -103,6 +104,17 @@ let locked: "h" | "v" | null = null;
  * ⚠️ 用 `ref` 而不是普通变量：`transform` 直接绑在模板上，
  * 普通变量改了不会触发重渲染（`dx` 当初就踩过这个）。
  */
+/**
+ * 主图（1600px 预览）画完：登记给 viewer store，让它开始预取原图。
+ *
+ * ★ 预取必须晚于这一步 —— 否则 8–22 MB 的原图会和用户正等着的预览
+ *   抢带宽（`docs/08` 附录 B.12）。
+ */
+function onMainLoad(): void {
+  s.imageReady = true;
+  if (s.id) markPreviewLoaded(s.id);
+}
+
 const zoom = ref(1);
 /** 双指起始间距。0 表示"本次手势不是双指"，用来区分单指/双指两条路径。 */
 let pinchStart = 0;
@@ -681,7 +693,7 @@ async function doDelete(): Promise<void> {
             :src="safeUrl(mainSrc)"
             :alt="detail.name"
             decoding="async"
-            @load="s.imageReady = true"
+            @load="onMainLoad"
             @error="s.error = '图片加载失败'"
           />
 
