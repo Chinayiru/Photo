@@ -5,7 +5,7 @@ import logging
 import time
 
 from ..core import Ctx, Reply, stream_reply
-from ..events import get_bus, stream_events
+from ..events import ensure_capacity, get_bus, stream_events
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +31,10 @@ async def events(ctx: Ctx) -> Reply:
     bus = getattr(st, "bus", None) if st is not None else None
     if bus is None:
         bus = get_bus()
+
+    if not ctx.q_bool("once", False):
+        # 开流之前就要判：一旦开始写响应头，状态码只能是 200。
+        ensure_capacity(bus)
 
     hello = {
         "device_id": getattr(st, "device_id", None) if st is not None else None,
