@@ -82,6 +82,38 @@ def _route_patterns() -> set[str]:
     return out
 
 
+def _cloud_route_patterns() -> set[str]:
+    """云端中继注册的 `/api/**` 路由（`cloud/relay/main.py` 的 `create_app`）。
+
+    ## 为什么前端要跟云端路由也对一遍
+
+    手机端面对的 API 有**两个面**：家里那台电脑（`backend/app/routers`）和
+    云端中继（`cloud/relay`）。云端页要做"账号登录 → 自动配对"
+    （`docs/11` ISSUE-038）时打的是 `/api/auth/login`、
+    `/api/devices/{id}/pair` —— 这两条**只存在于中继**，后端路由表里没有。
+    只比后端会把正确调用判成"漂移"，逼人往 `INTENTIONALLY_UNUSED` 里加
+    假理由，那比不检查更坏。
+
+    只看 `/api/**`：`/d/{device_id}/**` 是转发通道，前端不直接写死它
+    （由 `cloudBaseFromLocation()` 拼出来）。
+    """
+    try:
+        from cloud.relay.db import CloudDB
+        from cloud.relay.main import create_app
+    except Exception:  # noqa: BLE001 - 缺可选依赖时不该让检查崩掉
+        return set()
+    try:
+        app = create_app(CloudDB(":memory:"))
+    except Exception:  # noqa: BLE001
+        return set()
+    out: set[str] = set()
+    for route in app.routes:
+        path = str(getattr(route, "path", "") or "")
+        if path.startswith("/api/"):
+            out.add(_normalize(path))
+    return out
+
+
 def _strip_comments(text: str) -> str:
     r"""把 JS/TS/Vue 的注释替换成等长空白（保留行号与列位置）。
 
@@ -170,7 +202,9 @@ def _shape(pattern: str) -> str:
 
 
 def main() -> int:
-    routes = _route_patterns()
+    backend = _route_patterns()
+    cloud = _cloud_route_patterns()
+    routes = backend | cloud
     route_shapes = {_shape(p): p for p in routes}
     frontend = _frontend_paths()
 
@@ -192,7 +226,8 @@ def main() -> int:
         if _shape(p) not in called_shapes and p not in INTENTIONALLY_UNUSED
     )
 
-    print(f"后端路由 {len(routes)} 条，前端引用 {len(frontend)} 条\n")
+    print(f"本机路由 {len(backend)} 条 + 云端路由 {len(cloud)} 条，"
+          f"前端引用 {len(frontend)} 条\n")
 
     if problems:
         print("✗ 发现前后端路径漂移：\n")

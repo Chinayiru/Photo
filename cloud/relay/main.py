@@ -220,8 +220,9 @@ def create_app(db: CloudDB | None = None, *,
               methods=["GET"]),
         Route("/api/devices/{device_id}/status",
               _bind(device_status, database, registry), methods=["GET"]),
+        # registry 是给「账号登录自动配对」用的：那条路要先确认电脑在线。
         Route("/api/devices/{device_id}/pair",
-              _bind(redeem_pair_code, database), methods=["POST"]),
+              _bind(redeem_pair_code, database, registry), methods=["POST"]),
         Route("/api/devices/{device_id}/paircode",
               _bind(issue_pair_code, database), methods=["POST"]),
         Route("/api/devices/{device_id}/clients/{client_id}",
@@ -286,7 +287,13 @@ def create_app(db: CloudDB | None = None, *,
         Middleware(SecurityHeadersMiddleware),
     ]
 
-    return Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
+    # 把 registry 挂到 app.state 上：测试要能「伪造一台在线电脑」才测得了
+    # 自动配对（真实场景里它由 `/agent/ws` 注册）。不放这里的话，测试要么
+    # 起真隧道（重），要么去摸闭包变量（脆）。
+    app = Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
+    app.state.registry = registry
+    app.state.db = database
+    return app
 
 
 def _bind(fn: Any, *deps: Any) -> Any:
