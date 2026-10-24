@@ -84,9 +84,29 @@ const mode = ref<"code" | "account">("code");
 const entry = ref<"lan" | "cloud">(
   (cloudPage.value || relayRoot.value) ? "cloud" : "lan",
 );
-/** 云端入口能拿到"设备页"吗：设备页才有 6 位码这条路。 */
-const codeAvailable = computed(() =>
-  !relayRoot.value && (entry.value === "lan" || cloudPage.value));
+/**
+ * 配对码**两种入口都给**：局域网靠 IP 找电脑，云端靠一条带 `/d/<id>` 的链接
+ * （二维码/聊天里那条）找电脑。只有中继首页没有码可用 —— 那里连设备都还没定。
+ */
+const codeAvailable = computed(() => !relayRoot.value);
+
+/**
+ * 云端入口在局域网页面上时，6 位码要打到 `/d/<id>/api/pair`，所以需要用户给一条
+ * 云端链接（或直接给带 `/d/<id>` 的地址）。从链接里取出设备页基址。
+ */
+const cloudLink = ref("");
+const cloudPairBase = computed(() => {
+  const raw = cloudLink.value.trim();
+  if (!raw) return "";
+  try {
+    const u = new URL(raw.includes("://") ? raw : `https://${raw}`);
+    const m = /^\/d\/([0-9a-fA-F]{32})(?:\/|$)/.exec(u.pathname);
+    if (!m) return "";
+    return `${u.origin}/d/${m[1]!.toLowerCase()}`;
+  } catch {
+    return "";
+  }
+});
 /**
  * 账号登录**两种入口都给**。
  *
@@ -125,8 +145,13 @@ const canSubmitAccount = computed(() =>
   email.value.trim().length > 3 && password.value.length > 0 && !accountBusy.value);
 
 const base = computed(() => buildBase(host.value, port.value));
+/** 配对码要打到的基址：局域网入口=手填/当前地址；云端入口=设备页链接。 */
+const codeTarget = computed(() => {
+  if (cloudPage.value) return "";
+  return entry.value === "cloud" ? cloudPairBase.value : base.value;
+});
 const canSubmit = computed(() =>
-  (cloudPage.value || !!host.value.trim())
+  (cloudPage.value || (entry.value === "cloud" ? !!cloudPairBase.value : !!host.value.trim()))
   && /^\d{6}$/.test(code.value.replace(/[\s-]/g, "")) && !busy.value);
 
 onMounted(() => {
@@ -192,7 +217,9 @@ async function runPair(target: string): Promise<void> {
   error.value = "";
   // 云端页面上没有"电脑地址"可填：基址由 `location` 决定（见 `pair()`）
   if (!target && !cloudPage.value) {
-    error.value = "请填写电脑的 IP 地址";
+    error.value = entry.value === "cloud"
+      ? "请填写一条云端链接（形如 https://域名/d/xxxx）"
+      : "请填写电脑的 IP 地址";
     return;
   }
   if (!/^\d{6}$/.test(code.value.replace(/[\s-]/g, ""))) {
@@ -213,7 +240,7 @@ async function runPair(target: string): Promise<void> {
 }
 
 async function submit(): Promise<void> {
-  await runPair(base.value);
+  await runPair(codeTarget.value);
 }
 
 /** 粘贴整条 URL / "IP 码" 文本。 */
@@ -351,7 +378,7 @@ function onCodeInput(e: Event): void {
         >账号登录</button>
       </div>
 
-      <label v-if="codeAvailable && mode === 'code' && !cloudPage && !relayRoot" class="field">
+      <label v-if="entry === 'lan' && codeAvailable && mode === 'code' && !cloudPage" class="field">
         <span class="lbl">电脑地址</span>
         <div class="addr">
           <input
@@ -376,6 +403,22 @@ function onCodeInput(e: Event): void {
         </div>
         <span class="hint">电脑上打开 PhotoBridge 就能看到这个地址</span>
       </label>
+      <template v-if="codeAvailable && mode === 'code' && entry === 'cloud' && !cloudPage">
+        <label class="field">
+          <span class="lbl">云端链接</span>
+          <input
+            v-model="cloudLink"
+            class="input-lg"
+            type="url"
+            inputmode="url"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck="false"
+            placeholder="https://域名/d/0123abcd…"
+          />
+          <span class="hint">电脑二维码/聊天里那条链接；配对码会打到它指定的那台电脑</span>
+        </label>
+      </template>
       <p v-else-if="codeAvailable && mode === 'code'" class="cloud-note">
         {{ relayRoot
           ? "登录你的账号，选一台电脑连上。照片不经过中继保存，只在传输时路过。"
