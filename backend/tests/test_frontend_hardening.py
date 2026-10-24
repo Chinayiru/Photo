@@ -130,3 +130,28 @@ def test_every_src_and_href_binding_goes_through_safe_url() -> None:
         for match in bare.finditer(src):
             offenders.append(f"{path.name}: :src/:href=\"{match.group(1)}\"")
     assert offenders == [], f"这些绑定没走 safeUrl()：{offenders}"
+
+def test_the_linter_is_installed_and_forbids_v_html() -> None:
+    """TC-XSS-SEC-006 的判据必须真的存在（docs/07 §11）。
+
+    这条判据原先写成「vue/no-v-html 必须开启」，但仓库里既没有 eslint 依赖
+    也没有 lint 脚本 —— 一条无法执行的判据等于零。现在它检查三件真东西：
+    依赖在、脚本在、规则真的被配成 error（不是 warn，warn 会让流水线保持绿色）。
+    """
+    import json
+
+    repo = REPO
+    pkg = json.loads((repo / "frontend" / "package.json").read_text(encoding="utf-8"))
+
+    dev = pkg["devDependencies"]
+    for name in ("eslint", "eslint-plugin-vue", "vue-eslint-parser"):
+        assert name in dev, f"缺 {name}：判据无从执行"
+    assert "lint" in pkg["scripts"], "没有 lint 脚本，判据照样没人跑"
+    assert "eslint" in pkg["scripts"]["lint"]
+    # "--max-warnings 0" 是这条脚本的重点：warning 不该让流水线保持绿色
+    assert "--max-warnings 0" in pkg["scripts"]["lint"]
+
+    cfg = (repo / "frontend" / "eslint.config.mjs").read_text(encoding="utf-8")
+    assert '"vue/no-v-html": "error"' in cfg, "v-html 没被禁成 error"
+    assert '"no-eval": "error"' in cfg
+
