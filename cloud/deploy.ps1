@@ -61,26 +61,31 @@ Ok "管理员权限"
 # `-Password` 仍然接受（无人值守场景），但默认走交互式输入。清掉变量里
 # 的明文痕迹是做不到的（.NET 字符串不可变），能做的是**不让它出现在
 # 任何会被记录的地方**：argv、事件 4688、PSReadLine 历史。
-if (-not $Password) {
-    # 无人值守（SSH / 计划任务）时没有交互式控制台，`Read-Host -AsSecureString`
-    # 会直接挂住或抛错。这条路留给编排用：口令放在调用方进程的环境变量里，
-    # 不进 argv、不进脚本、不进 PSReadLine 历史。
+function Resolve-Password {
+    # ★ 只在**真要登记新设备**时调用（第 4 步的 else 分支）。早先这段写在
+    #   脚本开头无条件执行，于是无人值守升级（SSH / 计划任务 / 没有控制台）
+    #   会卡在 `Read-Host -AsSecureString` 上：脚本连第 1 步都进不去，
+    #   而且因为预检输出还没打出来，现场看起来像"什么都没发生"——
+    #   `docs/11` ISSUE-037。
+    #
+    #   无人值守的编排走环境变量：口令放在调用方进程的环境变量里，不进
+    #   argv、不进脚本、不进 PSReadLine 历史，读完立刻从进程环境里抹掉。
+    if ($Password) { return $Password }
     if ($env:PB_DEPLOY_PASSWORD) {
-        $Password = $env:PB_DEPLOY_PASSWORD
+        $plain = $env:PB_DEPLOY_PASSWORD
         Remove-Item Env:\PB_DEPLOY_PASSWORD -ErrorAction SilentlyContinue
+        return $plain
     }
-}
-if (-not $Password) {
     $sec = Read-Host -AsSecureString "请输入云端账号口令（输入不回显）"
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
     try {
-        $Password = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+        $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
     } finally {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
     }
-    if (-not $Password) { Fail "口令为空" }
+    if (-not $plain) { Fail "口令为空" }
+    return $plain
 }
-Ok "口令已就绪（未写入命令行）"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 # 脚本通常在包根目录下运行（把 deploy.ps1 拷到根，然后右键“以管理员身份运行”）。
 # 但也允许留在 cloud\ 里跑（.\cloud\deploy.ps1），这里统一回退到包根。
@@ -208,6 +213,10 @@ if ($reuseDid -and $reuseTok) {
     $deviceId = "(沿用库中已有设备)"
     $agentTok = "(不重发；新增设备请手工运行 scripts\cloud_init.py init ...)"
 } else {
+
+    # 到这里才需要口令：上面两个分支（沿用上次的启动器 / 库已存在）都用不到它。
+    $Password = Resolve-Password
+    Ok "口令已就绪（未写入命令行）"
 
     Push-Location $InstallDir
     $prevEap4 = $ErrorActionPreference
