@@ -1,0 +1,68 @@
+# PhotoBridge —— Windows 单机 + 自有域名 + 443 的 Caddy 配置（**模板，尚未启用**）
+#
+# 与仓库里那份 `cloud/Caddyfile` 的区别：那份给 Docker Compose 用（上游写
+# `relay:8000`，域名从 `.env` 注入）；这份给「就在这台 Windows 上跑 Caddy，
+# 上游是 127.0.0.1:8000」用，所以：
+#
+#   1. 上游地址是 `127.0.0.1:8000`；
+#   2. ★ 因为 Caddy 与 relay 同机，relay 看到的对端恒为 127.0.0.1 —— 必须在
+#      `run_relay.ps1` 里保留 `PB_CLOUD_TRUSTED_PROXIES=127.0.0.1`，否则
+#      所有人的限流桶会合并成一个（`docs/11` ISSUE-030）。反过来，**一旦把
+#      8000 端口重新对公网开放，这个变量必须立刻删除**，否则 X-Forwarded-For
+#      就成了可以随便伪造的东西。
+#   3. 证书由 Caddy 自己申请（HTTP-01 需要 80 可达）。阿里云大陆机器上的域名
+#      需要先完成 **ICP 备案**，否则 80/443 会被拦在备案检查上；
+#      不想备案就走 Cloudflare 命名隧道（见 `docs/08` 附录 B.10）。
+#
+# 启用前把 photobridge.example.com 换成真实域名，然后：
+#   caddy validate --config Caddyfile.windows-domain
+#   caddy run --config Caddyfile.windows-domain
+
+{
+	email ops@example.com
+	# 生产环境建议关掉自动 HTTPS 的 redirect 以外的花活
+	admin off
+}
+
+photobridge.example.com {
+	encode zstd gzip
+
+	# 与 relay 自己发的安全头保持一致（`shared/security_headers.py` 是唯一来源）。
+	# 这里不重复写 HSTS/XFO/CSP：relay 已经发了，重复添加会变成两个值，
+	# 浏览器按「取交集/取第一个」处理，排障时会非常费解。
+	-Server
+
+	# ★ 隧道入口必须写在最前面：Caddy 的 handle 是互斥匹配、先命中先生效。
+	handle /agent/ws {
+		reverse_proxy 127.0.0.1:8000 {
+			flush_interval -1
+			transport http {
+				read_timeout 0
+				write_timeout 0
+				dial_timeout 10s
+			}
+		}
+	}
+
+	# 其余全部交给 relay（它自己认路由：/api/**、/d/**、SPA 兜底）
+	handle {
+		reverse_proxy 127.0.0.1:8000 {
+			# 让 relay 拿到真实来源：netutil 只信任来自受信网段的 XFF
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+			# 不要覆盖 Host：relay 的 check_host 依赖它
+			header_up Host {host}
+		}
+	}
+
+	log {
+		# 只留状态与耗时；**不记 query string**（配对码在 `?code=` 里，
+		# 见 `docs/11` ISSUE-033 的同类问题）
+		output file C:\PhotoBridgeCloud\logs\caddy.log {
+			roll_size 20mb
+			roll_keep 7
+		}
+		format console
+	}
+}
