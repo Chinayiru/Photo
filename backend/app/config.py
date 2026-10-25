@@ -255,6 +255,17 @@ class RootConfig:
     def can_delete(self) -> bool:
         return self.mode == "readwrite"
 
+    @property
+    def can_modify(self) -> bool:
+        """能不能改动**已存在**的条目（移动/改名）。
+
+        比 `can_write` 严一档：`upload` 模式的含义是"只许新增、不许改已有
+        文件"。移动和改名都直接改写用户原有的目录组织（审计 F01：这两个
+        接口原来用的是 `can_write`，于是只允许上传的目录也能把整库照片
+        搬走、改名）。
+        """
+        return self.mode == "readwrite"
+
     def display(self) -> str:
         return self.label or self.id
 
@@ -792,6 +803,17 @@ def check_bind_safety(host: str, cfg: Config | None = None) -> tuple[bool, str]:
             f"{host} 是公网地址。本程序一期只做局域网访问，"
             "公网暴露请走二期云中继（不需要端口映射）。"
         )
+
+    # ★ 审计 F04：原来这两个检查只写在**通配地址**分支里，于是
+    #   `server.host=192.168.1.10` + `auth.require_pairing=false` 能起一个
+    #   任何同网段设备都能读照片的无鉴权服务 —— 与通配地址一样危险，
+    #   只是"看起来只绑了一个网卡"。任何非回环监听都必须过这两关。
+    if not c.auth.get("require_pairing", True):
+        return False, (
+            "auth.require_pairing 为 false，绑定非回环地址将无鉴权暴露照片库"
+        )
+    if bool(c.get("server.panel_http", False)):
+        return False, "server.panel_http 为 true 时不允许绑定非回环地址"
 
     return True, f"绑定到 {host}（需确认该地址属于可信网段）"
 

@@ -646,7 +646,10 @@ class TrayController:
         # ★ 配对码同时写进日志：窗口是"额外能力"（无桌面会话、Tk 异常、
         # 连点冲突都可能让窗口弹不出来），而配对码本身是当次交互的一次性
         # 凭据、5 分钟后失效 —— 写下来比"用户看不到码、以为程序坏了"划算。
-        log.info("托盘生成配对码 %s（%d 秒内有效）", code, int(PAIR_CODE_TTL))
+# ★ 审计 F05：这里原来把 6 位码原样写进日志（`%s`）—— 能读
+            #   `data/logs/agent.log` 的人就多了一次 5 分钟内的配对机会。
+            log.info("托盘生成配对码（%d 秒内有效，码本身不落日志）",
+                     int(PAIR_CODE_TTL))
         return code, pair_qr_url(base, code, st.device_id), ips
 
     def _port(self) -> int:

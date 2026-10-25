@@ -858,7 +858,7 @@ async def delete_items(ctx: Ctx) -> Reply:
     failed: list[dict[str, Any]] = []
     for mid in clean:
         try:
-            if await _trash_one(st, mid):
+            if await _trash_one(st, mid, client_id=_ctx_client_id(ctx)):
                 deleted += 1
             else:
                 failed.append({"id": mid, "error": "not_found"})
@@ -869,7 +869,19 @@ async def delete_items(ctx: Ctx) -> Reply:
     return json_reply({"deleted": deleted, "failed": failed})
 
 
-async def _trash_one(st: AppState, mid: int) -> bool:
+def _ctx_client_id(ctx: Ctx) -> str:
+    """这条请求是哪台手机发起的（审计 F07）。
+
+    中间件把已认证的客户端放进 `ctx.state["client"]`；拿不到（回环面板、
+    内部任务）就回空串，审计里留空而不是编一个。
+    """
+    info = ctx.state.get("client") or {}
+    if isinstance(info, dict):
+        return str(info.get("id") or "")[:32]
+    return str(getattr(info, "id", "") or "")[:32]
+
+
+async def _trash_one(st: AppState, mid: int, *, client_id: str = "") -> bool:
     """把一张照片移入系统回收站并标记 missing。
 
     先移文件再改库：反过来（先标 missing 再移文件）如果进程在中间被杀，
@@ -898,6 +910,7 @@ async def _trash_one(st: AppState, mid: int) -> bool:
     audit.record(
         db, st.cfg, audit.ACTION_DELETE,
         rel_path=row["rel_path"], device=st.device_name,
+        client_id=client_id or None,
         detail={"media_id": mid, "root": row["root_id"]},
     )
     return True
@@ -1213,15 +1226,15 @@ async def move_items(ctx: Ctx) -> Reply:
         if root is None:
             failed.append({"id": mid, "code": "E1004", "message": "照片所在目录已移除"})
             continue
-        if not root.can_write:
-            raise ReadonlyError("当前为只读模式，无法移动")
+        if not root.can_modify:
+            raise ReadonlyError("当前模式不允许移动已有照片")
 
         try:
             if root.id not in resolved_dirs:
                 # 空串表示库根 —— 沙箱要求 rel_path 非空，所以根这一档
                 # 不调 sandbox.resolve（它本来就是可信的根配置）。
                 if target_rel:
-                    sandbox.resolve(root, target_rel, "write", cfg=st.cfg)
+                    sandbox.resolve(root, target_rel, "modify", cfg=st.cfg)
                     # ★ 审计 F14：`resolve()` 只保证"没越出库根"，它不知道
                     # `data` / `node_modules` / `#recycle` / `.photobridge_tmp`
                     # 这些目录名在本库的语义里**不该放照片**（索引器会跳过，
@@ -1247,7 +1260,7 @@ async def move_items(ctx: Ctx) -> Reply:
                 continue
 
             dst_rel = f"{rel_dir}/{name}" if rel_dir else name
-            dst = sandbox.resolve(root, dst_rel, "write", cfg=st.cfg)
+            dst = sandbox.resolve(root, dst_rel, "modify", cfg=st.cfg)
 
             # 目标目录不存在则创建（mkdir -p 语义，见接口文档）
             if not dst.parent.exists():
@@ -1255,7 +1268,7 @@ async def move_items(ctx: Ctx) -> Reply:
                     None, lambda p=dst.parent: p.mkdir(parents=True, exist_ok=True)
                 )
                 # 建完重新解析：新建目录也可能是别人刚放进去的 junction
-                dst = sandbox.resolve(root, dst_rel, "write", cfg=st.cfg)
+                dst = sandbox.resolve(root, dst_rel, "modify", cfg=st.cfg)
 
             if dst.exists():
                 if on_conflict == "skip":
@@ -1292,7 +1305,7 @@ async def move_items(ctx: Ctx) -> Reply:
             else:
                 renamed = False
 
-            src = sandbox.resolve(root, src_rel, "write", cfg=st.cfg)
+            src = sandbox.resolve(root, src_rel, "modify", cfg=st.cfg)
             if not src.exists():
                 failed.append({"id": mid, "code": "E1004", "message": "文件已不在磁盘上"})
                 continue
@@ -1338,6 +1351,7 @@ async def move_items(ctx: Ctx) -> Reply:
         audit.record(
             db, st.cfg, audit.ACTION_MOVE,
             rel_path=dst_rel, device=st.device_name,
+            client_id=_ctx_client_id(ctx),
             detail={"media_id": mid, "from": src_rel, "to": dst_rel,
                     "renamed": renamed, "root": row["root_id"]},
         )
@@ -1419,8 +1433,8 @@ async def rename_item(ctx: Ctx) -> Reply:
     root = st.cfg.root_by_id(row["root_id"])
     if root is None:
         raise NotFound("照片所在目录已移除")
-    if not root.can_write:
-        raise ReadonlyError("当前为只读模式，无法改名")
+    if not root.can_modify:
+        raise ReadonlyError("当前模式不允许改名已有照片")
 
     # 名字里不能有路径分隔符 —— 否则"改名"会变成"移动"，而移动是另一个
     # 接口（它有自己的权限与冲突语义）。这一条必须在沙箱之前拦，
@@ -1446,8 +1460,8 @@ async def rename_item(ctx: Ctx) -> Reply:
 
     dst_rel = f"{src_dir}/{new_name}" if src_dir else new_name
     # 沙箱会一并拒绝 Windows 保留名（CON/PRN/…）、非法字符、结尾空格或点
-    dst = sandbox.resolve(root, dst_rel, "write", cfg=st.cfg)
-    src = sandbox.resolve(root, src_rel, "write", cfg=st.cfg)
+    dst = sandbox.resolve(root, dst_rel, "modify", cfg=st.cfg)
+    src = sandbox.resolve(root, src_rel, "modify", cfg=st.cfg)
 
     if dst.exists():
         # spec 必须显式给 E3012。Conflict 的默认 spec 是 E1012，它的
@@ -1494,6 +1508,7 @@ async def rename_item(ctx: Ctx) -> Reply:
     audit.record(
         db, st.cfg, audit.ACTION_RENAME,
         rel_path=dst_rel, device=st.device_name,
+        client_id=_ctx_client_id(ctx),
         detail={"media_id": mid, "from": src_rel, "to": dst_rel,
                 "root": row["root_id"]},
     )

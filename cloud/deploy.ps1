@@ -16,10 +16,14 @@ PhotoBridge 云端中继（relay）部署脚本 —— Windows Server 单机版
 #>
 [CmdletBinding()]
 param(
-    [string]$BaseUrl    = "http://203.0.113.10:8000",
+    # ★ 审计 F03：原来默认是 `http://<公网 IP>:8000` —— 照着默认参数部署
+    #   就等于把账号口令、agent 令牌、照片全部以明文跑在公网上。现在默认空，
+    #   且必须是 https://（只有回环地址允许 http://）。
+    [string]$BaseUrl    = "",
     [string]$Email      = "me@example.com",
-    # ★ 口令**没有默认值**。曾经这里是 `"PbCloud2026!"`，而它同时是线上
-    #   云账号的真实口令 —— 等于把凭据写进仓库，还被一条测试钉住了
+    # ★ 口令**没有默认值**。曾经这里写着一个线上云账号的真实口令
+    #   （2026-10-26 已轮换，旧口令失效；源码里的明文也已抹掉）——
+    #   等于把凭据写进仓库，还被一条测试钉住了
     #   （`test_windows_deploy_script_does_not_hardcode_a_password` 的断言
     #   却是"必须等于这个硬编码值"，名字与断言相反，与 ISSUE-018 同型）。
     #   现在留空则交互式询问（`Read-Host -AsSecureString`），口令只经

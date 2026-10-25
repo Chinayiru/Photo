@@ -328,6 +328,18 @@ class TunnelClient:
             raw = "https://" + raw
         parts = urlsplit(raw)
         scheme = "wss" if parts.scheme in ("https", "wss") else "ws"
+        # ★ 审计 F03：不许把"公网 http 基址"悄悄降级成 ws://。明文
+        #   websocket 会把 `Authorization: Bearer <agent 令牌>` 和整条照片
+        #   流转发在公网上，路径上任何一跳都能读走。只有回环地址（本机自测、
+        #   局域网调试）允许明文。
+        if scheme == "ws":
+            hn = (parts.hostname or "").lower()
+            loopback = hn in ("localhost", "::1") or hn.startswith("127.")
+            if not loopback:
+                raise RuntimeError(
+                    "cloud.base_url 必须使用 https://（明文 ws:// 会把 agent "
+                    f"令牌和照片暴露给中间人）：{raw}"
+                )
         host = parts.netloc
         if not host:
             return ""
