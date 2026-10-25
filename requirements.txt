@@ -18,7 +18,8 @@ uvicorn>=0.30
 
 # --- 图片处理 ---
 # Pillow 负责所有非 HEIC 格式的缩略图与尺寸探测。
-Pillow>=10.3
+# 13.0 修复 TIFF/BMP 等不可信图片解析中的内存安全及资源耗尽漏洞。
+Pillow>=13.0.0
 # ★ HEIC 必需：iPhone 默认就是 HEIC，没有它用户导入 iPhone 照片时
 #   会得到"不支持的格式"，而 HEIC 恰恰是照片库里最常见的一种。
 #   它必须在 Pillow 之后导入（依赖 Pillow 的插件机制）。
