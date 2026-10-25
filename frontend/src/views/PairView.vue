@@ -64,7 +64,55 @@ const accountError = ref("");
  * 也没有 6 位码可用 —— 只能账号登录 + 选电脑。真机上从聊天窗直接打开域名
  * 走的就是这条分支（ISSUE-041）。
  */
-const relayRoot = computed(() => relayRootBase() !== "");
+/**
+ * 这个页面到底是**电脑自己**伺服的，还是**中继**伺服的？
+ *
+ * 不能只看域名：家里电脑如果用 Tailscale MagicDNS / 域名访问，主机名长得和
+ * 中继域名一模一样，`relayRootBase()` 会把它当中继首页 ⇒ 页面上只剩账号登录、
+ * 配对码整块消失（用户实测踩到）。
+ *
+ * 判据改成"问一句"：中继根上没有 `/api/system/ping`（那是电脑端才有的），
+ * 电脑端会回 `{"pong":true,...}`。一次请求，几百毫秒，换掉一整类误判。
+ */
+const originKind = ref<"unknown" | "agent" | "relay">(
+  cloudPage.value ? "agent" : "unknown",
+);
+const relayRoot = computed(() => originKind.value === "relay");
+
+function markOrigin(kind: "agent" | "relay"): void {
+  originKind.value = kind;
+  // 排障用：页面在控制台里 `document.documentElement.dataset.pbOrigin`
+  // 就能看到这次判定的结果，不用猜。
+  document.documentElement.setAttribute("data-pb-origin", kind);
+}
+
+async function probeOrigin(): Promise<void> {
+  if (cloudPage.value) { markOrigin("agent"); return; }
+  try {
+    const r = await fetch(`${window.location.origin}/api/system/ping`, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    // 判据是响应头 `x-pb-origin: agent`（电脑端每个响应都带），不是 body：
+    // 中继会把公开的 /api/* 转到设备上，body 里的 pong 真假分不出来。
+    if (r.headers.get("x-pb-origin") === "agent") {
+      markOrigin("agent");
+      return;
+    }
+    if (r.ok) {
+      const body = await r.json() as { pong?: boolean };
+      // 老版本电脑端还没这枚头时才退化成看 body —— 但只有在"主机名本来就
+      // 不像中继域名"时才敢认，否则中继转发设备回包同样会给出 pong。
+      const looksRelay = relayRootBase() !== "";
+      markOrigin(body && body.pong && !looksRelay ? "agent" : "relay");
+      return;
+    }
+  } catch {
+    /* 打不通也按中继处理：中继域的 ping 会 404/401，不会给 pong */
+  }
+  markOrigin(relayRootBase() !== "" ? "relay" : "agent");
+}
 /**
  * 登录方式：**配对码** 与 **账号登录** 二选一，用顶部切换，不并排堆在一屏。
  *
@@ -171,8 +219,12 @@ onMounted(() => {
   // 局域网页是从电脑自己身上打开的，地址就是当前 location——
   // 让用户手输一遍 IP 只会多一个出错点（ISSUE-040：真机上按钮"点不动"
   // 的一种情形就是地址栏空着、按钮又是灰的，谁也说不清缺什么）。
-  // 中继首页没有配对码可输，直接落在账号登录上
-  if (relayRoot.value) mode.value = "account";
+  // 先认出"这是电脑还是中继"，再决定默认落在哪个入口/哪种登录
+  void probeOrigin().then(() => {
+    if (relayRoot.value) { entry.value = "cloud"; mode.value = "account"; }
+    else if (cloudPage.value) { entry.value = "cloud"; }
+    else { entry.value = "lan"; mode.value = "code"; }
+  });
   if (!cloudPage.value && !relayRoot.value
       && !host.value.trim() && window.location.hostname) {
     host.value = window.location.hostname;

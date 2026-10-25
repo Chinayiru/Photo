@@ -151,6 +151,7 @@ def build_app(cfg: Config | None = None, *, state: AppState | None = None) -> An
 
     # 中间件注册顺序 = 洋葱从外到内。鉴权必须在**内层**，
     # 这样请求日志能包住 401（否则鉴权失败不进访问日志，排障看不到）。
+    router.use(_origin_marker_middleware)
     router.use(_request_log_middleware)
     router.use(auth_middleware)
     origins = _cors_origins(cfg)
@@ -238,6 +239,27 @@ async def _request_log_middleware(ctx, nxt):
     ms = (time.perf_counter() - t0) * 1000
     if ms >= 300 or reply.status >= 400:
         log.info("%s %s -> %s %.0fms", ctx.method, ctx.path, reply.status, ms)
+    return reply
+
+
+async def _origin_marker_middleware(ctx, nxt):
+    """给每个响应打一记"我是电脑端"的标记头（`x-pb-origin: agent`）。
+
+    前端要区分"页面是电脑伺服的，还是云端中继伺服的"，因为这决定配对页上
+    该给「配对码」还是「账号登录」。光看域名不够：家里电脑用 Tailscale
+    MagicDNS 或自己的域名访问时，主机名和中继域名长得一样；只看
+    `/api/system/ping` 也不够 —— 中继会把公开的 `/api/*` 转到设备上，
+    于是中继首页也能回 `{"pong":true}`，前端会把中继当成本机（实测踩到：
+    局域网入口的配对码整块消失）。
+
+    同源请求可以读到响应头，所以这一枚 header 是可信判据：中继转发的是
+    设备回包，但中继自己生成的响应不会有它。
+    """
+    reply = await nxt(ctx)
+    try:
+        reply.headers["x-pb-origin"] = "agent"
+    except Exception:  # noqa: BLE001 - 标记头永远不该让请求失败
+        log.debug("打标记头失败：%s %s", ctx.method, ctx.path)
     return reply
 
 
