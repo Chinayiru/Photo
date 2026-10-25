@@ -74,6 +74,20 @@ class OversizedImageError(RuntimeError):
         self.height = height
 
 
+class CorruptImageError(RuntimeError):
+    """文件在**加载/解码边界**就判定为损坏（截断、畸形辅助块等）。
+
+    与 `OversizedImageError` 同类：重试没有意义，应在引擎里直接判永久失败。
+
+    ★ 为什么需要这个归一：Pillow 13 收紧了 PNG 辅助块校验 —— 声明长度与
+    实际字节不符的 cHRM / gAMA / tRNS / iCCP 现在在 `Image.open()` 阶段就抛
+    `UnidentifiedImageError`（Pillow 12 是静默忽略、照常出图），截断的 IDAT
+    则仍抛 `OSError: image file is truncated`。不归一的话，这类坏文件会走
+    `RETRY_BACKOFF` 重排三次（5s/30s/300s），每次占满一个解码闸门，而闸门
+    只有 4 个 —— 几张坏图就能把整个缩略图队列拖住。
+    """
+
+
 #: 解码时先缩到这个尺寸以内，再精缩到目标尺寸。
 DRAFT_MAX: Final[int] = 2048
 
@@ -171,7 +185,14 @@ def _open_downscaled(path: str | Path, target: int) -> Image.Image:
     吞掉 —— 它一旦被吞，超大图就会继续走到 `im.reduce()`/`im.load()`，
     正好绕开了这道防护。
     """
-    im = Image.open(path)
+    try:
+        im = Image.open(path)
+    except FileNotFoundError:
+        # 文件消失是"这一轮读不到"，不是坏图：让调用方按缺失去处理。
+        raise
+    except (Image.UnidentifiedImageError, OSError, ValueError, SyntaxError) as exc:
+        # 头就坏了（含 Pillow 13 起新拒的畸形 PNG 辅助块），不必再解码。
+        raise CorruptImageError(f"{type(exc).__name__}: {exc}") from exc
     try:
         if im.width > MAX_IMAGE_EDGE or im.height > MAX_IMAGE_EDGE:
             raise OversizedImageError(im.width, im.height)
@@ -207,7 +228,17 @@ def generate_thumb(
             im = im.convert("RGB")
         # thumbnail 保证等比且**不会放大**。resize 会把 200x200 的图
         # 插值成 1600x1600 —— 浪费带宽且更糊。
-        im.thumbnail((size, size), Image.Resampling.LANCZOS)
+        try:
+            im.thumbnail((size, size), Image.Resampling.LANCZOS)
+            # ★ 必须在这里把像素真正解完。Pillow 会把截断文件的报错**推迟**
+            # 到 `save()` 内部的 `self.load()` 才抛出，而 save 阶段我们
+            # 不能把 OSError 一律当坏图（磁盘满也是 OSError）。先在解码边界
+            # 强制 load，坏图就在此处现形；能到这里说明数据完整，save 只需编码。
+            im.load()
+        except (OSError, ValueError, SyntaxError) as exc:
+            # 像素数据坏了（典型：IDAT 截断、CRC 错）。这里只包住解码，
+            # 保存阶段的 OSError 可能是磁盘满，不能一并当坏图。
+            raise CorruptImageError(f"{type(exc).__name__}: {exc}") from exc
         w, h = im.size
 
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -482,6 +513,13 @@ class ThumbEngine:
                     # 这里再自增一次会让"失败数"翻倍。
                     self._set_state(media_id, "failed", None)
                     log.warning("thumb skipped (image too large) media_id=%s: %s",
+                                media_id, exc)
+                    return False
+                except CorruptImageError as exc:
+                    # 同理：坏文件不会因为等 5 秒就变好。直接永久失败，
+                    # 把闸门留给真正能出图的照片。
+                    self._set_state(media_id, "failed", None)
+                    log.warning("thumb skipped (corrupt image) media_id=%s: %s",
                                 media_id, exc)
                     return False
         self._set_state(media_id, "ok", source_signature(src_mtime, row["size"]))

@@ -536,20 +536,31 @@ def test_engine_cache_hit_skips_regeneration(tmp_path: Path, monkeypatch) -> Non
     assert thumb_path(cfg, "library", "c.jpg", 320).read_bytes() == b"cached"
 
 
-def test_engine_bad_file_goes_to_retry_not_failed_immediately(
+def test_engine_transient_error_goes_to_retry_not_failed_immediately(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """首次失败应进入重试，而不是直接标 failed。
+    """瞬时失败（文件被占用、磁盘忙）应进入重试，而不是直接标 failed。
 
-    瞬时失败（文件被占用、磁盘忙）通常 1 次重试就过；直接标 failed
-    会让用户在杀毒软件扫描时就永久失去缩略图。
+    直接标 failed 会让用户在杀毒软件扫描时就永久失去缩略图。
+    ⚠️ 注意区分：**坏文件**不适用这条（见下一条），坏文件重试一万次也一样。
     """
-    bad = tmp_path / "bad.jpg"
-    bad.write_bytes(b"not an image")
-    st = bad.stat()
-    rows = [{"id": 3, "root_id": "library", "rel_path": "bad.jpg", "mtime": st.st_mtime,
+    good = tmp_path / "busy.jpg"
+    Image.new("RGB", (20, 20), (1, 2, 3)).save(good, "JPEG")
+    st = good.stat()
+    rows = [{"id": 3, "root_id": "library", "rel_path": "busy.jpg", "mtime": st.st_mtime,
              "size": st.st_size, "orientation": 1, "thumb_state": "pending",
              "thumb_etag": None, "missing": 0}]
+
+    calls = {"n": 0}
+    real = thumbs._generate_thumb_kw
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("文件被另一个进程占用")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(thumbs, "_generate_thumb_kw", flaky)
     eng, _, db = _engine_fixture(tmp_path, monkeypatch, rows)
 
     async def main() -> None:
@@ -560,8 +571,36 @@ def test_engine_bad_file_goes_to_retry_not_failed_immediately(
         await eng.stop()
 
     asyncio.run(main())
-    assert eng.failed == 0, "首次失败不该直接标 failed"
+    assert calls["n"] == 1, "首次失败后应该等退避（5s），不该当场重试"
+    assert eng.failed == 0, "瞬时失败不该直接标 failed"
     assert db.rows[3]["thumb_state"] == "pending", "应保持 pending 等待重试"
+
+
+def test_engine_corrupt_file_fails_immediately(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """坏文件（连头都读不出）不该占用退避重试的闸门，直接判永久失败。
+
+    Pillow 13 起畸形 PNG 辅助块会在 `Image.open()` 就抛错，被归一成
+    `CorruptImageError`；这类错误重试没有意义。
+    """
+    bad = tmp_path / "bad.jpg"
+    bad.write_bytes(b"not an image")
+    st = bad.stat()
+    rows = [{"id": 4, "root_id": "library", "rel_path": "bad.jpg", "mtime": st.st_mtime,
+             "size": st.st_size, "orientation": 1, "thumb_state": "pending",
+             "thumb_etag": None, "missing": 0}]
+    eng, _, db = _engine_fixture(tmp_path, monkeypatch, rows)
+
+    async def main() -> None:
+        eng.start()
+        eng.enqueue(4)
+        await eng.queue.join()
+        await asyncio.sleep(0.05)
+        await eng.stop()
+
+    asyncio.run(main())
+    assert db.rows[4]["thumb_state"] == "failed", "坏文件应直接永久失败"
 
 
 def test_engine_queue_full_drops_without_blocking(tmp_path: Path, monkeypatch) -> None:

@@ -18,7 +18,13 @@ uvicorn>=0.30
 
 # --- 图片处理 ---
 # Pillow 负责所有非 HEIC 格式的缩略图与尺寸探测。
-Pillow>=10.3
+# Pillow 13 修复了 TIFF/BMP 等不可信图片解析中的内存安全与资源耗尽问题
+# （GHSA-q45j-58j2-45rg 等，见 report/安全审计-2026-10-26.md S06）。
+# 13 也收紧了几处输入校验：PNG 辅助块（cHRM/gAMA/tRNS/iCCP）声明长度与
+# 实际字节不符时，`Image.open()` 直接抛 UnidentifiedImageError（12 是静默
+# 忽略）；mode="I" 不能再存 PNG（须先转 I;16）。本仓库的加载/导出边界已按
+# 新行为收紧并有回归用例：backend/tests/test_pillow13_boundaries.py。
+Pillow>=13.0.0
 # ★ HEIC 必需：iPhone 默认就是 HEIC，没有它用户导入 iPhone 照片时
 #   会得到"不支持的格式"，而 HEIC 恰恰是照片库里最常见的一种。
 #   它必须在 Pillow 之后导入（依赖 Pillow 的插件机制）。
@@ -50,7 +56,3 @@ pystray>=0.19
 # 而这是最难排查的一类问题（换个手机又能扫出来）。
 # qrcode 是纯 Python、无编译依赖，打包进 exe 体积也小。
 qrcode>=7.4
-# 已知：Pillow 12.x 的 TIFF/BMP 解码路径有内存安全与资源耗尽公告
-# （GHSA-q45j-58j2-45rg 等，见 report/安全审计-2026-10-26.md S06）。
-# 因为跨两个大版本会连带影响 HEIC 插件与缩略图链路，升级不在本次合并里做：
-# 需要单独验证（装 13.x → 跑 HEIC/缩略图/EXIF 回归 → 重打 EXE → 再部署）。
