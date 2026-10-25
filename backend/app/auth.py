@@ -244,7 +244,8 @@ def new_token() -> str:
 
 
 def _issue_client_token(now: float, client_id: str,
-                        device_name: str | None, cfg: Any = None) -> str:
+                        device_name: str | None, cfg: Any = None,
+                        db: Any = None) -> str:
     """签发一枚 client_token，**配了云端时签成两端都能验的 HMAC 令牌**。
 
     ## 为什么局域网配对也必须签 HMAC 令牌
@@ -284,7 +285,7 @@ def _issue_client_token(now: float, client_id: str,
     天数表示 —— 用 `MAX_TTL_DAYS`（100 年）。
     """
     cfg = _cloud_cfg(cfg)
-    secret = _tunnel_secret(cfg)
+    secret = _signing_secret(db, cfg)
     if secret:
         # 延迟导入：`tunnel.py` 在模块级 import 了本模块的常量，顶层
         # 反向 import 会成环（`backend/app/tunnel.py:53` 那组 import）。
@@ -454,7 +455,7 @@ def consume_pair_code(
 
     # --- 通过校验，签发 token ---
     client_id = secrets.token_hex(16)
-    token = _issue_client_token(now, client_id, device_name, cfg)
+    token = _issue_client_token(now, client_id, device_name, cfg, db)
     # AC-5.10：过期时刻**必须落库**。
     #
     # 原来这里只把 `now + 90 天` 拼进响应体给客户端看，库里一个字段都
@@ -588,8 +589,64 @@ def _cloud_cfg(cfg: Any = None) -> Any:
         return None
 
 
-def _tunnel_secret(cfg: Any = None) -> str:
-    """两端共享的 HMAC 密钥 = `sha256(agent_token)`。
+def _signing_secret(db: Any = None, cfg: Any = None) -> str:
+    """签发令牌用的 HMAC 密钥：**电脑端私有**（`settings.client_signing_secret`）。
+
+    `db is None` 时退回旧密钥：有几个调用点（如 `_tunnel_secret()` 的老
+    用法）拿不到数据库句柄。这种回退是过渡期的妥协 —— 真正的修复是把
+    db 一路传下去，`control.mint_client` / `_verify_cloud_token` 都已经做到了。
+    """
+    if db is not None:
+        try:
+            from .control import client_signing_secret
+
+            return client_signing_secret(db)
+        except Exception:       # noqa: BLE001 - 缺表/迁移中：退回旧密钥
+            return legacy_tunnel_secret(cfg)
+    return legacy_tunnel_secret(cfg)
+
+
+def legacy_window_open(db: Any = None) -> bool:
+    """`devices.allow_legacy_until` 还没过期吗？（默认关闭）
+
+    旧密钥 = `sha256(agent_token)`，它在云端库里明文躺着。只要我们还拿它
+    验签，"云端库泄露 → 伪造成任意手机令牌"这条攻击链就还在。所以默认
+    不接受，只在运维显式开的窗口期内接受（`pbctl allow-legacy <天数>`）。
+    """
+    if db is None:
+        return False
+    try:
+        row = db.query_one(
+            "SELECT MAX(allow_legacy_until) AS until FROM devices")
+    except Exception:               # noqa: BLE001 - 老库没有这一列
+        return False
+    until = 0.0
+    try:
+        until = float(row["until"]) if row is not None and row["until"] else 0.0
+    except (TypeError, ValueError):
+        return False
+    return until > time.time()
+
+
+def _candidate_secrets(db: Any = None, cfg: Any = None) -> list[str]:
+    """验签时要试的密钥列表：新密钥在前，旧密钥只在窗口期内兜底。"""
+    out: list[str] = []
+    fresh = _signing_secret(db, cfg)
+    if fresh:
+        out.append(fresh)
+    legacy = legacy_tunnel_secret(cfg)
+    if legacy and legacy not in out and legacy_window_open(db):
+        out.append(legacy)
+    return out
+
+
+def legacy_tunnel_secret(cfg: Any = None) -> str:
+    """**旧**令牌的 HMAC 密钥 = `sha256(agent_token)`。
+
+    ★ 2026-10-26 起新签发的令牌**不再**用它（见 `control.client_signing_secret()`）：
+    这个值在云端库里明文躺着，等于把签名私钥放进了云端数据库 ——
+    库一泄露就能离线签出任意手机令牌。这里保留只为让 90 天有效期的
+    老令牌自然过期，别再往这条路上加东西。
 
     没配 `cloud.agent_token` 时返回空串，调用方据此跳过云端令牌校验
     —— 一台根本没用过云端的电脑不该因为"表里有个不认识的令牌"而
@@ -616,8 +673,9 @@ def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
     ★ `expires_at` 用令牌自己的 `exp`，不用 `token_ttl_days` 配置：
     令牌是云端签的，它的寿命由云端决定，本地配置改了也不该让它变长。
     """
-    secret = _tunnel_secret(ctx.app.cfg if ctx.app is not None else None)
-    if not secret:
+    cfg = ctx.app.cfg if ctx.app is not None else None
+    candidates = _candidate_secrets(db, cfg)
+    if not candidates:
         return None
     st = ctx.app
     # ★ 这里比对的必须是**云端**设备 id，不是本地那个 16 位 id。
@@ -629,7 +687,11 @@ def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
 
     cfg = ctx.app.cfg if ctx.app is not None else None
     device_id = cloud_device_id(cfg, st.device_id if st is not None else "")
-    claims = token_mod.verify_token(secret, token, device_id=device_id)
+    claims = None
+    for secret in candidates:
+        claims = token_mod.verify_token(secret, token, device_id=device_id)
+        if claims is not None:
+            break
     if claims is None:
         return None
 

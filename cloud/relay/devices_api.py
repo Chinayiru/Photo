@@ -25,6 +25,7 @@ from typing import Any
 from starlette.requests import Request
 from starlette.responses import Response
 
+from ..relay import control as cloud_control
 from ..relay.auth import require_account
 from ..relay.db import CloudDB
 from ..relay.devices import (
@@ -235,6 +236,12 @@ async def delete_client(request: Request, db: CloudDB,
     if row is None:
         return json_error("E1004", request_id=_rid(request))
     db.execute("UPDATE clients SET revoked = 1 WHERE id = ?", (cid,))
+    # 立刻推给电脑端（`docs/06` §13.2：轮询兜底仍然保留，但用户点"移除"
+    # 的那一下就应该生效）。控制通道是尽力而为：电脑离线时这里什么也不做，
+    # 等它上线后由 `GET /api/clients/revoked` 补齐。
+    registry = getattr(getattr(request.app, "state", None), "registry", None)
+    await cloud_control.call_agent(
+        cloud_control.conn_for(registry, did), "revoke_clients", {"ids": [cid]})
     return no_content()
 
 

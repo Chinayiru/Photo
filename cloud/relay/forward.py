@@ -39,7 +39,8 @@ from starlette.responses import Response, StreamingResponse
 from shared.mux import MuxClosed
 from shared.protocol import HEAD_TIMEOUT, TOTAL_TIMEOUT
 
-from ..relay import netutil
+from ..relay import control as cloud_control
+from ..relay import netutil, security
 from ..relay.devices import (
     DeviceRegistry,
     TunnelConnection,
@@ -285,6 +286,10 @@ class Forwarder:
             # `find_or_adopt_lan_token` 的 docstring）；验不过仍然是 401。
             row = find_or_adopt_lan_token(self.db, token, device_id)
         if row is None:
+            # 电脑端用**自己的**密钥签的令牌（2026-10-26 起默认）：云端没有
+            # 密钥，只能请电脑判一次，判过再把哈希收编进 `clients`。
+            row = await self._adopt_token_via_agent(token, device_id)
+        if row is None:
             # 令牌死透了：顺手清掉浏览器里的死 cookie，否则 `<img>` 会
             # 用同一个死令牌一直 401（它发不出 Authorization 头）。
             return _error(401, "E2002", "配对已失效，请重新配对",
@@ -313,6 +318,43 @@ class Forwarder:
                                      client_ip=_client_ip(request))
         finally:
             self.inflight.release(device_id)
+
+    async def _adopt_token_via_agent(self, token: str,
+                                     device_id: str) -> Any:
+        """请电脑端验一枚云端不认识的令牌，并把结果收编进 `clients`。
+
+        典型来源：手机在家连局域网、`POST /api/pair` 拿到的令牌 —— 云端
+        没参与那次配对，所以库里没有它的哈希。以前靠"云端也算得出同一个
+        HMAC 密钥"来验，而那正是数据库泄露就能伪造令牌的根源。
+
+        验过之后必须落库：不落库的话这枚令牌在账号后台里是隐形的，
+        用户看到"已配对 0 台手机"，点不了移除。
+        """
+        result = await cloud_control.call_agent(
+            cloud_control.conn_for(self.registry, device_id), "verify_client",
+            {"token": token, "device_id": device_id})
+        if not result or not result.get("valid"):
+            return None
+        client_id = str(result.get("client_id") or "")[:64]
+        expires_at = float(result.get("expires_at") or 0.0)
+        if not client_id or expires_at <= time.time():
+            return None
+        name = str(result.get("name") or "").strip()[:64] or "手机"
+        now = time.time()
+        try:
+            self.db.execute(
+                "INSERT INTO clients(id, device_id, name, token_hash, last_seen,"
+                " created_at, revoked, expires_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, 0, ?)"
+                " ON CONFLICT(id) DO UPDATE SET name = excluded.name,"
+                "   token_hash = excluded.token_hash,"
+                "   expires_at = excluded.expires_at",
+                (client_id, device_id, name, security.hash_token(token), now,
+                 now, expires_at))
+        except Exception as exc:        # noqa: BLE001
+            log.debug("收编局域网令牌失败：%s", type(exc).__name__)
+            return None
+        return find_client_by_token(self.db, token)
 
     async def _handle_public(self, request: Request, device_id: str,
                              rid: str) -> Response:

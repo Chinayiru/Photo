@@ -492,6 +492,22 @@ class Database:
                 "  SELECT id FROM devices WHERE revoked = 0"
                 "   ORDER BY created_at ASC, id ASC LIMIT 1)")
 
+        # --- devices：补 allow_legacy_until 列（ISSUE-049）---
+        #
+        # 2026-10-26 之前，手机令牌由云端用 `sha256(agent_token)` 签 ——
+        # 那个值就在云端库里，泄露即可伪造令牌。现在签发权回到电脑端
+        # （`control.client_signing_secret()`），旧密钥**默认不再接受**。
+        #
+        # 默认 0 = 关闭。这不是苛刻而是必须：只要还接受旧密钥，"云端库泄露
+        # 就能伪造令牌"这条边界就依然是敞开的。确实需要迁移老手机时，
+        # 用 `python -m backend.pbctl allow-legacy 7` 开一个限时窗口，
+        # 让老令牌在这段时间里继续能用，之后自动关回去。
+        if cols and "allow_legacy_until" not in cols:
+            log.info("迁移 devices：新增 allow_legacy_until 列（默认关闭旧密钥）")
+            conn.execute(
+                "ALTER TABLE devices ADD COLUMN allow_legacy_until "
+                "REAL NOT NULL DEFAULT 0")
+
         # --- upload_sessions：补 client_id 列（ISSUE-034 ②）---
         #
         # 补出来是 NULL，语义是"归属未知"。这类历史会话不可被任何

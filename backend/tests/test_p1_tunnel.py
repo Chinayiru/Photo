@@ -1326,8 +1326,10 @@ def test_revoked_client_is_pushed_to_agent(rig_factory) -> None:
     out = _run(main())
     assert out["before"][0] == 200, out["before"]
     assert out["revoked"][0] == 204, out["revoked"]
-    ids = [str(c["id"]) for c in out["listing"].get("clients", [])]
-    assert out["changed"] >= 1, out
+    # `changed` 可以是 0：2026-10-26 起云端删掉手机的**那一下**就会通过
+    # 控制通道推给电脑端（ISSUE-049），轮询再跑一遍自然是 0 行。
+    # 真正要证的是下面两条 401。
+    assert out["changed"] >= 0, out
     assert out["after"][0] == 401, (
         "撤销后电脑端必须停止接受该令牌（AC-5.8）", out["after"])
     assert out["after_tunnel"][0] == 401, out["after_tunnel"]
@@ -1435,7 +1437,8 @@ def test_lan_token_is_adopted_so_it_can_be_revoked(rig_factory) -> None:
         "局域网令牌必须被收编进云端 clients，否则账号后台看不到、也移除不掉",
         out["adopted"], out["cid"])
     assert out["revoked_status"] == 204, out["revoked_status"]
-    assert out["changed"] >= 1, out
+    # 同上：即时推送已生效时，轮询这一遍就是 0 行。
+    assert out["changed"] >= 0, out
     # 局域网通路走的是本地 `devices` 表，撤销后是 **403 E2004**（"这台设备
     # 被主动移除"），与"令牌不存在"的 401 E2002 刻意区分开 ——
     # 两者都回 401 的话，用户在电脑上移除手机后，手机只会提示"配对失效"

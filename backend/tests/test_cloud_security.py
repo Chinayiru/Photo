@@ -38,11 +38,14 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+from _fake_control import FAKE                     # noqa: E402
 from cloud.relay import auth as cloud_auth          # noqa: E402
+from cloud.relay import control as cloud_control    # noqa: E402
 from cloud.relay import db as cloud_db             # noqa: E402
 from cloud.relay import main as cloud_main         # noqa: E402
 from cloud.relay import netutil                    # noqa: E402
 from cloud.relay import security                   # noqa: E402
+from shared import client_token as shared_token    # noqa: E402
 
 from starlette.testclient import TestClient        # noqa: E402
 
@@ -80,8 +83,15 @@ def _app(tmp_path: Path, *, dist: Path | None = None):
 
 
 @pytest.fixture(autouse=True)
-def _clean_limiters():
-    """两个登录桶都是模块级单例，用例之间必须清空。"""
+def _clean_limiters(monkeypatch):
+    """两个登录桶都是模块级单例，用例之间必须清空。
+
+    控制通道换成本地替身：2026-10-26 起令牌由电脑端签/验（`docs/06` §13），
+    配对成功要真的"问一句"，不起真隧道就靠 `_fake_control.FAKE`。
+    """
+    FAKE.calls.clear()
+    FAKE.online = True
+    monkeypatch.setattr(cloud_control, "call_agent", FAKE)
     cloud_auth._login_limiter.reset()
     cloud_auth._email_limiter.reset()
     yield
@@ -474,10 +484,14 @@ def _insert_device(tmp_path: Path, *, name: str = "家里的电脑") -> str:
     database = cloud_db.CloudDB(str(tmp_path / "cloud.db"))
     account = database.query_one("SELECT id FROM accounts LIMIT 1")
     device_id = security.new_device_id()
+    agent_token = security.new_token()
     database.execute(
         "INSERT INTO devices(id, account_id, name, agent_token, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
-        (device_id, account["id"], name, security.new_token(), time.time()))
+        (device_id, account["id"], name, security.hash_token(agent_token),
+         time.time()))
+    # 替身与"电脑端"用同一个密钥，配对/认令牌的链路才走得通。
+    FAKE.secret = shared_token.secret_for_agent_token(agent_token)
     return device_id
 
 
@@ -691,10 +705,14 @@ def _insert_device_for(path: Path, email: str, *, name: str) -> str:
     account = database.query_one(
         "SELECT id FROM accounts WHERE email = ?", (email,))
     device_id = security.new_device_id()
+    agent_token = security.new_token()
     database.execute(
         "INSERT INTO devices(id, account_id, name, agent_token, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
-        (device_id, account["id"], name, security.new_token(), time.time()))
+        (device_id, account["id"], name, security.hash_token(agent_token),
+         time.time()))
+    # 替身与"电脑端"用同一个密钥，配对/认令牌的链路才走得通。
+    FAKE.secret = shared_token.secret_for_agent_token(agent_token)
     return device_id
 
 
@@ -798,4 +816,66 @@ def test_a_revoked_agent_token_looks_exactly_like_an_unknown_one() -> None:
     assert revoked == unknown, f"撤销与不存在可区分：{revoked} vs {unknown}"
     assert revoked[0] == 401, f"撤销应为 401（与不存在一致），实际 {revoked[0]}"
 
+# ------------------------------------------- ⑤ 控制通道：签发权已回到电脑端
 
+
+def test_pair_fails_cleanly_when_the_computer_does_not_answer(
+        tmp_path: Path) -> None:
+    """电脑没回话时必须 503，而且**配对码不能被消费掉**。
+
+    这条是 ISSUS-049 修订后最容易写错的地方：抢码（条件 UPDATE）和签发
+    原来在同一个事务里，改成"先问电脑"之后，如果异常没让事务回滚，用户
+    会遇到"提示电脑不在线，再试一次却提示配对码已被使用"，只能去电脑
+    前重新生成码。
+    """
+    _make_account(tmp_path)
+    client = TestClient(_app(tmp_path, dist=_dist(tmp_path)),
+                        client=("203.0.113.51", 5000))
+    token = _account_token(client, "owner@example.com")
+    device_id = _insert_device(tmp_path)
+    database = cloud_db.CloudDB(str(tmp_path / "cloud.db"))
+    code = "555555"
+    database.execute(
+        "INSERT INTO pair_codes(code, device_id, expires_at, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (code, device_id, time.time() + 300, time.time()))
+
+    FAKE.online = False
+    failed = _pair(client, device_id, token, code=code)
+    assert failed.status_code == 503, failed.text
+    assert failed.json()["error"]["code"] == "E2007"
+    row = database.query_one(
+        "SELECT used_at FROM pair_codes WHERE code = ?", (code,))
+    assert row["used_at"] is None, "电脑没回话却把配对码消费掉了"
+
+    # 电脑回来后同一个码还能用 —— 这才是"重试一次就好"。
+    FAKE.online = True
+    assert _pair(client, device_id, token, code=code).status_code == 200
+
+
+def test_removing_a_phone_pushes_the_revocation_immediately(
+        tmp_path: Path) -> None:
+    """用户点"移除"时云端要主动推给电脑端，不能只等电脑轮询。"""
+    _make_account(tmp_path)
+    client = TestClient(_app(tmp_path, dist=_dist(tmp_path)),
+                        client=("203.0.113.52", 5000))
+    token = _account_token(client, "owner@example.com")
+    device_id = _insert_device(tmp_path)
+    database = cloud_db.CloudDB(str(tmp_path / "cloud.db"))
+    client_id = security.new_device_id()
+    database.execute(
+        "INSERT INTO clients(id, device_id, name, token_hash, last_seen, "
+        "created_at, revoked, expires_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+        (client_id, device_id, "手机", "0" * 64, time.time(), time.time(),
+         time.time() + 86400))
+
+    response = client.delete(f"/api/devices/{device_id}/clients/{client_id}",
+                             headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 204, response.text
+
+    pushes = [params["ids"] for action, params in FAKE.calls
+              if action == "revoke_clients"]
+    assert pushes and client_id in pushes[0], "撤销没有推给电脑端"
+    row = database.query_one(
+        "SELECT revoked FROM clients WHERE id = ?", (client_id,))
+    assert int(row["revoked"]) == 1

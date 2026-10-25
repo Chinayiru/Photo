@@ -30,7 +30,9 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+from _fake_control import FAKE                     # noqa: E402
 from cloud.relay import auth as cloud_auth          # noqa: E402
+from cloud.relay import control as cloud_control    # noqa: E402
 from cloud.relay import db as cloud_db             # noqa: E402
 from cloud.relay import main as cloud_main         # noqa: E402
 from cloud.relay import pairing as cloud_pairing   # noqa: E402
@@ -44,8 +46,15 @@ DEVICE_NAME = "家里的电脑"
 
 
 @pytest.fixture(autouse=True)
-def _clean_auto_attempts():
-    """自动配对的计数是模块级字典，用例之间必须清空。"""
+def _clean_auto_attempts(monkeypatch):
+    """自动配对的计数是模块级字典，用例之间必须清空。
+
+    另外把控制通道换成本地替身：2026-10-26 起令牌由电脑端签，
+    `cloud/relay/pairing.py` 会真的去问隧道要令牌（见 `_fake_control`）。
+    """
+    FAKE.calls.clear()
+    FAKE.online = True
+    monkeypatch.setattr(cloud_control, "call_agent", FAKE)
     cloud_pairing._AUTO_ATTEMPTS.clear()
     cloud_auth._login_limiter.reset()
     cloud_auth._email_limiter.reset()
@@ -92,6 +101,8 @@ def _device(client: TestClient, *, email: str = "owner@example.com",
         "revoked) VALUES (?, ?, ?, ?, ?, ?)",
         (device_id, str(account["id"]), name,
          security.hash_token(agent_token), time.time(), revoked))
+    # 替身用与电脑端同一个密钥签名，这样"云端签的令牌电脑端能验"仍然可测。
+    FAKE.secret = shared_token.secret_for_agent_token(agent_token)
     return device_id, agent_token
 
 

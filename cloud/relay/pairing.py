@@ -65,6 +65,7 @@ from typing import Any
 from starlette.requests import Request
 from starlette.responses import Response
 
+from ..relay import control as cloud_control
 from ..relay import netutil, security
 from ..relay.auth import require_account
 from ..relay.db import CloudDB
@@ -208,7 +209,7 @@ async def redeem_pair_code(request: Request, db: CloudDB,
 
     # 自动配对：不看码，看「你是谁 + 这台电脑是不是你的 + 它现在在不在线」。
     if auto:
-        return _auto_pair(request, db, registry, account, device, did,
+        return await _auto_pair(request, db, registry, account, device, did,
                           client_name)
 
     if not isinstance(code, str) or not security.is_valid_pair_code(code):
@@ -268,30 +269,53 @@ async def redeem_pair_code(request: Request, db: CloudDB,
     # 走到这里就成功。**先用条件 UPDATE 抢下这个码**，再签发令牌：
     # 两条并发请求同时通过上面的检查是可能的（同一个码在两台手机上
     # 同时点），条件 UPDATE 的影响行数就是那把锁。
-    with db.transaction() as conn:
-        cur = conn.execute(
-            "UPDATE pair_codes SET used_at = ? WHERE code = ? "
-            "AND used_at IS NULL", (now, code.strip()))
-        if cur.rowcount != 1:
-            return json_error("E1005", message="配对码已被使用",
-                              request_id=_rid(request))
-        return _mint_client(conn, db, device, did, client_name, now, ip,
-                            via="配对码", request=request)
+    try:
+        with db.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE pair_codes SET used_at = ? WHERE code = ? "
+                "AND used_at IS NULL", (now, code.strip()))
+            if cur.rowcount != 1:
+                return json_error("E1005", message="配对码已被使用",
+                                  request_id=_rid(request))
+            return await _mint_client(conn, db, device, did, client_name, now,
+                                      ip, via="配对码", request=request)
+    except _MintUnavailable:
+        # 事务已回滚：配对码没被消费，用户可以在电脑回来后再试一次。
+        return json_error("E2007",
+                          message="电脑当前不在线，无法签发配对令牌",
+                          request_id=_rid(request))
 
 
-def _mint_client(conn: Any, db: CloudDB, device: Any, did: str,
-                 client_name: str, now: float, ip: str, *,
-                 via: str, request: Request) -> Response:
+class _MintUnavailable(Exception):
+    """电脑端没回应控制通道（离线 / 隧道刚断）。
+
+    单独一个异常而不是返回 None：`_mint_client()` 都在事务里被调用，
+    必须让事务回滚（配对码不能被消费掉），调用方再把异常翻成 503 `E2007`。
+    """
+
+
+async def _mint_client(conn: Any, db: CloudDB, device: Any, did: str,
+                       client_name: str, now: float, ip: str, *,
+                       via: str, request: Request) -> Response:
     """写 `clients` 行并返回令牌响应；**必须在调用方的事务里跑**。
 
     码路径把它塞进「条件 UPDATE 抢码」那同一个事务（抢码和写令牌要么都成，
     要么都不成）；自动配对路径另开一个事务。两条路都在这里收口，是为了
     避免出现「码路径修了令牌过期时间、自动配对忘了修」这种分叉。
     """
-    client_id = security.new_device_id()
-    expires_at = now + security.CLIENT_TOKEN_TTL_DAYS * 86400
-    token = _issue_client_token(device, client_id, client_name, now,
-                                expires_at)
+    registry = getattr(getattr(request.app, "state", None), "registry", None)
+    minted = await cloud_control.call_agent(
+        cloud_control.conn_for(registry, did), "mint_client",
+        {"name": client_name, "device_id": did,
+         "ttl_days": int(security.CLIENT_TOKEN_TTL_DAYS)})
+    if minted is None:
+        raise _MintUnavailable()
+    client_id = str(minted.get("client_id") or "")
+    token = str(minted.get("token") or "")
+    expires_at = float(minted.get("expires_at") or 0.0)
+    if not client_id or not token or expires_at <= now:
+        # 电脑端回了话但内容不对（版本不匹配/自己算错了）：按"没签成"处理。
+        raise _MintUnavailable()
     conn.execute(
         "INSERT INTO clients(id, device_id, name, token_hash, "
         "last_seen, created_at, revoked, expires_at) "
@@ -321,36 +345,8 @@ def _mint_client(conn: Any, db: CloudDB, device: Any, did: str,
     }, request_id=_rid(request))
 
 
-def _issue_client_token(device: Any, client_id: str, client_name: str,
-                        now: float, expires_at: float) -> str:
-    """签发一枚可被**电脑端离线验签**的 client_token（`shared/client_token.py`）。
-
-    ## 为什么不能再用 `security.new_token()`（32 字节随机串）
-
-    一期令牌是在电脑上签发的，电脑自己 `devices` 表里就有那一行，所以
-    "查库比对 sha256"能成立。二期手机是**云端**发令牌，电脑的库里没有
-    这一行，于是手机第一次走进隧道就会被 `require_client` 判 401
-    （`docs/04-接口设计文档.md:99-112` 把这个缺口写在了明面上）。
-
-    电脑端不能为此回源云端：用户之所以要"局域网直连"，就是因为不想让
-    每次滑动时间线都经过公网。断网时回源失败 = 局域网也废了。
-
-    于是换成 HMAC 令牌：密钥是 `sha256(agent_token)`，云端手里就是
-    `devices.agent_token` 那一列，电脑端手里是 `agent_token` 明文，
-    两边算出来同一个值。电脑端 `require_client` 先查本地库（一期令牌
-    兼容），查不到再验签（二期令牌）——两条路并存，老配对不受影响。
-
-    ## 过期时间
-
-    令牌自带的 `exp` 与 `clients.expires_at` 必须**同源**（都用同一个
-    `expires_at` 算），否则会出现"云端认为还有效、电脑认为已过期"，
-    表现是令牌有效期内随机 401。这里用 `expires_at` 反推天数。
-    """
-    secret = str(device["agent_token"] or "")
-    ttl_days = max(1, int((expires_at - now) // 86400))
-    return shared_token.issue_token(
-        secret, client_id=client_id, device_id=str(device["id"]),
-        ttl_days=ttl_days, now=now, client_name=client_name)
+# ★ `_issue_client_token()` 已删除（2026-10-26）：令牌签发权已挪回电脑端（`backend/app/control.py`），
+# 云端拿不到签名密钥，只存 `sha256(token)`。见 `docs/06` §13。
 
 
 def purge_expired_codes(db: CloudDB, *, older_than: float = 86400.0) -> int:
@@ -378,8 +374,9 @@ def purge_expired_codes(db: CloudDB, *, older_than: float = 86400.0) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _auto_pair(request: Request, db: CloudDB, registry: Any, account: Any,
-               device: Any, did: str, client_name: str) -> Response:
+async def _auto_pair(request: Request, db: CloudDB, registry: Any,
+                     account: Any, device: Any, did: str,
+                     client_name: str) -> Response:
     """`{"auto": true}` 分支：账号已验明，只差「这台电脑在不在线」。"""
     account_id = str(account["id"])
     ip = _client_ip(request)
@@ -395,9 +392,14 @@ def _auto_pair(request: Request, db: CloudDB, registry: Any, account: Any,
                           request_id=_rid(request))
     _note_auto(account_id, ip)
     now = time.time()
-    with db.transaction() as conn:
-        return _mint_client(conn, db, device, did, client_name, now, ip,
-                            via="账号登录", request=request)
+    try:
+        with db.transaction() as conn:
+            return await _mint_client(conn, db, device, did, client_name, now,
+                                      ip, via="账号登录", request=request)
+    except _MintUnavailable:
+        return json_error("E2007",
+                          message="电脑当前不在线，无法签发配对令牌",
+                          request_id=_rid(request))
 
 
 def _auto_limited(account_id: str, ip: str) -> float | None:
