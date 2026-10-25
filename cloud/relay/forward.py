@@ -309,15 +309,25 @@ class Forwarder:
             return _error(429, "E4003", "请求太密集", retry_after=1,
                           request_id=rid)
 
+        # ★ 审计 F06：额度必须**活到响应体传完**。原来这里是
+        #   `try: return await self._relay(...) finally: release()` ——
+        #   而 `_relay` 返回的是 StreamingResponse，`return` 那一刻响应体
+        #   还在从隧道里往手机灌。于是手机上挂 64 个慢速 `/raw` 就能
+        #   把在途计数刷回 0，再开 64 个，隧道任务与文件句柄无上限增长。
+        #   现在把释放交给 `_release_with_body()`：非流式响应立刻释放，
+        #   流式响应等生成器结束（正常结束、异常、客户端断开都算）。
+        release = _Once(lambda: self.inflight.release(device_id))
         try:
             # 来源 IP 也要带进帧（不只是匿名配对那一条）：电脑端的审计
             # 记录与 `_rate_limit` 都读 `Ctx.client_ip`，缺了会全部落成
             # `"cloud"` 一个桶。
-            return await self._relay(request, device_id, rid,
+            resp = await self._relay(request, device_id, rid,
                                      client_id=client_id,
                                      client_ip=_client_ip(request))
-        finally:
-            self.inflight.release(device_id)
+        except BaseException:
+            release()
+            raise
+        return _release_with_body(resp, release)
 
     async def _adopt_token_via_agent(self, token: str,
                                      device_id: str) -> Any:
@@ -782,6 +792,29 @@ class _ByteCounter:
 
     def __init__(self) -> None:
         self.total = 0
+
+
+def _release_with_body(resp: Response, release: "_Once") -> Response:
+    """把"还额度"这件事挂到响应体的生命周期上（审计 F06）。
+
+    - 非流式响应（JSON 错误、304）：体已经完整在内存里，立即释放；
+    - 流式响应：包一层生成器，`finally` 里释放 —— 正常结束、抛错、
+      客户端中途断开（Starlette 会 `aclose()`）三种情况都会走到。
+    """
+    it = getattr(resp, "body_iterator", None)
+    if it is None:
+        release()
+        return resp
+
+    async def _wrapped() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in it:
+                yield chunk
+        finally:
+            release()
+
+    resp.body_iterator = _wrapped()
+    return resp
 
 
 class _Once:

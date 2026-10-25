@@ -63,6 +63,12 @@ photobridge.example.com {
 			roll_size 20mb
 			roll_keep 7
 		}
-		format console
+		# ★ 审计 F05：`format console` 会把整个 URI（含 `?code=`）写进
+		# 访问日志 —— 扫一次二维码就有一条明文配对码落盘。遮盖它。
+		format filter {
+			request>uri query {
+				replace code REDACTED
+			}
+		}
 	}
 }

@@ -28,7 +28,7 @@ from typing import Final, Literal
 from .config import Config, RootConfig, TMP_DIRNAME, get as get_config
 from .errors import E1009, E1015, SandboxError
 
-Need = Literal["read", "write", "delete"]
+Need = Literal["read", "write", "modify", "delete"]
 
 # --------------------------------------------------------------------------
 # 常量
@@ -376,6 +376,13 @@ def _step_7_permission(root: RootConfig, need: Need, cfg: Config | None) -> None
     elif need == "write":
         if mode not in ("upload", "readwrite"):
             raise _Reject("write_not_permitted", mode)
+    elif need == "modify":
+        # 移动/改名：只改已有条目，不新增也不删除。`upload` 模式不许。
+        # 故意**不**受 `auth.allow_delete` 影响 —— 用户关掉"删除"通常
+        # 是怕照片丢，而移动/改名同样会动目录结构，所以它俩只认模式；
+        # 这条也避免了"关掉删除 = 顺手把移动也锁死"的意外。
+        if mode != "readwrite":
+            raise _Reject("modify_not_permitted", f"mode={mode}")
     elif need == "delete":
         if mode != "readwrite":
             raise _Reject("delete_not_permitted", f"mode={mode}")
