@@ -230,7 +230,9 @@ def _make_url_entry(root: Any, url: str, *, primary: bool) -> Any:
 
 
 def _show_qr_window(title: str, url: str, code: str, ips: list[str],
-                    alt_urls: list[str] | None = None) -> None:
+                    alt_urls: list[str] | None = None,
+                    refetch: Any = None,
+                    on_ready: Any = None) -> None:
     """弹出一个二维码窗口（阻塞直到用户关闭）。
 
     在**独立线程**里跑自己的 `tkinter` 主循环。不用主线程是因为
@@ -249,6 +251,21 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str],
     配对页，而 6 位码要人站在电脑边上才看得到 —— 见 `docs/11` ISSUE-024）。
     代价是在家里也走中继，所以窗口里把局域网地址**明文列出来**：
     用户想在家直连，照着输一次即可（那个 origin 会独立配一次对）。
+
+    ## `refetch` 是干什么的
+
+    配对码只有 5 分钟寿命，二维码里编着码，所以"过期了怎么办"必须能在
+    窗口里解决 —— 否则用户得关窗、再点一遍托盘菜单。`refetch()` 应当返回
+    `(code, url, ips, alt_urls)`，由调用方（`TrayController._new_pair_code`）
+    重新生成；它在**工作线程**里执行，算完再 `root.after` 回到 Tk 线程，
+    免得生成过程中的数据库小抖动把窗口卡住。
+
+    ## `on_ready` 是干什么的
+
+    测试用的钩子：控件建好、`mainloop` 之前回调一次，参数是含
+    `root / code_label / qr_label / refresh_btn / status / state` 的 dict。
+    没有它就只能靠人眼看窗口，而"点刷新后码有没有换"恰恰是最容易悄悄坏掉
+    的一环（线程回到 Tk、旧码失效、复制按钮跟不跟着变）。
     """
     def _run() -> None:
         try:
@@ -288,8 +305,8 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str],
                 log.info("从二维码窗口打开：%s", u)
                 _open_path(u)
 
-            def _url_row(label: str, u: str, *, primary: bool) -> None:
-                row = tk.Frame(root)
+            def _url_row(parent: Any, label: str, u: str, *, primary: bool) -> None:
+                row = tk.Frame(parent)
                 row.pack(fill="x", padx=16, pady=(3, 0))
                 tk.Label(row, text=label, font=("Segoe UI", 8), fg="#6b7280",
                          width=9, anchor="w").pack(side="left")
@@ -313,35 +330,117 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str],
             # 图片"，抛 `TclError: image "pyimage2" doesn't exist`，窗口弹不
             # 出来（2026-10-24 实测：连点两次必现）。
             photo = ImageTk.PhotoImage(img, master=root)
-
-            tk.Label(root, image=photo).pack(padx=16, pady=(16, 8))
+            qr_label = tk.Label(root, image=photo)
+            qr_label.pack(padx=16, pady=(16, 8))
             # 保持引用：PhotoImage 被 GC 后窗口里就是一片空白
             root._qr_photo = photo            # type: ignore[attr-defined]
 
+            # 刷新会换掉码（连着 URL 一起换），所以"当前是哪个码"必须存在
+            # 变量里而不是闭包里绑死 —— 否则点一下刷新，复制按钮还给你旧的。
+            state = {"code": code, "url": url}
+
             code_row = tk.Frame(root)
             code_row.pack(pady=(0, 4))
-            big = tk.Label(code_row, text=code, font=("Segoe UI", 30, "bold"),
-                           cursor="hand2")
-            big.pack(side="left")
-            big.bind("<Button-1>", lambda _e: _copy(code, "配对码"))
+            code_label = tk.Label(code_row, text=code, font=("Segoe UI", 30, "bold"),
+                                  cursor="hand2")
+            code_label.pack(side="left")
+            code_label.bind("<Button-1>", lambda _e: _copy(state["code"], "配对码"))
             tk.Button(code_row, text="复制码", font=("Segoe UI", 8),
-                      command=lambda: _copy(code, "配对码")).pack(side="left", padx=(10, 0))
+                      command=lambda: _copy(state["code"], "配对码")).pack(side="left", padx=(10, 0))
             tk.Label(root, text="在手机上扫码，或手动输入上面 6 位数字",
                      font=("Segoe UI", 10)).pack()
 
             # 地址不是给人"抄"的，是给人"点"的：一行一个入口，
             # 双击或按「打开」直接在浏览器里跑起来，按「复制」进剪贴板。
             tk.Frame(root, height=6).pack()
-            for i, (label, u) in enumerate(_entry_rows(url, alt_urls)):
-                _url_row(label, u, primary=(i == 0))
-            if len(ips) > 1:
-                others = "  ".join(f"http://{ip}" for ip in ips[1:])
-                tk.Label(root, text=f"其他网卡：{others}", font=("Segoe UI", 8),
-                         fg="#9ca3af", wraplength=420).pack(padx=16, pady=(4, 0))
+            rows_holder = tk.Frame(root)
+            rows_holder.pack(fill="x")
+            ips_label = tk.Label(root, text="", font=("Segoe UI", 8),
+                                 fg="#9ca3af", wraplength=420)
+            ips_label.pack(padx=16, pady=(4, 0))
 
-            tk.Label(root, text="配对码 5 分钟内有效，过期后重新生成",
-                     font=("Segoe UI", 8), fg="#9ca3af").pack(pady=(6, 0))
+            def _paint_rows(u: str, alts: list[str] | None) -> None:
+                for child in rows_holder.winfo_children():
+                    child.destroy()
+                for i, (label, addr) in enumerate(_entry_rows(u, alts)):
+                    _url_row(rows_holder, label, addr, primary=(i == 0))
+
+            def _paint_ips(ips_now: list[str]) -> None:
+                others = "  ".join(f"http://{ip}" for ip in ips_now[1:])
+                ips_label.configure(text=f"其他网卡：{others}" if others else "")
+
+            _paint_rows(url, alt_urls)
+            _paint_ips(ips)
+
+            status = tk.Label(root, text="", font=("Segoe UI", 8), fg="#b45309")
+            status.pack(pady=(6, 0))
+
+            def _apply(res: Any) -> None:
+                refresh_btn.configure(state="normal", text="刷新二维码和配对码")
+                if res is None:
+                    status.configure(text="刷新失败，详见 data/logs/agent.log")
+                    return
+                new_code, new_url, new_ips, new_alts = res
+                state["code"], state["url"] = new_code, new_url
+                code_label.configure(text=new_code)
+                try:
+                    new_photo = ImageTk.PhotoImage(_qr_pil_image(new_url), master=root)
+                    qr_label.configure(image=new_photo)
+                    # 旧图必须被引用到新图之后才能放手，否则中间会有
+                    # 一帧白框（Tk 会立刻回收已无引用的 PhotoImage）
+                    root._qr_photo = new_photo    # type: ignore[attr-defined]
+                except Exception:       # noqa: BLE001
+                    log.warning("刷新二维码图片失败", exc_info=True)
+                _paint_rows(new_url, new_alts)
+                _paint_ips(new_ips)
+                status.configure(text=f"已刷新 {time.strftime('%H:%M:%S')}，"
+                                      f"旧码立即失效（新码 5 分钟内有效）")
+                try:
+                    root.update_idletasks()
+                except Exception:       # noqa: BLE001
+                    pass
+
+            def _refresh() -> None:
+                if refetch is None:
+                    status.configure(text="这个窗口没有提供刷新入口")
+                    return
+                refresh_btn.configure(state="disabled", text="正在刷新…")
+                status.configure(text="")
+                log.info("用户手动刷新二维码与配对码")
+
+                def _work() -> None:
+                    try:
+                        res = refetch()
+                    except Exception:       # noqa: BLE001
+                        log.exception("刷新配对码失败")
+                        res = None
+                    try:
+                        # Tk 只能在自己的线程里碰，回主循环去改控件
+                        root.after(0, lambda: _apply(res))
+                    except Exception:       # noqa: BLE001
+                        pass                # 窗口已经关了，改不了就算了
+
+                threading.Thread(target=_work, name="photobridge-qr-refresh",
+                                 daemon=True).start()
+
+            refresh_btn = tk.Button(root, text="刷新二维码和配对码",
+                                    font=("Segoe UI", 9), command=_refresh)
+            refresh_btn.pack(pady=(8, 0))
+            tk.Label(root, text="配对码 5 分钟内有效；想换一个就点上面的刷新",
+                     font=("Segoe UI", 8), fg="#9ca3af").pack(pady=(2, 0))
+
             tk.Button(root, text="关闭", width=12, command=root.destroy).pack(pady=12)
+
+            if on_ready is not None:
+                on_ready({
+                    "root": root,
+                    "qr_label": qr_label,
+                    "code_label": code_label,
+                    "refresh_btn": refresh_btn,
+                    "status": status,
+                    "state": state,
+                    "_refresh": _refresh,
+                })
 
             root.update_idletasks()
             # 居中
@@ -586,8 +685,17 @@ class TrayController:
             notify_error("生成配对码失败，详见 data/logs/agent.log")
             return
         code, url, ips = got
+
+        def _refetch() -> tuple[str, str, list[str], list[str]] | None:
+            """窗口里点「刷新」时重新生成一枚码（顺带重算入口地址）。"""
+            again = self._new_pair_code()
+            if again is None:
+                return None
+            new_code, new_url, new_ips = again
+            return new_code, new_url, new_ips, (self._alt_urls_for(new_url) or [])
+
         _show_qr_window("PhotoBridge 配对", url, code, ips,
-                        self._alt_urls_for(url) or None)
+                        self._alt_urls_for(url) or None, refetch=_refetch)
 
     def _has_paired_device(self) -> bool:
         """是否已经有手机配对过（未撤销的）。"""
