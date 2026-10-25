@@ -206,6 +206,29 @@ def _entry_rows(url: str, alt_urls: list[str] | None) -> list[tuple[str, str]]:
     return rows
 
 
+def _make_url_entry(root: Any, url: str, *, primary: bool) -> Any:
+    """造一个"内容已经在里面、但用户改不了"的地址框。
+
+    ★ 顺序不能反：`tk.Entry(state="readonly")` 之后再 `insert()` 会被
+    **静默丢弃** —— 窗口照样弹出来，只是每条地址都是空白的（2026-10-26
+    实测踩到，用户看到的就是"扫码地址被屏蔽了"）。所以先 insert，再
+    `configure(state="readonly")`，并且宽度按地址长度算，免得长地址被截。
+    """
+    import tkinter as tk
+
+    ent = tk.Entry(
+        root,
+        font=("Consolas", 8),
+        relief="flat",
+        readonlybackground="#f8fafc",
+        fg="#2563eb" if primary else "#059669",
+        width=max(24, min(len(url) + 2, 78)),
+    )
+    ent.insert(0, url)
+    ent.configure(state="readonly")
+    return ent
+
+
 def _show_qr_window(title: str, url: str, code: str, ips: list[str],
                     alt_urls: list[str] | None = None) -> None:
     """弹出一个二维码窗口（阻塞直到用户关闭）。
@@ -272,10 +295,7 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str],
                          width=9, anchor="w").pack(side="left")
                 # 用只读 Entry 而不是 Label：用户能点进去 Ctrl+A/Ctrl+C，
                 # 也能整段选中看一眼自己复制的是什么。
-                ent = tk.Entry(row, font=("Consolas", 8), state="readonly",
-                               readonlybackground="#f8fafc", relief="flat",
-                               fg="#2563eb" if primary else "#059669", width=30)
-                ent.insert(0, u)
+                ent = _make_url_entry(row, u, primary=primary)
                 ent.pack(side="left", fill="x", expand=True, ipady=2)
                 ent.bind("<Button-1>", lambda _e, w=ent: w.select_range(0, "end"))
                 ent.bind("<Double-Button-1>", lambda _e, x=u: _open(x))
