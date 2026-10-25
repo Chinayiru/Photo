@@ -182,6 +182,30 @@ def _qr_pil_image(data: str, *, box: int = 8, border: int = 3) -> Any:
 _QR_OPEN = threading.Event()
 
 
+def _entry_rows(url: str, alt_urls: list[str] | None) -> list[tuple[str, str]]:
+    """二维码窗口里要列出来的入口地址：`[(标签, 地址), ...]`。
+
+    二维码只能编**一个**地址，而云端入口与局域网入口是两个不同的 origin，
+    各自有独立的 localStorage 与 cookie —— 用户想在家直连，就得手动打开
+    局域网那条地址单独配一次。所以窗口里必须把几条地址都**列出来**，
+    并且能一键复制、一键打开（光显示成一行灰字，用户还得手抄一遍，
+    实测真的会抄错）。
+
+    去重按字符串精确比较：`http://a` 与 `http://a/` 视为两条是刻意的，
+    后者会被浏览器当成同一个 origin，但混进来只会让窗口变长，
+    所以调用方传进来的应当是规范化的地址。
+    """
+    rows: list[tuple[str, str]] = [("扫码地址", url)]
+    seen = {url}
+    for u in (alt_urls or []):
+        u = (u or "").strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        rows.append(("在家直连" if len(rows) == 1 else "其他入口", u))
+    return rows
+
+
 def _show_qr_window(title: str, url: str, code: str, ips: list[str],
                     alt_urls: list[str] | None = None) -> None:
     """弹出一个二维码窗口（阻塞直到用户关闭）。
@@ -222,6 +246,45 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str],
             root.resizable(False, False)
             root.attributes("-topmost", True)
 
+            def _copy(text: str, what: str) -> None:
+                """复制到剪贴板，并让按钮闪一下"已复制"。
+
+                用 tkinter 自己的剪贴板而不是 `subprocess(\"clip\")`：
+                这里本来就有 Tk 解释器，省掉一次进程创建，也不会闪黑框。
+                """
+                try:
+                    root.clipboard_clear()
+                    root.clipboard_append(text)
+                    # 不 update 的话，有的系统在窗口销毁前读不到内容
+                    root.update_idletasks()
+                    log.info("已复制%s：%s", what, text)
+                except Exception:       # noqa: BLE001
+                    log.warning("复制%s失败", what, exc_info=True)
+
+            def _open(u: str) -> None:
+                log.info("从二维码窗口打开：%s", u)
+                _open_path(u)
+
+            def _url_row(label: str, u: str, *, primary: bool) -> None:
+                row = tk.Frame(root)
+                row.pack(fill="x", padx=16, pady=(3, 0))
+                tk.Label(row, text=label, font=("Segoe UI", 8), fg="#6b7280",
+                         width=9, anchor="w").pack(side="left")
+                # 用只读 Entry 而不是 Label：用户能点进去 Ctrl+A/Ctrl+C，
+                # 也能整段选中看一眼自己复制的是什么。
+                ent = tk.Entry(row, font=("Consolas", 8), state="readonly",
+                               readonlybackground="#f8fafc", relief="flat",
+                               fg="#2563eb" if primary else "#059669", width=30)
+                ent.insert(0, u)
+                ent.pack(side="left", fill="x", expand=True, ipady=2)
+                ent.bind("<Button-1>", lambda _e, w=ent: w.select_range(0, "end"))
+                ent.bind("<Double-Button-1>", lambda _e, x=u: _open(x))
+                ent.bind("<Return>", lambda _e, x=u: _open(x))
+                tk.Button(row, text="打开", width=5, font=("Segoe UI", 8),
+                          command=lambda x=u: _open(x)).pack(side="left", padx=(4, 0))
+                tk.Button(row, text="复制", width=5, font=("Segoe UI", 8),
+                          command=lambda x=u: _copy(x, "地址")).pack(side="left", padx=(4, 0))
+
             img = _qr_pil_image(url)
             # ★ 必须显式给 `master`：不给的话 `ImageTk.PhotoImage` 会挂到
             # `tkinter._default_root` 上，而那个全局变量指向上一次创建的
@@ -235,26 +298,26 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str],
             # 保持引用：PhotoImage 被 GC 后窗口里就是一片空白
             root._qr_photo = photo            # type: ignore[attr-defined]
 
-            big = tk.Label(root, text=code, font=("Segoe UI", 30, "bold"))
-            big.pack(pady=(0, 4))
+            code_row = tk.Frame(root)
+            code_row.pack(pady=(0, 4))
+            big = tk.Label(code_row, text=code, font=("Segoe UI", 30, "bold"),
+                           cursor="hand2")
+            big.pack(side="left")
+            big.bind("<Button-1>", lambda _e: _copy(code, "配对码"))
+            tk.Button(code_row, text="复制码", font=("Segoe UI", 8),
+                      command=lambda: _copy(code, "配对码")).pack(side="left", padx=(10, 0))
             tk.Label(root, text="在手机上扫码，或手动输入上面 6 位数字",
                      font=("Segoe UI", 10)).pack()
 
-            tk.Label(root, text=url, font=("Consolas", 9),
-                     fg="#2563eb", wraplength=380).pack(pady=(8, 2), padx=16)
+            # 地址不是给人"抄"的，是给人"点"的：一行一个入口，
+            # 双击或按「打开」直接在浏览器里跑起来，按「复制」进剪贴板。
+            tk.Frame(root, height=6).pack()
+            for i, (label, u) in enumerate(_entry_rows(url, alt_urls)):
+                _url_row(label, u, primary=(i == 0))
             if len(ips) > 1:
                 others = "  ".join(f"http://{ip}" for ip in ips[1:])
                 tk.Label(root, text=f"其他网卡：{others}", font=("Segoe UI", 8),
-                         fg="#6b7280", wraplength=380).pack(padx=16)
-            # 备选入口（二维码编云端地址时，这里就是局域网直连地址）。
-            # 必须明文显示而不能藏在二维码里：两个 origin 各自独立配对，
-            # 用户想在家里直连就得手动打开一次这个地址。
-            alt = [u for u in (alt_urls or []) if u and u != url]
-            if alt:
-                tk.Label(root, text="在家直连（更快，需单独配一次）：",
-                         font=("Segoe UI", 8), fg="#6b7280").pack(pady=(6, 0))
-                tk.Label(root, text="\n".join(alt), font=("Consolas", 8),
-                         fg="#059669", wraplength=380).pack(padx=16)
+                         fg="#9ca3af", wraplength=420).pack(padx=16, pady=(4, 0))
 
             tk.Label(root, text="配对码 5 分钟内有效，过期后重新生成",
                      font=("Segoe UI", 8), fg="#9ca3af").pack(pady=(6, 0))
