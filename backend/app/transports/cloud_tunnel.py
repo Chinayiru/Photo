@@ -122,9 +122,87 @@ def _clean_path(raw: Any) -> str:
         raise _PathRejected("path 含 ..")
     # 只允许 /api/** ：/panel/** 是电脑本机才有的面板，静态资源不在隧道上
     # 承载（前端由云端自己发，见 cloud/relay/main.py）。
+    #
+    # 另放行**一条**精确路径 `/.pb/control`：云端 → 电脑端的内部控制面
+    # （签发令牌、验签、立即撤销，见 backend/app/control.py）。手机够不到它
+    # ——云端给手机的路由前缀是 `/d/<id>/api/…`，`/` 开头的新段进不来。
+    if raw == _CONTROL_PATH:
+        return raw
     if not (raw == "/api" or raw.startswith("/api/")):
         raise _PathRejected(f"path 不在 /api 下：{raw!r}")
     return raw
+
+
+_CONTROL_PATH = "/.pb/control"
+
+
+async def _handle_control(mux: Any, rid: int, req: Any, state: Any,
+                          cfg: Any) -> None:
+    """处理 `POST /.pb/control`（`backend/app/control.py`）。
+
+    ★ 这里**不查路由表**：控制通道是隧道内部协议的一部分，不该出现在
+    HTTP 路由里（出现在路由里就意味着"某个中间件忘了拦"会把它暴露给
+    手机）。先把请求体读净、再一次性回一个完整 JSON —— 控制消息都很小，
+    没有流式必要，反倒是流式更容易漏掉 `res_end` 而挂住云端。
+    """
+    from .. import control as control_mod
+
+    if str(req.head.get("method") or "").upper() != "POST":
+        await _send_control(mux, rid, 405, {"ok": False, "code": "E5001",
+                                            "message": "控制通道只接受 POST"})
+        return
+
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        async for chunk in req.iter_body():
+            total += len(chunk)
+            if total > control_mod.MAX_BODY:
+                await _send_control(mux, rid, 413, {"ok": False, "code": "E5002",
+                                                    "message": "控制请求体过大"})
+                return
+            chunks.append(bytes(chunk))
+    except Exception as exc:        # noqa: BLE001 - 读体失败只回报，不抛
+        await _send_control(mux, rid, 400, {"ok": False, "code": "E5001",
+                                            "message": f"读请求体失败：{exc}"})
+        return
+
+    try:
+        action, payload = control_mod.parse_request(b"".join(chunks))
+        result = control_mod.handle(state, cfg, action, payload)
+    except control_mod.ControlError as exc:
+        await _send_control(mux, rid, exc.status,
+                            {"ok": False, "code": exc.code, "message": exc.message})
+        return
+    except Exception as exc:        # noqa: BLE001
+        # ★ 绝不把异常原文回给云端：控制通道的错误信息里可能出现本地路径。
+        # 完整堆栈进本地日志，云端只看到类型名。
+        import logging
+
+        logging.getLogger("pb.control").exception("控制动作失败")
+        await _send_control(mux, rid, 500, {"ok": False, "code": "E5000",
+                                            "message": f"控制动作失败：{type(exc).__name__}"})
+        return
+
+    body = dict(result or {})
+    body.setdefault("ok", True)
+    await _send_control(mux, rid, 200, body)
+
+
+async def _send_control(mux: Any, rid: int, status: int,
+                        obj: dict[str, Any]) -> None:
+    """把控制响应写成一帧完整响应。"""
+    import json as _json
+
+    data = _json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    try:
+        await mux.res_head(rid, status,
+                           {"content-type": "application/json; charset=utf-8"},
+                           body_len=len(data))
+        await mux.res_body(rid, data)
+        await mux.res_end(rid)
+    except Exception:               # noqa: BLE001 - 对端已断：无处可报
+        pass
 
 
 class _PathRejected(Exception):
@@ -171,6 +249,10 @@ class TunnelDispatcher:
         """处理一个 `InboundRequest`（`shared.mux` 的回调）。"""
         head = req.head
         rid = req.req_id
+        raw_path = head.get("path")
+        if isinstance(raw_path, str) and raw_path == _CONTROL_PATH:
+            await _handle_control(mux, rid, req, self.router.app, self.cfg)
+            return
         try:
             path, query = _split_path_query(_clean_path(head.get("path")))
         except _PathRejected as exc:

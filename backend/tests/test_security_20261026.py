@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -42,6 +43,13 @@ def local(tmp_path):
     )
     db = Database(tmp_path / "test.db")
     db.init()
+    # 本文件用的是"旧密钥签的令牌"（`sha256(agent_token)`）。2026-10-26 起
+    # 那条路默认关闭（ISSUE-049），这里显式开一个窗口，让本文件继续测它
+    # 真正关心的事：撤销能不能挡住请求。
+    db.execute(
+        "INSERT INTO devices(id, name, created_at, revoked, allow_legacy_until)"
+        " VALUES (?, '老手机', ?, 0, ?)",
+        ("b" * 16, time.time(), time.time() + 86400))
     st = AppState(cfg=cfg, db=db)
     router = Router(app=st)
     router.use(auth.auth_middleware)
@@ -243,7 +251,9 @@ def test_revocation_across_real_http_and_websocket_tunnel(tmp_path, scenario):
                     token=rig.account_token,
                 )
                 assert status == 204
-                assert auth.sync_revoked_clients(rig.state, [rig.client_id]) >= 1
+                # 即时推送（ISSUE-049）可能已经把它标成 revoked，
+                # 所以这里的轮询返回值只要求"是整数"。
+                assert auth.sync_revoked_clients(rig.state, [rig.client_id]) >= 0
                 replay = token
             for url, path in [
                 (rig.lan, "/api/timeline"),
