@@ -33,6 +33,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from ..relay import netutil, security
+from ..relay.body import RequestBodyTooLarge, read_json_object
 from ..relay.db import CloudDB
 from ..relay.limiter import RateLimiter
 from ..relay.reply import json_error, json_reply, no_content
@@ -133,7 +134,10 @@ async def login(request: Request, db: CloudDB) -> Response:
         return json_error("E4001", request_id=_rid(request),
                           retry_after=max(1, int(retry)))
 
-    body = await _json_object(request)
+    try:
+        body = await _json_object(request)
+    except RequestBodyTooLarge:
+        return json_error("E1006", request_id=_rid(request))
     if body is None:
         return json_error("E1001", message="请求体必须是 JSON 对象",
                           request_id=_rid(request))
@@ -313,16 +317,4 @@ async def _json_object(request: Request) -> dict[str, Any] | None:
     `text/plain`（为了避开 CORS 预检），而这里拒掉它只会让某些前端
     莫名其妙地 400。安全边界不在 Content-Type 上，而在随后的字段校验。
     """
-    import json
-
-    try:
-        raw = await request.body()
-    except Exception:       # noqa: BLE001
-        return None
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-    except (ValueError, UnicodeDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
+    return await read_json_object(request)

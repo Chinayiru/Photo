@@ -215,10 +215,23 @@ def test_relay_root_account_login_sources() -> None:
     assert "applyPaired(r, `${origin}/d/${deviceId}`)" in pair_fn, (
         "首页配完要把基址锚到设备页，否则刷新后设备 id 丢了")
 
-    # 3) 视图：账号区按 showAccount 显示；配对码与"连接电脑"只在设备页
-    assert "const showAccount = computed(() => cloudPage.value || relayRoot.value)" in view
-    assert '<template v-if="showAccount">' in view
-    assert '<label v-if="!relayRoot" class="field">' in view
-    assert 'v-if="!relayRoot"\n        class="btn primary block lg"' in view
-    assert 'v-if="relayRoot && accountDevices.length"' in view, "首页要能列电脑"
-    assert "pairAccountDevice(id, accountToken.value)" in view
+    # 3) 视图：入口（局域网/云端）× 登录方式（配对码/账号）两组切换
+    #
+    # 2026-10-26 起配对页是四个组合，不再有 `showAccount` 这个总开关：
+    # 原来"云端/中继首页才给账号入口"的写法被"进入方式"开关取代。断言跟着
+    # 实现走，但守的还是同一条语义——两组开关都在、且各自只控制自己那一块。
+    assert 'v-if="codeAvailable && accountAvailable"' in view, "两组都能用时才出现切换"
+    assert 'role="tablist" aria-label="登录方式"' in view
+    assert '@click="mode = \'code\'"' in view
+    assert '@click="mode = \'account\'"' in view
+    assert "entry = 'lan'" in view, "进入方式：局域网"
+    assert "entry = 'cloud'" in view, "进入方式：云端"
+    assert '<template v-if="accountAvailable && mode === \'account\'">' in view
+    # 配对码区只在"配对码"模式下出现（两种入口都要能填码）
+    assert 'v-if="codeAvailable && mode === \'code\'" class="field"' in view
+    # 云端入口用配对码时，必须多一个"云端链接"输入框，否则不知道连哪台电脑
+    assert "codeAvailable && mode === 'code' && entry === 'cloud' && !cloudPage" in view
+    assert 'v-if="relayRoot && accountDevices.length"' in view, "中继首页要能列电脑"
+    # 账号配对的落地调用：中继首页列电脑时点哪台配哪台（第三个参数是基址）
+    assert "pairAccountDevice(id, accountToken.value, resolvedAccountBase.value)" in view
+    assert "chooseAccountDevice(d.id)" in view

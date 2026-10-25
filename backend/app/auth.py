@@ -638,6 +638,11 @@ def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
     exp = float(claims["exp"])
     now = time.time()
     try:
+        local = db.query_one(
+            "SELECT revoked, expires_at FROM devices WHERE id = ?", (client_id,))
+        if local is not None and (local["revoked"] or (
+                local["expires_at"] is not None and local["expires_at"] <= now)):
+            return None
         _ensure_cloud_table(db)
         # ★ 撤销标记必须被 `DO UPDATE` 保留。
         #
@@ -670,6 +675,7 @@ def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
         )
     except Exception as e:  # noqa: BLE001 —— 缓存写失败不该让请求 500
         log.debug("写入云端令牌缓存失败 client_id=%s: %s", client_id, e)
+        return None
 
     # 云端已撤销的令牌不能再放行。缓存行被 `sync_revoked_clients()`
     # 打了 `expires_at=0`，这里一次主键查询就够（比再算一遍 HMAC 便宜）。
@@ -678,9 +684,10 @@ def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
         row = db.query_one(
             f"SELECT expires_at FROM {_CLOUD_TOKEN_TABLE} WHERE client_id = ?",
             (client_id,))
-    except Exception:  # noqa: BLE001 —— 表刚建/并发建，退化为"按令牌判"
-        row = None
-    if row is not None and float(row["expires_at"] or 0) <= now:
+    except Exception:  # noqa: BLE001 —— 撤销状态不可用时拒绝访问
+        log.warning("无法确认云端令牌撤销状态，拒绝访问 client_id=%s", client_id)
+        return None
+    if row is None or float(row["expires_at"] or 0) <= now:
         return None
 
     return {"id": client_id, "name": name, "cloud": True, "expires_at": exp}
@@ -710,6 +717,10 @@ def sync_revoked_clients(st: Any, revoked_ids: list[str],
     """
     if not revoked_ids:
         return 0
+    from .tunnel import cloud_device_id
+
+    device_id = cloud_device_id(st.cfg, st.device_id)
+    now = time.time()
     _ensure_cloud_table(st.db)
     n = 0
     for cid in revoked_ids:
@@ -717,9 +728,12 @@ def sync_revoked_clients(st: Any, revoked_ids: list[str],
         if not key:
             continue
         n += int(st.db.execute_rowcount(
-            f"UPDATE {_CLOUD_TOKEN_TABLE} SET expires_at = 0"
-            " WHERE client_id = ? AND (expires_at IS NULL OR expires_at > 0)",
-            (key,)))
+            f"INSERT INTO {_CLOUD_TOKEN_TABLE}"
+            " (client_id, device_id, expires_at, created_at) VALUES (?, ?, 0, ?)"
+            " ON CONFLICT(client_id) DO UPDATE SET expires_at = 0"
+            f" WHERE {_CLOUD_TOKEN_TABLE}.expires_at IS NULL"
+            f" OR {_CLOUD_TOKEN_TABLE}.expires_at > 0",
+            (key, device_id, now)))
         # 幂等：已经 revoked 的行不重复计数（rowcount 只数真正改到的行）。
         n += int(st.db.execute_rowcount(
             "UPDATE devices SET revoked = 1 WHERE id = ? AND revoked = 0",
@@ -857,6 +871,9 @@ def is_loopback(ctx: Ctx) -> bool:
     而它端出的是配对数、设备清单与审计日志。判不准的时候要拒绝，
     不是放行。
     """
+    # 隧道中的 IP 是远端元数据，不能授予本机管理权限。
+    if getattr(ctx, "via", "lan") != "lan":
+        return False
     ip = (ctx.client_ip or "").strip().lower()
     if ip.startswith("::ffff:"):
         ip = ip[7:]
