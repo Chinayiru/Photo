@@ -68,6 +68,7 @@ from starlette.responses import Response
 from ..relay import netutil, security
 from ..relay.auth import require_account
 from ..relay.db import CloudDB
+from ..relay.body import RequestBodyTooLarge, read_json_object
 from ..relay.devices import find_device_by_agent_token
 from ..relay.reply import json_error, json_reply
 from shared import client_token as shared_token
@@ -190,7 +191,10 @@ async def redeem_pair_code(request: Request, db: CloudDB,
     if int(device["revoked"] or 0):
         return json_error("E2006", request_id=_rid(request))
 
-    body = await _json_object(request)
+    try:
+        body = await _json_object(request)
+    except RequestBodyTooLarge:
+        return json_error("E1006", request_id=_rid(request))
     if body is None:
         return json_error("E1001", message="请求体必须是 JSON 对象",
                           request_id=_rid(request))
@@ -550,16 +554,4 @@ def _rid(request: Request) -> str:
 
 
 async def _json_object(request: Request) -> dict[str, Any] | None:
-    import json
-
-    try:
-        raw = await request.body()
-    except Exception:       # noqa: BLE001
-        return None
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-    except (ValueError, UnicodeDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
+    return await read_json_object(request)

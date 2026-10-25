@@ -27,12 +27,12 @@
 * 于是 `key = sha256(agent_token)` 电脑端能算（对明文做一次 sha256），
   云端手上就有（那一列就是）。
 
-安全性没有下降：云端数据库泄露时攻击者已经拿着 `agent_token` 的哈希
-**直接冒充电脑**（云端比对的就是哈希），能读到这台机器的全部照片；
-能否伪造客户端令牌在这个前提下不改变任何后果。反过来，电脑端拿到
-令牌后仍然只信自己算出来的 `device_id`（`dev` claim），所以一枚为
-设备 A 签发的令牌在设备 B 上无效——这正是 `docs/04` §1.2 要求的
-"必须同时校验令牌绑定的 device_id == 路径里的"。
+信任边界：云端数据库中的这一列同时也是客户端令牌的签名密钥。
+数据库泄露后，攻击者可以伪造新的客户端令牌，获得照片 API 访问权。
+哈希本身不能直接冒充电脑建立隧道，因为云端会对提交的 agent_token
+再次哈希。P1 仍把云端服务和数据库视为可信鉴权方；要抵抗云端被攻破，
+需要另行设计本机授权与端到端鉴权，不能仅靠这份 HMAC 实现。
+电脑端仍校验 `device_id`（`dev` claim），设备 A 的令牌在设备 B 上无效。
 
 ## 为什么不用 JWT 库
 
@@ -98,7 +98,11 @@ def _b64d(text: str) -> bytes:
     """补回填充再解。非法 base64 抛 `ValueError`（调用方一律当验签失败）。"""
     pad = "=" * (-len(text) % 4)
     try:
-        return _UNB64((text + pad).encode("ascii"))
+        raw = _UNB64((text + pad).encode("ascii"))
+        # 同一签名只能有一种文本表示；否则可改变 token_hash，绕开撤销记录。
+        if _b64e(raw) != text:
+            raise ValueError("non-canonical base64")
+        return raw
     except (binascii.Error, UnicodeEncodeError, ValueError) as exc:
         raise ValueError("bad base64") from exc
 

@@ -244,6 +244,7 @@ class LocalHttpTransport(ServerTransport):
             # 本代际，用来挑针对性的漏洞利用最省事。安全测试里它是唯一
             # 自报家门的指纹。
             server_header=False,
+            proxy_headers=False,
             # 不用 uvicorn 的 reload/workers —— 我们是单进程带托盘的程序，
             # 多 worker 会让内存里的索引器状态分裂成多份。
             lifespan="off",
