@@ -331,8 +331,28 @@ export const currentPreviewUrl = computed<string>(() => {
   // （p{size}-{int(mtime)}-{int(size)}），所以用 mtime+size 自己拼版本串，
   // 效果等价：源文件一变，v 就变。
   const v = `p${s.detail.mtime}-${s.detail.size}`;
-  return previewUrl(s.detail.id, v, 1600);
+  return previewUrl(s.detail.id, v, previewSize());
 });
+
+/**
+ * 按屏幕该要多大档位的预览。
+ *
+ * 1600 px 的预览约 450 KB，而手机屏幕物理宽度通常只有 1080 px —— 多出来
+ * 的像素看不见，却要走家里那条 2 Mbps 的上行，等于白等 1 秒多。这里取
+ * 「屏幕长边物理像素」，向上取到最近的可用档位（640 / 1024 / 1600）。
+ *
+ * ★ 只影响**取哪一档**，不影响"放大才用原图"那条约束：档位再准也只是
+ *   预览，1.5× 以上照样切原图。
+ */
+export function previewSize(): number {
+  const dpr = window.devicePixelRatio || 1;
+  const longEdge = Math.max(window.screen?.width ?? 0, window.screen?.height ?? 0);
+  const need = longEdge * dpr;
+  for (const s of [640, 1024, 1600]) {
+    if (need <= s) return s;
+  }
+  return 1600;
+}
 
 /** 加载大图时的低清占位（320 缩略图先顶上，避免白屏）。 */
 export const currentThumbUrl = computed<string>(() => {

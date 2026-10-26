@@ -83,6 +83,13 @@ MAX_LIMIT = 500
 DEFAULT_LIMIT = 100
 PLACEHOLDER_SIZE = 320
 
+#: 预览接口额外接受的档位（除配置里的 `thumbs.sizes` 之外）。
+#:
+#: 手机屏幕物理宽度多在 1080 px 上下，1600 px 那份对它是**多出来的像素**：
+#: 450 KB 和 200 KB 在 2 Mbps 的上行上差 1 秒多，而画质用户分辨不出来。
+#: 640 给的是"小窗/横屏"档，320 用来复用缩略图已经生成的缓存。
+_PREVIEW_EXTRA_SIZES = (320, 640, 1024, 1600)
+
 #: 兜底缩略图解码用的**单线程**池（没有 ThumbEngine 时才会用到）。
 #:
 #: ★ 原来这里传的是 `run_in_executor(None, ...)`，也就是 asyncio 的默认
@@ -421,13 +428,21 @@ async def get_preview(ctx: Ctx) -> Reply:
     预览图**按需生成但不写回 DB 的 thumb_state**：1600 是"用户点开了这张"
     的信号，不是批量后台任务；把它计入 thumb_state 会让重扫时的
     "待生成"数量与用户预期不符。
+
+    ## 为什么要能选尺寸（在外面用的时候）
+
+    1600 px 的预览约 450 KB。走家里那条 2 Mbps 的上行，手机要等约 1.8 秒；
+    而手机屏幕物理宽度普遍只有 1080 px，1600 那份多出来的像素用户看不见。
+    按屏幕给 1024（约 200 KB）能把等待砍一半。所以这里放开一组固定档位：
+    320 / 640 / 1024 / 1600，加上配置里声明的尺寸。
     """
     st = _st(ctx)
     db = st.db
     mid = ctx.param_int("media_id")
     sizes = st.thumb_sizes()
+    allowed = tuple(sorted(set(sizes) | set(_PREVIEW_EXTRA_SIZES)))
     default = sizes[-1] if sizes else 1600
-    size = parse_size(ctx.q("size"), sizes, name="size") if ctx.q("size") else default
+    size = parse_size(ctx.q("size"), allowed, name="size") if ctx.q("size") else default
 
     row = db.query_one(
         "SELECT id, root_id, rel_path, mtime, size, orientation, missing"
@@ -533,7 +548,7 @@ async def get_raw(ctx: Ctx) -> Reply:
     mid = ctx.param_int("media_id")
 
     row = db.query_one(
-        "SELECT id, root_id, rel_path, file_name, ext, size, missing"
+        "SELECT id, root_id, rel_path, file_name, ext, size, mtime, missing"
         "  FROM media WHERE id = ?",
         (mid,),
     )
@@ -559,6 +574,11 @@ async def get_raw(ctx: Ctx) -> Reply:
     filename = common.download_filename(
         ctx.q("name"), row["file_name"]) if download else None
 
+    # ETag 用「源文件 mtime + 字节数」：不读内容就能算，且源文件一改必然变。
+    # 手机在 5G 上重看一张 10 MB 的原图要 40 秒，而带 ETag 的复验只要
+    # 一个 20 ms 的往返 + 304（几百字节）—— 这是"同一张图看第二遍"的差别。
+    etag = f"r-{int(row['mtime'])}-{size}"
+
     try:
         rng = parse_range(ctx.header("range"), size)
     except RangeNotSatisfiable:
@@ -574,12 +594,27 @@ async def get_raw(ctx: Ctx) -> Reply:
             "Accept-Ranges": "bytes",
         }) from None
 
+    # 复验只在「整份请求」上做：带 Range 的请求要的是某一段字节，
+    # 拿 304 回它会让客户端以为那段拿到了。
+    if rng is None and not download and etag_matches(
+            ctx.header("if-none-match"), etag):
+        r = empty_reply(304)
+        r.set_etag(etag)
+        r.set_cache(0, private=True)
+        r.headers["Accept-Ranges"] = "bytes"
+        r.set("Vary", "Authorization")
+        return r
+
     if rng is None:
         r = file_reply(iter_file(src), media_type, size, 200, filename=filename)
         r.headers["Accept-Ranges"] = "bytes"
+        r.set_etag(etag)
         # 原图不做长缓存：用户可能重命名/替换，而原图的 ETag 变化
         # 不一定会触发前端刷新 URL。
+        # 但 `max-age=0` 不等于"不缓存"：带上 ETag 后浏览器会走
+        # `If-None-Match` 复验，命中就是 304 —— 不再重下 10 MB。
         r.set_cache(0, private=True)
+        r.set("Vary", "Authorization")
         _apply_disposition(r, filename, download=download)
         return r
 
@@ -588,7 +623,9 @@ async def get_raw(ctx: Ctx) -> Reply:
                    media_type, range_length(rng), 206, filename=filename,
                    headers={"Content-Range": content_range_header(rng, size)})
     r.headers["Accept-Ranges"] = "bytes"
+    r.set_etag(etag)
     r.set_cache(0, private=True)
+    r.set("Vary", "Authorization")
     _apply_disposition(r, filename, download=download)
     return r
 

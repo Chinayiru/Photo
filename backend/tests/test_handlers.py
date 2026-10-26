@@ -1573,3 +1573,69 @@ async def _index_all(st: AppState) -> None:
     from app.indexer import Indexer
 
     await Indexer(st.cfg, st.db).scan_root(st.cfg.root_by_id("library"))
+
+
+# --------------------------------------------------------------------------
+# /raw 的条件请求（ETag + 304）
+#
+# 场景：在外面用 5G 看一张 10 MB 的原图，第一次要 40 秒。第二次看同一张时
+# 浏览器手里已经有字节了，只要服务端给出 ETag，它只需发一个 `If-None-Match`
+# 复验 —— 命中就 304（几百字节、一个往返），不必把 10 MB 再走一遍上行。
+#
+# 这条链路上"上行只有 2 Mbps"是硬约束，所以"不发第二次"比"发得更快"重要。
+# --------------------------------------------------------------------------
+
+def test_raw_returns_etag_and_answers_if_none_match_with_304(tmp_path, library) -> None:
+    st = _state(tmp_path, library)
+    ids = _seed(st, library)
+    mid = ids[0]
+
+    r1 = _call(st, "GET", f"/api/items/{mid}/raw", params={"media_id": str(mid)})
+    assert r1.status == 200
+    etag = r1.headers.get("ETag")
+    assert etag, "原图必须带 ETag，否则每次重看都要重下整张"
+    _body(r1)  # 消费掉流，模拟真实读完
+
+    # 复验：带回来同一个 ETag → 304，且**没有正文**
+    r2 = _call(st, "GET", f"/api/items/{mid}/raw",
+               headers={"If-None-Match": etag}, params={"media_id": str(mid)})
+    assert r2.status == 304, f"同一张原图复验应当 304，实际 {r2.status}"
+    assert _body(r2) == b""
+    assert r2.headers.get("ETag") == etag
+
+
+def test_raw_range_request_is_never_answered_with_304(tmp_path, library) -> None:
+    """带 Range 的请求要的是"某一段字节"，回 304 会让客户端以为那段拿到了。"""
+    st = _state(tmp_path, library)
+    ids = _seed(st, library)
+    mid = ids[0]
+
+    etag = _call(st, "GET", f"/api/items/{mid}/raw",
+                 params={"media_id": str(mid)}).headers["ETag"]
+    r = _call(st, "GET", f"/api/items/{mid}/raw",
+              headers={"Range": "bytes=0-15", "If-None-Match": etag},
+              params={"media_id": str(mid)})
+    assert r.status == 206, f"Range + If-None-Match 必须给 206，实际 {r.status}"
+    assert len(_body(r)) == 16
+
+
+def test_raw_etag_changes_when_the_source_file_changes(tmp_path, library) -> None:
+    """照片被替换（同名覆盖）后，旧 ETag 必须失效，否则手机会一直看旧图。"""
+    st = _state(tmp_path, library)
+    ids = _seed(st, library)
+    mid = ids[0]
+    row = st.db.query_one("SELECT rel_path FROM media WHERE id=?", (mid,))
+    src = library / row["rel_path"]
+
+    etag_old = _call(st, "GET", f"/api/items/{mid}/raw",
+                     params={"media_id": str(mid)}).headers["ETag"]
+
+    # 换个内容 + 换个 mtime（真实替换至少会改其中一样）
+    _img(src, size=(120, 90), color=(10, 20, 30))
+    st.db.execute("UPDATE media SET mtime = mtime + 5, size = ? WHERE id = ?",
+                  (src.stat().st_size, mid))
+
+    r = _call(st, "GET", f"/api/items/{mid}/raw",
+              headers={"If-None-Match": etag_old}, params={"media_id": str(mid)})
+    assert r.status == 200, "源文件变了就不能再回 304（否则手机永远看旧图）"
+    assert r.headers["ETag"] != etag_old
