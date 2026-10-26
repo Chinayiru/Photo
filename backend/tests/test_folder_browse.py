@@ -334,3 +334,35 @@ def test_server_time_is_present_for_clock_skew(tmp_path) -> None:
     body = _body(_call(st, "GET", "/api/folders/media", query={"dir": "dir"}))
     assert abs(body["server_time"] - time.time()) < 60
     assert isinstance(body["tz_offset_minutes"], int)
+
+# --------------------------------------------------- 参数名与计数口径
+
+def test_folders_accepts_dir_alias_like_path(tmp_path) -> None:
+    """`?dir=` 与 `?path=` 必须等价。
+
+    两个端点（目录列表 / 层内媒体）在描述"同一层"时参数名不一致，前端一定
+    会写错一个 —— 实测踩过：前端传 `dir`，目录列表只读 `path`，于是每一层
+    都返回根层目录，点进去纹丝不动。
+    """
+    st = _state(tmp_path)
+    _seed(st)
+    a = _body(_call(st, "GET", "/api/folders", query={"path": "dir"}))
+    b = _body(_call(st, "GET", "/api/folders", query={"dir": "dir"}))
+    assert a["path"] == b["path"] == "dir"
+    assert [f["path"] for f in a["folders"]] == [f["path"] for f in b["folders"]]
+
+
+def test_folders_reports_direct_and_recursive_counts(tmp_path) -> None:
+    """`count` 递归、`direct` 直属、`files` 本层直属总数。
+
+    三个数字回答三个不同问题："这文件夹一共多少张"、"点进去这一层有多少张"、
+    "现在这一层有多少张"。少一个就必须在 UI 上猜口径。
+    """
+    st = _state(tmp_path)
+    _seed(st)
+    body = _body(_call(st, "GET", "/api/folders"))
+    assert body["files"] == 1, "根层直属 1 张（a.jpg）"
+    dirs = {f["path"]: f for f in body["folders"]}
+    assert dirs["dir"]["direct"] == 3, "dir/ 直属 3 张"
+    assert dirs["dir"]["count"] == 4, "dir/ 递归 4 张（含 sub/）"
+    assert dirs["dir"]["count"] > dirs["dir"]["direct"]

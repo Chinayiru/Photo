@@ -352,9 +352,14 @@ export interface MediaDetail {
 
 /** `GET /api/folders` → `backend/app/handlers/browse.py: folders()` */
 export interface FolderEntry {
+  /** 目录名（最后一层）。 */
   name: string;
+  /** 相对根的路径，可直接当 `dir` 回传。 */
   path: string;
+  /** 递归条目数（含所有子孙目录）。点进去看到的"本层直属"数量是 `direct`。 */
   count: number;
+  /** 本层直属条目数（不含子目录）。 */
+  direct: number;
   has_children: boolean;
   cover_id: number | null;
 }
@@ -363,7 +368,10 @@ export interface FoldersResponse {
   root: string;
   path: string;
   folders: FolderEntry[];
+  /** 子目录个数。 */
   total: number;
+  /** 当前这一层**直属**的条目数（面包屑旁的数字用它）。 */
+  files: number;
 }
 
 /** `POST /api/items/delete` → `backend/app/handlers/browse.py: delete_items()` */

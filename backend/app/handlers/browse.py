@@ -765,7 +765,10 @@ async def folders(ctx: Ctx) -> Reply:
     root = st.cfg.root_by_id(root_id, allow_disabled=False)
     assert root is not None
 
-    raw_path = ctx.q("path") or ""
+    # `dir` 优先、`path` 兼容：`/api/folders/media` 用的是 `dir`，
+    # 两个端点同一层目录却用两个参数名，前端一定会写错一个 ——
+    # 实测就踩过：前端传 `dir`，这里只读 `path`，于是永远返回根层。
+    raw_path = ctx.q("dir") or ctx.q("path") or ""
     # path 参与 SQL 前缀匹配，必须先用沙箱归一化。
     # 归一化只做形态整理（不做安全检查），所以这里还要**显式**拒绝 `..`：
     # 不拒绝的话 `path=../..` 会静默匹配不到任何目录并返回空列表，
