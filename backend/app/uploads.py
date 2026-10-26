@@ -157,7 +157,7 @@ def get_session(db: Database, upload_id: str, *, client_id: str | None = None) -
 
 
 def root_of(cfg: Config, sess: dict[str, Any]) -> RootConfig:
-    root = cfg.root_by_id(sess["root_id"])
+    root = cfg.root_by_id(sess["root_id"], allow_disabled=False)
     if root is None:
         raise AppError(E1012, "媒体根目录已被移除，上传无法继续")
     return root
@@ -342,7 +342,7 @@ def find_duplicate(
         params.append(root_id)
     sql += " ORDER BY id ASC LIMIT 4"      # 多取几条：第一条可能已不在磁盘上
     for row in db.query(sql, params):
-        root = cfg.root_by_id(row["root_id"])
+        root = cfg.root_by_id(row["root_id"], allow_disabled=False)
         if root is None:
             continue
         try:
@@ -576,9 +576,9 @@ def create_session(
 
     ext = check_extension(cfg, name)
 
-    root = cfg.root_by_id(root_id) if root_id else None
+    root = cfg.root_by_id(root_id, allow_disabled=False) if root_id else None
     if root is None:
-        root = cfg.root_by_id(cfg.default_root_id)
+        root = cfg.root_by_id(cfg.default_root_id, allow_disabled=False)
     if root is None:
         raise AppError(E1012, "尚未配置媒体根目录")
     if not root.can_write:

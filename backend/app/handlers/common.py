@@ -14,7 +14,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Sequence
 
 from ..thumbs import source_signature
 
@@ -222,16 +222,32 @@ def timeline_order(order: str | None) -> str:
 def timeline_where(*, root_id: str | None = None, ts_from: float | None = None,
                    ts_to: float | None = None, kind: str | None = None,
                    dir_prefix: str | None = None, camera: str | None = None,
-                   has_gps: bool | None = None) -> tuple[str, list[Any]]:
+                   has_gps: bool | None = None,
+                   enabled_root_ids: Sequence[str] | None = None,
+                   ) -> tuple[str, list[Any]]:
     """构造 WHERE 子句 + 参数。
 
     所有调用方共用它，是为了保证 `missing = 0 AND kind = 'image'` 这两条
     永远不会被漏掉 —— 漏掉 missing 就会把"文件已被删除"的照片显示出来，
     点开才报错。
+
+    ★ 审计 F01：`enabled_root_ids` 是"这块共享还存在吗"的唯一事实来源。
+    传了它就只在这个集合里查；传空列表（所有根都停了）直接 `AND 0`。
+    `None` 表示"调用方不按根过滤"（只有电脑端的维护/统计代码会这么用，
+    对手机暴露的接口一律必须传）。**只靠 `?root=` 过滤是不够的**：不传
+    `root` 时就是查全库，禁用根的照片仍然会出现在时间线和搜索结果里。
     """
     sql = " WHERE missing = 0 AND kind = 'image'"
     params: list[Any] = []
 
+    if enabled_root_ids is not None:
+        ids = [str(r) for r in enabled_root_ids]
+        if not ids:
+            # 一个根都没启用：返回空集，而不是拼出 `IN ()` 这种非法 SQL。
+            sql += " AND 0"
+        else:
+            sql += f" AND root_id IN ({','.join('?' * len(ids))})"
+            params.extend(ids)
     if root_id is not None:
         sql += " AND root_id = ?"
         params.append(root_id)

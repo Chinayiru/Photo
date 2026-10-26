@@ -266,42 +266,103 @@ async def redeem_pair_code(request: Request, db: CloudDB,
         return json_error("E1003", message="配对码已过期",
                           request_id=_rid(request))
 
-    # 走到这里就成功。**先用条件 UPDATE 抢下这个码**，再签发令牌：
-    # 两条并发请求同时通过上面的检查是可能的（同一个码在两台手机上
-    # 同时点），条件 UPDATE 的影响行数就是那把锁。
+    # 走到这里就成功。
+    #
+    # ★ 审计 F04：**签发要等电脑回话，绝不能等在一个事务里**。原来的写法是
+    # "一个 `BEGIN IMMEDIATE` 里先抢码、再 `await` 电脑签发"，后果是云端库的
+    # 写锁在整个网络往返期间（隧道 + 控制通道，最长 5 秒超时）被占着 ——
+    # 而云端的写操作不只是配对：登录、心跳、上传登记、设备列表全在排队。
+    # 电脑卡一下或隧道抖一下，整个云端就被拖到超时。
+    #
+    # 现在拆成三段，任何 `await` 都不持有事务、也不持有行锁：
+    #
+    #   F04a 短事务抢码 → F04b 事务外等签发 → F04c 短事务写 clients
+    #
+    # 失败口径不变：签不出来就把码**还回去**（用户拿着一个"已使用"的码
+    # 是死路，他自己没有任何办法恢复），所以 `_release_code()` 是失败路径
+    # 的必经一站，两条失败分支都调它。
+    claimed_at = now
+    if not _claim_code(db, code.strip(), claimed_at):
+        # 并发下另一台手机先抢到了这个码；与"已被使用"同一口径。
+        return json_error("E1005", message="配对码已被使用",
+                          request_id=_rid(request))
+
     try:
-        with db.transaction() as conn:
-            cur = conn.execute(
-                "UPDATE pair_codes SET used_at = ? WHERE code = ? "
-                "AND used_at IS NULL", (now, code.strip()))
-            if cur.rowcount != 1:
-                return json_error("E1005", message="配对码已被使用",
-                                  request_id=_rid(request))
-            return await _mint_client(conn, db, device, did, client_name, now,
-                                      ip, via="配对码", request=request)
+        minted = await _mint_via_agent(request, did, client_name)
     except _MintUnavailable:
-        # 事务已回滚：配对码没被消费，用户可以在电脑回来后再试一次。
+        _release_code(db, code.strip(), claimed_at)
         return json_error("E2007",
                           message="电脑当前不在线，无法签发配对令牌",
                           request_id=_rid(request))
+
+    if not _write_client(db, did=did, client_name=client_name,
+                         minted=minted, now=now):
+        _release_code(db, code.strip(), claimed_at)
+        return json_error("E2007", message="配对结果未能保存，请重试",
+                          request_id=_rid(request))
+
+    return _pair_reply(request, db, device, did, ip, minted, via="配对码")
 
 
 class _MintUnavailable(Exception):
     """电脑端没回应控制通道（离线 / 隧道刚断）。
 
-    单独一个异常而不是返回 None：`_mint_client()` 都在事务里被调用，
-    必须让事务回滚（配对码不能被消费掉），调用方再把异常翻成 503 `E2007`。
+    单独一个异常而不是返回 None：调用方要据此走**释放配对码**的分支，
+    并把异常翻成 503 `E2007`。它现在只在事务**外**被抛出（F04b），
+    所以不会再出现"事务被异常回滚"这种间接后果。
     """
 
 
-async def _mint_client(conn: Any, db: CloudDB, device: Any, did: str,
-                       client_name: str, now: float, ip: str, *,
-                       via: str, request: Request) -> Response:
-    """写 `clients` 行并返回令牌响应；**必须在调用方的事务里跑**。
+# ---------------------------------------------------------------------------
+# 审计 F04：配对的三段式
+# ---------------------------------------------------------------------------
+#
+# 三个函数各管一段，边界写在名字上，改的人不会把新逻辑塞回错的那一段：
+#
+#   _claim_code()     短事务：条件 UPDATE 抢码，影响行数就是那把锁
+#   _mint_via_agent() 事务外：await 电脑签发（唯一允许长耗时的位置）
+#   _write_client()   短事务：INSERT clients
+#
+# 失败路径：签发失败 / 写库失败都必须 `_release_code()`，把码还回去。
 
-    码路径把它塞进「条件 UPDATE 抢码」那同一个事务（抢码和写令牌要么都成，
-    要么都不成）；自动配对路径另开一个事务。两条路都在这里收口，是为了
-    避免出现「码路径修了令牌过期时间、自动配对忘了修」这种分叉。
+
+def _claim_code(db: CloudDB, code: str, claimed_at: float) -> bool:
+    """F04a：短事务抢码。抢到返回 True；被别人抢走返回 False。
+
+    用 `used_at = claimed_at` 而不是布尔列，是为了让释放能精确对上这一次
+    抢码（`WHERE used_at = ?`）—— 万一清理任务或另一次抢码改过这一行，
+    释放就不会误伤。两条请求同时通过前置检查是可能的（同一个码在两台
+    手机上同时点），条件 UPDATE 的影响行数就是那把锁。
+    """
+    with db.transaction() as conn:
+        cur = conn.execute(
+            "UPDATE pair_codes SET used_at = ? WHERE code = ? "
+            "AND used_at IS NULL", (claimed_at, code))
+    return cur.rowcount == 1
+
+
+def _release_code(db: CloudDB, code: str, claimed_at: float) -> bool:
+    """失败路径：把抢到但没签成的码还回去。
+
+    只释放"自己抢的那一次"（`used_at = claimed_at`）。释放不命中不报错：
+    行可能已被 `purge_expired_codes()` 清掉，那是正常情况，记一条日志即可。
+    """
+    with db.transaction() as conn:
+        cur = conn.execute(
+            "UPDATE pair_codes SET used_at = NULL "
+            "WHERE code = ? AND used_at = ?", (code, claimed_at))
+    released = cur.rowcount == 1
+    if not released:
+        log.warning("配对码释放未命中 code=%s（可能已被清理/已被再次抢走）", code)
+    return released
+
+
+async def _mint_via_agent(request: Request, did: str,
+                          client_name: str) -> dict[str, Any]:
+    """F04b：事务外等电脑签发。**调用时不得持有任何事务或行锁。**
+
+    返回 `{client_id, token, expires_at}`；电脑没回话、或回来的内容不成立
+    （版本不匹配 / 自己算错了）一律抛 `_MintUnavailable`。
     """
     registry = getattr(getattr(request.app, "state", None), "registry", None)
     minted = await cloud_control.call_agent(
@@ -313,18 +374,40 @@ async def _mint_client(conn: Any, db: CloudDB, device: Any, did: str,
     client_id = str(minted.get("client_id") or "")
     token = str(minted.get("token") or "")
     expires_at = float(minted.get("expires_at") or 0.0)
-    if not client_id or not token or expires_at <= now:
-        # 电脑端回了话但内容不对（版本不匹配/自己算错了）：按"没签成"处理。
+    if not client_id or not token or expires_at <= time.time():
         raise _MintUnavailable()
-    conn.execute(
-        "INSERT INTO clients(id, device_id, name, token_hash, "
-        "last_seen, created_at, revoked, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
-        (client_id, did, client_name, security.hash_token(token),
-         now, now, expires_at))
+    return {"client_id": client_id, "token": token, "expires_at": expires_at}
 
+
+def _write_client(db: CloudDB, *, did: str, client_name: str,
+                  minted: dict[str, Any], now: float) -> bool:
+    """F04c：短事务写 clients。写失败返回 False（调用方负责释放配额）。
+
+    `client_id` 是电脑端生成的 32 hex，理论上不会撞；但 `INSERT` 撞主键、
+    磁盘写满、库被锁超时都可能发生。**不抛异常**是有意的：抛出去会让
+    调用方以为"签发出了问题"，而实际上要做的动作是"释放配对码 + 让用户
+    重试"，两者必须分开才能各自写清楚。
+    """
+    try:
+        with db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO clients(id, device_id, name, token_hash, "
+                "last_seen, created_at, revoked, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+                (minted["client_id"], did, client_name,
+                 security.hash_token(minted["token"]), now, now,
+                 minted["expires_at"]))
+        return True
+    except sqlite3.Error as e:
+        log.warning("写 clients 失败 device=%s: %s", did, e)
+        return False
+
+
+def _pair_reply(request: Request, db: CloudDB, device: Any, did: str, ip: str,
+                minted: dict[str, Any], *, via: str) -> Response:
+    """配对成功后的响应（两条路共用，令牌只在这里出现一次）。"""
     _clear_failures(db, did, ip)
-    log.info("配对成功 device=%s client=%s 方式=%s", did, client_id, via)
+    log.info("配对成功 device=%s client=%s 方式=%s", did, minted["client_id"], via)
     import json as _json
     try:
         lan_ips = _json.loads(device["last_lan"] or "[]")
@@ -335,11 +418,11 @@ async def _mint_client(conn: Any, db: CloudDB, device: Any, did: str,
     # 令牌只在**这一次**响应里出现（库里只有哈希）。前端必须立刻存进
     # localStorage，否则只能重新配对。
     return json_reply({
-        "client_token": token,
-        "client_id": client_id,
+        "client_token": minted["token"],
+        "client_id": minted["client_id"],
         "device_id": did,
         "device_name": device["name"],
-        "expires_at": expires_at,
+        "expires_at": minted["expires_at"],
         "lan_ips": [str(x) for x in lan_ips][:16],
         "server_public_key": None,      # 二期 E2E 预留
     }, request_id=_rid(request))
@@ -392,14 +475,19 @@ async def _auto_pair(request: Request, db: CloudDB, registry: Any,
                           request_id=_rid(request))
     _note_auto(account_id, ip)
     now = time.time()
+    # ★ 审计 F04：自动配对同样是"等电脑签发"，同样不许在事务里等。
+    # 这条路没有配对码，所以失败时没有东西要释放；写库失败只回报错。
     try:
-        with db.transaction() as conn:
-            return await _mint_client(conn, db, device, did, client_name, now,
-                                      ip, via="账号登录", request=request)
+        minted = await _mint_via_agent(request, did, client_name)
     except _MintUnavailable:
         return json_error("E2007",
                           message="电脑当前不在线，无法签发配对令牌",
                           request_id=_rid(request))
+    if not _write_client(db, did=did, client_name=client_name,
+                         minted=minted, now=now):
+        return json_error("E2007", message="配对结果未能保存，请重试",
+                          request_id=_rid(request))
+    return _pair_reply(request, db, device, did, ip, minted, via="账号登录")
 
 
 def _auto_limited(account_id: str, ip: str) -> float | None:

@@ -261,6 +261,9 @@ export async function pair(base: string, code: string,
     let actual = "";
     try {
       const ping = await api.get<PingResponse>("/api/system/ping", {
+        // 候选地址探活：不带任何凭据（`auth` 默认是 `"client"`，而这里的目标
+        // 还不是已配对基址，显式写 `"none"` 让意图留在代码里）。
+        auth: "none",
         timeoutMs: 5000, skipAuthLost: true, base: cleanBase,
       });
       actual = ping.device_id;
@@ -284,6 +287,8 @@ export async function pair(base: string, code: string,
     const r = await api.post<PairResponse>("/api/pair", { code: cleanCode }, {
       // 配对本身是未鉴权的，不要因为它 401 就触发"配对失效"逻辑
       skipAuthLost: true,
+      // 同上：目标不是已配对基址，客户端令牌一律不发
+      auth: "none",
       timeoutMs: 15_000,
       // 候选地址只走这一次请求；落盘在下面 `savePairing()` 里发生
       base: cleanBase,
@@ -369,7 +374,8 @@ export async function pairWithAccount(
     const login = await api.post<{ account_token?: string }>(
       "/api/auth/login",
       { email: mail, password },
-      { base: origin, skipAuthLost: true, timeoutMs: 15_000 },
+      // 登录接口自己就是发凭据的那一端，不能再带凭据
+      { base: origin, skipAuthLost: true, auth: "none", timeoutMs: 15_000 },
     );
     const accountToken = String(login.account_token || "");
     if (!accountToken) {
@@ -386,7 +392,9 @@ export async function pairWithAccount(
         base: origin,
         skipAuthLost: true,
         timeoutMs: 15_000,
-        headers: { Authorization: `Bearer ${accountToken}` },
+        // 账号三态：这条走的是账号令牌，不是客户端令牌
+        auth: "account",
+        accountToken,
       },
     );
 
@@ -462,7 +470,7 @@ export async function loginAccount(
   const login = await api.post<{ account_token?: string }>(
     "/api/auth/login",
     { email: mail, password },
-    { base, skipAuthLost: true, timeoutMs: 15_000 },
+    { base, skipAuthLost: true, auth: "none", timeoutMs: 15_000 },
   );
   const token = String(login.account_token || "");
   if (!token) {
@@ -477,7 +485,8 @@ export async function loginAccount(
     base,
     skipAuthLost: true,
     timeoutMs: 15_000,
-    headers: { Authorization: `Bearer ${token}` },
+    auth: "account",
+    accountToken: token,
   });
   const devices: AccountDevice[] = (list.devices || []).map((d) => ({
     id: String(d.id || ""),
@@ -507,7 +516,8 @@ export async function pairAccountDevice(
       base: origin,
       skipAuthLost: true,
       timeoutMs: 15_000,
-      headers: { Authorization: `Bearer ${token}` },
+      auth: "account",
+      accountToken: token,
     },
   );
   applyPaired(r, `${origin}/d/${deviceId}`);

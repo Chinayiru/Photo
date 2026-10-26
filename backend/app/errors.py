@@ -297,11 +297,17 @@ def to_app_error(exc: BaseException) -> AppError:
     # 也因为它继承 ConfigError（普通 Exception），落不到任何 OSError 分支。
     # 惰性 import 避免 config ↔ errors 的循环导入（config 不 import errors）。
     try:
-        from .config import UnknownRootError
+        from .config import RootDisabledError, UnknownRootError
     except Exception:  # noqa: BLE001 —— 配置模块缺失时退化为原行为
         UnknownRootError = ()  # type: ignore[assignment,misc]
+        RootDisabledError = ()  # type: ignore[assignment,misc]
     if isinstance(exc, UnknownRootError):
         return BadRequest("媒体根目录不存在")
+    # ★ 审计 F01：停用根对**请求**的表现必须和"不存在"一模一样（404），
+    # 否则 403 与 404 的差别就成了根目录枚举面。管理员在电脑端日志里
+    # 能看到 `RootDisabledError` 的原文，客户端只看到 E1004。
+    if isinstance(exc, RootDisabledError):
+        return NotFound(None)
     for typ, spec in EXC_MAP:
         if isinstance(exc, typ):
             # 注意：这里传 detail=None 而不是 str(exc)。str(OSError) 在 Windows 上

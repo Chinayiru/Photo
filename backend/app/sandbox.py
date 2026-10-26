@@ -26,7 +26,7 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Literal
 
 from .config import Config, RootConfig, TMP_DIRNAME, get as get_config
-from .errors import E1009, E1015, SandboxError
+from .errors import E1004, E1009, E1015, SandboxError
 
 Need = Literal["read", "write", "modify", "delete"]
 
@@ -136,7 +136,10 @@ def resolve(root: RootConfig, rel_path: str, need: Need = "read", *, cfg: Config
         _step_7_permission(root, need, cfg)
         return p
     except _Reject as r:
-        raise SandboxError(r.rule, r.detail or None, E1009) from None
+        # 审计 F01：停用根要表现得像"不存在"（404 E1004），不是"路径不合法"。
+        # 400 会让客户端以为是自己的参数问题，而它其实什么都没做错。
+        spec = E1004 if r.rule == "root_disabled" else E1009
+        raise SandboxError(r.rule, r.detail or None, spec) from None
 
 
 def _steps_1_to_3(rel_path: str) -> tuple[str, list[str]]:
@@ -367,7 +370,14 @@ def _step_7_permission(root: RootConfig, need: Need, cfg: Config | None) -> None
       readonly  → 只读浏览
       upload    → 只读 + 可新增（不能删/不能改已有文件）
       readwrite → 只读 + 新增 + 删除（进回收站）+ 移动 + 改名
+
+    ★ 审计 F01：**第一步先看 `enabled`**。禁用的根不是"降级为只读"，
+    而是"这块共享整个不存在" —— 读、写、移动、删除全都得拒。放在最前面
+    而不是各分支里，是因为将来加 `Need` 值时会天然继承这条判断，不会
+    因为漏写一个 elif 就把禁用根放进来。
     """
+    if not getattr(root, "enabled", True):
+        raise _Reject("root_disabled", root.id)
     mode = root.mode
     if need == "read":
         # 三种模式都能读，此处无需拒绝；保留分支是为了未来加 'hidden' 模式
@@ -546,7 +556,12 @@ def assert_writable(root: RootConfig, need: Need = "write") -> None:
     try:
         _step_7_permission(root, need, None)
     except _Reject as r:
-        spec = E1015 if r.rule.endswith("by_config") else E1009
+        if r.rule == "root_disabled":       # 同 resolve()：表现为"不存在"
+            spec = E1004
+        elif r.rule.endswith("by_config"):
+            spec = E1015
+        else:
+            spec = E1009
         raise SandboxError(r.rule, r.detail or None, spec) from None
 
 

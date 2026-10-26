@@ -47,6 +47,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import string
 import time
 from typing import Any
 
@@ -58,6 +59,7 @@ __all__ = [
     "verify_token",
     "secret_for_agent_token",
     "TOKEN_MAX_LEN",
+    "looks_like_token",
 ]
 
 #: 令牌前缀。用 `pbc`（PhotoBridge Client）而不是 `eyJ`（JWT 的 base64 头），
@@ -86,8 +88,43 @@ MAX_TTL_DAYS = 36500
 #: 仍然远小于任何有意义的 DoS 面（一次 HMAC 只吃固定大小的密钥）。
 TOKEN_MAX_LEN = 1024
 
+#: 令牌长度的下界。实测最短的合法令牌（`{}` 空 claims + 32 字节签名）也在
+#: 60 字符上下；取 40 只是"明显不是令牌"的门槛，判真假的活仍归 `verify_token()`。
+TOKEN_MIN_LEN = 40
+
+#: base64url 字符集（不填充）。形状检查用它，**不用**正则：正则要 import re，
+#: 而这个文件被电脑端（无云端依赖）共用，越轻越好。
+_TOKEN_CHARS = frozenset(
+    string.ascii_letters + string.digits + "-_"
+)
+
 _B64 = base64.urlsafe_b64encode
 _UNB64 = base64.urlsafe_b64decode
+
+
+def looks_like_token(token: str) -> bool:
+    """形状检查：只回答"这值不值得送去验一次"。**不解码、不验签。**
+
+    云端 `/d/**` 的鉴权路径上，一枚云端不认识的令牌会触发**回源** —— 请家里
+    那台电脑用控制通道验一次（`Forwarder._adopt_token_via_agent`）。那是一次
+    隧道往返，比一次字典查询贵四个数量级；攻击者只要反复送
+    `Authorization: Bearer a`，就能把用户家的电脑当成自己的验签器，还能把
+    `clients` 表刷满无关行（审计 F03）。
+
+    所以先看形状：三段、`pbc1` 前缀、base64url 字符集、长度落在
+    `[TOKEN_MIN_LEN, TOKEN_MAX_LEN]`。不合格的当场拒，不过隧道。
+    """
+    if not isinstance(token, str):
+        return False
+    if not (TOKEN_MIN_LEN <= len(token) <= TOKEN_MAX_LEN):
+        return False
+    parts = token.split(".")
+    if len(parts) != 3 or parts[0] != TOKEN_PREFIX:
+        return False
+    for part in parts[1:]:
+        if not part or any(ch not in _TOKEN_CHARS for ch in part):
+            return False
+    return True
 
 
 def _b64e(raw: bytes) -> str:
