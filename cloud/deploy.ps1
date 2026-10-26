@@ -182,14 +182,26 @@ if ($aclOk) { Ok "只有 SYSTEM 与 Administrators 可访问" }
 else { Warn "ACL 没收紧成功，请手工执行：icacls `"$InstallDir`" /inheritance:r /grant:r `"*S-1-5-18:(OI)(CI)F`" /grant:r `"*S-1-5-32-544:(OI)(CI)F`"" }
 
 # ── 3. 依赖 ───────────────────────────────────────────────────────────────
-Step 3 "安装依赖（relay 只需要 3 个包）"
+Step 3 "安装依赖（按锁文件 + 哈希）"
+# ★ 审计 F05：这里原来写的是 `"starlette>=0.37" "uvicorn>=0.30" "websockets>=12.0"`
+#   加 `--trusted-host mirrors.aliyun.com`。两个问题叠在一起：
+#   - 下限约束意味着每次装到的都可能是不认识的版本（供应链投毒/上游破坏性
+#     变更都拦不住）；
+#   - `--trusted-host` 直接关掉 TLS 证书校验，等于允许中间人替换安装包。
+#   改成 `cloud/requirements.lock`（每包带 sha256）+ `--require-hashes`：
+#   版本与字节都由锁文件钉死，镜像只提供下载，不再有信任决策。
+#   仍走阿里云镜像只是因为速度；镜像返回的内容必须对上锁文件里的哈希，
+#   对不上就装不上。
+$req = Join-Path $InstallDir "cloud\requirements.lock"
+if (-not (Test-Path $req)) {
+    Fail "找不到依赖锁文件 $req（应由 Step 2 铺开 cloud\ 目录时一起带过来）"
+}
 & $py -m pip install --quiet --disable-pip-version-check `
     -i https://mirrors.aliyun.com/pypi/simple/ `
-    --trusted-host mirrors.aliyun.com `
-    "starlette>=0.37" "uvicorn>=0.30" "websockets>=12.0"
+    --require-hashes -r $req
 if ($LASTEXITCODE -ne 0) { Fail "pip 安装失败（退出码 $LASTEXITCODE）" }
 & $py -c "import starlette, uvicorn, websockets; print('  starlette', starlette.__version__, '| uvicorn', uvicorn.__version__, '| websockets', websockets.__version__)"
-Ok "依赖就绪"
+Ok "依赖就绪（版本与哈希来自 cloud\requirements.lock）"
 
 # ── 4. 云端库与设备 ───────────────────────────────────────────────────────
 Step 4 "建云端库、登记设备"

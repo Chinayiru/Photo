@@ -291,6 +291,28 @@ class UnknownRootError(ConfigError):
     """
 
 
+class RootDisabledError(ConfigError):
+    """请求指向的根目录存在，但被管理员设成了 `enabled: false`（审计 F01）。
+
+    为什么单独立一个类、而不是复用 `UnknownRootError`：两者的**修复方式
+    不同** —— `UnknownRootError` 是"id 写错了"，用户改客户端就行；这里 id
+    是对的，是管理员主动停了这块共享，客户端没有任何办法自救。
+
+    但**对外的表现必须一样**：都是 404 `E1004`。若对"已停用"回 403，
+    持有有效令牌的人就能借此枚举出"这台电脑上有哪些根目录"（403 与 404
+    的差别本身就是信息泄漏）。所以 `errors.to_app_error()` 把两者都翻成
+    404，只在电脑端日志里区分。
+
+    ★ 这条闸门的默认方向是**拒绝**：`Config.root_by_id()` 默认不返回
+    停用根。任何"确实需要读停用根"的内部用途（索引维护命令等）必须显式
+    写 `allow_disabled=True` —— 默认安全，例外留痕。
+    """
+
+    def __init__(self, root_id: str) -> None:
+        super().__init__(f"媒体根目录已停用：{root_id!r}")
+        self.root_id = root_id
+
+
 class Config:
     """配置对象。不可变语义：改配置请改 raw 后 save()。"""
 
@@ -403,11 +425,18 @@ class Config:
     def enabled_roots(self) -> list[RootConfig]:
         return [r for r in self.roots if r.enabled]
 
-    def root_by_id(self, root_id: str | None) -> RootConfig:
+    def root_by_id(self, root_id: str | None,
+                   *, allow_disabled: bool = False) -> RootConfig:
         """按 id 取根。root_id 为空时返回第一个启用的根。
 
         未知 id 抛 `UnknownRootError`（ConfigError 的子类，见其 docstring）——
         这是请求参数错，要被 API 层翻成 400，而不是 500。
+
+        ★ `allow_disabled=False`（默认）时，命中 `enabled: false` 的根抛
+        `RootDisabledError` → 404 E1004（审计 F01）。这条默认值就是修复的
+        核心：管理员停用某块共享之后，**所有**按 id 取根的地方（原图、缩略图、
+        预览、上传、移动/改名）自动一起失效，不需要逐个 handler 去记得加
+        检查。需要读停用根的内部用途必须写 `allow_disabled=True`，一眼可查。
         """
         if root_id is None:
             roots = self.enabled_roots
@@ -416,6 +445,8 @@ class Config:
             return roots[0]
         for r in self.roots:
             if r.id == root_id:
+                if not r.enabled and not allow_disabled:
+                    raise RootDisabledError(root_id)
                 return r
         raise UnknownRootError(f"未知的根目录 id: {root_id!r}")
 
@@ -1200,7 +1231,8 @@ __all__ = [
     "ALLOWED_IMAGE_EXTS", "APP_ROOT", "CONFIG_PATH", "Config", "ConfigError",
     "DATA_DIR", "DEFAULT_CONFIG", "DEFAULT_EXCLUDE_DIRS", "DEFAULT_TZ_OFFSET_MIN",
     "FUTURE_RAW_EXTS", "FUTURE_VIDEO_EXTS", "LOOPBACK_HOSTS", "ROOT_MODES",
-    "RootConfig", "SECRETS_PATH", "TMP_DIRNAME", "WILDCARD_HOSTS", "UnknownRootError",
+    "RootConfig", "RootDisabledError", "SECRETS_PATH", "TMP_DIRNAME",
+    "WILDCARD_HOSTS", "UnknownRootError",
     "bootstrap_default_root", "check_bind_safety", "ensure_dirs", "get",
     "is_first_run", "is_loopback_host", "load", "local_ipv4_addresses",
 ]

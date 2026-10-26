@@ -36,6 +36,7 @@ from typing import Any, AsyncIterator
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 
+from shared.client_token import looks_like_token
 from shared.mux import MuxClosed
 from shared.protocol import HEAD_TIMEOUT, TOTAL_TIMEOUT
 
@@ -50,7 +51,11 @@ from ..relay.devices import (
     touch_client,
 )
 from ..relay.limiter import (
+    AUTH_FAIL_MAX,
+    AUTH_FAIL_WINDOW,
+    AUTH_RATE_PER_MIN,
     MAX_INFLIGHT_PER_DEVICE,
+    MAX_INFLIGHT_TOTAL,
     RATE_LIMIT_PER_SEC,
     ConcurrencyLimiter,
     RateLimiter,
@@ -70,6 +75,10 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+
+#: `ConcurrencyLimiter` 是按 key 分桶的，全局闸门就借一个固定 key。
+#: 用 `"__all__"` 而不是 `""`：空串容易和"还没解析出设备 id"的路径混淆。
+_INFLIGHT_ALL = "__all__"
 
 #: 允许转发到电脑端的请求头（`docs/04` §1.3）。
 #:
@@ -235,7 +244,8 @@ class Forwarder:
     """
 
     __slots__ = ("registry", "db", "rate", "public_rate", "pair_rate",
-                 "inflight", "uploads", "meter")
+                 "inflight", "inflight_total", "auth_rate", "auth_fail",
+                 "uploads", "meter")
 
     def __init__(self, registry: DeviceRegistry, db: Any) -> None:
         self.registry = registry
@@ -251,6 +261,15 @@ class Forwarder:
         # 用户体验完全不同，混在一起的症状是"点了几下之后连状态都不对了"。
         self.pair_rate = RateLimiter(PAIR_RATE_PER_MIN, window=60.0)
         self.inflight = ConcurrencyLimiter(MAX_INFLIGHT_PER_DEVICE)
+        # ★ 审计 F03：单设备 64 之外还要一个**全局**上限。没有它时三台设备
+        #   各挂 60 个慢速 `/raw` 就是 180 条并发隧道往返 + 同样多的文件句柄，
+        #   2 vCPU 的云主机撑不住，受影响的是别人的隧道。
+        self.inflight_total = ConcurrencyLimiter(MAX_INFLIGHT_TOTAL)
+        # ★ 审计 F03：按来源 IP 限制"要验令牌的请求"与其中的失败。
+        #   两个桶分开：正常浏览会把 `auth_rate` 用得比较满（一次缩略图潮
+        #   就有几十个请求），但失败计数只该被真正的猜令牌推高。
+        self.auth_rate = RateLimiter(AUTH_RATE_PER_MIN, window=60.0)
+        self.auth_fail = RateLimiter(AUTH_FAIL_MAX, window=AUTH_FAIL_WINDOW)
         self.uploads = UploadLimiter()
         self.meter = TrafficMeter(db)
 
@@ -274,9 +293,24 @@ class Forwarder:
             return await self._handle_public(request, device_id, rid)
 
         # ---- 1/2/3 鉴权 ----
+        ip = _client_ip(request)
+        # 先按来源 IP 记一次"鉴权尝试"。放在查库之前，因为它挡的正是
+        # "用同一个来源 IP 反复送令牌"（审计 F03）。
+        allowed, retry = self.auth_rate.hit(ip)
+        if not allowed:
+            return _error(429, "E4001", "请求太频繁", request_id=rid,
+                          retry_after=max(1, int(retry)))
+
         token = _client_token(request)
         if not token:
-            return _error(401, "E2002", "缺少配对令牌", request_id=rid)
+            return self._reject_auth(ip, rid, "缺少配对令牌")
+        # ★ 审计 F03：形状检查必须在**回源之前**。云端不认识的令牌会触发
+        #   `_adopt_token_via_agent()` —— 一次隧道往返，让家里的电脑替陌生人
+        #   验签，验过还会往 `clients` 里插一行。`Bearer a` 这种垃圾值不该
+        #   有资格把电脑变成验签器。
+        if not looks_like_token(token):
+            return self._reject_auth(ip, rid, "配对已失效，请重新配对",
+                                     clear_cookie=True)
         row = find_client_by_token(self.db, token)
         if row is None:
             # --- 局域网配对签发的令牌 ---
@@ -292,8 +326,8 @@ class Forwarder:
         if row is None:
             # 令牌死透了：顺手清掉浏览器里的死 cookie，否则 `<img>` 会
             # 用同一个死令牌一直 401（它发不出 Authorization 头）。
-            return _error(401, "E2002", "配对已失效，请重新配对",
-                          request_id=rid, clear_cookie=True)
+            return self._reject_auth(ip, rid, "配对已失效，请重新配对",
+                                     clear_cookie=True)
         if str(row["device_id"]) != device_id:
             # ★ 没有这一步，手机上任何一次配对都能读**别的**设备。
             # 令牌里的 device_id 是唯一可信的归属，路径里的只是它想访问的。
@@ -305,7 +339,15 @@ class Forwarder:
         if not ok:
             return _error(429, "E4001", "请求太频繁", request_id=rid,
                           retry_after=max(1, int(retry)))
+        # ★ 审计 F03：全局并发闸门在设备闸门**之前**。顺序反过来时，
+        #   一台设备刷满自己 64 个额度后就不再碰全局计数，全局上限形同虚设。
+        if not self.inflight_total.take(_INFLIGHT_ALL):
+            log.warning("全局回源并发已满（%d），拒绝 device=%s",
+                        MAX_INFLIGHT_TOTAL, device_id)
+            return _error(429, "E4003", "云端回源并发已满，请稍后重试",
+                          retry_after=1, request_id=rid)
         if not self.inflight.take(device_id):
+            self.inflight_total.release(_INFLIGHT_ALL)
             return _error(429, "E4003", "请求太密集", retry_after=1,
                           request_id=rid)
 
@@ -316,7 +358,7 @@ class Forwarder:
         #   把在途计数刷回 0，再开 64 个，隧道任务与文件句柄无上限增长。
         #   现在把释放交给 `_release_with_body()`：非流式响应立刻释放，
         #   流式响应等生成器结束（正常结束、异常、客户端断开都算）。
-        release = _Once(lambda: self.inflight.release(device_id))
+        release = _Once(lambda: self._release_inflight(device_id))
         try:
             # 来源 IP 也要带进帧（不只是匿名配对那一条）：电脑端的审计
             # 记录与 `_rate_limit` 都读 `Ctx.client_ip`，缺了会全部落成
@@ -328,6 +370,27 @@ class Forwarder:
             release()
             raise
         return _release_with_body(resp, release)
+
+    def _release_inflight(self, device_id: str) -> None:
+        """还两个闸门的额度：设备一个、全局一个。
+
+        两个必须在同一处还：全局额度是在设备闸门之前拿的（`handle` 里那个
+        顺序是有原因的），任何一条只还其一的路径都会让全局计数慢慢漏高，
+        最后表现成"没人访问但云端一直 429"。
+        """
+        self.inflight.release(device_id)
+        self.inflight_total.release(_INFLIGHT_ALL)
+
+    def _reject_auth(self, ip: str, rid: str, message: str, *,
+                     clear_cookie: bool = False) -> Response:
+        """一次认证失败：先记账，超限改判 429，否则按原样 401。"""
+        allowed, retry = self.auth_fail.hit(ip)
+        if not allowed:
+            log.warning("来源 IP 认证失败过多 ip=%s", ip)
+            return _error(429, "E4001", "认证失败次数过多，请稍后再试",
+                          request_id=rid, retry_after=max(1, int(retry)))
+        return _error(401, "E2002", message, request_id=rid,
+                      clear_cookie=clear_cookie)
 
     async def _adopt_token_via_agent(self, token: str,
                                      device_id: str) -> Any:

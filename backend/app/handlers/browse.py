@@ -142,6 +142,10 @@ async def timeline(ctx: Ctx) -> Reply:
     if root_id is not None and root_id != "":
         if not st.cfg.has_root(root_id):
             raise AppError(E1001, f"未知的 root：{root_id}")
+        # 审计 F01：显式点名一个已停用的根 → 404 E1004（root_by_id 抛
+        # RootDisabledError，由 errors.to_app_error 归一）。不点名时靠
+        # 下面的 enabled_root_ids 过滤，禁用根的照片一条都不出现。
+        st.cfg.root_by_id(root_id, allow_disabled=False)
 
     ts_from = parse_ts(ctx.q("from"), what="from")
     ts_to = parse_ts(ctx.q("to"), what="to")
@@ -153,6 +157,7 @@ async def timeline(ctx: Ctx) -> Reply:
         ts_from=ts_from,
         ts_to=ts_to,
         kind=ctx.q("kind"),
+        enabled_root_ids=[r.id for r in st.cfg.enabled_roots],
     )
 
     cursor = ctx.q("cursor")
@@ -202,6 +207,11 @@ async def get_item(ctx: Ctx) -> Reply:
     if row is None:
         raise NotFound(f"media id={mid}")
 
+    # ★ 审计 F01：详情也是"列表/详情"这条授权线上的一个出口。不加这一行，
+    #   管理员停用根之后，手机上仍能按 id 拉到 EXIF、路径、拍摄地点 ——
+    #   而这正是当初共享那块照片时最敏感的那部分元数据。
+    st.cfg.root_by_id(row["root_id"], allow_disabled=False)
+
     # 前后邻居用于查看器左右滑动。这里各查一次而不是等到滑动时再查，
     # 是因为滑动时的额外往返在弱网下会明显卡顿，而两次主键索引查询
     # 在本地只需几十微秒。
@@ -247,7 +257,7 @@ def _source_sig(st: AppState, row: Any) -> str:
     文件读不到（已丢失/越界）时退回 DB 值，让上层走 missing 分支。
     """
     try:
-        root = st.cfg.root_by_id(row["root_id"])
+        root = st.cfg.root_by_id(row["root_id"], allow_disabled=False)
         if root is None:
             raise LookupError("root 不存在")
         src = sandbox.resolve(root, row["rel_path"], "read", cfg=st.cfg)
@@ -269,6 +279,12 @@ async def _serve_thumb(st: AppState, ctx: Ctx, mid: int) -> Reply:
     )
     if row is None:
         raise NotFound(f"media id={mid}")
+
+    # ★ 审计 F01：缓存命中也要过授权。缩略图/预览都是"先看磁盘有没有缓存
+    #   文件"，而那些文件在管理员停用根之后**不会消失** —— 只在生成路径上
+    #   校验，等于"停用之前已经生成过的图全部继续可读"。这一行必须在任何
+    #   `dst.exists()` 之前，否则有等于没有。
+    st.cfg.root_by_id(row["root_id"], allow_disabled=False)
 
     if not row["missing"] and row["thumb_state"] == "failed":
         # 已判定失败的图不再反复重试：每次请求都重试会让一张坏图
@@ -367,7 +383,7 @@ async def _generate_sync(st: AppState, row: Any, dst: Path, size: int) -> None:
     """没有 ThumbEngine 时的兜底生成（测试与轻量嵌入场景）。"""
     from ..thumbs import OversizedImageError
 
-    src = sandbox.resolve(st.cfg.root_by_id(row["root_id"]), row["rel_path"],
+    src = sandbox.resolve(st.cfg.root_by_id(row["root_id"], allow_disabled=False), row["rel_path"],
                           "read", cfg=st.cfg)
     if not src.exists():
         return
@@ -452,6 +468,10 @@ async def get_preview(ctx: Ctx) -> Reply:
     if row is None:
         raise NotFound(f"media id={mid}")
 
+    # ★ 审计 F01：同 `_serve_thumb` —— 停用根的预览缓存文件仍在磁盘上，
+    #   必须在 304/缓存分支之前就拒绝，而不是等到重新生成时才拒。
+    st.cfg.root_by_id(row["root_id"], allow_disabled=False)
+
     dst = thumb_path(st.cfg, row["root_id"], row["rel_path"], size)
     sig = f"p{size}-{int(row['mtime'])}-{int(row['size'])}"
 
@@ -526,7 +546,7 @@ async def _ensure_size(st: AppState, row: Any, dst: Path, size: int) -> None:
     """只生成指定尺寸（预览用），不碰 thumb_state。"""
     from ..thumbs import generate_thumb
 
-    src = sandbox.resolve(st.cfg.root_by_id(row["root_id"]), row["rel_path"],
+    src = sandbox.resolve(st.cfg.root_by_id(row["root_id"], allow_disabled=False), row["rel_path"],
                           "read", cfg=st.cfg)
     if not src.exists():
         return
@@ -557,7 +577,7 @@ async def get_raw(ctx: Ctx) -> Reply:
     if row["missing"]:
         raise NotFound(f"源文件已丢失 media_id={mid}")
 
-    root = st.cfg.root_by_id(row["root_id"])
+    root = st.cfg.root_by_id(row["root_id"], allow_disabled=False)
     # ★ 即使路径来自我们自己的数据库，也要过沙箱：配置可能已经改过，
     # 旧行的 rel_path 现在可能指向库外（或变成 junction）。
     src = sandbox.resolve(root, row["rel_path"], "read", cfg=st.cfg)
@@ -661,7 +681,7 @@ async def folders(ctx: Ctx) -> Reply:
     root_id = common.root_id_param(ctx) or st.cfg.default_root_id
     if not root_id or not st.cfg.has_root(root_id):
         raise AppError(E1001, f"未知的 root：{root_id}")
-    root = st.cfg.root_by_id(root_id)
+    root = st.cfg.root_by_id(root_id, allow_disabled=False)
     assert root is not None
 
     raw_path = ctx.q("path") or ""
@@ -784,6 +804,8 @@ async def search(ctx: Ctx) -> Reply:
 
     if root_id is not None and not st.cfg.has_root(root_id):
         raise AppError(E1001, f"未知的 root：{root_id}")
+    if root_id is not None:
+        st.cfg.root_by_id(root_id, allow_disabled=False)      # 审计 F01：停用根 → 404 E1004
     if not any([q, root_id, ts_from is not None, ts_to is not None,
                 camera, dir_prefix, has_gps is not None]):
         raise AppError(E1001, "至少需要一个筛选条件")
@@ -793,6 +815,9 @@ async def search(ctx: Ctx) -> Reply:
     where, params = timeline_where(
         root_id=root_id, ts_from=ts_from, ts_to=ts_to,
         dir_prefix=dir_prefix, camera=camera, has_gps=has_gps,
+        # 审计 F01：搜索不带 root 时是查全库，必须显式限定在启用根里 ——
+        # 否则管理员停掉的那块照片照样能搜出来。
+        enabled_root_ids=[r.id for r in st.cfg.enabled_roots],
     )
     if q:
         # 一期用 LIKE 而非 FTS5：文件名匹配是"包含"语义，
@@ -934,7 +959,7 @@ async def _trash_one(st: AppState, mid: int, *, client_id: str = "") -> bool:
     if row is None:
         return False
 
-    root = st.cfg.root_by_id(row["root_id"])
+    root = st.cfg.root_by_id(row["root_id"], allow_disabled=False)
     if root is None:
         return False
     path = sandbox.resolve(root, row["rel_path"], "delete", cfg=st.cfg)
@@ -1242,7 +1267,7 @@ async def move_items(ctx: Ctx) -> Reply:
             # 去磁盘上把它搬到别的目录。这里点名那个目录段。
             seg = ""
             if row is not None:
-                _root = st.cfg.root_by_id(row["root_id"])
+                _root = st.cfg.root_by_id(row["root_id"], allow_disabled=False)
                 if _root is not None:
                     seg = sandbox.excluded_dir_segment(str(row["rel_path"]), _root)
             # ★ 命中排除目录时用专属码 E1019（与 rename 同源）。
@@ -1259,7 +1284,7 @@ async def move_items(ctx: Ctx) -> Reply:
             })
             continue
 
-        root = st.cfg.root_by_id(row["root_id"])
+        root = st.cfg.root_by_id(row["root_id"], allow_disabled=False)
         if root is None:
             failed.append({"id": mid, "code": "E1004", "message": "照片所在目录已移除"})
             continue
@@ -1453,7 +1478,7 @@ async def rename_item(ctx: Ctx) -> Reply:
         # 扫描排除范围，说清真正的原因 —— 文件还在，只是索引器不再认它。
         seg = ""
         if row is not None:
-            _root = st.cfg.root_by_id(row["root_id"])
+            _root = st.cfg.root_by_id(row["root_id"], allow_disabled=False)
             if _root is not None:
                 seg = sandbox.excluded_dir_segment(str(row["rel_path"]), _root)
         if seg:
@@ -1467,7 +1492,7 @@ async def rename_item(ctx: Ctx) -> Reply:
             )
         raise NotFound("照片不存在")
 
-    root = st.cfg.root_by_id(row["root_id"])
+    root = st.cfg.root_by_id(row["root_id"], allow_disabled=False)
     if root is None:
         raise NotFound("照片所在目录已移除")
     if not root.can_modify:
@@ -1606,7 +1631,7 @@ async def _run_scan_all(st: AppState) -> None:
 
 async def _run_scan_root(st: AppState, root_id: str) -> None:
     try:
-        root = st.cfg.root_by_id(root_id)
+        root = st.cfg.root_by_id(root_id, allow_disabled=False)
         if root is not None:
             await st.indexer.scan_root(root)
     except Exception:  # noqa: BLE001

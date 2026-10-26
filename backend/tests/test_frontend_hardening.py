@@ -56,9 +56,94 @@ def test_request_options_can_carry_a_one_shot_base() -> None:
     """`RequestOptions.base` 存在且真的覆盖 `currentBase()`，但不落盘。"""
     src = _read("frontend/src/api/client.ts")
     assert "base?: string;" in src
-    assert "opt.base || currentBase()" in src, (
+    # 2026-10-26（审计 F02）：`currentBase()` 提到 `pairedBase` 变量里 —— 它同时
+    # 是"这次请求默认打到哪"和"目标是不是已配对基址"两个判据的来源。
+    assert "const pairedBase = currentBase();" in src
+    assert "const base = opt.base || pairedBase;" in src, (
         "once() 没读 opt.base —— 配对时的候选基址会失效"
     )
+
+
+# --- 审计 F02：RequestOptions.auth 三态 -------------------------------------
+
+def test_auth_mode_is_a_closed_three_state() -> None:
+    """`auth` 只能是 `"none" | "client" | "account"`，默认 `"client"`。
+
+    审计 F02：原来的实现是"本地有令牌就一律带上"。配对时用户填的是候选地址
+    （打错的 IP、或者压根不是自己的电脑），令牌跟着发过去就等于把照片访问权
+    交给对方，而且那枚 `pbc1.…` 在对方日志里能活 90 天。
+    """
+    src = _read("frontend/src/api/client.ts")
+    assert 'export type AuthMode = "none" | "client" | "account";' in src
+    assert "auth?: AuthMode;" in src
+    assert "accountToken?: string;" in src
+    assert 'const mode: AuthMode = opt.auth ?? "client";' in src, (
+        "默认值必须显式写出来：缺省等于 client，且只在已配对基址上生效"
+    )
+
+
+def test_client_token_only_goes_to_the_paired_base() -> None:
+    """客户端令牌的附加条件必须把"目标基址"算进去。"""
+    src = _read("frontend/src/api/client.ts")
+    assert '} else if (mode === "client" && token && sameBase(base, pairedBase)) {' in src, (
+        "客户端令牌又变回无条件附加了 —— 候选地址会被喂一枚 90 天令牌（F02）"
+    )
+    # 判据函数本身要在（宽松比较：多一个斜杠不能把已配对请求判成匿名）
+    assert "function sameBase(a: string, b: string): boolean" in src
+    assert 'return norm(a) === norm(b);' in src
+
+
+def test_account_mode_requires_an_account_token() -> None:
+    """声明 `auth: "account"` 却没给令牌 → 当场报错，不发匿名请求。"""
+    src = _read("frontend/src/api/client.ts")
+    assert 'if (!opt.accountToken) {' in src
+    assert "缺少账号令牌" in src
+
+
+def test_pairing_paths_explicitly_use_no_credentials() -> None:
+    """探活与 `/api/pair` 必须显式 `auth: "none"`（目标尚未成为已配对基址）。"""
+    src = _read("frontend/src/stores/auth.ts")
+    ping = src[src.index('api.get<PingResponse>("/api/system/ping"'):]
+    ping_call = ping[: ping.index("});")]
+    assert 'auth: "none"' in ping_call, "候选地址探活带上了凭据（F02）"
+    pair = src[src.index('api.post<PairResponse>("/api/pair"'):]
+    pair_call = pair[: pair.index("});")]
+    assert 'auth: "none"' in pair_call, "配对请求带上了凭据（F02）"
+    # 登录接口本身是发凭据的那一端，同样不能带
+    login = src[src.index('"/api/auth/login"'):]
+    login_call = login[: login.index(");")]
+    assert 'auth: "none"' in login_call
+
+
+def test_account_calls_use_the_account_state_not_ad_hoc_headers() -> None:
+    """账号接口必须走 `auth: "account"`，不许再手写 Authorization 头。
+
+    手写头的坏处不是难看：它绕过了三态判定，谁也不知道这一行带的是哪种凭据。
+    """
+    src = _read("frontend/src/stores/auth.ts")
+    assert src.count('auth: "account"') >= 3
+    assert "headers: { Authorization:" not in src, (
+        "auth.ts 里又出现了手写 Authorization 头（F02）"
+    )
+
+
+def test_no_ad_hoc_authorization_headers_outside_the_client() -> None:
+    """除 `client.ts`（唯一发请求的地方）外，`api.*` 调用不许手写凭据头。"""
+    import re as _re
+
+    offenders: list[str] = []
+    for path in (REPO / "frontend/src").rglob("*"):
+        if path.suffix not in (".ts", ".vue"):
+            continue
+        if path.name in ("client.ts", "storage.ts", "uploader.ts",
+                         "events.ts", "transport.ts", "viewer.ts"):
+            # 这几个文件本来就绕开 api 层直接发请求（<img>/EventSource/XHR），
+            # 它们的凭据来源另有判据（cookie、absUrl、probeAt）
+            continue
+        text = path.read_text(encoding="utf-8")
+        if _re.search(r"headers:\s*\{\s*Authorization", text):
+            offenders.append(str(path.relative_to(REPO)))
+    assert not offenders, f"这些文件手写了 Authorization 头：{offenders}"
 
 # --- SEC-24：safeUrl() 守卫 -------------------------------------------------
 

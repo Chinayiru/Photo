@@ -78,6 +78,7 @@ __all__ = [
     "require_client",
     "optional_client",
     "sync_revoked_clients",
+    "SigningSecretUnavailable",
     "auth_middleware",
     "PUBLIC_PATHS",
     "PANEL_PATHS",
@@ -593,20 +594,42 @@ def _cloud_cfg(cfg: Any = None) -> Any:
         return None
 
 
+class SigningSecretUnavailable(RuntimeError):
+    """电脑端私有签名密钥读不出来（审计 M01）。
+
+    ★ 这个异常存在的唯一目的是**不让调用方回退**。以前这里是
+    `except Exception: return legacy_tunnel_secret(cfg)`：一旦
+    `settings.client_signing_secret` 读失败（库损坏、迁移半途、磁盘只读），
+    验签就会"降级"到那枚**云端库里也有明文**的旧密钥 —— 正好是
+    ISSUE-049 修掉的那条攻击链，而且降级时没有任何日志。
+
+    现在拆成两条互不影响的路径：私有密钥坏了 = 拒绝认证 + 告警；旧密钥
+    只在 `devices.allow_legacy_until` 显式窗口内、作为**独立候选**参与
+    验签（`_candidate_secrets()` 里那一段），两者绝不互相顶替。
+    """
+
+
 def _signing_secret(db: Any = None, cfg: Any = None) -> str:
     """签发令牌用的 HMAC 密钥：**电脑端私有**（`settings.client_signing_secret`）。
 
     `db is None` 时退回旧密钥：有几个调用点（如 `_tunnel_secret()` 的老
     用法）拿不到数据库句柄。这种回退是过渡期的妥协 —— 真正的修复是把
     db 一路传下去，`control.mint_client` / `_verify_cloud_token` 都已经做到了。
+
+    ★ 审计 M01：`db is not None` 时**任何**读/生成失败都抛
+    `SigningSecretUnavailable`，不再静默换成旧密钥。拿不到私有密钥就是
+    "这台电脑现在没法判断令牌真假"，正确处置是拒绝并告警，不是换一把
+    攻击者也有的钥匙。
     """
     if db is not None:
         try:
             from .control import client_signing_secret
 
             return client_signing_secret(db)
-        except Exception:       # noqa: BLE001 - 缺表/迁移中：退回旧密钥
-            return legacy_tunnel_secret(cfg)
+        except Exception as exc:    # noqa: BLE001 - 任何失败都不能降级
+            log.warning("私有签名密钥不可用，拒绝云端令牌验签：%s", exc,
+                        exc_info=True)
+            raise SigningSecretUnavailable("私有签名密钥不可用") from exc
     return legacy_tunnel_secret(cfg)
 
 
@@ -633,7 +656,11 @@ def legacy_window_open(db: Any = None) -> bool:
 
 
 def _candidate_secrets(db: Any = None, cfg: Any = None) -> list[str]:
-    """验签时要试的密钥列表：新密钥在前，旧密钥只在窗口期内兜底。"""
+    """验签时要试的密钥列表：新密钥在前，旧密钥只在窗口期内兜底。
+
+    ★ 审计 M01：私有密钥不可用时**抛异常**，不返回"只有旧密钥"的列表。
+    否则调用方的 for 循环会拿旧密钥验签成功，等于悄悄降级。
+    """
     out: list[str] = []
     fresh = _signing_secret(db, cfg)
     if fresh:
@@ -678,7 +705,15 @@ def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
     令牌是云端签的，它的寿命由云端决定，本地配置改了也不该让它变长。
     """
     cfg = ctx.app.cfg if ctx.app is not None else None
-    candidates = _candidate_secrets(db, cfg)
+    try:
+        candidates = _candidate_secrets(db, cfg)
+    except SigningSecretUnavailable:
+        # ★ 审计 M01：这里必须**失败关闭**。修好之前的行为是静默用旧密钥
+        #   验签 —— 一把云端库里躺着明文的钥匙。宁可让手机 401（用户看到
+        #   "配对已失效"，去看电脑日志就知道是密钥坏了），也不能让一个
+        #   库泄露者签出的令牌在这台电脑上通过。
+        log.warning("无权验签云端令牌：电脑端私有密钥不可用（已拒绝）")
+        return None
     if not candidates:
         return None
     st = ctx.app

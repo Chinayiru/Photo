@@ -186,6 +186,20 @@ export function currentBase(): string {
 }
 
 /**
+ * 两个基址是不是同一个（忽略末尾 `/` 与大小写差异）。
+ *
+ * 只用来判断"这次请求的目标是不是已配对基址"，从而决定要不要带客户端令牌
+ * （`RequestOptions.auth`）。因此**故意做得宽松**：宁可把它认成同一个而带上
+ * 令牌，也不能因为多写了一个斜杠就判定"不是同一台"，那会让已配对的请求
+ * 全部变成匿名请求（症状是所有接口 401，用户以为配对失效了）。
+ */
+function sameBase(a: string, b: string): boolean {
+  const norm = (s: string) => s.trim().replace(/\/+$/, "").toLowerCase();
+  if (!a || !b) return false;
+  return norm(a) === norm(b);
+}
+
+/**
  * 把相对 API 路径变成可直接放进 `<img src>` 的绝对 URL。
  *
  * ★ 必须带 `v`（thumb_v）：后端给缩略图发 `immutable, max-age=31536000`，
@@ -270,6 +284,8 @@ function clientHeader(): string {
  * 请求
  * ------------------------------------------------------------------ */
 
+export type AuthMode = "none" | "client" | "account";
+
 export interface RequestOptions {
   method?: string;
   /** 自动 JSON.stringify 并设 Content-Type。 */
@@ -284,6 +300,21 @@ export interface RequestOptions {
   timeoutMs?: number;
   /** 不触发"配对失效"跳转（配对接口自身用）。 */
   skipAuthLost?: boolean;
+  /**
+   * 这次请求带哪种凭据。**默认 `"client"`**。
+   *
+   * - `"client"`：客户端令牌（`pbc1.…`），且**仅当目标基址就是已配对基址**；
+   * - `"account"`：账号令牌（配 `accountToken`），中继根/设备页的账号接口用；
+   * - `"none"`：什么也不带（探活、`/api/pair`、`/api/auth/login`）。
+   *
+   * ★ 默认值不能是"本地有令牌就带上"。配对时用户填的是**候选地址**：可能是
+   *   打错的 IP，也可能压根不是自己的电脑（`docs/11` SEC-25）。把已配对基址
+   *   的令牌发给一个陌生地址，等于把照片访问权交出去；而这类请求一旦成功，
+   *   对方的访问日志里就留下了一枚 90 天有效的凭据。
+   */
+  auth?: AuthMode;
+  /** `auth: "account"` 时携带的账号令牌（`account_token`，7 天、可撤销）。 */
+  accountToken?: string;
   /**
    * 这一次请求用的基址，覆盖 `currentBase()`，**不落盘**。
    *
@@ -325,7 +356,8 @@ async function parseError(res: Response): Promise<ApiError> {
 
 async function once<T>(path: string, opt: RequestOptions): Promise<T> {
   // `opt.base` 只用于"这次试一个候选地址"（配对），成功之前不进 localStorage。
-  const base = opt.base || currentBase();
+  const pairedBase = currentBase();
+  const base = opt.base || pairedBase;
   if (!base) {
     throw new ApiError({
       status: 0,
@@ -344,8 +376,23 @@ async function once<T>(path: string, opt: RequestOptions): Promise<T> {
   }
 
   const headers = new Headers(opt.headers);
+  const mode: AuthMode = opt.auth ?? "client";
   const token = getToken();
-  if (token) {
+  if (mode === "account") {
+    if (!opt.accountToken) {
+      // 声明了账号凭据却没给令牌：宁可当场报错，也不要静默发一个匿名请求
+      // —— 那种请求在云端只会得到 401 E2001，排查时看不出是代码写错了。
+      throw new ApiError({
+        status: 0,
+        code: "E1001",
+        message: "缺少账号令牌",
+        userHint: "请重新登录 PhotoBridge 账号",
+      });
+    }
+    headers.set("Authorization", `Bearer ${opt.accountToken}`);
+  } else if (mode === "client" && token && sameBase(base, pairedBase)) {
+    // ★ 只有"目标就是已配对基址"才带客户端令牌：候选地址（配对时试的那个）
+    //   不是已配对基址，令牌一律不发（`docs/11` SEC-25）。
     headers.set("Authorization", `Bearer ${token}`);
     // ★ 自愈：token 在 localStorage 里但 cookie 没了（用户手动清了
     // 站点数据只清了一部分、从别的浏览器导入过 localStorage、

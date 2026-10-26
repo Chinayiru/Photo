@@ -467,7 +467,7 @@ class ThumbEngine:
         if row is None or row["missing"]:
             return False
 
-        root = self.cfg.root_by_id(row["root_id"])
+        root = self.cfg.root_by_id(row["root_id"], allow_disabled=False)
         # ★ 过沙箱。缩略图读取也必须走唯一入口 —— 索引器写库时的路径
         # 可能来自更早的配置，配置改了之后旧行仍然指向库外。
         src = sandbox.resolve(root, row["rel_path"], "read", cfg=self.cfg)

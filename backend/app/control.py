@@ -48,9 +48,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import time
 from typing import Any
+
+#: 模块日志。控制通道的失败**必须**留痕：这条链路平时安静，出问题时
+#: 要么是"云端在命令电脑签令牌"（要能查），要么是"密钥坏了"（要能告警）。
+log = logging.getLogger(__name__)
 
 #: 控制通道路径。`/api/**` 白名单之外**唯一**放行的一条（见
 #: `backend/app/transports/cloud_tunnel.py::_clean_path`），因此手机无论
@@ -244,10 +249,20 @@ def _candidate_secrets(state: Any) -> list[str]:
 
     旧密钥是 `sha256(agent_token)`，云端库里就有 —— 接受它等于把签名权
     又放回云端。默认关，`pbctl allow-legacy <天数>` 才开。
+
+    ★ 审计 M01：`client_signing_secret()` 读不出来时**整体失败**，绝不
+    退化成"只试旧密钥"。那等于把 ISSUE-049 修掉的攻击链重新接上，而且
+    退化时一眼看不出来（照样能验签成功）。
     """
     from .auth import legacy_tunnel_secret, legacy_window_open
 
-    out = [client_signing_secret(state.db)]
+    try:
+        fresh = client_signing_secret(state.db)
+    except Exception as exc:        # noqa: BLE001 - 任何失败都不能降级
+        log.warning("控制通道：私有签名密钥不可用，拒绝验签：%s", exc,
+                    exc_info=True)
+        raise ControlError("E5001", "签名密钥不可用，已拒绝校验", 500) from exc
+    out = [fresh]
     legacy = legacy_tunnel_secret(getattr(state, "cfg", None))
     if legacy and legacy not in out and legacy_window_open(state.db):
         out.append(legacy)

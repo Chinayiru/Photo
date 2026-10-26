@@ -35,7 +35,11 @@ from typing import Any, Hashable
 __all__ = [
     "RATE_LIMIT_PER_SEC",
     "MAX_INFLIGHT_PER_DEVICE",
+    "MAX_INFLIGHT_TOTAL",
     "MAX_UPLOAD_CONCURRENCY",
+    "AUTH_RATE_PER_MIN",
+    "AUTH_FAIL_MAX",
+    "AUTH_FAIL_WINDOW",
     "RateLimiter",
     "ConcurrencyLimiter",
     "UploadLimiter",
@@ -47,6 +51,26 @@ RATE_LIMIT_PER_SEC: int = 120
 MAX_INFLIGHT_PER_DEVICE: int = 64
 #: 单设备并发上传上限（`docs/04`：429 E4002 + Retry-After: 3）。
 MAX_UPLOAD_CONCURRENCY: int = 3
+
+#: 全云端**所有设备合计**的并发回源上限（审计 F03）。
+#:
+#: 没有它时只有单设备 64：三台设备各挂 60 个慢速 `/raw` 就是 180 条并发的
+#: 隧道往返 + 同样多的文件句柄，而云主机只有 2 vCPU / 4 GB —— 一台机器被
+#: 刷满就轮到整台服务器，别的用户的隧道一起掉线。
+MAX_INFLIGHT_TOTAL: int = 512
+
+#: 按来源 IP 的**鉴权尝试**上限（每分钟）。`/d/**` 上每一个要验令牌的请求
+#: 都算一次。放得很宽：正常手机一次缩略图潮就有 20–60 个请求，快速滑动能到
+#: 100+/分钟。这个桶挡的是"拿一个来源 IP 扫令牌"，不是正常浏览。
+AUTH_RATE_PER_MIN: int = 600
+
+#: 按来源 IP 的**认证失败**上限（窗口 `AUTH_FAIL_WINDOW` 秒）。
+#:
+#: 正常的失败只有"手机重新配对前的那一刻"（本地还留着旧令牌），一两次就到头；
+#: 10 分钟 20 次足够容错，而一枚 32 字节随机令牌的爆破进度远达不到这个量级。
+AUTH_FAIL_MAX: int = 20
+#: 认证失败计数窗口（秒）。
+AUTH_FAIL_WINDOW: float = 600.0
 
 
 class RateLimiter:
