@@ -12,7 +12,14 @@
 # 以外的全部排除在外，所以"上下文是仓库根"不会把 frontend/node_modules、
 # data/、模拟照片这些几百 MB 的东西塞进构建缓存。
 
-FROM python:3.12-slim
+# ★ 基础镜像按 digest 固定，不跟浮动标签。原因：审计指出
+#   `FROM python:3.12-slim` 会在某天悄悄换成另一个 patch 版本，
+#   于是"昨天构建通过、今天构建失败"，而且无法证明线上镜像对应哪份
+#   源码。digest 换新是**显式动作**（升级时手动改这一行并重跑用例）。
+#
+#   换新方法：
+#     docker buildx imagetools inspect python:3.12-slim --format '{{.Manifest.Digest}}'
+FROM python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704
 
 # 环境变量
 ENV PYTHONUNBUFFERED=1 \
@@ -23,9 +30,17 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# 先装依赖（利用层缓存：requirements.txt 不变就不重装）
-COPY requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# 先装依赖（利用层缓存：锁文件不变就不重装）。
+#
+# ★ 装的是 `requirements.lock` 而不是 `requirements.txt`：前者是
+#   "验证过的确切版本 + 每个发布物的 sha256"，`--require-hashes` 让
+#   pip 在任何一个包被替换/篡改时直接失败。`requirements.txt` 仍保留
+#   下限约束 + 选型说明，供人读；两者由
+#   `backend/tests/test_build_repro.py` 保证一致。
+#
+#   重新生成锁文件：`.venv/Scripts/python.exe build/_make_lock.py`
+COPY requirements.txt requirements.lock ./
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 
 # 再拷源码（改代码不会让依赖层失效）
 COPY shared/ ./shared/
@@ -39,6 +54,11 @@ COPY scripts/cloud_init.py ./scripts/cloud_init.py
 #   构建前必须先 `cd frontend && npm run build`；`deploy.sh` 的 `--check`
 #   会验证这个目录存在，否则构建出来的镜像里没有页面。
 COPY frontend/dist/ ./frontend/dist/
+
+# 供应链清单（CycloneDX）。运行时不需要它，但镜像里带上以后，
+# 拿到一个镜像就能回答"这台机器上到底装了哪些版本的组件"，
+# 不必去反推构建时的仓库状态。
+COPY sbom/ ./sbom/
 
 # 数据目录（会被 compose 的卷覆盖）
 RUN mkdir -p /data
@@ -60,7 +80,14 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 #   "电脑连在 worker A、手机请求打到 worker B" 变成常态，表现是随机 503。
 #   `cloud/relay/main.py::main()` 里已经写死单进程，这里再显式写一遍，
 #   因为绕过 main() 直接调 uvicorn 是运维最容易做的事。
+#
+# ★ `--no-proxy-headers`：绝不无条件相信 `X-Forwarded-For`。老写法
+#   `--proxy-headers --forwarded-allow-ips 172.16.0.0/12` 会让
+#   `scope["client"]` 被请求头改写，任何能动这个头的人都能自选来源 IP，
+#   于是登录/配对限速一人一个桶、形同不存在（ISSUE-049）。真要跑在
+#   反代后面，把反代自己的地址段写进 `PB_CLOUD_TRUSTED_PROXIES`，
+#   由 `cloud/relay/netutil.py` 决定信谁。
 CMD ["python", "-m", "uvicorn", "cloud.relay.main:create_app", \
      "--factory", "--host", "0.0.0.0", "--port", "8000", \
      "--workers", "1", "--ws", "websockets", \
-     "--proxy-headers", "--forwarded-allow-ips", "172.16.0.0/12"]
+     "--no-proxy-headers"]

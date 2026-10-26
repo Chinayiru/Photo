@@ -14,6 +14,9 @@
 !shared
 !scripts
 !requirements.txt
+!requirements.lock
+!sbom
+!sbom/**
 
 !cloud/**/*.py
 !cloud/Dockerfile
