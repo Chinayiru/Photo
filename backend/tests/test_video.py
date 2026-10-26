@@ -525,3 +525,92 @@ def test_detail_video_block_is_none_for_images() -> None:
     from app.handlers.common import _video_block
 
     assert _video_block({"kind": "image"}) is None
+
+
+# --------------------------------------------------------------------------
+# 11. V0 诊断：音频一票否决 / 容器决定 Content-Type / moov 位置
+# --------------------------------------------------------------------------
+
+def test_pcm_audio_vetoes_playback_even_with_h264() -> None:
+    """旧 iPhone 导出的 MOV 大量是 H.264 + PCM：只看视频编码会误判成"能播"。"""
+    assert V.playback_hint(container="mp4", vcodec="h264",
+                           acodec="pcm_s16le") == V.HINT_NO
+    assert V.is_playable(container="mp4", vcodec="h264",
+                         acodec="pcm_s16le") is False
+    # 没有音轨（空串）不算否决
+    assert V.playback_hint(container="mp4", vcodec="h264", acodec="") == V.HINT_OK
+
+
+@pytest.mark.parametrize("acodec", ["ac3", "dts", "truehd", "wmav2"])
+def test_exotic_audio_codecs_are_all_vetoed(acodec: str) -> None:
+    assert V.playback_hint(container="mp4", vcodec="h264", acodec=acodec) == V.HINT_NO
+
+
+def test_reason_explains_the_actual_blocker() -> None:
+    """文案与判据必须指向同一个原因，否则用户看到自相矛盾的提示。"""
+    assert "pcm_s16le" in V.playback_reason(
+        container="mp4", vcodec="h264", acodec="pcm_s16le")
+    assert "HEVC" in V.playback_reason(
+        container="mp4", vcodec="hevc", acodec="aac")
+    assert "mkv" in V.playback_reason(container="mkv", vcodec="h264", acodec="aac")
+    # 能播就没有理由可讲
+    assert V.playback_reason(container="mp4", vcodec="h264", acodec="aac") == ""
+
+
+@pytest.mark.parametrize("container,expected", [
+    ("mp4", "video/mp4"),
+    ("mov", "video/mp4"),      # MOV 也是 ISO BMFF：报 quicktime 只有 Safari 认
+    ("webm", "video/webm"),
+    ("mkv", "video/x-matroska"),
+    ("avi", "video/x-msvideo"),
+])
+def test_stream_content_type_follows_container(container: str, expected: str) -> None:
+    assert V.stream_content_type(container) == expected
+
+
+def test_stream_content_type_falls_back_to_extension() -> None:
+    assert V.stream_content_type("", ext="MOV") == "video/mp4"
+    assert V.stream_content_type("", ext="xy") == "application/octet-stream"
+
+
+def _box(kind: bytes, payload: bytes = b"") -> bytes:
+    return (8 + len(payload)).to_bytes(4, "big") + kind + payload
+
+
+def test_moov_before_mdat_detects_faststart(tmp_path) -> None:
+    fast = tmp_path / "fast.mp4"
+    fast.write_bytes(_box(b"ftyp", b"isom0000") + _box(b"moov") + _box(b"mdat", b"\0" * 16))
+    assert V.moov_before_mdat(fast) == 1
+
+    slow = tmp_path / "slow.mp4"
+    slow.write_bytes(_box(b"ftyp", b"isom0000") + _box(b"mdat", b"\0" * 16) + _box(b"moov"))
+    assert V.moov_before_mdat(slow) == 0
+
+
+def test_moov_before_mdat_survives_garbage(tmp_path) -> None:
+    """不是 ISO BMFF 的文件返回 None（不是异常、也不是 False）。"""
+    junk = tmp_path / "junk.bin"
+    junk.write_bytes(b"RIFF\x00\x00\x00\x00AVI ")
+    assert V.moov_before_mdat(junk) is None
+    assert V.moov_before_mdat(tmp_path / "nope.mp4") is None
+
+
+def test_video_block_reports_reason_and_faststart() -> None:
+    from app.handlers.common import _video_block
+
+    row = {"kind": "video", "duration": 2.0, "container": "mp4",
+           "vcodec": "h264", "acodec": "pcm_s16le", "faststart": 0}
+    block = _video_block(row)
+    assert block["hint"] == V.HINT_NO
+    assert "pcm_s16le" in block["reason"]
+    assert block["faststart"] is False
+
+
+def test_video_block_tolerates_rows_without_faststart_column() -> None:
+    from app.handlers.common import _video_block
+
+    row = {"kind": "video", "duration": 2.0, "container": "mp4",
+           "vcodec": "h264", "acodec": "aac"}
+    block = _video_block(row)
+    assert block["faststart"] is None
+    assert block["reason"] == ""

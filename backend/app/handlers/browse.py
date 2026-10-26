@@ -596,7 +596,8 @@ async def get_raw(ctx: Ctx) -> Reply:
     mid = ctx.param_int("media_id")
 
     row = db.query_one(
-        "SELECT id, root_id, rel_path, file_name, ext, size, mtime, kind, missing"
+        "SELECT id, root_id, rel_path, file_name, ext, size, mtime, kind, missing,"
+        "       container"
         "  FROM media WHERE id = ?",
         (mid,),
     )
@@ -617,7 +618,15 @@ async def get_raw(ctx: Ctx) -> Reply:
     except OSError:
         raise NotFound("源文件无法读取") from None
 
-    media_type = content_type_for(row["ext"])
+    # ★ 视频的 Content-Type 必须**按容器**给，不能按扩展名：库里 `.MOV` 绝大多数
+    #   是 ISO BMFF（`ftyp` 里就是 `qt  `/`mp42`），按扩展名会回
+    #   `video/quicktime` —— 那是 Safari 的说法，Chrome/安卓会当成"不支持的源"，
+    #   表现就是"手机上这个视频播不了"。
+    if videomod.row_kind(row) == "video":
+        media_type = videomod.stream_content_type(
+            row["container"] or "", ext=row["ext"])
+    else:
+        media_type = content_type_for(row["ext"])
     download = ctx.q_bool("download", False)
     filename = common.download_filename(
         ctx.q("name"), row["file_name"]) if download else None

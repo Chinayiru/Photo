@@ -88,6 +88,48 @@ def cmd_legacy_status(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backfill_faststart(_args: argparse.Namespace) -> int:
+    """把库里视频的 `faststart`（moov 在不在 mdat 之前）补上。
+
+    为什么需要单独一条命令：索引器只在文件 mtime/size 变化时重新探测，
+    升级到带 `faststart` 列的版本后，**已有的行全是 NULL** —— 重扫也不会
+    补，因为文件没变。NULL 的后果是播放页不提示"未做 faststart，起播很慢"。
+
+    只读文件头（每个文件几十字节），不改任何源文件。
+    """
+    from .app import sandbox as _sandbox
+    from .app import video as _video
+
+    db, cfg = _open_db()
+    done = skipped = failed = 0
+    try:
+        rows = db.query(
+            "SELECT id, root_id, rel_path FROM media"
+            " WHERE kind = 'video' AND faststart IS NULL")
+        for row in rows:
+            root = cfg.root_by_id(row["root_id"], allow_disabled=True)
+            if root is None:
+                skipped += 1
+                continue
+            try:
+                src = _sandbox.resolve(root, row["rel_path"], "read", cfg=cfg)
+                flag = _video.moov_before_mdat(src)
+            except Exception as exc:              # noqa: BLE001 - 单行失败不该中断整批
+                print(f"跳过 {row['rel_path']}：{exc}", file=sys.stderr)
+                failed += 1
+                continue
+            if flag is None:
+                skipped += 1
+                continue
+            db.execute("UPDATE media SET faststart = ? WHERE id = ?", (flag, row["id"]))
+            done += 1
+    finally:
+        db.close()
+    print(f"已补 {done} 行，跳过 {skipped} 行（非 ISO BMFF 或根已禁用），失败 {failed} 行")
+    print("提示：查询即刻生效，无需重启。")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="pbctl", description="照片桥运维小命令")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -101,6 +143,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("legacy-status", help="查看旧密钥窗口")
     p.set_defaults(func=cmd_legacy_status)
+
+    p = sub.add_parser("backfill-faststart",
+                       help="补齐视频的 moov/mdat 顺序（播放快慢提示用）")
+    p.set_defaults(func=cmd_backfill_faststart)
 
     args = parser.parse_args(argv)
     return int(args.func(args) or 0)

@@ -758,12 +758,13 @@ class Indexer:
         """
         is_video = ext in videomod.VIDEO_EXTS_INDEX
         kind = "video" if is_video else "image"
-        duration = vcodec = acodec = container = None
+        duration = vcodec = acodec = container = faststart = None
         if is_video and probe is not None and probe.ok:
             duration = probe.duration if probe.duration > 0 else None
             vcodec = probe.vcodec or None
             acodec = probe.acodec or None
             container = probe.container or None
+            faststart = probe.faststart
         width = probe.width if (is_video and probe and probe.ok) else (
             info.width if info else None)
         height = probe.height if (is_video and probe and probe.ok) else (
@@ -782,7 +783,7 @@ class Indexer:
             None,           # thumb_etag：源文件变了就作废，强制重新生成
             0,              # missing
             time.time(),    # indexed_at
-            duration, vcodec, acodec, container,
+            duration, vcodec, acodec, container, faststart,
         )
 
     _UPSERT_SQL: Final[str] = """
@@ -791,8 +792,8 @@ class Indexer:
             taken_at, taken_src, width, height, camera, lens,
             iso, fnum, exposure, focal, gps_lat, gps_lon, orientation,
             thumb_state, thumb_etag, missing, indexed_at,
-            duration, vcodec, acodec, container
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            duration, vcodec, acodec, container, faststart
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(root_id, rel_path) DO UPDATE SET
             file_name  = excluded.file_name,
             ext        = excluded.ext,
@@ -820,6 +821,7 @@ class Indexer:
             vcodec     = COALESCE(excluded.vcodec,   media.vcodec),
             acodec     = COALESCE(excluded.acodec,   media.acodec),
             container  = COALESCE(excluded.container, media.container),
+            faststart  = COALESCE(excluded.faststart,  media.faststart),
             -- 内容变了（mtime/size 不同）则缩略图作废，重置为 pending。
             -- 否则保留原状态，避免每次扫描都重新生成 4915 张缩略图。
             thumb_state = CASE

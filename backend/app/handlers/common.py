@@ -188,6 +188,13 @@ def _video_block(row: Any) -> dict[str, Any] | None:
     except (IndexError, KeyError):
         # 老调用点只 SELECT 了部分列（如维护脚本）—— 不是错误，只是没信息
         return None
+    try:
+        faststart = row["faststart"]
+    except (IndexError, KeyError):
+        faststart = None
+
+    hint = videomod.playback_hint(container=container, vcodec=vcodec,
+                                  acodec=acodec)
     return {
         "duration": row["duration"],
         "container": container,
@@ -196,8 +203,16 @@ def _video_block(row: Any) -> dict[str, Any] | None:
         # `playable` 是"Chrome 桌面确定能播"；`hint` 才是前端的行动依据：
         # HEVC 在 iOS Safari 能播、在 Windows Chrome 多半不能 —— 只给布尔值
         # 会让主客户端（手机）白白退回"下载原片"。
-        "playable": videomod.is_playable(container=container, vcodec=vcodec),
-        "hint": videomod.playback_hint(container=container, vcodec=vcodec),
+        "playable": videomod.is_playable(container=container, vcodec=vcodec,
+                                         acodec=acodec),
+        "hint": hint,
+        # 为什么播不了/可能播不了 —— 文案由服务端出，前端照抄（判据和文案
+        # 待在一起才不会互相矛盾）。
+        "reason": videomod.playback_reason(container=container, vcodec=vcodec,
+                                           acodec=acodec) if hint != "ok" else "",
+        # moov 在 mdat 之前吗（None=判断不了）。False 表示未做 faststart：
+        # 播放器必须先读到文件尾才起播，跨网络时就是长时间转圈。
+        "faststart": None if faststart is None else bool(faststart),
     }
 
 
