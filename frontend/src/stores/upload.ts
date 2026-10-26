@@ -103,6 +103,25 @@ function localId(): string {
  * ------------------------------------------------------------------ */
 
 /**
+ * 队列上限（ISSUE-060 B）。
+ *
+ * 为什么要有：手机相册一次全选很容易选到几百上千张。全塞进队列的后果
+ * 不是"慢"，而是**用户看不到自己在传什么、也停不下来**（列表几千行，
+ * 每条都占一个 DOM 节点 + 一个 File 句柄）。200 张已经够一次旅行的量，
+ * 再多就分批传 —— 至少每批结束用户能确认一次结果。
+ *
+ * 上限只在**入队时**拦：已经在队里的不会被踢掉。
+ */
+export const MAX_QUEUE = 200;
+
+/** 上一次入队时因为超过上限而被跳过的数量（UI 据此给明确提示）。 */
+let lastSkipped = 0;
+
+export function skippedByLimit(): number {
+  return lastSkipped;
+}
+
+/**
  * 添加文件到队列。
  *
  * `accept="image/*"` 已在 input 上限制，但安卓某些文件管理器会绕过；
@@ -112,11 +131,16 @@ export function enqueue(files: FileList | File[] | null): number {
   if (!files) return 0;
   const s = uploadStore.state;
   let n = 0;
+  lastSkipped = 0;
   for (const f of Array.from(files)) {
     if (!isImage(f) && !isVideoFile(f)) continue;
     // 同名同大小同 mtime 已在队列里 → 跳过（用户重复选了同一张）
     if (s.tasks.some((t) => t.name === f.name && t.size === f.size
       && t.mtime === Math.floor(f.lastModified / 1000))) continue;
+    if (s.tasks.length >= MAX_QUEUE) {
+      lastSkipped += 1;
+      continue;
+    }
     s.tasks.push({
       id: localId(),
       uploadId: null,
