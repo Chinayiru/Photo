@@ -555,7 +555,13 @@ function clientName(): string {
  */
 function scrubPairQuery(): void {
   try {
-    window.history.replaceState(null, "", window.location.pathname + window.location.hash);
+    // fragment 里带过配对码（`#code=…`）就整个丢掉：留着等于把码写进
+    // 浏览器历史。不带码的 fragment（路由）必须保留，否则会把用户
+    // 弹回首页。
+    const hash = /(?:^|[?&#])(?:code|c|pair|did)=/.test(window.location.hash)
+      ? ""
+      : window.location.hash;
+    window.history.replaceState(null, "", window.location.pathname + hash);
   } catch {
     /* 极少数内嵌 WebView 禁用 replaceState：抹不掉也不能让配对算失败 */
   }
@@ -704,7 +710,10 @@ export function parsePairInput(raw: string):
       : /^http:\/\//i.test(text) ? "http" : "";
     try {
       const u = new URL(/^https?:\/\//i.test(text) ? text : `http://${text}`);
+      // fragment 里的参数也算：扫码链接是 `#code=…`（不进服务端日志）
+      const hashParamsOfUrl = hashParams(u.hash);
       const code = u.searchParams.get("code")
+        || hashParamsOfUrl.get("code")
         || u.searchParams.get("c")
         || u.searchParams.get("pair")
         || "";
@@ -723,7 +732,7 @@ export function parsePairInput(raw: string):
           code: code.replace(/[\s-]/g, ""),
           // 粘贴整条链接时也带上（`#/pair?code=..&did=..` 形式从 hash 里找）
           did: (u.searchParams.get("did")
-            || new URLSearchParams(u.hash.replace(/^#\/?[^?]*\??/, "")).get("did")
+            || hashParamsOfUrl.get("did")
             || "").trim(),
         };
       }
@@ -766,10 +775,23 @@ export function parsePairInput(raw: string):
  * 已经分给了另一台也跑着 PhotoBridge 的电脑 —— 于是"扫码配对"会把
  * 手机绑到别人的电脑上，还会把对方的照片显示出来。
  */
+/**
+ * 把 `location.hash` 解析成参数表。
+ *
+ * 托盘二维码编的是 `#code=123456&did=…`（fragment，见 `tray.pair_qr_url`）；
+ * 历史形态 `#/pair?code=123456` 也要继续认（已经发出去的截图、书签）。
+ * 两种都归一到同一个 `URLSearchParams`，调用方不必关心是哪种。
+ */
+function hashParams(rawHash: string): URLSearchParams {
+  const body = rawHash.replace(/^#/, "");
+  const q = body.indexOf("?");
+  return new URLSearchParams(q >= 0 ? body.slice(q + 1) : body);
+}
+
 export function pairParamsFromLocation():
 { base: string; code: string; did: string } | null {
   const search = new URLSearchParams(window.location.search);
-  const hash = new URLSearchParams(window.location.hash.replace(/^#\/?[^?]*\??/, ""));
+  const hash = hashParams(window.location.hash);
   const code = search.get("code") || hash.get("code");
   if (!code) return null;
   const host = window.location.hostname;

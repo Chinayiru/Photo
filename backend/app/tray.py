@@ -132,8 +132,16 @@ def build_icon_image(size: int = _ICON_SIZE) -> Any:
 def pair_qr_url(base_url: str, code: str, device_id: str | None = None) -> str:
     """手机扫码后要打开的地址。
 
-    `?code=` 是前端 `PairView.vue` 认的参数（`pairParamsFromLocation()`），
-    扫码后配对码会自动填进输入框，用户只需点"配对"。
+    `#code=`（**fragment**）是前端 `PairView.vue` 认的参数
+    （`pairParamsFromLocation()`），扫码后配对码会自动填进输入框，
+    用户只需点"配对"。
+
+    ★ 为什么是 fragment 而不是 `?code=`：query string 会进服务端访问
+      日志、反向代理日志、浏览器历史与 `Referer` 头 —— 每一层都得单独
+      遮盖（`cloud/Caddyfile` 里那段 `filter` 就是干这个的，但它只是
+      补丁）。fragment 不参与任何一次 HTTP 请求，从根上没有暴露面。
+      代价是"把链接发给别人"时必须整条发（浏览器地址栏里的 fragment
+      在复制时是保留的，实测无损）。
 
     ★ `&did=` 带电脑的 `device_id`（AC-5.2）。它防的是一种很隐蔽的
     错配：二维码是**静态**的（用户可能截图存着、或者打印出来贴在
@@ -142,7 +150,7 @@ def pair_qr_url(base_url: str, code: str, device_id: str | None = None) -> str:
     会把用户的手机绑到别人的电脑上，还会把对方的照片显示出来。
     带上 device_id 后前端就能发现"这个码不属于这台电脑"。
     """
-    url = f"{base_url.rstrip('/')}/?code={quote(code, safe='')}"
+    url = f"{base_url.rstrip('/')}/#code={quote(code, safe='')}"
     if device_id:
         url += f"&did={quote(device_id, safe='')}"
     return url
