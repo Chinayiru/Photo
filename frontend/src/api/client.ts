@@ -425,9 +425,14 @@ async function once<T>(path: string, opt: RequestOptions): Promise<T> {
       headers,
       body: payload,
       signal: ctrl.signal,
-      // 局域网直连是明文 HTTP，凭据不进 cookie，这里无所谓；
-      // 显式 omit 避免未来加 cookie 时出现跨源带凭据的问题
-      credentials: "omit",
+      // ★ 必须 `same-origin`，不能 `omit`：
+      // 服务端会在每次带 Bearer 的响应里顺手 `Set-Cookie: pb_token`（自愈路径，
+      // 给发不出自定义头的 `<img>` / `<video>` / `EventSource` 用）。
+      // `omit` 会让浏览器**丢弃**那条 Set-Cookie —— 于是媒体元素永远拿不到
+      // cookie，`<video src>` 每次都 401 E2002，播放器每 1.5 秒重试一次，
+      // 用户看到的就是"视频一直在转圈、永远放不起"（2026-10-26 真实故障）。
+      // `same-origin` 只对同源请求带凭据，不会有跨源泄漏问题。
+      credentials: "same-origin",
       cache: "no-store",
     });
   } catch (e) {
