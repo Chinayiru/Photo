@@ -33,6 +33,41 @@ const cloudPage = ref(cloudBaseFromLocation() !== "");
 
 const host = ref("");
 const port = ref("8787");
+/**
+ * 候选入口（`GET /api/system/entrances`，匿名接口）：点一下就填好地址。
+ *
+ * 为什么需要：用户不知道家里电脑今天被 DHCP 分到哪个 IP，更不知道
+ * Tailscale 会给它分另一个地址。"装好了却连不上"里相当一部分，就是
+ * 手填地址填错或填了根本连不上的虚拟网卡。
+ */
+type EntryItem = { label: string; host: string; url: string };
+const entryItems = ref<EntryItem[]>([]);
+const cloudEntry = ref<EntryItem | null>(null);
+
+function applyEntry(it: EntryItem): void {
+  const u = parseBaseUrl(it.url);
+  if (!u) return;
+  host.value = u.hostname;
+  port.value = u.port || "8787";
+}
+
+async function loadEntrances(): Promise<void> {
+  try {
+    const r = await fetch("/api/system/entrances", {
+      headers: { accept: "application/json" },
+    });
+    if (!r.ok) return;
+    const data = (await r.json()) as {
+      lan?: EntryItem[];
+      vpn?: EntryItem[];
+      cloud?: EntryItem | null;
+    };
+    entryItems.value = [...(data.lan ?? []), ...(data.vpn ?? [])];
+    cloudEntry.value = data.cloud ?? null;
+  } catch {
+    // 探测失败不影响主流程：仍然可以手填
+  }
+}
 const code = ref("");
 const pasteText = ref("");
 const busy = ref(false);
@@ -203,6 +238,8 @@ const canSubmit = computed(() =>
   && /^\d{6}$/.test(code.value.replace(/[\s-]/g, "")) && !busy.value);
 
 onMounted(() => {
+  // 候选入口与配对流程互相独立，并行去取（失败也不影响手填）
+  void loadEntrances();
   // 扫码进来时 URL 里已经带好了参数，别让用户再输一遍
   const p = pairParamsFromLocation();
   if (p) {
@@ -455,6 +492,15 @@ function onCodeInput(e: Event): void {
         </div>
         <span class="hint">电脑上打开 PhotoBridge 就能看到这个地址</span>
       </label>
+      <div v-if="entry === 'lan' && mode === 'code' && !cloudPage && entryItems.length" class="entry-hints">
+        <button
+          v-for="it in entryItems"
+          :key="it.url"
+          type="button"
+          class="hint-chip"
+          @click="applyEntry(it)"
+        >{{ it.label }} <code>{{ it.host }}</code></button>
+      </div>
       <template v-if="codeAvailable && mode === 'code' && entry === 'cloud' && !cloudPage">
         <label class="field">
           <span class="lbl">云端链接</span>
@@ -470,6 +516,11 @@ function onCodeInput(e: Event): void {
           />
           <span class="hint">电脑二维码/聊天里那条链接；配对码会打到它指定的那台电脑</span>
         </label>
+        <div v-if="cloudEntry" class="entry-hints">
+          <button type="button" class="hint-chip" @click="cloudLink = cloudEntry.url">
+            {{ cloudEntry.label }} <code>{{ cloudEntry.host }}</code>
+          </button>
+        </div>
       </template>
       <p v-else-if="codeAvailable && mode === 'code'" class="cloud-note">
         {{ relayRoot
@@ -894,5 +945,33 @@ function onCodeInput(e: Event): void {
 .dev-state.on {
   background: rgba(38, 166, 91, 0.16);
   color: #26a65b;
+}
+/* 候选入口：点一下就填好地址 */
+.entry-hints {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 6px 0 2px;
+}
+
+.hint-chip {
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.3;
+  padding: 7px 10px;
+  border: 1px solid var(--line, #d8d8d8);
+  border-radius: 999px;
+  background: var(--chip-bg, #f6f6f6);
+  color: inherit;
+  cursor: pointer;
+}
+
+.hint-chip code {
+  font-family: ui-monospace, Consolas, monospace;
+  opacity: 0.75;
+}
+
+.hint-chip:active {
+  transform: scale(0.98);
 }
 </style>

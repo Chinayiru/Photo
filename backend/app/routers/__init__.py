@@ -27,6 +27,9 @@ def build_router() -> Router:
     # --- 系统 ---------------------------------------------------------
     r.add("GET", "/api/system/ping", h_system.ping, name="system.ping")
     r.add("GET", "/api/system/info", h_system.info, name="system.info")
+    r.add(
+        "GET", "/api/system/entrances", h_system.entrances, name="system.entrances",
+    )
     r.add("GET", "/api/system/stats", h_system.stats, name="system.stats")
     r.add("GET", "/api/events", h_events.events, name="system.events")
 

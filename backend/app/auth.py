@@ -206,6 +206,10 @@ CLIENT_COOKIE: str = "pb_token"
 #: 它的安全依赖"必须持有 5 分钟内有效的 6 位码"+ 按 IP 限速。
 PUBLIC_PATHS: frozenset[str] = frozenset({
     "/api/system/ping",
+    #: 配对页要在**没有任何令牌**时就把「家里 Wi-Fi / VPN / 云端」三条入口
+    #: 摆出来，所以这个接口必须匿名。它只返回本机地址 —— 扫一遍网段就能
+    #: 拿到的东西，藏起来没有意义（判据见 `entrances.py` 的模块注释）。
+    "/api/system/entrances",
     "/api/pair",
 })
 
