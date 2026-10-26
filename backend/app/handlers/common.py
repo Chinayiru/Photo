@@ -193,7 +193,11 @@ def _video_block(row: Any) -> dict[str, Any] | None:
         "container": container,
         "vcodec": vcodec,
         "acodec": acodec,
+        # `playable` 是"Chrome 桌面确定能播"；`hint` 才是前端的行动依据：
+        # HEVC 在 iOS Safari 能播、在 Windows Chrome 多半不能 —— 只给布尔值
+        # 会让主客户端（手机）白白退回"下载原片"。
         "playable": videomod.is_playable(container=container, vcodec=vcodec),
+        "hint": videomod.playback_hint(container=container, vcodec=vcodec),
     }
 
 
