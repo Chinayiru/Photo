@@ -166,3 +166,34 @@ coll = COLLECT(         # noqa: F821
     upx_exclude=[],
     name="PhotoBridge",
 )
+
+# --------------------------------------------------------------------------
+# 产物自带的版本清单（S06：让"仓库钉了 Pillow 13"和"用户手上这个包是不是
+# 13"能一条命令对上）
+# --------------------------------------------------------------------------
+# 为什么必须在**构建时**写：Pillow 的漏洞是"编译进产物里的解码器"的漏洞，
+# 改了 requirements.txt 不会让任何已经打好的包变安全。2026-10-18 打的那个
+# `dist/PhotoBridge` 就还冻着 12.x，而仓库里 1700+ 条测试全绿也发现不了 ——
+# 因为测试跑的是 `.venv`，不是那个包。把版本写进产物，
+# `backend/tests/test_packaging_s06_pillow.py` 才能把它和 requirements.lock
+# 对齐（在 CI 之外、用户机器上也一样看得见）。
+import hashlib as _hashlib
+import json as _json
+import platform as _platform
+from datetime import datetime as _datetime, timezone as _timezone
+
+import PIL as _PIL
+
+_build_info = {
+    "app": "PhotoBridge",
+    "built_at": _datetime.now(_timezone.utc).isoformat(timespec="seconds"),
+    "python": _platform.python_version(),
+    "pillow": _PIL.__version__,
+    "requirements_lock_sha256": _hashlib.sha256(
+        (REPO / "requirements.lock").read_bytes()
+    ).hexdigest(),
+}
+_out = Path(DISTPATH) / "PhotoBridge" / "build_info.json"   # noqa: F821
+_out.write_text(_json.dumps(_build_info, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8")
+print(f"📦 已写入 {_out}：Pillow {_build_info['pillow']}")
