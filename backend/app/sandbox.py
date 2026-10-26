@@ -142,6 +142,28 @@ def resolve(root: RootConfig, rel_path: str, need: Need = "read", *, cfg: Config
         raise SandboxError(r.rule, r.detail or None, spec) from None
 
 
+def resolve_dir(root: RootConfig, rel_path: str, *,
+                cfg: Config | None = None) -> Path:
+    """目录版 `resolve`：允许**空路径**（表示库根本身）。
+
+    为什么需要它：`resolve(root, "")` / `resolve(root, ".")` 会被
+    `_steps_1_to_3` 当成空路径拒掉（E1009 path_denied）—— 那个判断是对的，
+    空路径在"访问某个文件"的语境下没有意义。但"列出根层有哪些子目录"
+    是一个合法需求（「按文件夹」视图的第一屏）。
+
+    这里不是绕过沙箱：清单仍然由 `_real_root()`（realpath 后的根）给出，
+    权限判定仍走 `_step_7_permission`。区别只在于基准路径就是根，
+    不存在"往根外走"这一步。
+    """
+    if rel_path.strip().strip("/\\.") == "":
+        _step_7_permission(root, "read", cfg)
+        return _real_root(root)
+    # `need` 写死 "read"：这个函数只服务于"列某层子目录"，不提供写/删入口。
+    # 留成参数会变成 check_lint 规则 10 要防的那件事 ——
+    # "need 不是字面量，客户端可能把读声明成删"。
+    return resolve(root, rel_path, "read", cfg=cfg)
+
+
 def _steps_1_to_3(rel_path: str) -> tuple[str, list[str]]:
     """步 1–3：形态、段级、字符与长度。返回 (归一化路径, 段列表)。"""
     # ---------- 步 1：形态 ----------

@@ -107,6 +107,16 @@ CREATE TABLE IF NOT EXISTS media (
 CREATE INDEX IF NOT EXISTS idx_media_timeline
   ON media(taken_at DESC, id DESC);
 
+-- 「按文件夹」浏览：按 (根, 相对路径) 定位一层目录。
+-- 没有它时 `WHERE root_id = ? AND rel_path LIKE 'x/%' AND rel_path NOT LIKE
+-- 'x/%/%'` 只能 SCAN media（5000 行时约 3ms，看着不慢，但目录分页是
+-- 每翻一页扫一次、且随库增长线性变差）。有了它 EXPLAIN 走
+-- `SEARCH media USING INDEX idx_media_root_dir (root_id=? AND rel_path>? AND rel_path<?)`。
+-- ⚠️ 它**不能**替 timeline 索引：ORDER BY 仍是 taken_at，SQLite 会在这里
+-- 取到候选行后做一次有界排序（开销正比于该目录条目数，与总库大小无关）。
+CREATE INDEX IF NOT EXISTS idx_media_root_dir
+  ON media(root_id, rel_path);
+
 -- 去重/秒传：sha256 命中时快速定位（部分索引，索引时大部分行为 NULL）
 CREATE INDEX IF NOT EXISTS idx_media_sha
   ON media(sha256) WHERE sha256 IS NOT NULL;

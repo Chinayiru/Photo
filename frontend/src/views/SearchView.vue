@@ -38,6 +38,38 @@ const loading = ref(false);
 const searched = ref(false);
 const error = ref("");
 
+/**
+ * 已搜出的结果分布在哪些文件夹（ISSUE-060 C）。
+ *
+ * 用户"找一张照片"时的真实困境往往不是搜不到，而是**搜到一堆**：文件名
+ * 都有"IMG"，翻了三屏还没找到。给出目录分布，一眼就能看出"我要的都在
+ * 「青甘环线/第一天」里"，点一下就直接下钻过去 —— 比继续翻页快得多。
+ *
+ * 只取前 8 个（按条数降序）：再多就失去"一眼看清"的作用。
+ */
+const dirStats = computed(() => {
+  const m = new Map<string, number>();
+  for (const it of items.value) {
+    const d = it.dir ?? "";
+    if (!d) continue;
+    m.set(d, (m.get(d) ?? 0) + 1);
+  }
+  return Array.from(m.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([dir, count]) => ({
+      dir,
+      count,
+      // 只显示最后一层目录名：完整路径太长，横排会挤成省略号
+      name: dir.split("/").filter(Boolean).pop() ?? dir,
+    }));
+});
+
+/** 切到「照片」Tab 并下钻到这个目录（由 App.vue 监听）。 */
+function gotoFolder(dir: string): void {
+  window.dispatchEvent(new CustomEvent("pb:goto-folder", { detail: dir }));
+}
+
 const groups = computed(() => groupByDay(items.value));
 
 /* ------------------------------------------------------------------ *
@@ -213,6 +245,18 @@ function onOpen(id: number): void {
       <p v-if="error" class="err">{{ error }}</p>
     </div>
 
+    <div v-if="groups.length > 0 && dirStats.length > 0" class="dirs">
+      <span class="dirs-label">这些结果在这些文件夹：</span>
+      <button
+        v-for="d in dirStats"
+        :key="d.dir"
+        class="dir-chip"
+        type="button"
+        :title="d.dir"
+        @click="gotoFolder(d.dir)"
+      >{{ d.name }} · {{ d.count }}</button>
+    </div>
+
     <PhotoGrid
       v-if="groups.length > 0"
       :groups="groups"
@@ -266,6 +310,38 @@ function onOpen(id: number): void {
   flex-direction: column;
   /* 多选入口/全选按钮是 absolute，需要这里有定位上下文 */
   position: relative;
+}
+
+/* 结果里的目录胶囊（ISSUE-060 C）：横向滚动，不换行占高度 */
+.dirs {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 8px 10px 2px;
+  scrollbar-width: none;
+}
+
+.dirs::-webkit-scrollbar {
+  display: none;
+}
+
+.dirs-label {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--fg-3);
+}
+
+.dir-chip {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--fg-1);
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
 }
 
 .form {

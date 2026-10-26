@@ -24,6 +24,8 @@ import {
   requeueInterrupted,
   resumeAll,
   retryTask,
+  MAX_QUEUE,
+  skippedByLimit,
   statusClass,
   statusText,
   summaryText,
@@ -65,8 +67,17 @@ function onFiles(e: Event): void {
   const files = el.files;
   if (!files || files.length === 0) return;
   const n = enqueue(files);
+  const skipped = skippedByLimit();
   if (n === 0) {
-    toastWarn("没有可上传的图片（只支持图片文件，已跳过重复项）");
+    if (skipped > 0) {
+      // 队列已满时"一个都没加"必须给出**这一条**原因，
+      // 否则用户看到的是"没有可上传的图片"，会以为格式不对。
+      toastWarn(`队列已满（最多 ${MAX_QUEUE} 个），先传完再选`);
+    } else {
+      toastWarn("没有可上传的图片（只支持图片文件，已跳过重复项）");
+    }
+  } else if (skipped > 0) {
+    toastWarn(`已加入 ${n} 个，另有 ${skipped} 个超出队列上限（最多 ${MAX_QUEUE} 个）`);
   } else {
     toastOk(`已加入 ${n} 个文件`);
   }

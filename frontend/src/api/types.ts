@@ -360,7 +360,7 @@ export interface FolderEntry {
 }
 
 export interface FoldersResponse {
-  root: string | null;
+  root: string;
   path: string;
   folders: FolderEntry[];
   total: number;

@@ -44,6 +44,11 @@ def build_router() -> Router:
     r.add("GET", "/api/timeline", h_browse.timeline, name="browse.timeline")
     r.add("GET", "/api/search", h_browse.search, name="browse.search")
     r.add("GET", "/api/folders", h_browse.folders, name="browse.folders")
+    # 「按文件夹」视图的正文：某一层目录里**直接**存放的条目（游标分页）。
+    # 独立端点而非给 /api/folders 加参数：前者是一页媒体、后者是目录列表，
+    # 两者的分页语义不同（一个按 taken_at 游标、一个按目录名字典序）。
+    r.add("GET", "/api/folders/media", h_browse.folder_media,
+          name="browse.folder_media")
     r.add("GET", "/api/items/{media_id}", h_browse.get_item, name="browse.item")
     r.add("GET", "/api/items/{media_id}/thumb", h_browse.get_thumb, name="browse.thumb")
     r.add("GET", "/api/items/{media_id}/preview", h_browse.get_preview, name="browse.preview")

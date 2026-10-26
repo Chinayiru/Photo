@@ -808,23 +808,105 @@ async def folders(ctx: Ctx) -> Reply:
         b = buckets.get(sub)
         if b is None:
             b = {"name": depth_segs[-1], "path": (prefix + sub).strip("/"),
-                 "count": 0, "has_children": False, "cover_id": None}
+                 "count": 0, "direct": 0, "has_children": False, "cover_id": None}
             buckets[sub] = b
+        # `count` = 递归（含所有子孙目录里的条目）；`direct` = 只算直接放在
+        # 这个目录里的。两个都要，因为它们是两件不同的事（决策 D8）：
+        # 「这个文件夹一共多少张」和「点进去这一屏会有多少张」。
+        # 只给递归数会让用户点进去发现少了一大截（子目录里的不在本层），
+        # 只给直接数又会让他以为整个"青甘环线"只有 30 张。
         b["count"] += 1
+        if len(segs) - 1 == depth:
+            b["direct"] += 1
         if b["cover_id"] is None:
             b["cover_id"] = None          # 封面单独查，避免这里多带一列
         if len(segs) - 1 > depth:
             b["has_children"] = True
 
+    # ★ 空目录也必须出现在树里。
+    #
+    # 上面的计数全部来自 media 表，而"刚建的空目录"和"只有子目录、没有
+    # 直接文件"的目录在表里一行都没有 —— 不补的话用户会以为那个文件夹
+    # 消失了（他会去文件资源管理器确认它还在，然后开始怀疑同步）。
+    #
+    # 只补 depth==1 的直接子目录：更深层的信息由用户点进去之后的那次
+    # 请求补全（那时它就成了"当前层"）。一次 scandir 的成本远低于
+    # 为每个目录各扫一遍。
+    if depth == 1:
+        _merge_disk_dirs(root, base, buckets, st.cfg)
+
     items = sorted(buckets.values(), key=lambda x: x["path"])
     _attach_covers(st.cfg, db, root_id, items)
+
+    # 「当前这一层直接有多少张」——面包屑旁的数字用它。
+    # 和上面的 `count`（递归）分开算，理由见 buckets 那段注释。
+    files_here = _count_direct(st, root_id, base)
 
     return json_reply({
         "root": root_id,
         "path": base,
         "folders": items,
         "total": len(items),
+        "files": files_here,
     })
+
+
+def _has_any_child(path: str) -> bool:
+    """目录里还有没有东西（用来决定是否显示可下钻的箭头）。"""
+    try:
+        with os.scandir(path) as it:
+            return next(it, None) is not None
+    except OSError:
+        return False
+
+
+def _merge_disk_dirs(root: Any, base: str, buckets: dict[str, dict[str, Any]],
+                     cfg: Any) -> None:
+    """把磁盘上存在、但 media 表里没有行的子目录补进目录树。
+
+    `count` / `direct` 都是 0 —— 这些目录确实没有索引到的条目
+    （要么空，要么里面的东西还没扫到）。前端据 `count == 0` 显示
+    "空"而不是"加载中"。
+    """
+    try:
+        # 根层用 `resolve_dir`（它允许空路径）；子层仍走 `resolve`。
+        abs_base = sandbox.resolve_dir(root, base, cfg=cfg)
+    except Exception:
+        return                    # 目录不存在 / 无权读：树里就不列它
+    try:
+        with os.scandir(abs_base) as it:
+            entries = [(e.name, e.path) for e in it]
+    except OSError:
+        return
+    prefix = base + "/" if base else ""
+    for name, abs_child in entries:
+        rel = prefix + name
+        if rel in buckets:
+            continue
+        if sandbox.excluded_dir_segment(rel, root, last_is_file=False):
+            continue
+        try:
+            if not os.path.isdir(abs_child) or os.path.islink(abs_child):
+                continue
+        except OSError:
+            continue
+        buckets[rel] = {"name": name, "path": rel, "count": 0, "direct": 0,
+                        "has_children": _has_any_child(abs_child),
+                        "cover_id": None}
+
+
+def _count_direct(st: AppState, root_id: str, base: str) -> int:
+    """某一层目录里**直接**存放的媒体数量（不含子目录）。"""
+    where, params = common.timeline_where(
+        root_id=root_id,
+        allow_video=bool(st.cfg.video_enabled),
+        enabled_root_ids=[r.id for r in st.cfg.enabled_roots],
+    )
+    where += _DIRECT_ONLY if not base else _DIRECT_ONLY_NESTED
+    if base:
+        params.extend([_esc(base) + "/%", _esc(base) + "/%/%"])
+    row = st.db.query_one(f"SELECT COUNT(*) AS n FROM media{where}", params)
+    return int(row["n"]) if row else 0
 
 
 def _esc(s: str) -> str:
@@ -851,6 +933,151 @@ def _attach_covers(cfg: Any, db: Any, root_id: str,
             (root_id, 1 if cfg.video_enabled else 0, _esc(p) + "/%"),
             default=None,
         )
+
+
+# --------------------------------------------------------------------------
+# 按目录列媒体（「按文件夹」视图的正文）
+# --------------------------------------------------------------------------
+
+# 「只看本层，不含子目录」的两条 SQL 片段。
+# 为什么用 `NOT LIKE '前缀/%/%'` 而不是 `instr()`：LIKE 与前缀走同一套
+# 转义（`_esc`），少一处拼装就少一处能写错的地方；而且这两条都能吃到
+# `idx_media_root_dir(root_id, rel_path)` 的 SEARCH。
+_DIRECT_ONLY = " AND rel_path NOT LIKE '%/%' ESCAPE '\\'"
+_DIRECT_ONLY_NESTED = (" AND rel_path LIKE ? ESCAPE '\\'"
+                       " AND rel_path NOT LIKE ? ESCAPE '\\'")
+
+
+def _dir_param(ctx: Ctx, st: AppState, root: Any) -> str:
+    """校验并归一化 `dir` 参数。
+
+    目录是**用户可控的路径片段**，所以必须先过 `sandbox.resolve`：
+    它负责 `..`、绝对路径、盘符、重解析点（junction/symlink）、
+    是否在根内、以及"这个根允许读吗"。这里额外显式拒绝 `..`，
+    因为 `normalize_rel` 只做形态整理，不拒绝它 —— 不拒的话
+    `dir=../..` 会静默匹配不到任何行，用户看到"这个文件夹是空的"，
+    以为照片丢了。
+    """
+    raw = ctx.q("dir") or ""
+    # ★ 必须在 `normalize_rel` **之前**判这几条：normalize 只做形态整理，
+    #   它会把 `/abs` 的斜杠吃掉、把 `..` 原样留着或折叠掉 —— 判完再归一，
+    #   才谈得上"拒绝越界"。
+    probe = raw.replace("\\", "/")
+    if probe.startswith("/") or (len(probe) > 1 and probe[1] == ":"):
+        raise AppError(E1001, "dir 参数非法")
+    if any(seg == ".." for seg in probe.split("/")):
+        raise AppError(E1001, "dir 参数非法")
+    try:
+        d = sandbox.normalize_rel(raw).strip("/")
+    except Exception:
+        raise AppError(E1001, "dir 参数非法") from None
+    if d:
+        try:
+            # `resolve` 只做"形态 + 越界 + 权限"判定，**不要求路径存在**，
+            # 所以还要单独判存在：否则 `dir=打错的目录名` 会一路走到
+            # SQL 前缀匹配、返回空列表，前端显示"这个文件夹是空的" ——
+            # 用户看到的是"我的照片不见了"，而不是"这个目录不存在"。
+            if not sandbox.exists(root, d, cfg=st.cfg):
+                raise AppError(E1001, "目录不存在")
+            sandbox.resolve(root, d, "read", cfg=st.cfg)
+        except AppError:
+            raise
+        except Exception:
+            # 越界 / 被排除（回收站、.tmp）/ 无读权限都归到这里。
+            # 不回显绝对路径（硬约束 6）。
+            raise AppError(E1001, "目录不可访问") from None
+    return d
+
+
+async def folder_media(ctx: Ctx) -> Reply:
+    """`GET /api/folders/media` —— 「按文件夹」视图里某一层的正文。
+
+    ## 参数
+    `root`（可选，缺省用默认根）、`dir`（相对目录，空 = 根层）、
+    `cursor`、`limit`、`kind`。
+
+    ## 排序（决策 D12）
+    `taken_at DESC, id DESC` —— 和时间线**逐字一致**。两个视图排序不同
+    会让用户切来切去时彻底失去方向感（"刚才那张在这儿怎么不在这儿"）。
+
+    ## 为什么只列本层
+    「按文件夹」的语义是**逐层下钻**：想看子目录就点进去。把子目录里的
+    条目也混进来，等于把目录树压平成一个大列表，"按文件夹分类"就失去了
+    意义（那正是「全部图片」在做的事）。
+
+    ## 分页
+    游标与时间线同构（`encode_cursor(taken_at, id)`）：目录里新增照片
+    不会让已经翻过的页错位（OFFSET 会）。走到第 50 页时走的是
+    `idx_media_root_dir` 的等值+前缀 SEARCH，另加一次有界排序
+    （开销正比于该目录的条目数，与总库大小无关）。
+    """
+    st = _st(ctx)
+    db = st.db
+
+    root_id = (common.root_id_param(ctx) or "")
+    if not root_id:
+        # 没点名就用默认根。全库都被停用时 `default_root_id` 会抛
+        # ConfigError —— 对客户端应当表现为"内容不存在"（E1004），
+        # 与"这个根被停用"一致，而不是一个 500 或"配置错误"。
+        try:
+            root_id = st.cfg.default_root_id or ""
+        except Exception:
+            raise AppError(E1004) from None
+    if not root_id or not st.cfg.has_root(root_id):
+        raise AppError(E1001, f"未知的 root：{root_id}")
+    # 停用的根 → 404 E1004（root_by_id 抛 RootDisabledError）
+    root = st.cfg.root_by_id(root_id, allow_disabled=False)
+    assert root is not None
+
+    base = _dir_param(ctx, st, root)
+
+    limit = ctx.q_int("limit", DEFAULT_LIMIT, minimum=1, maximum=MAX_LIMIT)
+
+    where, params = common.timeline_where(
+        root_id=root_id,
+        kind=ctx.q("kind"),
+        allow_video=bool(st.cfg.video_enabled),
+        enabled_root_ids=[r.id for r in st.cfg.enabled_roots],
+    )
+    where += _DIRECT_ONLY if not base else _DIRECT_ONLY_NESTED
+    if base:
+        params.extend([_esc(base) + "/%", _esc(base) + "/%/%"])
+
+    # 本层总数：给面包屑显示「共 N 张」，也让前端能判断"到底了"。
+    # 和分页查询共用同一段 WHERE，避免两处口径漂移。
+    total_row = db.query_one(f"SELECT COUNT(*) AS n FROM media{where}", params)
+    total = int(total_row["n"]) if total_row else 0
+
+    cursor = ctx.q("cursor")
+    if cursor:
+        cur_ts, cur_id = decode_cursor(cursor)
+        where += " AND (taken_at < ? OR (taken_at = ? AND id < ?))"
+        params.extend([cur_ts, cur_ts, cur_id])
+
+    rows = db.query(
+        f"SELECT {TIMELINE_COLUMNS} FROM media{where}"
+        " ORDER BY taken_at DESC, id DESC LIMIT ?",
+        [*params, limit + 1],
+    )
+    has_more = len(rows) > limit
+    if has_more:
+        rows = rows[:limit]
+
+    next_cursor = None
+    if has_more and rows:
+        last = rows[-1]
+        next_cursor = encode_cursor(float(last["taken_at"]), int(last["id"]))
+
+    return json_reply({
+        "root": root_id,
+        "dir": base,
+        "items": [row_to_item(r) for r in rows],
+        "total": total,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "server_time": time.time(),
+        "tz_offset_minutes": int(st.cfg.tz_offset_minutes),
+    })
 
 
 # --------------------------------------------------------------------------
@@ -885,7 +1112,18 @@ async def search(ctx: Ctx) -> Reply:
     ts_from = parse_ts(ctx.q("from"), what="from")
     ts_to = parse_ts(ctx.q("to"), what="to")
     camera = ctx.q("camera") or None
-    dir_prefix = ctx.q("dir") or None
+    # `dir` 是用户可控路径片段，必须过沙箱（硬约束 1）。
+    # 这里只是作为 SQL 前缀，不会真的读文件，但不校验就留下一条
+    # "绕过 sandbox 的路径参数"的口子，而口子一旦存在就没人再看它。
+    dir_prefix = None
+    if ctx.q("dir"):
+        # 先用**已经过上面校验**的 root（点名且存在），否则退回默认根。
+        candidate = root_id if (root_id and st.cfg.has_root(root_id)) \
+            else st.cfg.default_root_id
+        probe_root = st.cfg.root_by_id(candidate, allow_disabled=False) if candidate else None
+        if probe_root is None:
+            raise AppError(E1001, "按目录搜索需要先有一个可用的库")
+        dir_prefix = _dir_param(ctx, st, probe_root) or None
     gps_raw = ctx.q("has_gps")
     has_gps = None if gps_raw is None or gps_raw == "" else ctx.q_bool("has_gps")
 

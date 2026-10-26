@@ -24,6 +24,7 @@ import { onAuthLost } from "./api/client";
 import { closeEvents, connectEvents, reconnectEvents } from "./api/events";
 import { authStore, isPaired, probe } from "./stores/auth";
 import { exit as exitSelect, selectionStore } from "./stores/selection";
+import { openFolder } from "./stores/timeline";
 import { startEvents, stopEvents } from "./stores/system";
 import { requeueInterrupted, uploadStore } from "./stores/upload";
 
@@ -96,7 +97,24 @@ watch(
 
 let onVisible: (() => void) | null = null;
 
+/**
+ * 跳到某个文件夹（由搜索页广播）。
+ *
+ * `detail` 是相对根的目录路径；空串/非字符串一律忽略 —— 宁可什么都不做，
+ * 也不要切到一个"根层"把用户从搜索结果里莫名其妙踢走。
+ */
+function onGotoFolder(e: Event): void {
+  const dir = (e as CustomEvent<unknown>).detail;
+  if (typeof dir !== "string" || dir === "") return;
+  openFolder(dir);
+  tab.value = "timeline";
+}
+
 onMounted(() => {
+  // 搜索页的「只看这个文件夹」→ 切到照片 Tab 并下钻到那个目录。
+  // ★ 用 window 事件而不是共享 store：Tab 的选择权在 App 自己手里，
+  //   子视图不该反向 import App 的 ref（会绕成环）。
+  window.addEventListener("pb:goto-folder", onGotoFolder as EventListener);
   // token 失效（401 E2002 / 403 E2004）→ client 会回调这里，踢回配对页
   onAuthLost(() => {
     paired.value = false;
@@ -128,6 +146,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener("pb:goto-folder", onGotoFolder as EventListener);
   if (onVisible) document.removeEventListener("visibilitychange", onVisible);
   stopEvents();
   closeEvents();

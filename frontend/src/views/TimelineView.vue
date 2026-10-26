@@ -11,11 +11,15 @@
 import { computed, onActivated, onDeactivated, onMounted, onBeforeUnmount, ref, watch } from "vue";
 import PhotoGrid from "../components/PhotoGrid.vue";
 import {
+  crumbs,
   groups,
   isEmpty,
   emptyHint,
   loadMore,
+  openFolder,
+  refreshFolders,
   removeItem,
+  setMode,
   timelineStore,
 } from "../stores/timeline";
 import { systemStore } from "../stores/system";
@@ -39,6 +43,28 @@ const totalRef = computed(() => timelineStore.state.totalInLibrary);
 
 const selActive = computed(() => selectionStore.state.active);
 const selected = selectedSet;
+
+/* ------------------------------------------------------------------ *
+ * 浏览方式（ISSUE-060 A）：全部图片 ⇄ 按文件夹
+ * ------------------------------------------------------------------ */
+
+const mode = computed(() => timelineStore.state.mode);
+const folders = computed(() => timelineStore.state.folders);
+const folderTotal = computed(() => timelineStore.state.folderTotal);
+const crumbList = crumbs;
+
+function switchMode(m: "all" | "folder"): void {
+  if (mode.value === m) return;
+  setMode(m);
+  // 切到文件夹模式时，第一屏往往是"几个目录块 + 没几张照片"，
+  // 撑不满屏就再也触发不到触底加载 —— 补一次探测。
+  window.setTimeout(poke, 300);
+}
+
+function gotoFolder(path: string): void {
+  openFolder(path);
+  window.setTimeout(poke, 300);
+}
 
 onMounted(() => {
   if (!loaded.value) void loadMore();
@@ -96,6 +122,7 @@ function retry(): void {
 /** 扫描完成后库里多了照片，用户下拉刷新能立刻看到。 */
 function refresh(): Promise<void> {
   return loadMore(true).then(() => {
+    if (mode.value === "folder") void refreshFolders();
     window.setTimeout(poke, 200);
   });
 }
@@ -302,6 +329,64 @@ onDeactivated(() => {
       </span>
     </div>
 
+    <!--
+      浏览方式切换（ISSUE-060 A）。
+      ★ 默认仍然是「全部图片」：绝大多数时候用户只想翻最近的照片，
+        按文件夹是"我知道它在哪个目录里"时才用的路径。
+    -->
+    <div class="browse">
+      <div class="seg" role="tablist" aria-label="浏览方式">
+        <button
+          class="seg-btn"
+          :class="{ on: mode === 'all' }"
+          type="button"
+          role="tab"
+          :aria-selected="mode === 'all'"
+          @click="switchMode('all')"
+        >全部图片</button>
+        <button
+          class="seg-btn"
+          :class="{ on: mode === 'folder' }"
+          type="button"
+          role="tab"
+          :aria-selected="mode === 'folder'"
+          @click="switchMode('folder')"
+        >按文件夹</button>
+      </div>
+
+      <!-- 面包屑：点任意一级跳回去；最后一级是当前目录，不可点 -->
+      <div v-if="mode === 'folder'" class="crumbs">
+        <template v-for="(c, i) in crumbList" :key="c.path">
+          <span v-if="i > 0" class="crumb-sep" aria-hidden="true">›</span>
+          <button
+            v-if="i < crumbList.length - 1"
+            class="crumb"
+            type="button"
+            @click="gotoFolder(c.path)"
+          >{{ c.label }}</button>
+          <span v-else class="crumb now">{{ c.label }}</span>
+        </template>
+        <span v-if="folderTotal >= 0" class="crumb-count">共 {{ folderTotal }} 项</span>
+      </div>
+    </div>
+
+    <!-- 当前层的子目录。没有子目录时整行不占位，照片墙直接顶上来 -->
+    <div v-if="mode === 'folder' && folders.length > 0" class="folders">
+      <button
+        v-for="f in folders"
+        :key="f.path"
+        class="folder-tile"
+        type="button"
+        @click="gotoFolder(f.path)"
+      >
+        <span class="folder-ico" aria-hidden="true">📁</span>
+        <span class="folder-name ellipsis">{{ f.name }}</span>
+        <span class="folder-meta">
+          {{ f.count }} 项<template v-if="f.has_children"> · 含子文件夹</template>
+        </span>
+      </button>
+    </div>
+
     <div v-if="!loaded && loading" class="skeleton-wrap">
       <div v-for="i in 12" :key="i" class="skeleton sk-cell" />
     </div>
@@ -371,6 +456,127 @@ onDeactivated(() => {
   position: relative;
   /* 下拉时整体下移，露出上面的指示器。跟手，所以不加 transition */
   will-change: transform;
+}
+
+/* ------------------------------------------------------------------ *
+ * 浏览方式：分段开关 + 面包屑 + 子目录块（ISSUE-060 A）
+ * ------------------------------------------------------------------ */
+
+.browse {
+  flex: 0 0 auto;
+  padding: 8px 10px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* 分段开关：两段等宽，选中那段用 accent 填充 */
+.seg {
+  display: flex;
+  background: var(--bg-3);
+  border-radius: 999px;
+  padding: 3px;
+  gap: 3px;
+}
+
+.seg-btn {
+  flex: 1 1 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg-2);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 7px 10px;
+  border-radius: 999px;
+  /* 触摸反馈要跟手：不加 transition，按下即变 */
+}
+
+.seg-btn.on {
+  background: var(--accent);
+  color: #fff;
+}
+
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--fg-2);
+  padding: 0 2px;
+}
+
+.crumb {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  padding: 2px 4px;
+  border-radius: 6px;
+  max-width: 12em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.crumb.now {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.crumb-sep {
+  color: var(--fg-3);
+}
+
+.crumb-count {
+  margin-left: auto;
+  color: var(--fg-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.folders {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 8px 10px 2px;
+  /* 横滑条不显示滚动条，但仍然能滑（移动端常见做法） */
+  scrollbar-width: none;
+}
+
+.folders::-webkit-scrollbar {
+  display: none;
+}
+
+.folder-tile {
+  flex: 0 0 auto;
+  width: 116px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg-2);
+}
+
+.folder-ico {
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.folder-name {
+  font-size: 13px;
+  font-weight: 600;
+  max-width: 100%;
+}
+
+.folder-meta {
+  font-size: 11px;
+  color: var(--fg-3);
+  font-variant-numeric: tabular-nums;
 }
 
 /*
