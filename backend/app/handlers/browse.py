@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from .. import audit, sandbox, video as videomod
+from .. import audit, sandbox, streamticket, video as videomod
 from ..config import ALLOWED_IMAGE_EXTS
 from ..core import Ctx, Reply, empty_reply, file_reply, json_reply, stream_reply
 from ..core.cursor import decode_cursor, encode_cursor
@@ -38,6 +38,7 @@ from ..errors import (
     NotFound,
     ReadonlyError,
     SandboxError,
+    Unauthorized,
 )
 from ..state import AppState
 from ..thumbs import placeholder_webp, source_signature, thumb_path
@@ -700,11 +701,34 @@ async def stream_video(ctx: Ctx) -> Reply:
     拒绝播放。真的想下载视频，前端走 `/raw?download=1`。
     """
     st = _st(ctx)
-    row = st.db.query_one("SELECT kind FROM media WHERE id = ?",
-                          (ctx.param_int("media_id"),))
+    mid = ctx.param_int("media_id")
+
+    # 带票的请求不经过 Bearer 鉴权（见 `auth.py` 的放行分支），票在这里验：
+    # 绑定条目 + 短命 + 电脑端私钥签名（`streamticket.py`）。
+    ticket = ctx.q("t")
+    if ticket and not streamticket.verify(st.db, ticket, mid):
+        raise Unauthorized("播放票无效或已过期，请重新打开视频")
+
+    row = st.db.query_one("SELECT kind FROM media WHERE id = ?", (mid,))
     if row is not None and videomod.row_kind(row) != "video":
         raise AppError(E1001, "该条目不是视频")
     return await get_raw(ctx)
+
+
+async def stream_ticket(ctx: Ctx) -> Reply:
+    """`GET /api/items/{id}/stream-ticket` —— 换一张播放票。
+
+    前端在把地址递给 `<video>` **之前**调用它（需要 Bearer，正常鉴权）。
+    返回 `{"ticket": "...", "expires_in": 300}`；过期了重新换一张即可。
+    """
+    st = _st(ctx)
+    mid = ctx.param_int("media_id")
+    ticket = streamticket.mint(st.db, mid)
+    r = json_reply({"ticket": ticket,
+                    "expires_in": int(streamticket.STREAM_TICKET_TTL)})
+    # 票是一次性的短命凭证：任何中间层都不许缓存它。
+    r.set_cache(0, private=True)
+    return r
 
 
 def _apply_disposition(reply: Reply, filename: str | None,

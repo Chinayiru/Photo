@@ -50,6 +50,9 @@ def build_router() -> Router:
     # 视频播放流：与 /raw 同一实现，只是前端据此选 <video>（ISSUE-055）
     r.add("GET", "/api/items/{media_id}/stream", h_browse.stream_video,
           name="browse.stream")
+    # 换票：`<video>` 发不了 Authorization，前端先换一张短命票拼进播放地址
+    r.add("GET", "/api/items/{media_id}/stream-ticket", h_browse.stream_ticket,
+          name="browse.stream_ticket")
 
     # --- 修改 ---------------------------------------------------------
     r.add("POST", "/api/items/delete", h_browse.delete_items, name="browse.delete")

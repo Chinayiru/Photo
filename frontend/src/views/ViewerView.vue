@@ -206,12 +206,42 @@ const videoHint = computed(() => {
 /** 值得递给 `<video>` 的条件：容器对 + 有播放地址 + 之前没试崩过。 */
 const videoPlayable = computed(() => isVideo.value
   && videoHint.value !== "no" && !!detail.value?.urls.video);
-const videoSrc = computed(() => (videoPlayable.value && !videoBroken.value
-  ? detail.value?.urls.video ?? ""
-  : ""));
+/**
+ * 播放票。
+ *
+ * `<video>` 由浏览器自己发请求：加不了 `Authorization` 头，cookie 那条路
+ * 又不可靠（ISSUE-033 的 `Secure`、ISSUE-057 的 `credentials: "omit"`
+ * 都让媒体元素拿不到凭证，症状是播放器每 1.5 秒重试一次、次次 401）。
+ * 所以先用 JS 换一张 5 分钟、只对这一条有效的票，拼进播放地址。
+ */
+const videoTicket = ref("");
+
+/** 换票失败时保持空串：`videoSrc` 为空 → 不挂 `<video>`，落到下载/原图。 */
+async function loadVideoTicket(id: number): Promise<void> {
+  videoTicket.value = "";
+  try {
+    const r = await api.get<{ ticket: string; expires_in: number }>(
+      `/api/items/${id}/stream-ticket`);
+    // 换票是异步的：这期间用户可能已经翻到下一条，别把票安到别人头上。
+    if (s.detail?.id === id) videoTicket.value = r.ticket;
+  } catch {
+    /* 换票失败：不递地址给 `<video>`，用户还能下载 */
+  }
+}
+
+const videoSrc = computed(() => {
+  if (!videoPlayable.value || videoBroken.value) return "";
+  const base = detail.value?.urls.video ?? "";
+  if (!base || !videoTicket.value) return "";
+  return `${base}?t=${encodeURIComponent(videoTicket.value)}`;
+});
 
 /** 换条目时清掉"上一条播崩了"的标记（否则下一条视频会被误判）。 */
-watch(() => detail.value?.id, () => { videoBroken.value = false; });
+watch(() => detail.value?.id, (id) => {
+  videoBroken.value = false;
+  videoTicket.value = "";
+  if (id != null && isVideo.value) void loadVideoTicket(id);
+}, { immediate: true });
 
 /**
  * 视频元信息到手（`loadedmetadata`）：等价于图片的 `onMainLoad`。
@@ -741,7 +771,7 @@ async function doDelete(): Promise<void> {
             `:key` 带 id：换视频时必须重建节点，否则会继续播上一条。
           -->
           <video
-            v-if="videoPlayable && !videoBroken"
+            v-if="videoPlayable && !videoBroken && !!videoSrc"
             :key="`video-${detail?.id}`"
             class="v-img video"
             :class="{ drag: dragging }"

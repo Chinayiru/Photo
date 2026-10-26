@@ -1050,6 +1050,21 @@ async def auth_middleware(ctx: Ctx, nxt: Any):
                 raise NotFound(path)
             return await nxt(ctx)
 
+    # --- 视频播放票（`?t=`）---
+    #
+    # `<video>` 由浏览器自己发请求：加不了 `Authorization`，cookie 这条路
+    # 又被现实打过两次脸（ISSUE-033 / ISSUE-057）。所以已认证的 JS 先换一张
+    # 5 分钟、只对单条目有效的票拼进播放地址（`streamticket.py`）。
+    # 这里只负责"放行到处理器"：票的真伪在 `browse.stream_video` 里验，
+    # 因为校验需要 `media_id`，而那是路由参数。
+    # ⚠️ `ctx.query` 的值是 **list[str]**，直接 `get("t")` 判真会踩坑：
+    #   `?t=`（空值）拿到的是 `[""]`，非空列表恒为真 —— 于是"带一个空票"
+    #   就能绕过整个鉴权中间件。必须按字符串判空。
+    ticket_q = (ctx.q("t") or "").strip()
+    if ticket_q and path.startswith("/api/items/") \
+            and path.endswith("/stream"):
+        return await nxt(ctx)
+
     # --- 公开路径 ---
     if path in PUBLIC_PATHS:
         return await nxt(ctx)
