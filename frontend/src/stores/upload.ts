@@ -113,7 +113,7 @@ export function enqueue(files: FileList | File[] | null): number {
   const s = uploadStore.state;
   let n = 0;
   for (const f of Array.from(files)) {
-    if (!isImage(f)) continue;
+    if (!isImage(f) && !isVideoFile(f)) continue;
     // 同名同大小同 mtime 已在队列里 → 跳过（用户重复选了同一张）
     if (s.tasks.some((t) => t.name === f.name && t.size === f.size
       && t.mtime === Math.floor(f.lastModified / 1000))) continue;
@@ -147,6 +147,20 @@ export function enqueue(files: FileList | File[] | null): number {
 function isImage(f: File): boolean {
   if (f.type.startsWith("image/")) return true;
   return /\.(jpe?g|png|webp|gif|bmp|heic|heif|avif|tiff?)$/i.test(f.name);
+}
+
+/**
+ * 可上传的视频（ISSUE-055）。
+ *
+ * ★ 只放行**能播**的容器（mp4/m4v/mov/webm）：`mkv`/`avi` 能索引但不能上传，
+ *   传上去只会得到一个点开就报错的条目。真要看那些，用户该在电脑上转码 ——
+ *   这件事不该由手机端悄悄替他做决定。
+ */
+function isVideoFile(f: File): boolean {
+  if (f.type.startsWith("video/")) {
+    return /\.(mp4|m4v|mov|webm)$/i.test(f.name);
+  }
+  return /\.(mp4|m4v|mov|webm)$/i.test(f.name);
 }
 
 /* ------------------------------------------------------------------ *

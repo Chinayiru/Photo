@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Sequence
 
+from .. import video as videomod
 from ..thumbs import source_signature
 
 log = logging.getLogger(__name__)
@@ -45,8 +46,8 @@ __all__ = [
 # 刻意**不查** exif 的十余个字段：一页 100 条时这能省掉约 60% 的字节，
 # 且避免了"用户只是滑动列表却触发了 100 次 EXIF 反序列化"。
 TIMELINE_COLUMNS = (
-    "id, root_id, rel_path, file_name, ext, size, mtime, taken_at, taken_src,"
-    " width, height, thumb_state, thumb_etag, missing,"
+    "id, root_id, rel_path, file_name, ext, kind, size, mtime, taken_at, taken_src,"
+    " width, height, duration, thumb_state, thumb_etag, missing,"
     " (gps_lat IS NOT NULL) AS has_gps"
 )
 
@@ -71,6 +72,8 @@ def row_to_item(row: Any) -> dict[str, Any]:
     return {
         "id": int(row["id"]),
         "name": row["file_name"],
+        "kind": row["kind"],
+        "duration": row["duration"],
         "taken_at": float(row["taken_at"]),
         "taken_src": row["taken_src"],
         "w": row["width"],
@@ -138,6 +141,7 @@ def row_to_detail(row: Any, *, prev_id: int | None = None,
         "width": row["width"],
         "height": row["height"],
         "orientation": row["orientation"],
+        "video": _video_block(row),
         "exif": {
             "camera": row["camera"],
             "lens": row["lens"],
@@ -158,9 +162,38 @@ def row_to_detail(row: Any, *, prev_id: int | None = None,
             "thumb": f"/api/items/{int(row['id'])}/thumb?size=320",
             "preview": f"/api/items/{int(row['id'])}/preview",
             "raw": f"/api/items/{int(row['id'])}/raw",
+            # 视频播放走 `/stream`：与 `/raw` 同一份实现（Range/206 全支持），
+            # 但语义分开 —— 前端拿到这个 URL 才用 `<video>` 而不是 `<img>`。
+            "video": (f"/api/items/{int(row['id'])}/stream"
+                      if row["kind"] == "video" else None),
         },
         "prev_id": prev_id,
         "next_id": next_id,
+    }
+
+
+def _video_block(row: Any) -> dict[str, Any] | None:
+    """视频的播放元信息；图片返回 `None`。
+
+    `playable` 由**服务端**判定而不是让前端自己看编码：能否在浏览器里播
+    取决于容器 + 视频编码 + 音频编码三者的组合（见 `video.is_playable`），
+    前端多写一份判断必然漂移 —— 判断分歧的表现是"点了播放，一直转圈"。
+    """
+    if videomod.row_kind(row) != "video":
+        return None
+    try:
+        container = row["container"] or ""
+        vcodec = row["vcodec"] or ""
+        acodec = row["acodec"] or ""
+    except (IndexError, KeyError):
+        # 老调用点只 SELECT 了部分列（如维护脚本）—— 不是错误，只是没信息
+        return None
+    return {
+        "duration": row["duration"],
+        "container": container,
+        "vcodec": vcodec,
+        "acodec": acodec,
+        "playable": videomod.is_playable(container=container, vcodec=vcodec),
     }
 
 
@@ -223,13 +256,19 @@ def timeline_where(*, root_id: str | None = None, ts_from: float | None = None,
                    ts_to: float | None = None, kind: str | None = None,
                    dir_prefix: str | None = None, camera: str | None = None,
                    has_gps: bool | None = None,
+                   allow_video: bool = True,
                    enabled_root_ids: Sequence[str] | None = None,
                    ) -> tuple[str, list[Any]]:
     """构造 WHERE 子句 + 参数。
 
-    所有调用方共用它，是为了保证 `missing = 0 AND kind = 'image'` 这两条
+    所有调用方共用它，是为了保证 `missing = 0` 与 `kind` 这两条判断
     永远不会被漏掉 —— 漏掉 missing 就会把"文件已被删除"的照片显示出来，
     点开才报错。
+
+    `kind` 语义（docs/04 §5.2.1）：`None`/`"all"` = 图片 + 视频；`"image"` /
+    `"video"` = 只看一种；其他值 = 空结果（不是报错，前端标签页自然空态）。
+    `allow_video=False`（视频功能关闭时）会把视频整类排除 —— 让用户
+    "看不见"比让他看见一排点了播不了的条目要好。
 
     ★ 审计 F01：`enabled_root_ids` 是"这块共享还存在吗"的唯一事实来源。
     传了它就只在这个集合里查；传空列表（所有根都停了）直接 `AND 0`。
@@ -237,8 +276,19 @@ def timeline_where(*, root_id: str | None = None, ts_from: float | None = None,
     对手机暴露的接口一律必须传）。**只靠 `?root=` 过滤是不够的**：不传
     `root` 时就是查全库，禁用根的照片仍然会出现在时间线和搜索结果里。
     """
-    sql = " WHERE missing = 0 AND kind = 'image'"
+    sql = " WHERE missing = 0"
     params: list[Any] = []
+
+    if kind == "image":
+        sql += " AND kind = 'image'"
+    elif kind == "video":
+        sql += " AND kind = 'video'" if allow_video else " AND 0"
+    elif kind is None or kind == "all":
+        # 混排：图片 + 视频（视频关闭时只剩图片）
+        sql += "" if allow_video else " AND kind = 'image'"
+    else:
+        # 未知的 kind 值：空结果，让"只看某类"的标签页自然显示空态
+        sql += " AND 0"
 
     if enabled_root_ids is not None:
         ids = [str(r) for r in enabled_root_ids]
@@ -271,10 +321,6 @@ def timeline_where(*, root_id: str | None = None, ts_from: float | None = None,
             params.append(d)
             params.append(_like_escape(d) + "/%")
 
-    if kind is not None and kind not in ("image", "all"):
-        # 一期没有视频。返回空结果而不是报错，让前端的
-        # "只看视频"标签页自然显示空态（docs/04 §5.2.1）。
-        sql += " AND 0"
     return sql, params
 
 

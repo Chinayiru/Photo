@@ -265,14 +265,19 @@ def test_timeline_same_second_records_are_not_skipped(tmp_path, library) -> None
 
 
 def test_timeline_items_have_no_heavy_exif_fields(tmp_path, library) -> None:
-    """轻量项不该带完整 EXIF —— 一页 100 条能省约 60% 字节。"""
+    """轻量项不该带完整 EXIF —— 一页 100 条能省约 60% 字节。
+
+    `kind` / `duration` 是 2026-10 加视频时新增的两个小字段（字符串 + 浮点，
+    约 20 字节），前端靠它们决定这一格用 `<img>` 还是角标标"视频"；
+    它们不属于"重"字段，真重的 EXIF 那十几个键依然一个都不许出现。
+    """
     st = _state(tmp_path, library)
     _seed(st, library)
     b = _json(_call(st, "GET", "/api/timeline"))
     item = b["items"][0]
-    assert set(item) == {"id", "name", "taken_at", "taken_src", "w", "h",
-                         "thumb_v", "size", "thumb_state", "has_gps",
-                         "root", "dir"}
+    assert set(item) == {"id", "name", "kind", "duration", "taken_at",
+                         "taken_src", "w", "h", "thumb_v", "size",
+                         "thumb_state", "has_gps", "root", "dir"}
 
 
 def test_timeline_order_asc_is_rejected_not_ignored(tmp_path, library) -> None:

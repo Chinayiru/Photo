@@ -21,6 +21,8 @@ from typing import Any, Callable, Final, Literal, Mapping
 
 import logging
 
+from . import video as videomod
+
 log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
@@ -67,10 +69,10 @@ ALLOWED_IMAGE_EXTS: Final[frozenset[str]] = frozenset({
     "heic", "heif",
 })
 
-#: 二期启用（此处仅作声明，一期不索引）：视频与 RAW。
-FUTURE_VIDEO_EXTS: Final[frozenset[str]] = frozenset({
-    "mp4", "mov", "m4v", "avi", "mkv", "3gp", "webm", "wmv", "flv", "mts",
-})
+#: 视频扩展名：**索引期**收哪些。二期已启用（ISSUE-055），真相在
+#: `backend/app/video.py`（容器识别与扩展名映射都在那里，这里只做导出）。
+#: 刻意不含 `3gp/wmv/flv/mts`：容器识别与浏览器播放都没有稳定答案。
+FUTURE_VIDEO_EXTS: Final[frozenset[str]] = videomod.VIDEO_EXTS_INDEX
 FUTURE_RAW_EXTS: Final[frozenset[str]] = frozenset({
     "dng", "cr2", "cr3", "nef", "arw", "raf", "rw2", "orf", "pef", "srw",
 })
@@ -179,6 +181,23 @@ DEFAULT_CONFIG: Final[dict[str, Any]] = {
         "quality": 78,
         "workers": 4,
         "gen_version": 1,           # 生成算法版本变化时递增，触发全量重生成
+    },
+    "video": {
+        # ★ 视频功能总开关（ISSUE-055）。关掉时：不索引视频、不接受视频
+        # 上传、不生成封面 —— 时间线里也就不会出现"点了播不了"的条目。
+        #
+        # 为什么要有开关而不是"装上就能用"：解码依赖外部 ffmpeg。没装的
+        # 机器上开着这个功能，用户会看到一排视频条目、点开全是错误；
+        # 明确关掉则是"我这里没有视频"，是两种完全不同的体验。
+        "enabled": True,
+        # ffmpeg/ffprobe 所在目录。空 = 自动找（程序旁 tools/ffmpeg/ → PATH）。
+        "ffmpeg_dir": "",
+        # 同时解码几路。2 vCPU 的机器上 2 路就能吃满，详见 video.py 模块文档。
+        "max_concurrency": 2,
+        # 封面取第几秒。D3：1.0 —— 手机视频开头常有黑场/对焦。
+        "frame_at": 1.0,
+        "probe_timeout": 10.0,
+        "frame_timeout": 30.0,
     },
     "auth": {
         "require_pairing": True,
@@ -377,6 +396,58 @@ class Config:
     @property
     def thumbs(self) -> dict[str, Any]:
         return self._raw["thumbs"]
+
+    @property
+    def video(self) -> dict[str, Any]:
+        return self._raw["video"]
+
+    @property
+    def video_enabled(self) -> bool:
+        return bool(self._raw["video"].get("enabled", False))
+
+    @property
+    def video_concurrency(self) -> int:
+        """解码并发，钳在 1..8。0 或负数会让闸门死锁，过大只会互相拖慢。"""
+        try:
+            n = int(self._raw["video"].get("max_concurrency", 2))
+        except (TypeError, ValueError):
+            return 2
+        return max(1, min(8, n))
+
+    @property
+    def video_frame_at(self) -> float:
+        """封面取第几秒，负数按 0 处理（ffmpeg 对负 `-ss` 行为未定义）。"""
+        try:
+            t = float(self._raw["video"].get("frame_at", 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+        return max(0.0, t)
+
+    @property
+    def allowed_index_exts(self) -> frozenset[str]:
+        """本轮索引应当收的扩展名 = 图片白名单 + （视频开启时的）视频白名单。
+
+        为什么不把视频扩展名直接写进 `root.include_exts`：那是用户级的
+        "收窄"配置，写进去之后就再也分不清"用户不要视频"和"程序关了视频"。
+        开关只认 `video.enabled` 这一处。
+        """
+        exts = set(ALLOWED_IMAGE_EXTS)
+        if self.video_enabled:
+            exts |= videomod.VIDEO_EXTS_INDEX
+        return frozenset(exts)
+
+    @property
+    def allowed_upload_exts(self) -> frozenset[str]:
+        """允许上传的扩展名 = 配置里的 `upload.allowed_exts` + （视频开启时的）可播视频。
+
+        `upload.allowed_exts` 是老用户 config.json 里**已经写死**的列表
+        （只有图片）。升级后不该让用户手动去加 `mp4` 才能传视频，
+        所以视频这一侧由开关决定，与那一行配置取并集。
+        """
+        exts = {str(e).lower().lstrip(".") for e in self._raw["upload"]["allowed_exts"]}
+        if self.video_enabled:
+            exts |= videomod.VIDEO_EXTS_UPLOAD
+        return frozenset(exts)
 
     @property
     def auth(self) -> dict[str, Any]:

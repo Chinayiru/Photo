@@ -203,6 +203,9 @@ async def info(ctx: Ctx) -> Reply:
             for root in st.roots_info()
         ],
         "index": st.index_info(),
+        # 视频能力（ISSUE-055）。`ffmpeg` 为空串 = 没找到可执行文件，
+        # 那台机器上视频全是占位图；用户需要知道"这是缺依赖，不是文件坏了"。
+        "video": _video_info(cfg),
         "watch": st.watch_info(),
         "thumbs": {
             "cache_bytes": cache_bytes,
@@ -237,8 +240,9 @@ async def stats(ctx: Ctx) -> Reply:
     def _count(sql: str, *params: Any) -> int:
         return int(db.scalar(sql, params, default=0) or 0)
 
-    total = _count("SELECT COUNT(*) FROM media WHERE missing = 0 AND kind = 'image'")
     images = _count("SELECT COUNT(*) FROM media WHERE missing = 0 AND kind = 'image'")
+    videos = _count("SELECT COUNT(*) FROM media WHERE missing = 0 AND kind = 'video'")
+    total = images + videos
     missing = _count("SELECT COUNT(*) FROM media WHERE missing = 1")
     pending = _count("SELECT COUNT(*) FROM media WHERE thumb_state='pending' AND missing=0")
     ok = _count("SELECT COUNT(*) FROM media WHERE thumb_state='ok' AND missing=0")
@@ -251,9 +255,9 @@ async def stats(ctx: Ctx) -> Reply:
         "media": {
             "total": total,
             "images": images,
-            "videos": 0,          # 一期不索引视频
+            "videos": videos,
             "missing": missing,
-            "by_kind": {"image": images},
+            "by_kind": {"image": images, "video": videos},
         },
         "thumbs": {
             "pending": pending,
@@ -409,6 +413,34 @@ def _db_stats(st: AppState) -> dict[str, Any]:
 def _lan_ips() -> list[str]:
     from ..config import local_ipv4_addresses
     return list(local_ipv4_addresses())
+
+
+def _video_info(cfg: Any) -> dict[str, Any]:
+    """视频能力：开关 + ffmpeg/ffprobe 是否找得到。
+
+    拿不到就返回保守值（`available: False`）而不是抛 —— 与
+    `_host_app_info` 同理：展示字段失败不该让首页白屏。
+    """
+    out: dict[str, Any] = {
+        "enabled": bool(getattr(cfg, "video_enabled", False)),
+        "available": False,
+        "ffmpeg": "",
+        "ffprobe": "",
+        "exts": [],
+    }
+    try:
+        from .. import video as videomod
+
+        out["exts"] = sorted(videomod.VIDEO_EXTS_INDEX)
+        if not out["enabled"]:
+            return out
+        ff = videomod.find_bin("ffmpeg", configured_dir=str(cfg.video.get("ffmpeg_dir") or ""))
+        fp = videomod.find_bin("ffprobe", configured_dir=str(cfg.video.get("ffmpeg_dir") or ""))
+        out["ffmpeg"], out["ffprobe"] = ff, fp
+        out["available"] = bool(ff and fp)
+    except Exception:       # noqa: BLE001
+        pass
+    return out
 
 
 def _host_app_info() -> dict[str, Any]:

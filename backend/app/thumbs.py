@@ -18,6 +18,8 @@ import asyncio
 import hashlib
 import logging
 import os
+import shutil
+import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -27,6 +29,7 @@ from typing import TYPE_CHECKING, Final, Iterable, Literal
 from PIL import Image
 
 from . import sandbox
+from . import video as videomod
 from .config import Config
 from .exif import _prepare_pillow
 
@@ -270,6 +273,49 @@ def _generate_thumb_kw(
     return generate_thumb(src, dst, size, quality=quality, orientation=orientation)
 
 
+def generate_video_thumb(
+    src: str | Path,
+    dst: Path,
+    size: int,
+    *,
+    at: float = 1.0,
+    quality: int = THUMB_QUALITY,
+    ffmpeg_dir: str = "",
+    timeout: float = 30.0,
+) -> tuple[int, int]:
+    """生成视频封面：ffmpeg 抽一帧到临时 JPEG，再走图片那条缩略图路径。
+
+    为什么不让 ffmpeg 直接输出缩放到目标尺寸的 WebP：那需要 `libwebp`
+    编码器（gyan 的 essentials 构建里有，用户自带的 ffmpeg 不一定有），
+    失败时给出的还是 ffmpeg 风格的错误。抽一帧 JPEG 是**所有构建**都
+    支持的，后面的缩放/编码与图片完全共用一条路径 —— 也就共用同一套
+    质量参数、同一套原子落盘、同一套坏图判定。
+
+    ⚠️ `orientation=None`：ffmpeg 抽帧时已按容器里的旋转元数据转正
+    （autorotate 默认开），再叠一层 EXIF 旋转会把竖拍视频转成横的。
+    """
+    tmpdir = Path(tempfile.mkdtemp(prefix="pb_vframe_"))
+    try:
+        frame = tmpdir / "frame.jpg"
+        videomod.extract_frame(
+            src, frame, at=at, timeout=timeout, ffmpeg_dir=ffmpeg_dir,
+        )
+        return generate_thumb(frame, dst, size, quality=quality, orientation=None)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _generate_video_thumb_kw(
+    src: str, dst: Path, size: int, quality: int, at: float,
+    ffmpeg_dir: str, timeout: float,
+) -> tuple[int, int]:
+    """同上，把关键字参数折成位置参数供 `run_in_executor` 使用。"""
+    return generate_video_thumb(
+        src, dst, size, at=at, quality=quality,
+        ffmpeg_dir=ffmpeg_dir, timeout=timeout,
+    )
+
+
 # --------------------------------------------------------------------------
 # 引擎
 # --------------------------------------------------------------------------
@@ -459,7 +505,7 @@ class ThumbEngine:
         任何一次替换都会被下一次请求/重扫发现，不需要 DB 参与。
         """
         row = self.db.query_one(
-            "SELECT id, root_id, rel_path, mtime, size, orientation,"
+            "SELECT id, root_id, rel_path, mtime, size, orientation, kind,"
             "       thumb_state, thumb_etag, missing"
             "  FROM media WHERE id = ?",
             (media_id,),
@@ -490,16 +536,34 @@ class ThumbEngine:
         if all(_fresh(p) for p in paths.values()):
             return False
 
+        is_video = videomod.row_kind(row) == "video"
         loop = asyncio.get_running_loop()
         async with self._sem:
             for size, dst in paths.items():
                 if _fresh(dst):
                     continue
                 try:
-                    await loop.run_in_executor(
-                        self._pool, _generate_thumb_kw,
-                        str(src), dst, size, THUMB_QUALITY, row["orientation"],
-                    )
+                    if is_video:
+                        await loop.run_in_executor(
+                            self._pool, _generate_video_thumb_kw,
+                            str(src), dst, size, THUMB_QUALITY,
+                            self.cfg.video_frame_at,
+                            str(self.cfg.video.get("ffmpeg_dir") or ""),
+                            float(self.cfg.video.get("frame_timeout", 30.0)),
+                        )
+                    else:
+                        await loop.run_in_executor(
+                            self._pool, _generate_thumb_kw,
+                            str(src), dst, size, THUMB_QUALITY, row["orientation"],
+                        )
+                except videomod.FFmpegMissing as exc:
+                    # ffmpeg 不在是**部署问题**：所有视频都会以同样方式失败。
+                    # 判永久失败而不是重排三次 —— 让用户在设置页看到一句
+                    # "找不到 ffmpeg"，而不是队列里几百个任务轮着烧 CPU。
+                    self._set_state(media_id, "failed", None)
+                    log.warning("thumb skipped (ffmpeg missing) media_id=%s: %s",
+                                media_id, exc)
+                    return False
                 except OversizedImageError as exc:
                     # 声明尺寸超单边上限：重试一万次也是同样结果，所以**不进**
                     # `_on_failure` 的退避重试，直接判永久失败（仍走同一个

@@ -365,10 +365,10 @@ def test_timeline_over_http(env):
     assert "敦煌.png" in names
     assert "clip.mp4" not in names
     assert "dead.jpg-lx2" not in names
-    # 轻量项字段集合
+    # 轻量项字段集合（`kind`/`duration` 是加视频时新增的两个小字段）
     assert set(items[0]) == {
-        "id", "name", "taken_at", "taken_src", "w", "h", "thumb_v",
-        "size", "thumb_state", "has_gps", "root", "dir",
+        "id", "name", "kind", "duration", "taken_at", "taken_src", "w", "h",
+        "thumb_v", "size", "thumb_state", "has_gps", "root", "dir",
     }
 
 
@@ -527,10 +527,16 @@ def test_upload_out_of_order_over_http(env):
 
 def test_upload_rejects_bad_extension_over_http(env):
     token = _pair(env)
+    # `.mkv`：能索引、不能上传（浏览器放不了，传上来只会多一个打不开的条目）
     r = env.post("/api/uploads/init", token=token,
-                 json_body={"name": "movie.mp4", "size": 1024})
+                 json_body={"name": "movie.mkv", "size": 1024})
     assert r.status == 400
     assert r.json()["error"]["code"] == "E1017"
+    # `.mp4` 在默认配置（`video.enabled = true`）下可以建会话 ——
+    # 老用户的 `upload.allowed_exts` 里没有 mp4，靠开关取并集才不用手改配置。
+    r2 = env.post("/api/uploads/init", token=token,
+                  json_body={"name": "movie.mp4", "size": 1024})
+    assert r2.status == 201, r2.text
 
 
 def test_rescan_returns_202_immediately(env):

@@ -47,6 +47,9 @@ def build_router() -> Router:
     r.add("GET", "/api/items/{media_id}/thumb", h_browse.get_thumb, name="browse.thumb")
     r.add("GET", "/api/items/{media_id}/preview", h_browse.get_preview, name="browse.preview")
     r.add("GET", "/api/items/{media_id}/raw", h_browse.get_raw, name="browse.raw")
+    # 视频播放流：与 /raw 同一实现，只是前端据此选 <video>（ISSUE-055）
+    r.add("GET", "/api/items/{media_id}/stream", h_browse.stream_video,
+          name="browse.stream")
 
     # --- 修改 ---------------------------------------------------------
     r.add("POST", "/api/items/delete", h_browse.delete_items, name="browse.delete")

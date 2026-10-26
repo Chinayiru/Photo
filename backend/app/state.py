@@ -124,7 +124,7 @@ class AppState:
         try:
             for row in self.db.query(
                 "SELECT root_id, COUNT(*) AS n FROM media"
-                " WHERE missing = 0 AND kind = 'image' GROUP BY root_id"
+                " WHERE missing = 0 GROUP BY root_id"
             ):
                 counts[str(row["root_id"])] = int(row["n"])
         except Exception:  # noqa: BLE001 —— 统计失败不该让 /info 整体 500
@@ -175,7 +175,7 @@ class AppState:
             default=0,
         )
         total = self.db.scalar(
-            "SELECT COUNT(*) FROM media WHERE missing = 0 AND kind = 'image'", default=0)
+            "SELECT COUNT(*) FROM media WHERE missing = 0", default=0)
         return {
             "state": "scanning" if running else ("idle" if last else "never"),
             "total": int(total or 0),
@@ -288,3 +288,4 @@ def get_state() -> AppState:
 def set_state(state: AppState | None) -> None:
     global _state
     _state = state
+

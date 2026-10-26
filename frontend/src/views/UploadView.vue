@@ -188,7 +188,7 @@ function clearAllDone(): void {
       ref="fileInput"
       class="sr"
       type="file"
-      accept="image/*"
+      accept="image/*,video/mp4,video/quicktime,video/webm"
       multiple
       @change="onFiles"
     />

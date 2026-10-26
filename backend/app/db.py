@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -60,7 +61,7 @@ CREATE TABLE IF NOT EXISTS media (
   file_name   TEXT    NOT NULL,                  -- 文件名（含扩展名）
   ext         TEXT    NOT NULL,                  -- 扩展名，小写，不含点
   kind        TEXT    NOT NULL DEFAULT 'image'
-                CHECK (kind IN ('image')),       -- 一期只有 image（二期走迁移脚本放开）
+                CHECK (kind IN ('image','video')),  -- 视频见 ISSUE-055
   size        INTEGER NOT NULL CHECK (size >= 0),
   mtime       REAL    NOT NULL,                  -- 文件系统 mtime（Unix 秒）
   sha256      TEXT,                              -- 内容哈希；索引时默认不填
@@ -78,6 +79,19 @@ CREATE TABLE IF NOT EXISTS media (
   gps_lat     REAL    CHECK (gps_lat IS NULL OR (gps_lat >= -90  AND gps_lat <= 90)),
   gps_lon     REAL    CHECK (gps_lon IS NULL OR (gps_lon >= -180 AND gps_lon <= 180)),
   orientation INTEGER CHECK (orientation IS NULL OR orientation BETWEEN 1 AND 8),
+  -- ★★ 视频（kind='video'）专用；图片行为 NULL ★★
+  --
+  -- 为什么放在 media 表而不是另开 media_video：时间线必须能"一条 SQL
+  -- 按时间倒序混排图片与视频"。分表就得 UNION，而 UNION 会让
+  -- `idx_media_timeline` 的 ORDER BY 优化失效（SQLite 对复合查询的
+  -- 排序只能落临时 B 树），5000 行就会明显卡；而且分页游标要跨两张表
+  -- 做键集扫描，复杂度换来的是零收益。
+  --
+  -- 四列都是可空的：老库里全是 NULL，代码里一律按"未知"处理。
+  duration    REAL    CHECK (duration IS NULL OR duration >= 0),  -- 秒
+  vcodec      TEXT,                              -- 'h264'/'hevc'/'vp9'/'av1'
+  acodec      TEXT,                              -- 'aac'/'opus'/...
+  container   TEXT,                              -- 'mp4'/'mov'/'webm'/'mkv'/'avi'
   thumb_state TEXT    NOT NULL DEFAULT 'pending'
                 CHECK (thumb_state IN ('pending','ok','failed')),
   thumb_etag  TEXT,                              -- 缩略图内容哈希（用于强 ETag + URL 版本参数）
@@ -301,6 +315,38 @@ CREATE INDEX IF NOT EXISTS idx_media_tags_tag ON media_tags(tag_id);
 """
 
 
+#: media 表的 `CREATE TABLE` 文本，从 `SCHEMA` 里**就地取出**。
+#:
+#: 为什么取出而不是再写一份：老库升级时要重建 media 表（SQLite 改不了
+#: CHECK 约束），重建用的 DDL 与新建库用的 DDL 必须完全一致。手写两份的
+#: 必然结果是"新装的库能存视频、升级上来的库插入视频报 CHECK 失败" ——
+#: 而且只在用户升级后扫描到第一个视频时才暴露。
+_MEDIA_DDL_RE: Final[re.Pattern[str]] = re.compile(
+    r"CREATE TABLE IF NOT EXISTS media \(.*?\n\);", re.DOTALL
+)
+
+
+def media_ddl(table: str = "media") -> str:
+    """`SCHEMA` 里 media 表的建表语句（可改表名，供迁移重建用）。"""
+    m = _MEDIA_DDL_RE.search(SCHEMA)
+    if m is None:  # pragma: no cover —— 只会在有人删掉 SCHEMA 里那张表时发生
+        raise RuntimeError("SCHEMA 里找不到 media 表定义")
+    return m.group(0).replace(
+        "CREATE TABLE IF NOT EXISTS media", f"CREATE TABLE {table}", 1
+    )
+
+
+#: 迁移重建 media 时要按名搬过去的列。顺序无关，但**必须是老库真实存在的**
+#: 列，否则 `INSERT ... SELECT` 会报 `no such column`。视频四列（duration
+#: /vcodec/acodec/container）故意不在内 —— 它们就是这次新加的，老库没有。
+_MEDIA_COPY_COLUMNS: Final[tuple[str, ...]] = (
+    "id", "root_id", "rel_path", "file_name", "ext", "kind", "size", "mtime",
+    "sha256", "taken_at", "taken_src", "width", "height", "camera", "lens",
+    "iso", "fnum", "exposure", "focal", "gps_lat", "gps_lon", "orientation",
+    "thumb_state", "thumb_etag", "missing", "indexed_at",
+)
+
+
 # --------------------------------------------------------------------------
 # 连接管理
 # --------------------------------------------------------------------------
@@ -518,6 +564,45 @@ class Database:
         if up_cols and "client_id" not in up_cols:
             log.info("迁移 upload_sessions：新增 client_id 列")
             conn.execute("ALTER TABLE upload_sessions ADD COLUMN client_id TEXT")
+
+        # --- media：放开 kind='video'，补视频四列（ISSUE-055）---
+        #
+        # `kind` 原来是 `CHECK (kind IN ('image'))`。CHECK 改不了，只能
+        # 重建表。这是本项目**唯一一次重建主表**，所以三条纪律写在这里：
+        #
+        # ① 重建用的 DDL 从 `SCHEMA` 里取（`media_ddl()`），不另写一份；
+        # ② 只按名搬已有列，新列留 NULL（NULL = 未知，代码里当"没探测过"）；
+        # ③ 重建后重新执行一遍 `SCHEMA`（索引与触发器随 DROP TABLE 消失），
+        #    再 `rebuild` 一次 FTS —— media_fts 是外部内容表，
+        #    内容行没变但索引条目被扰动过。
+        #
+        # 失败后果提醒：不迁移的话，**新库**一切正常，**升级的库**在扫描到
+        # 第一个视频时插入失败（CHECK constraint failed），表现为"视频
+        # 一个都不显示"。
+        mrow = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='media'"
+        ).fetchone()
+        if mrow and mrow[0] and "'video'" not in mrow[0]:
+            log.info("迁移 media：放开 kind='video' 并补视频四列")
+            cols = ", ".join(_MEDIA_COPY_COLUMNS)
+            # ⚠️ `media_tags.media_id` / `albums.cover_media_id` 上有
+            # `REFERENCES media(id)`。连接是 `foreign_keys=ON`，直接
+            # DROP 父表会把**标签行按 CASCADE 一起删掉**（用户丢的是标签，
+            # 而且没有任何报错）。所以重建期间必须临时关掉。
+            conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                conn.executescript(
+                    "BEGIN;"
+                    + media_ddl("media_new")
+                    + f"INSERT INTO media_new({cols}) SELECT {cols} FROM media;"
+                    + "DROP TABLE media;"
+                    + "ALTER TABLE media_new RENAME TO media;"
+                    + "COMMIT;"
+                )
+            finally:
+                conn.execute("PRAGMA foreign_keys=ON")
+            conn.executescript(SCHEMA)
+            conn.execute("INSERT INTO media_fts(media_fts) VALUES('rebuild')")
 
         # --- audit_log：补齐 pair/revoke/upload_reject 动作 ---
         row = conn.execute(
