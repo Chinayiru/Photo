@@ -21,7 +21,15 @@ from backend.app.tray import pair_qr_url
 
 
 def _qs(url: str) -> dict[str, list[str]]:
-    return parse_qs(urlparse(url).query)
+    """取配对参数（`#code=…` 形态）——老的 `?code=…` 也照旧认。
+
+    配对码走 fragment 之后，`urlparse(...).query` 是空串；这里统一
+    从 fragment 里取，没 fragment 再退回 query，这样同一个断言既能
+    守住新形态，也不至于把"老链接还能用"这件事测丢。
+    """
+    u = urlparse(url)
+    body = u.fragment[1:] if u.fragment.startswith("?") else u.fragment
+    return parse_qs(body or u.query)
 
 
 class TestPairQrUrl:
@@ -49,7 +57,7 @@ class TestPairQrUrl:
     def test_trailing_slash_does_not_double(self) -> None:
         # 托盘传进来的 base 有时带尾斜杠（`_lan_urls()` 的形态不固定）
         url = pair_qr_url("http://192.0.2.10:8787/", "123456", "dev-abc")
-        assert url.startswith("http://192.0.2.10:8787/?code=")
+        assert url.startswith("http://192.0.2.10:8787/#code=")
         assert "//?" not in url
 
     def test_params_are_url_encoded(self) -> None:
@@ -66,7 +74,29 @@ class TestPairQrUrl:
         assert u.scheme == "http"
         assert u.netloc == "192.0.2.10:8787"
         assert u.path == "/"
-        assert u.fragment == ""      # 二维码 URL 不能带 fragment，扫码器常截断
+
+    def test_code_travels_in_the_fragment_not_the_query(self) -> None:
+        """配对码只能走 fragment（一次性凭据不进任何日志）。
+
+        ## 为什么推翻了当年的判据
+
+        这里原本断言 `u.fragment == ""`，理由是"扫码器常截断
+        fragment"。那个理由指的是**老式条码枪**与个别手机的相机
+        识别：它们可能只取 `scheme://host/path`。代价是配对码进了
+        query string，于是同时出现在：服务器访问日志、反向代理日志、
+        浏览器历史、以及跨站请求的 `Referer` 头。为了在一处遮盖它
+        得改 Caddy 的 `filter`（`cloud/Caddyfile`），每加一层代理就
+        要再补一次——那才是真正会漏的地方。
+
+        现在是相机扫码（Android/iOS 相机、微信、支付宝都能整条打开
+        URL，fragment 保留）。万一某个扫码器真的截断了，后果是
+        "码没自动填"，用户手输 6 位数字即可——功能退化，不是安全
+        退化。反过来（码进日志）没有用户能感知的补救手段。
+        """
+        url = pair_qr_url("http://192.0.2.10:8787", "123456", "dev-abc")
+        u = urlparse(url)
+        assert u.query == "", "query 里不许出现配对码：它会进访问日志"
+        assert _qs(url)["code"] == ["123456"]
 
 
 class TestTrayWiring:

@@ -113,8 +113,11 @@ class TestCloudEntryIsThePrimaryQrTarget:
             "否则用户出门后打开域名会回到一个空白的配对页（ISSUE-024）"
         )
         assert u.path.startswith("/d/"), f"云端入口必须带 /d/<id> 前缀，实际 {u.path!r}"
-        assert parse_qs(u.query)["code"] == [code]
-        assert parse_qs(u.query)["did"], "云端入口同样要带 device_id（AC-5.2）"
+        # 参数走 fragment（配对码不进访问日志），见 test_tray.py 的同类判据
+        frag = parse_qs(u.fragment[1:] if u.fragment.startswith("?") else u.fragment)
+        assert frag["code"] == [code]
+        assert frag["did"], "云端入口同样要带 device_id（AC-5.2）"
+        assert u.query == "", "query 里不许出现配对码"
 
     def test_qr_falls_back_to_lan_when_tunnel_is_down(self, state) -> None:
         """隧道没连上时必须退回局域网，不能编一个打不开的云端地址。"""
@@ -169,7 +172,7 @@ class TestAltUrls:
 
     def test_lan_urls_are_listed_when_qr_is_cloud(self, state) -> None:
         tray = _make()
-        alt = tray._alt_urls_for(CLOUD_BASE + "/?code=123456")
+        alt = tray._alt_urls_for(CLOUD_BASE + "/#code=123456")
         assert alt == [LAN_BASE + "/"], (
             "二维码走云端时，窗口必须明文列出局域网地址，"
             "否则用户想在家直连时无从下手"
@@ -177,7 +180,7 @@ class TestAltUrls:
 
     def test_no_alt_when_qr_is_already_lan(self, state) -> None:
         tray = _make()
-        assert tray._alt_urls_for(LAN_BASE + "/?code=123456") == []
+        assert tray._alt_urls_for(LAN_BASE + "/#code=123456") == []
 
     def test_alt_urls_are_unique_and_slash_terminated(self, state) -> None:
         tray = _make([LAN_BASE, LAN_BASE + "/", "http://10.0.0.5:8787"])
