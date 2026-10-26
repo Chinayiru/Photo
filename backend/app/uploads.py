@@ -39,7 +39,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Final
 
-from . import archive, audit, sandbox
+from . import archive, audit, sandbox, video as videomod
 from .config import Config, RootConfig
 from .db import Database
 from .errors import (
@@ -371,9 +371,14 @@ def find_duplicate(
 
 
 def check_extension(cfg: Config, name: str) -> str:
-    """校验扩展名并返回规范形式（小写、带点）。"""
+    """校验扩展名并返回规范形式（小写、带点）。
+
+    ★ 判据是 `cfg.allowed_upload_exts`（配置白名单 ∪ 视频开关打开时的
+    可播视频），不是 `cfg.upload["allowed_exts"]` 本身 —— 后者在老用户
+    的 config.json 里已经写死成只有图片，升级后不该要求用户手动加 `mp4`。
+    """
     ext = archive.normalize_ext(os.path.splitext(name)[1])
-    if not ext or ext.lstrip(".") not in cfg.upload["allowed_exts"]:
+    if not ext or ext.lstrip(".") not in cfg.allowed_upload_exts:
         raise AppError(E1017, f"不支持的文件格式：{ext or '无扩展名'}")
     return ext
 
@@ -445,6 +450,17 @@ def check_magic(cfg: Config, name: str, head: bytes) -> str:
     短到无法判定一律拒绝）。
     """
     ext = check_extension(cfg, name)
+    # ★ 视频（ISSUE-055）：容器识别，不走图片的魔术字节表。
+    #   `.mp4` 与 `.heic` 头都是 `ftyp`，共用一张表会互相误判；
+    #   `video.check_container` 负责排除图片 brand 并校验扩展名与容器一致。
+    if ext.lstrip(".") in videomod.VIDEO_EXTS_UPLOAD:
+        ok, actual = videomod.check_container(ext.lstrip("."), head)
+        if not ok:
+            raise AppError(
+                E1017,
+                f"文件内容与扩展名不符（声明 {ext}，实际 {actual or '无法识别'}）",
+            )
+        return ext
     declared = _EXT_KIND.get(ext)
     actual = sniff_kind(head[:MAGIC_HEAD_BYTES])
     if declared is None or actual is None or actual != declared:

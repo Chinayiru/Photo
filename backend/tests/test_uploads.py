@@ -57,7 +57,8 @@ def library(tmp_path: Path) -> Path:
     return d
 
 
-def _cfg(tmp_path: Path, library: Path, *, mode: str = "readwrite", **upload) -> Config:
+def _cfg(tmp_path: Path, library: Path, *, mode: str = "readwrite",
+         video: bool | None = None, **upload) -> Config:
     up = {
         "subdir": "手机上传",
         "chunk_mb_lan": 1,          # 测试用 1 MB，避免造几 MB 数据
@@ -66,20 +67,23 @@ def _cfg(tmp_path: Path, library: Path, *, mode: str = "readwrite", **upload) ->
         "dedup": True,
     }
     up.update(upload)
+    raw: dict = {
+        "roots": [
+            {
+                "id": "library",
+                "path": str(library),
+                "label": "测试库",
+                "mode": mode,
+                "enabled": True,
+                "recursive": True,
+            }
+        ],
+        "upload": up,
+    }
+    if video is not None:
+        raw["video"] = {"enabled": video}
     return Config(
-        {
-            "roots": [
-                {
-                    "id": "library",
-                    "path": str(library),
-                    "label": "测试库",
-                    "mode": mode,
-                    "enabled": True,
-                    "recursive": True,
-                }
-            ],
-            "upload": up,
-        },
+        raw,
         path=tmp_path / "config.json",
         data_dir=tmp_path / "data",
     )
@@ -140,10 +144,35 @@ def test_create_session_writes_temp_inside_library(tmp_path, library, db):
 
 def test_extension_not_allowed_is_rejected(tmp_path, library, db):
     cfg = _cfg(tmp_path, library)
-    for bad in ("a.mp4", "a.jpg-lx2", "a.txt", "a.exe"):
+    # `.mp4` 原本也在表里，2026-10 起视频可以上传（ISSUE-055），改由
+    # `test_video_extension_allowed_when_enabled` 正面验证。`.mkv` 留在这里
+    # 是刻意的：它是"能索引但**不能**上传"的容器 —— 浏览器放不了，
+    # 传上来只会让用户多一个点开就报错的条目。
+    for bad in ("a.mkv", "a.jpg-lx2", "a.txt", "a.exe"):
         with pytest.raises(AppError) as ei:
             _make(db, cfg, name=bad)
         assert ei.value.code == "E1017", bad
+
+
+def test_video_extension_allowed_when_enabled(tmp_path, library, db):
+    """视频开关打开时，`.mp4`/`.mov`/`.webm` 可以建会话。
+
+    ★ 判据是 `cfg.allowed_upload_exts` 而不是 `cfg.upload["allowed_exts"]`：
+      老用户的 config.json 里那一行只有图片扩展名，升级后不该要求他
+      手动加 `mp4` 才能传视频。
+    """
+    cfg = _cfg(tmp_path, library, video=True)
+    for ok in ("a.mp4", "b.MOV", "c.webm"):
+        r = _make(db, cfg, name=ok)
+        assert r["created"] is True, ok
+
+
+def test_video_extension_rejected_when_disabled(tmp_path, library, db):
+    """开关关着时 `.mp4` 仍然被拒 —— 否则用户能传进一堆"看不见"的文件。"""
+    cfg = _cfg(tmp_path, library, video=False)
+    with pytest.raises(AppError) as ei:
+        _make(db, cfg, name="a.mp4")
+    assert ei.value.code == "E1017"
 
 
 def test_size_over_limit_rejected(tmp_path, library, db):

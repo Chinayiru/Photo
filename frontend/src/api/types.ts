@@ -222,6 +222,10 @@ export interface SystemStats {
 export interface MediaItem {
   id: number;
   name: string;
+  /** `"image"` | `"video"`（ISSUE-055）。 */
+  kind: string;
+  /** 视频时长（秒）；图片为 null。 */
+  duration: number | null;
   /** Unix 秒（不是毫秒）。 */
   taken_at: number;
   /** "exif" | "mtime" | "filename" | "none" */
@@ -273,6 +277,21 @@ export interface ExifInfo {
   focal: number | null;
 }
 
+/**
+ * 视频播放元信息（`common.py: _video_block()`）；图片为 `null`。
+ *
+ * `playable` 由服务端算：容器 + 视频编码 + 音频编码的组合决定浏览器能不能
+ * 直接播（mp4/H.264 可以，HEVC 在多数安卓/Chrome 上不行，mkv 基本不行）。
+ * 前端不要自己判断 —— 两份判断必然漂移，症状是"点了播放一直转圈"。
+ */
+export interface VideoInfo {
+  duration: number | null;
+  container: string;
+  vcodec: string;
+  acodec: string;
+  playable: boolean;
+}
+
 export interface MediaDetail {
   id: number;
   root: string;
@@ -290,6 +309,8 @@ export interface MediaDetail {
   width: number | null;
   height: number | null;
   orientation: number | null;
+  /** 视频元信息；图片为 null。 */
+  video: VideoInfo | null;
   exif: ExifInfo;
   gps: { lat: number; lon: number } | null;
   thumb_state: string;
@@ -298,7 +319,13 @@ export interface MediaDetail {
   /** true 表示"记录在但文件被移动了"，后端仍返回 200。 */
   missing: boolean;
   indexed_at: number;
-  urls: { thumb: string; preview: string; raw: string };
+  urls: {
+    thumb: string;
+    preview: string;
+    raw: string;
+    /** 视频播放流（仅 `kind === "video"` 时有值，Range/206 复用 `/raw`）。 */
+    video: string | null;
+  };
   /**
    * ⚠️ 语义与直觉相反（`backend/app/handlers/browse.py:177-190`）：
    *   - `prev_id` = **更新**的那张（taken_at 更大，或同秒时 id 更大）

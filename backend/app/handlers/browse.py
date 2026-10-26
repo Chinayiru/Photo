@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from .. import audit, sandbox
+from .. import audit, sandbox, video as videomod
 from ..config import ALLOWED_IMAGE_EXTS
 from ..core import Ctx, Reply, empty_reply, file_reply, json_reply, stream_reply
 from ..core.cursor import decode_cursor, encode_cursor
@@ -73,6 +73,7 @@ __all__ = [
     "get_thumb",
     "get_preview",
     "get_raw",
+    "stream_video",
     "folders",
     "search",
     "delete_items",
@@ -157,6 +158,9 @@ async def timeline(ctx: Ctx) -> Reply:
         ts_from=ts_from,
         ts_to=ts_to,
         kind=ctx.q("kind"),
+        # 视频开关关掉时，`kind=all` 也只给图片：看得见但点开播不了，
+        # 比看不见更让人困惑。
+        allow_video=bool(st.cfg.video_enabled),
         enabled_root_ids=[r.id for r in st.cfg.enabled_roots],
     )
 
@@ -215,18 +219,22 @@ async def get_item(ctx: Ctx) -> Reply:
     # 前后邻居用于查看器左右滑动。这里各查一次而不是等到滑动时再查，
     # 是因为滑动时的额外往返在弱网下会明显卡顿，而两次主键索引查询
     # 在本地只需几十微秒。
+    #
+    # ★ 只在**同类型**里找邻居：在视频里滑到下一张会突变一张照片、
+    #   播放器换成 <img>，切换成本比"到头了"高得多。
+    same_kind = videomod.row_kind(row)
     prev_id = db.scalar(
-        "SELECT id FROM media WHERE missing = 0 AND kind = 'image'"
+        "SELECT id FROM media WHERE missing = 0 AND kind = ?"
         " AND (taken_at > ? OR (taken_at = ? AND id > ?))"
         " ORDER BY taken_at ASC, id ASC LIMIT 1",
-        (row["taken_at"], row["taken_at"], mid),
+        (same_kind, row["taken_at"], row["taken_at"], mid),
         default=None,
     )
     next_id = db.scalar(
-        "SELECT id FROM media WHERE missing = 0 AND kind = 'image'"
+        "SELECT id FROM media WHERE missing = 0 AND kind = ?"
         " AND (taken_at < ? OR (taken_at = ? AND id < ?))"
         " ORDER BY taken_at DESC, id DESC LIMIT 1",
-        (row["taken_at"], row["taken_at"], mid),
+        (same_kind, row["taken_at"], row["taken_at"], mid),
         default=None,
     )
 
@@ -273,7 +281,7 @@ async def _serve_thumb(st: AppState, ctx: Ctx, mid: int) -> Reply:
     size = parse_size(ctx.q("size"), sizes)
 
     row = db.query_one(
-        "SELECT id, root_id, rel_path, mtime, size, orientation,"
+        "SELECT id, root_id, rel_path, mtime, size, orientation, kind,"
         "       thumb_state, thumb_etag, missing FROM media WHERE id = ?",
         (mid,),
     )
@@ -389,8 +397,8 @@ async def _generate_sync(st: AppState, row: Any, dst: Path, size: int) -> None:
         return
     loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(_THUMB_FALLBACK_POOL, _call_generate, str(src),
-                                   dst, size, row["orientation"])
+        await loop.run_in_executor(_THUMB_FALLBACK_POOL, _call_generate,
+                                   str(src), dst, size, _gen_opts(st.cfg, row))
     except OversizedImageError as exc:
         # 声明尺寸超单边上限 → 走与 ThumbEngine 完全相同的"永久失败"落库，
         # 让时间线拿到占位图而不是反复重试。不落库的话每次刷新都会再试一次，
@@ -409,10 +417,32 @@ async def _generate_sync(st: AppState, row: Any, dst: Path, size: int) -> None:
     )
 
 
-def _call_generate(src: str, dst: Path, size: int, orientation: Any) -> None:
+def _gen_opts(cfg: Any, row: Any) -> tuple[str, Any, float]:
+    """生成一张缩略/预览需要的那几个"来源相关"参数。
+
+    图片要 EXIF orientation（Pillow 不会替我们转正），视频要 ffmpeg 位置与
+    抽帧时间点；把差异收在这一个函数里，`_call_generate` 就只有一个版本。
+    """
+    if videomod.row_kind(row) == "video":
+        return (
+            "video",
+            str(cfg.video.get("ffmpeg_dir") or ""),
+            float(cfg.video_frame_at),
+        )
+    return ("image", row["orientation"], 0.0)
+
+
+def _call_generate(src: str, dst: Path, size: int,
+                   opts: tuple[str, Any, float]) -> None:
+    kind, arg, at = opts
+    if kind == "video":
+        from ..thumbs import generate_video_thumb
+
+        generate_video_thumb(Path(src), dst, size, at=at, ffmpeg_dir=str(arg))
+        return
     from ..thumbs import generate_thumb
 
-    generate_thumb(Path(src), dst, size, orientation=orientation)
+    generate_thumb(Path(src), dst, size, orientation=arg)
 
 
 async def _file_thumb_reply(st: AppState, dst: Path, sig: str, ctx: Ctx) -> Reply:
@@ -461,7 +491,7 @@ async def get_preview(ctx: Ctx) -> Reply:
     size = parse_size(ctx.q("size"), allowed, name="size") if ctx.q("size") else default
 
     row = db.query_one(
-        "SELECT id, root_id, rel_path, mtime, size, orientation, missing"
+        "SELECT id, root_id, rel_path, mtime, size, orientation, kind, missing"
         "  FROM media WHERE id = ?",
         (mid,),
     )
@@ -544,15 +574,13 @@ async def get_preview(ctx: Ctx) -> Reply:
 
 async def _ensure_size(st: AppState, row: Any, dst: Path, size: int) -> None:
     """只生成指定尺寸（预览用），不碰 thumb_state。"""
-    from ..thumbs import generate_thumb
-
     src = sandbox.resolve(st.cfg.root_by_id(row["root_id"], allow_disabled=False), row["rel_path"],
                           "read", cfg=st.cfg)
     if not src.exists():
         return
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, generate_thumb, src, dst, size,
-                               row["orientation"])
+    await loop.run_in_executor(None, _call_generate, str(src), dst, size,
+                               _gen_opts(st.cfg, row))
 
 
 async def get_raw(ctx: Ctx) -> Reply:
@@ -568,7 +596,7 @@ async def get_raw(ctx: Ctx) -> Reply:
     mid = ctx.param_int("media_id")
 
     row = db.query_one(
-        "SELECT id, root_id, rel_path, file_name, ext, size, mtime, missing"
+        "SELECT id, root_id, rel_path, file_name, ext, size, mtime, kind, missing"
         "  FROM media WHERE id = ?",
         (mid,),
     )
@@ -650,6 +678,26 @@ async def get_raw(ctx: Ctx) -> Reply:
     return r
 
 
+async def stream_video(ctx: Ctx) -> Reply:
+    """`GET /api/items/{id}/stream` —— 视频播放流。
+
+    与 `/raw` **同一份实现**，只多一层语义：前端拿到这个 URL 才用 `<video>`
+    而不是 `<img>`。视频播放离不开 Range（拖动进度条 = 从中间取一段字节），
+    而 `/raw` 在 ISSUE-053 里已经把 Range/206/416/ETag 全做对了，再写一份
+    只会多一处会漂移的实现。
+
+    唯一的行为差别：视频不做 `?download` 的附件语义 —— 播放器把
+    `Content-Disposition: attachment` 当成"不要内联播放"，Safari 会直接
+    拒绝播放。真的想下载视频，前端走 `/raw?download=1`。
+    """
+    st = _st(ctx)
+    row = st.db.query_one("SELECT kind FROM media WHERE id = ?",
+                          (ctx.param_int("media_id"),))
+    if row is not None and videomod.row_kind(row) != "video":
+        raise AppError(E1001, "该条目不是视频")
+    return await get_raw(ctx)
+
+
 def _apply_disposition(reply: Reply, filename: str | None,
                        *, download: bool) -> None:
     """覆盖 file_reply 默认的 `inline`。
@@ -704,9 +752,13 @@ async def folders(ctx: Ctx) -> Reply:
     # 的 bug 很难靠测试发现），而候选行数在有索引时很小。
     rows = db.query(
         "SELECT rel_path FROM media"
-        " WHERE missing = 0 AND kind = 'image' AND root_id = ?"
+        " WHERE missing = 0 AND root_id = ?"
+        # 视频开关只是个 0/1 参数：拼字符串会让 lint（规则 3）报"SQL 首参
+        # 拼接了非占位符内容"，也确实该走参数 —— 值不进 SQL 文本。
+        "   AND (kind = 'image' OR (kind = 'video' AND ? = 1))"
         "   AND rel_path LIKE ? ESCAPE '\\'",
-        (root_id, _esc(base) + "/%" if base else "%"),
+        (root_id, 1 if st.cfg.video_enabled else 0,
+         _esc(base) + "/%" if base else "%"),
     )
 
     buckets: dict[str, dict[str, Any]] = {}
@@ -732,7 +784,7 @@ async def folders(ctx: Ctx) -> Reply:
             b["has_children"] = True
 
     items = sorted(buckets.values(), key=lambda x: x["path"])
-    _attach_covers(db, root_id, items)
+    _attach_covers(st.cfg, db, root_id, items)
 
     return json_reply({
         "root": root_id,
@@ -746,7 +798,8 @@ def _esc(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _attach_covers(db: Any, root_id: str, items: list[dict[str, Any]]) -> None:
+def _attach_covers(cfg: Any, db: Any, root_id: str,
+                   items: list[dict[str, Any]]) -> None:
     """给每个目录挑一张封面（最新的那张）。
 
     用 `MIN(id)` 不够：封面应当是**最新**的照片才符合"相册目录"的直觉。
@@ -758,10 +811,11 @@ def _attach_covers(db: Any, root_id: str, items: list[dict[str, Any]]) -> None:
         if not p:
             continue
         it["cover_id"] = db.scalar(
-            "SELECT id FROM media WHERE missing = 0 AND kind = 'image'"
-            " AND root_id = ? AND (rel_path LIKE ? ESCAPE '\\')"
+            "SELECT id FROM media WHERE missing = 0 AND root_id = ?"
+            " AND (kind = 'image' OR (kind = 'video' AND ? = 1))"
+            " AND (rel_path LIKE ? ESCAPE '\\')"
             " ORDER BY taken_at DESC, id DESC LIMIT 1",
-            (root_id, _esc(p) + "/%"),
+            (root_id, 1 if cfg.video_enabled else 0, _esc(p) + "/%"),
             default=None,
         )
 
@@ -815,6 +869,7 @@ async def search(ctx: Ctx) -> Reply:
     where, params = timeline_where(
         root_id=root_id, ts_from=ts_from, ts_to=ts_to,
         dir_prefix=dir_prefix, camera=camera, has_gps=has_gps,
+        allow_video=bool(st.cfg.video_enabled),
         # 审计 F01：搜索不带 root 时是查全库，必须显式限定在启用根里 ——
         # 否则管理员停掉的那块照片照样能搜出来。
         enabled_root_ids=[r.id for r in st.cfg.enabled_roots],

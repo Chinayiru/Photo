@@ -127,6 +127,19 @@ const showImage = computed(() => props.item.thumb_state !== "failed" && !failed.
 
 const src = computed(() => thumbUrl(props.item.id, props.item.thumb_v, 320));
 
+/** 视频角标（ISSUE-055）：封面同样是缩略图，但要让人分得清"这是段片子"。 */
+const isVideo = computed(() => props.item.kind === "video");
+const durText = computed(() => {
+  const d = props.item.duration;
+  if (d === null || !Number.isFinite(d) || d <= 0) return "";
+  const total = Math.round(d);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const mm = h ? String(m).padStart(2, "0") : String(m);
+  return (h ? `${h}:` : "") + `${mm}:${String(s).padStart(2, "0")}`;
+});
+
 function onError(): void {
   failed.value = true;
 }
@@ -156,7 +169,7 @@ function onLoad(): void {
       pending 不显示占位块：它已经发了请求，服务端会当场生成。
     -->
     <span v-if="!showImage" class="ph" aria-hidden="true">
-      <span class="ph-icon">🖼</span>
+      <span class="ph-icon">{{ isVideo ? "🎬" : "🖼" }}</span>
       <span v-if="item.thumb_state === 'failed'" class="ph-tag">缩略图失败</span>
     </span>
 
@@ -176,6 +189,12 @@ function onLoad(): void {
     />
 
     <span v-if="item.has_gps" class="badge gps" aria-label="有位置信息">📍</span>
+
+    <!-- 视频角标：右下角，与左下角的 📍、右上角的选中圈互不打架 -->
+    <span v-if="isVideo" class="badge dur" :aria-label="`视频 ${durText}`">
+      <span class="play" aria-hidden="true">▶</span>
+      <span v-if="durText">{{ durText }}</span>
+    </span>
 
     <!--
       选中标记：
@@ -263,6 +282,24 @@ function onLoad(): void {
   bottom: 3px;
   padding: 2px 3px;
   background: rgba(0, 0, 0, 0.55);
+}
+
+.dur {
+  right: 3px;
+  bottom: 3px;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 4px;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  /* 等宽数字：几百个格子一起出现时时间不会左右跳 */
+  font-variant-numeric: tabular-nums;
+}
+
+.play {
+  font-size: 8px;
+  line-height: 1;
 }
 
 .check {

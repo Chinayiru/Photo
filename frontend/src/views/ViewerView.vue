@@ -72,7 +72,7 @@ const mainSrc = computed(() => currentPreviewUrl.value);
 
 /** 原图层是否该挂着（用户放大到 1.5× 以上且原图没失败过）。 */
 const rawSrc = computed(() => {
-  if (!s.detail || !useRaw.value || rawFailed.value) return "";
+  if (!s.detail || isVideo.value || !useRaw.value || rawFailed.value) return "";
   return rawSrcFor(s.detail.id);
 });
 
@@ -179,6 +179,32 @@ const infoOpen = ref(false);
 const hasPrev = computed(() => s.detail?.prev_id != null);
 const hasNext = computed(() => s.detail?.next_id != null);
 const detail = computed(() => s.detail);
+
+/* ------------------------------------------------------------------ *
+ * 视频（ISSUE-055）
+ *
+ * 视频与图片在查看器里的差别只有一处：主画面换成 `<video>`。缩放/原图这套
+ * 全部不适用（视频的像素密度固定，放大只是变糊），因此：
+ *   - `useRaw` / 原图层对视频直接短路
+ *   - 双指捏合、双击放大、下滑关闭都不接管（交给 `<video>` 的原生控件）
+ *   - 左右滑动仍然翻页（换条视频/换张图都很自然）
+ * ------------------------------------------------------------------ */
+const isVideo = computed(() => detail.value?.kind === "video");
+/** 浏览器能直接播时才给 `<video src>`；否则给"下载原片"的兜底。 */
+const videoPlayable = computed(() => isVideo.value
+  && !!detail.value?.video?.playable && !!detail.value?.urls.video);
+const videoSrc = computed(() => (videoPlayable.value ? detail.value?.urls.video ?? "" : ""));
+
+/**
+ * 视频元信息到手（`loadedmetadata`）：等价于图片的 `onMainLoad`。
+ *
+ * ★ 也必须调 `markPreviewLoaded`：否则 viewer store 会一直以为"预览还没好"，
+ *   后续那张图的 idle 预取会被无限推迟（预取队列是全局的）。
+ */
+function onVideoMeta(): void {
+  s.imageReady = true;
+  if (s.id) markPreviewLoaded(s.id);
+}
 
 /* ------------------------------------------------------------------ *
  * 改名 / 移动
@@ -371,6 +397,10 @@ function touchDist(e: TouchEvent): number {
  */
 function onTouchStart(e: TouchEvent): void {
   if (e.touches.length >= 2) {
+    // ★ 视频不接管双指：捏合应该留给"整页缩放"或什么都不做。
+    //   接管之后把 <video> 缩放到 2 倍，画面糊了也没有任何收益 ——
+    //   视频的像素密度是固定的，不像照片可以看细节。
+    if (isVideo.value) return;
     // 双指：接管本次手势。清掉单指的跟踪状态，防止松掉一根手指后
     // 残留的 startX/startY 触发一次莫名其妙的翻页。
     tracking = false;
@@ -441,7 +471,8 @@ function onTouchMove(e: TouchEvent): void {
   // --- 垂直：下滑关闭 ---
   // ⚠️ 只认向下（my > 0）。向上滑是很自然的"想看看图片下半部分"的动作，
   // 若也跟手会让用户以为图片被拖走了。
-  if (my > 0) {
+  // ★ 视频不接管：底部就是原生播放控制条，下滑关闭会和"拖进度条"打架。
+  if (my > 0 && !isVideo.value) {
     dy.value = my;
     dragging.value = true;
   }
@@ -474,7 +505,7 @@ function onTouchEnd(e: TouchEvent): void {
   // 双击的第一次点按在 touchend 时位移≈0、时长≈0，会被下面的
   // flick 判定当成"快速轻扫"（vx 很大）而误翻一页。
   const t = e.changedTouches[0];
-  if (t && !dragging.value) {
+  if (t && !dragging.value && !isVideo.value) {
     const now = Date.now();
     const nearLast =
       Math.abs(t.clientX - lastTapX) < DOUBLE_TAP_SLOP &&
@@ -684,8 +715,30 @@ async function doDelete(): Promise<void> {
             decoding="async"
           />
 
+          <!--
+            视频（ISSUE-055）：`preload="metadata"` 只要头几 KB（时长/尺寸/
+            首帧），不白等整段下载；`playsinline` 是 iOS 上不自动全屏的关键；
+            `controls` 交给浏览器 —— 自己写进度条要处理缓冲、音轨、字幕、
+            全屏、画中画，而这些原生控件在两端都做得更好。
+            `:key` 带 id：换视频时必须重建节点，否则会继续播上一条。
+          -->
+          <video
+            v-if="videoPlayable"
+            :key="`video-${detail?.id}`"
+            class="v-img video"
+            :class="{ drag: dragging }"
+            :style="imageTransform ? { transform: imageTransform } : undefined"
+            :src="safeUrl(videoSrc)"
+            :poster="safeUrl(currentThumbUrl)"
+            controls
+            playsinline
+            preload="metadata"
+            @loadedmetadata="onVideoMeta"
+            @error="s.error = '视频无法播放'"
+          />
+
           <img
-            v-if="detail"
+            v-else-if="detail"
             :key="detail.id"
             class="v-img main"
             :class="[{ drag: dragging }, slideClass]"
@@ -715,8 +768,20 @@ async function doDelete(): Promise<void> {
             @error="rawFailed = true"
           />
 
-          <div v-if="!s.imageReady && !s.error" key="loading" class="v-loading">
+          <div v-if="!s.imageReady && !s.error && !(isVideo && !videoPlayable)"
+               key="loading" class="v-loading">
             <span class="spinner big" />
+          </div>
+
+          <!--
+            编码放不了（HEVC/mkv/avi 很常见）：不能只显示"播放失败"，得给出
+            可执行的动作 —— 原片是好的，只是这个浏览器解不了。
+            用 `/raw?download=1` 下载：attachment 语义才能让手机"存到相册/文件"。
+          -->
+          <div v-if="isVideo && !videoPlayable && detail" key="vnote" class="v-rawnote">
+            这个视频的编码（{{ detail.video?.vcodec || "未知" }}）浏览器放不了，
+            <a class="v-dl" :href="safeUrl(`${detail.urls.raw}?download=1`)">下载原片</a>
+            到手机上看
           </div>
 
           <!--
@@ -980,6 +1045,18 @@ async function doDelete(): Promise<void> {
   pointer-events: none;
   /* 盖在预览之上（两者都是 absolute，靠 z-index 决定谁在上） */
   z-index: 1;
+}
+
+/* 视频：铺满舞台中心，原生控件在底部 */
+.v-img.video {
+  z-index: 1;
+  max-height: 100%;
+  background: #000;
+}
+
+.v-dl {
+  color: var(--accent);
+  text-decoration: underline;
 }
 
 /* 原图格式不支持时的提示条：贴在底部，不挡图片中心 */

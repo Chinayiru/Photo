@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Final, Iterable, Iterator
 
-from . import exif, sandbox, uploads
+from . import exif, sandbox, uploads, video as videomod
 from .config import Config, RootConfig
 from .events import EventBus
 from .errors import AppError
@@ -119,7 +119,10 @@ def _is_excluded_file(name: str, root: RootConfig) -> bool:
     return low.startswith("~$") or low.endswith(".tmp")
 
 
-def should_index(name: str, root: RootConfig, *, rel: str | None = None) -> bool:
+def should_index(
+    name: str, root: RootConfig, *, rel: str | None = None,
+    exts: frozenset[str] | None = None,
+) -> bool:
     """这个文件名该不该进索引？**与 `_walk` 的过滤条件逐条对齐**。
 
     为什么单独抽出来：全量扫描（`_walk`）与单文件增量（`index_one_file`）
@@ -145,12 +148,17 @@ def should_index(name: str, root: RootConfig, *, rel: str | None = None) -> bool
     用的是同一个函数，三处不会漂移。
 
     ⚠️ 这里**不含** junction/reparse 检查（那需要 lstat，是调用方的事）。
+
+    `exts` 缺省取 `root.include_exts`（= 只认图片）。索引器自己调用时传
+    `cfg.allowed_index_exts`（图片 + 视频开关打开时的视频白名单）——
+    视频与图片的**收窄**配置是两件事，见 `Config.allowed_index_exts`。
     """
     if _is_excluded_file(name, root):
         return False
     if rel is not None and sandbox.excluded_dir_segment(rel, root):
         return False
-    return _ext_of(name) in root.include_exts
+    allowed = root.include_exts if exts is None else exts
+    return _ext_of(name) in allowed
 
 
 def _ext_of(name: str) -> str:
@@ -189,6 +197,10 @@ def check_content(path: str, *, size: int = -1) -> bool:
     3. 若扩展名在白名单表里，识别出的类型**必须与扩展名相符**。
        扩展名不在表里（配置放宽了白名单）时只要求"看起来是图片"。
 
+    **视频扩展名走另一条判据**（ISSUE-055）：`video.check_container()`
+    —— 容器结构必须能被识别、且与扩展名相符。只读头 64 字节，同样是
+    一次 open。
+
     ⚠️ 读失败（权限、被占用、文件已消失）一律返回 **True**：
     索引器的第一条原则是"绝不因为一个坏文件中断扫描"，而"读不到"
     不等于"内容不对" —— 判成 False 会让一张权限受限的正常照片
@@ -203,6 +215,13 @@ def check_content(path: str, *, size: int = -1) -> bool:
         return True
     if len(head) < 12:
         return False
+    ext = _ext_of(path)
+    # ★ 视频（ISSUE-055）：走容器识别，不走图片的魔术字节表。
+    #   mp4 与 mov 的头都是 `ftyp`，与 HEIC 同族；`video.check_container`
+    #   负责把图片 brand 排除掉，并校验"扩展名与容器一致"。
+    if ext in videomod.VIDEO_EXTS_INDEX:
+        ok, _actual = videomod.check_container(ext, head)
+        return ok
     actual = uploads.sniff_kind(head)
     if actual is None:
         return False
@@ -212,7 +231,9 @@ def check_content(path: str, *, size: int = -1) -> bool:
     return True
 
 
-def _walk(root: RootConfig, stats: ScanStats) -> Iterator[tuple[str, os.stat_result]]:
+def _walk(
+    root: RootConfig, stats: ScanStats, *, exts: frozenset[str] | None = None,
+) -> Iterator[tuple[str, os.stat_result]]:
     """遍历根目录，产出 (相对路径, stat)。
 
     ★ **本函数是索引器最容易被忽视的越界点**。
@@ -280,7 +301,7 @@ def _walk(root: RootConfig, stats: ScanStats) -> Iterator[tuple[str, os.stat_res
             # --- 文件 ---
             if not entry.is_file(follow_symlinks=False):
                 continue
-            if not should_index(name, root):
+            if not should_index(name, root, exts=exts):
                 if not _is_excluded_file(name, root):
                     stats.skipped_ext += 1
                 continue
@@ -416,7 +437,10 @@ class Indexer:
         log.info("scan started root=%s path=%s", root.id, root.path)
         self._emit({"type": "scan_start", "root": root.id, "ts": time.time()})
         try:
-            await self._index_files(root, _walk(root, stats), stats, progress=True)
+            await self._index_files(
+                root, _walk(root, stats, exts=self.cfg.allowed_index_exts), stats,
+                progress=True,
+            )
             if not self._cancel.is_set():
                 stats.missing = self._mark_missing(root.id, stats.seen_rels)
             # ★ 收尾必推一条最终进度。
@@ -478,7 +502,9 @@ class Indexer:
                 stats.aborted = "用户中止"
                 break
             # 与 `_walk` / `index_one_file` 共用同一份判断，见 `should_index`。
-            if not should_index(rel.rsplit("/", 1)[-1], root):
+            if not should_index(
+                rel.rsplit("/", 1)[-1], root, exts=self.cfg.allowed_index_exts
+            ):
                 stats.skipped_ext += 1
                 continue
             stats.seen += 1
@@ -551,7 +577,7 @@ class Indexer:
         永远到不了 100 —— 用户盯着一个停在 87% 的进度条等下去。
         """
         return int(self.db.scalar(
-            "SELECT COUNT(*) FROM media WHERE missing = 0 AND kind = 'image'",
+            "SELECT COUNT(*) FROM media WHERE missing = 0",
             default=0) or 0)
 
     def _emit(self, event: dict) -> None:
@@ -672,24 +698,91 @@ class Indexer:
     async def _build_row(
         self, root: RootConfig, rel: str, st: os.stat_result, prev: dict | None,
     ) -> tuple:
-        """构造一条待写入的 media 行。"""
+        """构造一条待写入的 media 行。
+
+        图片：抽 EXIF（快，纯读文件头）。
+        视频：跑一次 ffprobe 拿时长/编码/宽高 —— **这是索引期唯一的重活**，
+        所以放在线程里（`asyncio.to_thread`），否则一次 500 个视频的扫描会把
+        事件循环占死，手机端所有请求一起超时。
+
+        探测失败不影响入库：视频照样进时间线，只是时长未知、`vcodec` 为空、
+        `is_playable` 判定为"不建议直接播"。丢一整个文件比丢元数据糟糕得多。
+        """
         name = rel.rsplit("/", 1)[-1]
         ext = _ext_of(name)
-        info = await exif.extract(sandbox.resolve(root, rel, "read", cfg=self.cfg))
-        taken_at, taken_src = resolve_taken_at(info, name, st.st_mtime)
+        path = sandbox.resolve(root, rel, "read", cfg=self.cfg)
 
+        if ext in videomod.VIDEO_EXTS_INDEX:
+            # 失败时 `probe()` 返回 ok=False（不抛），只有 FFmpegMissing 会抛。
+            try:
+                probe = await asyncio.to_thread(
+                    videomod.probe, path,
+                    timeout=float(self.cfg.video.get("probe_timeout", 10.0)),
+                    ffmpeg_dir=str(self.cfg.video.get("ffmpeg_dir") or ""),
+                )
+            except videomod.FFmpegMissing as exc:
+                log.warning("视频探测不可用（%s），按未知元数据入库：%s", exc, rel)
+                probe = videomod.ProbeResult(ok=False, error=str(exc))
+            taken_at, taken_src = resolve_taken_at(
+                exif.ExifInfo(), name, st.st_mtime)
+            return self._row_tuple(
+                root_id=root.id, rel=rel, name=name, ext=ext, st=st,
+                taken_at=taken_at, taken_src=taken_src, probe=probe, prev=prev,
+            )
+
+        info = await exif.extract(path)
+        taken_at, taken_src = resolve_taken_at(info, name, st.st_mtime)
+        return self._row_tuple(
+            root_id=root.id, rel=rel, name=name, ext=ext, st=st,
+            taken_at=taken_at, taken_src=taken_src, info=info, prev=prev,
+        )
+
+    @staticmethod
+    def _row_tuple(
+        *,
+        root_id: str,
+        rel: str,
+        name: str,
+        ext: str,
+        st: os.stat_result,
+        taken_at: float,
+        taken_src: str,
+        info: ExifInfo | None = None,
+        probe: videomod.ProbeResult | None = None,
+        prev: dict | None = None,
+    ) -> tuple:
+        """把"图片 EXIF 或视频探测结果"折成一行，列顺序与 `_UPSERT_SQL` 一致。
+
+        抽出来是因为**全量扫描与上传后增量索引必须产出完全相同的行**
+        —— 两份各写一遍的后果是"扫描进来的视频有时长、传上来的没有"。
+        """
+        is_video = ext in videomod.VIDEO_EXTS_INDEX
+        kind = "video" if is_video else "image"
+        duration = vcodec = acodec = container = None
+        if is_video and probe is not None and probe.ok:
+            duration = probe.duration if probe.duration > 0 else None
+            vcodec = probe.vcodec or None
+            acodec = probe.acodec or None
+            container = probe.container or None
+        width = probe.width if (is_video and probe and probe.ok) else (
+            info.width if info else None)
+        height = probe.height if (is_video and probe and probe.ok) else (
+            info.height if info else None)
         return (
-            root.id, rel, name, ext, "image",
+            root_id, rel, name, ext, kind,
             int(st.st_size), float(st.st_mtime),
             taken_at, taken_src,
-            info.width, info.height,
-            info.camera, info.lens,
-            info.iso, info.fnum, info.exposure, info.focal,
-            info.gps_lat, info.gps_lon, info.orientation,
+            width, height,
+            info.camera if info else None, info.lens if info else None,
+            info.iso if info else None, info.fnum if info else None,
+            info.exposure if info else None, info.focal if info else None,
+            info.gps_lat if info else None, info.gps_lon if info else None,
+            info.orientation if info else None,
             "pending" if prev is None else prev.get("thumb_state", "pending"),
             None,           # thumb_etag：源文件变了就作废，强制重新生成
             0,              # missing
             time.time(),    # indexed_at
+            duration, vcodec, acodec, container,
         )
 
     _UPSERT_SQL: Final[str] = """
@@ -697,11 +790,13 @@ class Indexer:
             root_id, rel_path, file_name, ext, kind, size, mtime,
             taken_at, taken_src, width, height, camera, lens,
             iso, fnum, exposure, focal, gps_lat, gps_lon, orientation,
-            thumb_state, thumb_etag, missing, indexed_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            thumb_state, thumb_etag, missing, indexed_at,
+            duration, vcodec, acodec, container
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(root_id, rel_path) DO UPDATE SET
             file_name  = excluded.file_name,
             ext        = excluded.ext,
+            kind       = excluded.kind,
             size       = excluded.size,
             mtime      = excluded.mtime,
             taken_at   = excluded.taken_at,
@@ -717,6 +812,14 @@ class Indexer:
             gps_lat    = excluded.gps_lat,
             gps_lon    = excluded.gps_lon,
             orientation= excluded.orientation,
+            -- 视频元数据只在探测成功时覆盖；探测失败（ok=False）时
+            -- excluded 里是 NULL，会把已有的好值冲掉 —— 所以用 COALESCE
+            -- 保住旧值。场景：ffmpeg 被临时挪走，重扫一遍不该把全库视频
+            -- 的时长与编码清空。
+            duration   = COALESCE(excluded.duration, media.duration),
+            vcodec     = COALESCE(excluded.vcodec,   media.vcodec),
+            acodec     = COALESCE(excluded.acodec,   media.acodec),
+            container  = COALESCE(excluded.container, media.container),
             -- 内容变了（mtime/size 不同）则缩略图作废，重置为 pending。
             -- 否则保留原状态，避免每次扫描都重新生成 4915 张缩略图。
             thumb_state = CASE
@@ -826,24 +929,41 @@ class Indexer:
             p = sandbox.resolve(root, rel, "read", cfg=self.cfg)
             # ★ 传 rel 而不是只看 p.name：单文件增量不走目录遍历，
             # 光看文件名会把 `data/a.jpg` 收进来，而全量扫描永远不收。
-            if not should_index(p.name, root, rel=rel):
+            if not should_index(
+                p.name, root, rel=rel, exts=self.cfg.allowed_index_exts
+            ):
                 log.info("index_one_file 跳过不在索引白名单内的文件 rel=%s", rel)
                 return None
             st = p.stat()
         except (AppError, OSError) as e:
             log.warning("index_one_file failed rel=%s: %s", rel, e)
             return None
-        info = exif.extract_sync(p)
         name = rel.rsplit("/", 1)[-1]
-        taken_at, taken_src = resolve_taken_at(info, name, st.st_mtime)
-        row = (
-            root.id, rel, name, _ext_of(name), "image",
-            int(st.st_size), float(st.st_mtime), taken_at, taken_src,
-            info.width, info.height, info.camera, info.lens,
-            info.iso, info.fnum, info.exposure, info.focal,
-            info.gps_lat, info.gps_lon, info.orientation,
-            "pending", None, 0, time.time(),
-        )
+        ext = _ext_of(name)
+        if ext in videomod.VIDEO_EXTS_INDEX:
+            # 这条路是同步的（上传完成后的收尾），探测直接跑在线程池外的
+            # 调用线程上 —— 它已经不在事件循环里（`handlers` 用 to_thread 调）。
+            try:
+                probe = videomod.probe(
+                    p,
+                    timeout=float(self.cfg.video.get("probe_timeout", 10.0)),
+                    ffmpeg_dir=str(self.cfg.video.get("ffmpeg_dir") or ""),
+                )
+            except videomod.FFmpegMissing as exc:
+                log.warning("视频探测不可用（%s）：%s", exc, rel)
+                probe = videomod.ProbeResult(ok=False, error=str(exc))
+            taken_at, taken_src = resolve_taken_at(exif.ExifInfo(), name, st.st_mtime)
+            row = self._row_tuple(
+                root_id=root.id, rel=rel, name=name, ext=ext, st=st,
+                taken_at=taken_at, taken_src=taken_src, probe=probe, prev=None,
+            )
+        else:
+            info = exif.extract_sync(p)
+            taken_at, taken_src = resolve_taken_at(info, name, st.st_mtime)
+            row = self._row_tuple(
+                root_id=root.id, rel=rel, name=name, ext=ext, st=st,
+                taken_at=taken_at, taken_src=taken_src, info=info, prev=None,
+            )
         ids = self._flush([row])
         if ids and self.thumbs is not None:
             self.thumbs.enqueue(ids[0])
@@ -851,3 +971,4 @@ class Indexer:
 
 
 __all__ = ["BATCH_SIZE", "Indexer", "ScanStats"]
+
