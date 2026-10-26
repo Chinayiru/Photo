@@ -35,7 +35,9 @@ ROOT = Path(__file__).resolve().parents[2]
 DEPLOY = ROOT / "cloud" / "deploy.ps1"
 RELAY_LOCK = ROOT / "cloud" / "requirements.lock"
 FULL_LOCK = ROOT / "requirements.lock"
-MAKER = ROOT / "build" / "_make_relay_lock.py"
+#: 生成器必须**在版本库里**（审查 Q-02）：`build/` 被 `.gitignore` 整体忽略，
+#: 放在那里会让干净 clone 上的两条用例直接找不到文件而红。
+MAKER = ROOT / "packaging" / "make_relay_lock.py"
 
 _PIN_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s\\]+)", re.MULTILINE)
 _HASH_RE = re.compile(r"--hash=sha256:([0-9a-f]{64})")

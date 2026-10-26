@@ -1256,7 +1256,7 @@ def main() -> int:
         # **不发出 POST /api/pair**（先配对再校验会把那一枚码用掉，
         # 用户拿着正确的电脑也无法重试）。
         br.evaluate("window.localStorage.clear()")
-        br.goto(f'{base}/?code={pc2["code"]}&did=deadbeefdeadbeef')
+        br.goto(f'{base}/#code={pc2["code"]}&did=deadbeefdeadbeef')
         ok = br.wait_for(
             "!!document.querySelector('input[placeholder*=\"192.168\"]')",
             budget=25, label="错配页面回配对页")
@@ -1278,7 +1278,7 @@ def main() -> int:
         #   `[2]` 节）留下的 token 直接满足，这个正向用例就成了空转 ——
         #   把校验写成"永远拒绝"也照样全绿。
         br.evaluate("window.localStorage.clear()")
-        br.goto(f'{base}/?code={pc2["code"]}&did={did}')
+        br.goto(f'{base}/#code={pc2["code"]}&did={did}')
         ok = br.wait_for("!!window.localStorage.getItem('pb.token')",
                          budget=25, label="正确 did 配对成功")
         check(ok, "did 与电脑一致时配对正常通过")
@@ -1770,9 +1770,14 @@ def main() -> int:
         alb = next((a for a in arr if a["multiple"]), None)
         cam = next((a for a in arr if a["capture"]), None)
         check(alb is not None, "「从相册选」的 input 带 multiple（可多选）")
-        check(alb and alb["accept"] == "image/*",
-              "相册 input 的 accept 是 image/*（手机上只列图片）",
-              f"{(alb or {}).get('accept')!r}")
+        acc = str((alb or {}).get("accept") or "")
+        # 视频上传（ISSUE-056）之后相册选择器要同时列出图片与可上传的视频容器。
+        # 判据从"恰好等于 image/*"改成"含 image/* 与视频容器"，但**必须**仍然
+        # 排除任意文件：`*/*` 会让用户能选到 .exe 之类的东西。
+        check(alb and acc.startswith("image/*") and "video/mp4" in acc
+              and "*/*" not in acc,
+              "相册 input 的 accept 含图片与视频容器（没放开成任意文件）",
+              f"{acc!r}")
         check(cam is not None, "「拍照」的 input 带 capture")
         check(cam and cam["capture"] == "environment",
               "拍照 input 的 capture=environment（后置摄像头）",
@@ -3072,6 +3077,7 @@ def main() -> int:
                   code_autocomplete: c ? c.getAttribute('autocomplete') : null,
                   btn_text: btn ? (btn.textContent || '').trim() : null,
                   btn_disabled: btn ? !!btn.disabled : null,
+                  btn_class: btn ? String(btn.className || '') : null,
                 });
               })()
             """)
@@ -3096,9 +3102,28 @@ def main() -> int:
         check(fs0.get("code_autocomplete") == "one-time-code",
               "配对码用了 autocomplete=one-time-code（iOS 短信码那一套）",
               f"{fs0.get('code_autocomplete')!r}")
-        check(fs0.get("btn_disabled") is True,
-              "★ 表单空时主按钮是**禁用**的（不会让人点了才发现没填）",
-              f"disabled={fs0.get('btn_disabled')}")
+        # 产品口径（`PairView.vue`：`canSubmit` 只控制 `.dim` 类，`disabled`
+        # 只留给"请求进行中"）：条件不足时按钮**置灰但仍可点**，点下去给一句
+        # 中文提示。把它断言成 `disabled=True` 会把实现逼成"灰按钮点不动、
+        # 用户看不出为什么连不上"——那种"更严格"的判据是假的严格。
+        check(fs0.get("btn_disabled") is False
+              and "dim" in str(fs0.get("btn_class") or ""),
+              "★ 表单空时主按钮置灰但可点（点了才给中文提示）",
+              f"disabled={fs0.get('btn_disabled')} class={fs0.get('btn_class')!r}")
+        br.evaluate("""
+          (() => {
+            const btn = [...document.querySelectorAll('button')]
+              .find(x => /连接/.test(x.textContent || ''));
+            if (btn) btn.dispatchEvent(new MouseEvent('click',
+              {bubbles: true, cancelable: true}));
+            return !!btn;
+          })()
+        """)
+        time.sleep(0.5)
+        _empty_hint = br.evaluate(
+            "(document.querySelector('.err')||{}).textContent || ''")
+        check(bool(_empty_hint.strip()),
+              "★ 空表单点下去有中文提示（不是静默无反应）", f"{_empty_hint!r}")
 
         pc_b02 = _panel_code(base)
         code_b02 = pc_b02["code"]
@@ -3244,14 +3269,18 @@ def main() -> int:
         url_scan = pair_qr_url(base, qr_pc["code"], dev_id)
         parsed_scan = _up.urlparse(url_scan)
         qs_scan = _up.parse_qs(parsed_scan.query)
+        # ★ 配对码在 **fragment** 里（`#code=..&did=..`）：fragment 不随请求
+        #   发给服务器、不进云端日志、不进 Referer。早期版本用的 query，
+        #   所以这里必须解析 fragment（query 留作向后兼容）。
+        _scan_frag = _up.parse_qs(parsed_scan.fragment)
         check(parsed_scan.scheme == "http" and bool(parsed_scan.netloc),
               f"二维码 URL 是合法的绝对地址  {url_scan}")
-        check(qs_scan.get("code") == [qr_pc["code"]],
-              "★ URL 里带的正是这枚配对码",
-              f"{qs_scan.get('code')}")
-        check(qs_scan.get("did") == [dev_id],
+        check(_scan_frag.get("code") == [qr_pc["code"]],
+              "★ URL 里带的正是这枚配对码（fragment 形式）",
+              f"{_scan_frag.get('code')}")
+        check(_scan_frag.get("did") == [dev_id],
               "★ URL 里带了 device_id（AC-5.2 的静态码防错配）",
-              f"{qs_scan.get('did')}")
+              f"{_scan_frag.get('did')}")
 
         # ★ 二维码**图像本身**能不能被扫出来，用解码器验。
         #   这一步不是"锦上添花"：二维码生成参数（box_size / border / 纠错级别）
@@ -3320,7 +3349,7 @@ def main() -> int:
         ok_scan = br.wait_for("!!window.localStorage.getItem('pb.token')",
                               budget=35, label="[4q] B-03 扫码自动配对")
         check(ok_scan,
-              "★ 带着 ?code=&did= 打开页面即自动配对（扫码后无需手动输码）")
+              "★ 带着 #code=&did= 打开页面即自动配对（扫码后无需手动输码）")
         ok_tl2 = br.wait_for(
             "document.querySelectorAll('[data-id]').length >= 1",
             budget=30, label="[4q] B-03 进时间线")

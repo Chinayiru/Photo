@@ -98,7 +98,11 @@ for s in ("", "-wal", "-shm"):
 
 db = Database(dbp)
 db.init()
-check(db.schema_version() == 1, "schema_version = 1")
+# 迁移账本：跑完所有迁移后，当前版本必须等于账本最后一版（docs/05 §7.1）。
+from app.db import MIGRATIONS, SCHEMA_VERSION
+check(db.schema_version() == SCHEMA_VERSION,
+      f"schema_version = {SCHEMA_VERSION}（账本 {len(MIGRATIONS)} 版）",
+      f"got={db.schema_version()}")
 check(db.initialized, "initialized 标志")
 
 n = db.scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table'")
@@ -133,7 +137,10 @@ check(fts_ext == 0, "按扩展名单独搜 jpg 不命中（'.' 是 tokenchar，�
 
 # 约束真的生效
 for sql, label, want_exc in (
-    ("INSERT INTO media(root_id,rel_path,file_name,ext,size,mtime,taken_at,kind) VALUES('l','b.jpg','b.jpg','jpg',1,1,1,'video')", "kind 约束拒绝 video", "IntegrityError"),
+    # ISSUE-055 之前这里钉的是"拒绝 video"；放开视频后视频是合法值（审查 6.2
+    # 指出这条已过时），改成钉**仍然非法**的枚举值，否则这条用例会自己造一行
+    # 脏数据，把下面三条 stats 断言一起打红。
+    ("INSERT INTO media(root_id,rel_path,file_name,ext,size,mtime,taken_at,kind) VALUES('l','b.jpg','b.jpg','jpg',1,1,1,'audio')", "kind 枚举拒绝非法值 audio", "IntegrityError"),
     # 注意 root_id 必须与 id=1 那一行一致（'library'）才会真的撞唯一键。
     # 写成 ('l','a.jpg') 是不会冲突的 —— 这是我第一版脚本的错。
     ("INSERT INTO media(root_id,rel_path,file_name,ext,size,mtime,taken_at) VALUES('library','2024/2024-05/a.jpg','a.jpg','jpg',1,1,1)", "UNIQUE(root_id,rel_path) 生效", "IntegrityError"),
@@ -146,6 +153,19 @@ for sql, label, want_exc in (
         check(False, label, "竟然插入成功")
     except Exception as e:  # noqa: BLE001
         check(type(e).__name__ == want_exc, label, type(e).__name__)
+
+# 正向：video 是合法值（ISSUE-055），四列可写；写完立刻删掉，不污染 stats。
+vid = db.insert_returning_id(
+    "INSERT INTO media(root_id, rel_path, file_name, ext, kind, size, mtime, taken_at,"
+    " duration, container, vcodec, acodec, faststart, indexed_at)"
+    " VALUES('library','2024/v.mp4','v.mp4','mp4','video',2048,?,?,'12.5','mp4',"
+    " 'hevc','aac',1,?)",
+    (now, now, now),
+)
+check(isinstance(vid, int) and vid > 1, "video 行可插入（kind/四列已放开）", f"id={vid}")
+db.execute("DELETE FROM media WHERE id = ?", (vid,))
+check(db.scalar("SELECT COUNT(*) FROM media") == 1, "删除后只剩 id=1 那一行",
+      str(db.scalar("SELECT COUNT(*) FROM media")))
 
 # 事务回滚
 try:

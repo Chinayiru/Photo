@@ -1,0 +1,38 @@
+PhotoBridge 随附的 ffmpeg / ffprobe —— 许可证与来源说明
+==========================================================
+
+本目录（tools/ffmpeg/）里的 ffmpeg.exe 与 ffprobe.exe 是**第三方程序**，
+不是 PhotoBridge 的一部分，按各自许可证分发。
+
+版本
+    ffmpeg version 9.0.2-essentials_build-www.gyan.dev
+    （Windows x64，essentials 构建）
+    ffmpeg.exe   sha256 3256173f3f8bffd7df12227c68adf68025edb1832273a9530688a7bb1ed8edec
+    ffprobe.exe  sha256 f0d36ecbbdd3bcfac3efa078c96c7271c2e68b3810595552ac3b7f17e9a65c52
+
+来源
+    https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+
+许可证
+    GPL-3.0-or-later。essentials 构建默认启用 GPL 组件（x264 等），因此整个
+    二进制按 GPL 分发，而不是 LGPL。
+
+    GPL 全文见 https://www.gnu.org/licenses/gpl-3.0.txt
+
+源码
+    FFmpeg 源码：https://ffmpeg.org/download.html
+    该构建的配置与补丁说明：https://www.gyan.dev/ffmpeg/builds/
+    也可以向作者索取：在项目仓库开 issue，我们提供对应版本的源码归档。
+
+为什么把二进制放在这里
+    `backend/app/video.py` 的 find_bin() 会按以下顺序找 ffmpeg：
+      1. 配置项 video.ffmpeg_dir
+      2. 环境变量 PHOTOBRIDGE_FFMPEG_DIR
+      3. **本目录**（<PhotoBridge.exe 所在目录>/tools/ffmpeg，或 .../bin）
+      4. 系统 PATH
+    放在这里，用户解压即用，不需要另外安装或配置。
+
+替换规则
+    升级 ffmpeg 时必须同步更新 `packaging/ffmpeg-pin.json` 里的版本、两个
+    sha256 与大小，并重跑 `scripts/check_ffmpeg_pin.py`。
+    校验不过的二进制不许进发布包（`packaging/bundle_tools.py` 会拦）。

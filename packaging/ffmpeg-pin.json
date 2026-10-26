@@ -1,0 +1,29 @@
+{
+  "_comment": "发布用 ffmpeg 的冻结清单（审查 Q-03）。scripts/check_ffmpeg_pin.py 会核对磁盘上的二进制是否与这里逐字节一致；打包前必须过这一关，否则用户装到的可能是被换过的 ffmpeg。",
+  "product": "gyan.dev ffmpeg essentials build (Windows x64)",
+  "version": "9.0.2-essentials_build-www.gyan.dev",
+  "vendor_banner": "ffmpeg version 9.0.2-essentials_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers",
+  "source_url": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+  "source_archive_sha256": null,
+  "pinned_at": "2026-10-26",
+  "license": "GPL-3.0-or-later（essentials 构建默认启用 GPL 组件；分发时必须随附许可证与源码获取方式）",
+  "files": {
+    "ffmpeg.exe": {
+      "sha256": "3256173f3f8bffd7df12227c68adf68025edb1832273a9530688a7bb1ed8edec",
+      "size": 105423872
+    },
+    "ffprobe.exe": {
+      "sha256": "f0d36ecbbdd3bcfac3efa078c96c7271c2e68b3810595552ac3b7f17e9a65c52",
+      "size": 105221120
+    }
+  },
+  "install_layout": [
+    "dist/PhotoBridge/tools/ffmpeg/ffmpeg.exe",
+    "dist/PhotoBridge/tools/ffmpeg/ffprobe.exe"
+  ],
+  "notes": [
+    "源码里 video.find_bin() 的查找顺序：video.ffmpeg_dir → PHOTOBRIDGE_FFMPEG_DIR → <exe 所在目录>/tools/ffmpeg(/bin) → PATH。",
+    "所以发布包只要把两个 exe 放在 exe 旁边的 tools/ffmpeg/ 下就能被找到，不需要改用户配置。",
+    "升级 ffmpeg 时必须同时改 version / files.sha256 / files.size 与 source_archive_sha256，并重跑 scripts/check_ffmpeg_pin.py。"
+  ]
+}

@@ -18,6 +18,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import inspect
 import logging
 import re
 import sqlite3
@@ -25,8 +27,9 @@ import threading
 import time
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Callable, Final
 
 from . import config as cfgmod
 from .errors import E3002, AppError
@@ -37,7 +40,7 @@ log = logging.getLogger(__name__)
 # 建表脚本
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION: Final[int] = 1
+#: 基线迁移名。`schema_version` 的第一行用它，之后每版一条（docs/05 §7.1）。
 SCHEMA_NAME: Final[str] = "001_init_photobridge"
 
 SCHEMA: Final[str] = """
@@ -361,6 +364,245 @@ _MEDIA_COPY_COLUMNS: Final[tuple[str, ...]] = (
 
 
 # --------------------------------------------------------------------------
+# 迁移账本
+# --------------------------------------------------------------------------
+#
+# 口径与 docs/05 §7.1 一致：`schema_version` 表里**每一行**代表一次已应用的
+# 迁移，`checksum` 是那次迁移**定义文本**的 sha256 前 16 位；改了就启动即报错。
+#
+# 为什么不铺 `migrations/*.sql`（05 §7.2 的旧写法）：本项目的迁移有几处只能由
+# Python 表达 —— 重建 `media` 表要临时关 `foreign_keys`（否则 `media_tags` 会
+# 被 CASCADE 连带删掉）、重建后还要重跑 `SCHEMA` 并 `rebuild` 一次 FTS。
+# SQL 文件写不出"顺带把索引和全文索引一起修好"。所以迁移就地写在 db.py 里，
+# 但**记账方式一字不差**：每版一条、带 checksum、顺序执行、版本号严格递增。
+
+
+class MigrationDrift(RuntimeError):
+    """已应用的迁移被改动过（checksum 对不上），拒绝启动。"""
+
+
+@dataclass(frozen=True)
+class Migration:
+    """一次迁移：版本号 + 名字 + 定义摘要 + 执行体。
+
+    `checksum` 是**构建期算好写进来的**常量，不是运行时算的：PyInstaller 打包后
+    没有 `.py` 源文件，`inspect.getsource()` 会抛 `OSError: could not get source
+    code`（`scripts/verify_exe.py` 实测抓到过）。所以摘要必须在还有源码的时候算，
+    运行期只做"账本 vs 常量"的比对。
+    """
+
+    version: int
+    name: str
+    checksum: str
+    apply: Callable[[sqlite3.Connection], None]
+
+
+def _migration_checksum(fn: Callable[[sqlite3.Connection], None]) -> str:
+    """迁移定义文本的 sha256 前 16 位（**仅开发期使用**，冻结产物里没有源码）。
+
+    取**源码**而不是取"执行过的 SQL"：同一个迁移在新库上会走到建列分支、
+    在老库上走幂等分支，取执行内容会让同一份定义算出不同 checksum。
+
+    `test_migration_ledger.py` 用它来校验 `MIGRATIONS` 里写死的 `checksum`
+    常量有没有跟上函数体；运行期不再调用它。
+    """
+    src = inspect.getsource(fn)
+    norm = "\n".join(line.rstrip() for line in src.splitlines() if line.strip())
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+
+def _m_001_init_photobridge(conn: sqlite3.Connection) -> None:  # noqa: ARG001
+    """基线：建表脚本就是 `SCHEMA`，`init()` 已经 `executescript` 过了。
+
+    这里只留一个空实现，作用是**在账本里占住 version 1**，让"从哪个版本起"
+    有据可查。早期版本的库里这一行已经存在（checksum 为 NULL），会被补记。
+    """
+
+
+def _m_002_devices_expires_at(conn: sqlite3.Connection) -> None:
+    """devices 补 expires_at 列（AC-5.10）。
+
+    `CREATE TABLE IF NOT EXISTS` 对已存在的表是空操作，所以新增的列在老库上
+    永远不会出现。不补的话 `_lookup_device` 的 SELECT 会抛
+    `no such column: expires_at` —— 而那是每个已配对用户在升级后发出的第一个
+    请求，表现为"升级后手机全部失联"。
+
+    补出来的列值全是 NULL。NULL 在本项目里明确表示"永不过期"，这正是升级用户
+    的既有语义：不该因为软件更新就让他们掉线。新配对的设备一律写入具体时刻。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(devices)")}
+    if cols and "expires_at" not in cols:
+        log.info("迁移 devices：新增 expires_at 列")
+        conn.execute("ALTER TABLE devices ADD COLUMN expires_at REAL")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_devices_expires ON devices(expires_at)")
+
+
+def _m_003_devices_role_owner(conn: sqlite3.Connection) -> None:
+    """devices 补 role 列（ISSUE-034 ③），并把最早配对的设备回填为 owner。
+
+    `ADD COLUMN ... NOT NULL DEFAULT 'viewer'` 是 SQLite 允许的（带非 NULL
+    默认值即可），老库原有的设备行会被填成 viewer。但**只填 viewer 是不够的**：
+    家里可能已经配对了好几台设备，升级后没有任何一台是 owner，于是"吊销设备"
+    这个功能对所有人都失效了 —— 包括那台站在电脑前、理应拥有权限的机器。
+    所以补列后要把最早配对、且未被吊销的那台回填成 owner：它按定义就是
+    "第一次在电脑前配对的那部手机"。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(devices)")}
+    if cols and "role" not in cols:
+        log.info("迁移 devices：新增 role 列（最早配对的设备回填为 owner）")
+        conn.execute(
+            "ALTER TABLE devices ADD COLUMN role TEXT NOT NULL DEFAULT 'viewer'")
+        conn.execute(
+            "UPDATE devices SET role = 'owner' WHERE id = ("
+            "  SELECT id FROM devices WHERE revoked = 0"
+            "   ORDER BY created_at ASC, id ASC LIMIT 1)")
+
+
+def _m_004_devices_allow_legacy_until(conn: sqlite3.Connection) -> None:
+    """devices 补 allow_legacy_until 列（ISSUE-049）。
+
+    2026-10-26 之前，手机令牌由云端用 `sha256(agent_token)` 签 —— 那个值就在
+    云端库里，泄露即可伪造令牌。现在签发权回到电脑端
+    （`control.client_signing_secret()`），旧密钥**默认不再接受**。
+
+    默认 0 = 关闭。这不是苛刻而是必须：只要还接受旧密钥，"云端库泄露就能伪造
+    令牌"这条边界就依然是敞开的。确实需要迁移老手机时，用
+    `python -m backend.pbctl allow-legacy 7` 开一个限时窗口。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(devices)")}
+    if cols and "allow_legacy_until" not in cols:
+        log.info("迁移 devices：新增 allow_legacy_until 列（默认关闭旧密钥）")
+        conn.execute(
+            "ALTER TABLE devices ADD COLUMN allow_legacy_until "
+            "REAL NOT NULL DEFAULT 0")
+
+
+def _m_005_upload_sessions_client_id(conn: sqlite3.Connection) -> None:
+    """upload_sessions 补 client_id 列（ISSUE-034 ②）。
+
+    补出来是 NULL，语义是"归属未知"。这类历史会话不可被任何客户端复用
+    （见 uploads.create_session）：既然搞不清它是谁的，就别把它交给别人 ——
+    宁可多花一次上传，也不能拼出一个混合文件。未完成的旧会话会自然过期
+    （session_ttl_hours），不需要主动清理。
+    """
+    up_cols = {r[1] for r in conn.execute("PRAGMA table_info(upload_sessions)")}
+    if up_cols and "client_id" not in up_cols:
+        log.info("迁移 upload_sessions：新增 client_id 列")
+        conn.execute("ALTER TABLE upload_sessions ADD COLUMN client_id TEXT")
+
+
+def _m_006_media_kind_video(conn: sqlite3.Connection) -> None:
+    """media 放开 `kind='video'`，补视频四列（ISSUE-055）。
+
+    `kind` 原来是 `CHECK (kind IN ('image'))`。CHECK 改不了，只能重建表。
+    这是本项目**唯一一次重建主表**，所以三条纪律写在这里：
+    ① 重建用的 DDL 从 `SCHEMA` 里取（`media_ddl()`），不另写一份；
+    ② 只按名搬已有列，新列留 NULL（NULL = 未知，代码里当"没探测过"）；
+    ③ 重建后重新执行一遍 `SCHEMA`（索引与触发器随 DROP TABLE 消失），
+       再 `rebuild` 一次 FTS —— media_fts 是外部内容表，内容行没变但索引
+       条目被扰动过。
+
+    失败后果提醒：不迁移的话，**新库**一切正常，**升级的库**在扫描到第一个
+    视频时插入失败（CHECK constraint failed），表现为"视频一个都不显示"。
+    """
+    mrow = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='media'"
+    ).fetchone()
+    if not (mrow and mrow[0] and "'video'" not in mrow[0]):
+        return
+    log.info("迁移 media：放开 kind='video' 并补视频四列")
+    cols = ", ".join(_MEDIA_COPY_COLUMNS)
+    # ⚠️ `media_tags.media_id` / `albums.cover_media_id` 上有
+    # `REFERENCES media(id)`。连接是 `foreign_keys=ON`，直接 DROP 父表会把
+    # **标签行按 CASCADE 一起删掉**（用户丢的是标签，而且没有任何报错）。
+    # 所以重建期间必须临时关掉。
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.executescript(
+            "BEGIN;"
+            + media_ddl("media_new")
+            + f"INSERT INTO media_new({cols}) SELECT {cols} FROM media;"
+            + "DROP TABLE media;"
+            + "ALTER TABLE media_new RENAME TO media;"
+            + "COMMIT;"
+        )
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(SCHEMA)
+    conn.execute("INSERT INTO media_fts(media_fts) VALUES('rebuild')")
+
+
+def _m_007_media_faststart(conn: sqlite3.Connection) -> None:
+    """media 补 faststart 列（V0 诊断：moov 在不在 mdat 之前）。
+
+    为什么单独一列而不是塞进 detail JSON：播放页要按它决定"要不要提示用户
+    会等很久"，查询时不能为此再打开文件。
+    """
+    mcols = {r[1] for r in conn.execute("PRAGMA table_info(media)")}
+    if mcols and "faststart" not in mcols:
+        log.info("迁移 media：新增 faststart 列")
+        conn.execute("ALTER TABLE media ADD COLUMN faststart INTEGER")
+
+
+def _m_008_audit_log_actions(conn: sqlite3.Connection) -> None:
+    """audit_log 补齐 pair/revoke/upload_reject 动作（CHECK 只能重建）。"""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='audit_log'"
+    ).fetchone()
+    if not (row and row[0] and "'pair'" not in row[0]):
+        return
+    log.info("迁移 audit_log：新增 pair/revoke 动作")
+    conn.executescript(
+        "ALTER TABLE audit_log RENAME TO audit_log_old;"
+        "CREATE TABLE audit_log ("
+        "  id          INTEGER PRIMARY KEY,"
+        "  ts          REAL NOT NULL,"
+        "  device_name TEXT,"
+        "  client_id   TEXT,"
+        "  action      TEXT NOT NULL"
+        "                CHECK (action IN ('upload','delete','move','rename',"
+        "                                  'rescan','config','pair','revoke',"
+        "                                  'upload_reject')),"
+        "  rel_path    TEXT,"
+        "  detail      TEXT"
+        ");"
+        "INSERT INTO audit_log(id, ts, device_name, client_id, action,"
+        "                      rel_path, detail)"
+        "  SELECT id, ts, device_name, client_id, action, rel_path, detail"
+        "    FROM audit_log_old;"
+        "DROP TABLE audit_log_old;"
+        "CREATE INDEX IF NOT EXISTS idx_audit_ts     ON audit_log(ts DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action, ts DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_audit_path   ON audit_log(rel_path, ts DESC);"
+    )
+
+
+#: 全部迁移，**按版本号严格递增**。新增迁移只能往后追加，已发布的迁移禁止修改
+#: （checksum 会拦住）。
+MIGRATIONS: Final[tuple[Migration, ...]] = (
+    Migration(1, SCHEMA_NAME, "8f0f1582f8a1a059", _m_001_init_photobridge),
+    Migration(2, "002_devices_expires_at", "a479c4622c4dcf5d",
+              _m_002_devices_expires_at),
+    Migration(3, "003_devices_role_owner", "31f1096acc1ced12",
+              _m_003_devices_role_owner),
+    Migration(4, "004_devices_allow_legacy_until", "3a203f55017f4c74",
+              _m_004_devices_allow_legacy_until),
+    Migration(5, "005_upload_sessions_client_id", "e070870d954ac8ff",
+              _m_005_upload_sessions_client_id),
+    Migration(6, "006_media_kind_video", "bb3dd43e2feec9c3",
+              _m_006_media_kind_video),
+    Migration(7, "007_media_faststart", "17a3caceac967213",
+              _m_007_media_faststart),
+    Migration(8, "008_audit_log_actions", "fbcd4a3c839e07a1",
+              _m_008_audit_log_actions),
+)
+
+#: 当前 schema 版本 = 账本里最后一版。`init()` 跑完后 `schema_version()` 应等于它。
+SCHEMA_VERSION: Final[int] = MIGRATIONS[-1].version
+
+
+# --------------------------------------------------------------------------
 # 连接管理
 # --------------------------------------------------------------------------
 
@@ -487,172 +729,52 @@ class Database:
     # --- 初始化 -----------------------------------------------------------
 
     def init(self) -> None:
-        """建表 + 迁移 + 记录版本。幂等，启动时调用一次。"""
+        """建表 + 按账本执行迁移。幂等，启动时调用一次。"""
         with self._write_lock:
             conn = self.connect()
             conn.executescript(SCHEMA)
             self._migrate(conn)
-            row = conn.execute(
-                "SELECT version FROM schema_version WHERE version = ?", (SCHEMA_VERSION,)
-            ).fetchone()
-            if row is None:
-                conn.execute(
-                    "INSERT INTO schema_version(version, applied_at, name, checksum) "
-                    "VALUES (?, ?, ?, NULL)",
-                    (SCHEMA_VERSION, time.time(), SCHEMA_NAME),
-                )
             self._initialized = True
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
-        """就地迁移。
+        """按账本执行未应用的迁移，并校验已应用迁移的定义没被改过。
 
-        ⚠️ 这里处理的都是 `CREATE TABLE IF NOT EXISTS` **改不动**的东西。
-        表已存在时那条语句是空操作，所以后来新增的 CHECK 约束
-        （例如 audit_log 新增 'pair'/'revoke' 动作）对老库完全不生效 ——
-        用户升级后第一次配对就会 `CHECK constraint failed`，
-        而且是发生在"配对成功、写审计"那一刻，token 已经发出去了。
+        为什么要账本而不是"再跑一遍所有幂等语句"：后者能补列，但补不出
+        **顺序与时间**（哪天真出的问题、从哪个版本升上来的都查不到），
+        也发现不了"有人回头改了迁移定义"。这两条正是 docs/05 §7.1 承诺的。
 
-        SQLite 不支持修改 CHECK，只能重建表。这张表只是索引
-        （主记录是 data/audit.log），所以搬数据没有丢失风险。
+        ⚠️ 这里**不能**调 `_migration_checksum(m.apply)`：那要读源码，而
+        PyInstaller 打出来的 exe 没有 `.py` 文件（实测 `OSError: could not get
+        source code`，一启动就崩）。摘要由 `MIGRATIONS` 里的常量提供。
         """
-        # --- devices：补 expires_at 列（AC-5.10）---
-        #
-        # `CREATE TABLE IF NOT EXISTS` 对已存在的表是空操作，所以新增的
-        # 列在老库上永远不会出现。不补的话 `_lookup_device` 的 SELECT
-        # 会抛 `no such column: expires_at` —— 而那是每个已配对用户在
-        # 升级后发出的第一个请求，表现为"升级后手机全部失联"。
-        #
-        # 补出来的列值全是 NULL。NULL 在本项目里明确表示"永不过期"，
-        # 这正是升级用户的既有语义：不该因为软件更新就让他们掉线。
-        # 新配对的设备一律写入具体时刻。
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(devices)")}
-        if cols and "expires_at" not in cols:
-            log.info("迁移 devices：新增 expires_at 列")
-            conn.execute("ALTER TABLE devices ADD COLUMN expires_at REAL")
+        applied = {
+            int(r[0]): r[1]
+            for r in conn.execute("SELECT version, checksum FROM schema_version")
+        }
+        for m in MIGRATIONS:
+            want = m.checksum
+            if m.version in applied:
+                got = applied[m.version]
+                if got is None:
+                    # 老库只写了基线那一行、checksum 为 NULL（早期实现）。
+                    # 补记定义摘要，不当作漂移 —— 否则所有存量用户升级即启动失败。
+                    conn.execute(
+                        "UPDATE schema_version SET checksum = ?, name = ? "
+                        "WHERE version = ?", (want, m.name, m.version))
+                    log.info("迁移记账补齐：%03d %s → %s", m.version, m.name, want)
+                elif got != want:
+                    raise MigrationDrift(
+                        f"迁移 {m.version:03d} {m.name} 的定义已被修改"
+                        f"（账本 {got}，实际 {want}）。已应用的迁移不可修改，"
+                        "请新建一个版本号更大的迁移。")
+                continue
+            log.info("执行迁移 %03d %s", m.version, m.name)
+            m.apply(conn)
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_devices_expires ON devices(expires_at)")
-
-        # --- devices：补 role 列（ISSUE-034 ③）---
-        #
-        # `ADD COLUMN ... NOT NULL DEFAULT 'viewer'` 是 SQLite 允许的
-        # （带非 NULL 默认值即可），老库原有的设备行会被填成 viewer。
-        # 但**只填 viewer 是不够的**：家里可能已经配对了好几台设备，
-        # 升级后没有任何一台是 owner，于是"吊销设备"这个功能对所有人
-        # 都失效了 —— 包括那台站在电脑前、理应拥有权限的机器。
-        # 所以补列后要把最早配对、且未被吊销的那台回填成 owner：
-        # 它按定义就是"第一次在电脑前配对的那部手机"。
-        if cols and "role" not in cols:
-            log.info("迁移 devices：新增 role 列（最早配对的设备回填为 owner）")
-            conn.execute(
-                "ALTER TABLE devices ADD COLUMN role TEXT NOT NULL DEFAULT 'viewer'")
-            conn.execute(
-                "UPDATE devices SET role = 'owner' WHERE id = ("
-                "  SELECT id FROM devices WHERE revoked = 0"
-                "   ORDER BY created_at ASC, id ASC LIMIT 1)")
-
-        # --- devices：补 allow_legacy_until 列（ISSUE-049）---
-        #
-        # 2026-10-26 之前，手机令牌由云端用 `sha256(agent_token)` 签 ——
-        # 那个值就在云端库里，泄露即可伪造令牌。现在签发权回到电脑端
-        # （`control.client_signing_secret()`），旧密钥**默认不再接受**。
-        #
-        # 默认 0 = 关闭。这不是苛刻而是必须：只要还接受旧密钥，"云端库泄露
-        # 就能伪造令牌"这条边界就依然是敞开的。确实需要迁移老手机时，
-        # 用 `python -m backend.pbctl allow-legacy 7` 开一个限时窗口，
-        # 让老令牌在这段时间里继续能用，之后自动关回去。
-        if cols and "allow_legacy_until" not in cols:
-            log.info("迁移 devices：新增 allow_legacy_until 列（默认关闭旧密钥）")
-            conn.execute(
-                "ALTER TABLE devices ADD COLUMN allow_legacy_until "
-                "REAL NOT NULL DEFAULT 0")
-
-        # --- upload_sessions：补 client_id 列（ISSUE-034 ②）---
-        #
-        # 补出来是 NULL，语义是"归属未知"。这类历史会话不可被任何
-        # 客户端复用（见 uploads.create_session）：既然搞不清它是谁的，
-        # 就别把它交给别人 —— 宁可多花一次上传，也不能拼出一个混合文件。
-        # 未完成的旧会话会自然过期（session_ttl_hours），不需要主动清理。
-        up_cols = {r[1] for r in conn.execute("PRAGMA table_info(upload_sessions)")}
-        if up_cols and "client_id" not in up_cols:
-            log.info("迁移 upload_sessions：新增 client_id 列")
-            conn.execute("ALTER TABLE upload_sessions ADD COLUMN client_id TEXT")
-
-        # --- media：放开 kind='video'，补视频四列（ISSUE-055）---
-        #
-        # `kind` 原来是 `CHECK (kind IN ('image'))`。CHECK 改不了，只能
-        # 重建表。这是本项目**唯一一次重建主表**，所以三条纪律写在这里：
-        #
-        # ① 重建用的 DDL 从 `SCHEMA` 里取（`media_ddl()`），不另写一份；
-        # ② 只按名搬已有列，新列留 NULL（NULL = 未知，代码里当"没探测过"）；
-        # ③ 重建后重新执行一遍 `SCHEMA`（索引与触发器随 DROP TABLE 消失），
-        #    再 `rebuild` 一次 FTS —— media_fts 是外部内容表，
-        #    内容行没变但索引条目被扰动过。
-        #
-        # 失败后果提醒：不迁移的话，**新库**一切正常，**升级的库**在扫描到
-        # 第一个视频时插入失败（CHECK constraint failed），表现为"视频
-        # 一个都不显示"。
-        mrow = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='media'"
-        ).fetchone()
-        if mrow and mrow[0] and "'video'" not in mrow[0]:
-            log.info("迁移 media：放开 kind='video' 并补视频四列")
-            cols = ", ".join(_MEDIA_COPY_COLUMNS)
-            # ⚠️ `media_tags.media_id` / `albums.cover_media_id` 上有
-            # `REFERENCES media(id)`。连接是 `foreign_keys=ON`，直接
-            # DROP 父表会把**标签行按 CASCADE 一起删掉**（用户丢的是标签，
-            # 而且没有任何报错）。所以重建期间必须临时关掉。
-            conn.execute("PRAGMA foreign_keys=OFF")
-            try:
-                conn.executescript(
-                    "BEGIN;"
-                    + media_ddl("media_new")
-                    + f"INSERT INTO media_new({cols}) SELECT {cols} FROM media;"
-                    + "DROP TABLE media;"
-                    + "ALTER TABLE media_new RENAME TO media;"
-                    + "COMMIT;"
-                )
-            finally:
-                conn.execute("PRAGMA foreign_keys=ON")
-            conn.executescript(SCHEMA)
-            conn.execute("INSERT INTO media_fts(media_fts) VALUES('rebuild')")
-
-        # --- media：补 faststart 列（V0 诊断：moov 在不在 mdat 之前）---
-        # 为什么单独一列而不是塞进 detail JSON：播放页要按它决定"要不要提示
-        # 用户会等很久"，查询时不能为此再打开文件。
-        mcols = {r[1] for r in conn.execute("PRAGMA table_info(media)")}
-        if mcols and "faststart" not in mcols:
-            log.info("迁移 media：新增 faststart 列")
-            conn.execute("ALTER TABLE media ADD COLUMN faststart INTEGER")
-
-        # --- audit_log：补齐 pair/revoke/upload_reject 动作 ---
-        row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='audit_log'"
-        ).fetchone()
-        if row and row[0] and "'pair'" not in row[0]:
-            log.info("迁移 audit_log：新增 pair/revoke 动作")
-            conn.executescript(
-                "ALTER TABLE audit_log RENAME TO audit_log_old;"
-                "CREATE TABLE audit_log ("
-                "  id          INTEGER PRIMARY KEY,"
-                "  ts          REAL NOT NULL,"
-                "  device_name TEXT,"
-                "  client_id   TEXT,"
-                "  action      TEXT NOT NULL"
-                "                CHECK (action IN ('upload','delete','move','rename',"
-                "                                  'rescan','config','pair','revoke',"
-                "                                  'upload_reject')),"
-                "  rel_path    TEXT,"
-                "  detail      TEXT"
-                ");"
-                "INSERT INTO audit_log(id, ts, device_name, client_id, action,"
-                "                      rel_path, detail)"
-                "  SELECT id, ts, device_name, client_id, action, rel_path, detail"
-                "    FROM audit_log_old;"
-                "DROP TABLE audit_log_old;"
-                "CREATE INDEX IF NOT EXISTS idx_audit_ts     ON audit_log(ts DESC);"
-                "CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action, ts DESC);"
-                "CREATE INDEX IF NOT EXISTS idx_audit_path   ON audit_log(rel_path, ts DESC);"
+                "INSERT INTO schema_version(version, applied_at, name, checksum) "
+                "VALUES (?, ?, ?, ?)",
+                (m.version, time.time(), m.name, want),
             )
 
     @property
@@ -889,5 +1011,6 @@ def close_db() -> None:
         _db = None
 
 
-__all__ = ["Database", "SCHEMA", "SCHEMA_NAME", "SCHEMA_VERSION", "close_db",
-           "get_db", "init_db", "make_db"]
+__all__ = ["MIGRATIONS", "Database", "Migration", "MigrationDrift", "SCHEMA",
+           "SCHEMA_NAME", "SCHEMA_VERSION", "close_db", "get_db", "init_db",
+           "make_db"]

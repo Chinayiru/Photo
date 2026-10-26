@@ -101,10 +101,24 @@ def _write_cfg(work: Path, port: int, lib: Path) -> Path:
 
 
 def _make_lib(lib: Path) -> None:
+    """造三张**真能解码**的小图。
+
+    这里原来写的是 `b"\\xff\\xd8\\xff\\xe0" + b"x" * 64` —— 一个只有 SOI 标记
+    和 64 个 'x' 的假 JPEG。Pillow 10 时代 `Image.open()` 只读文件头，这种
+    垃圾字节也能"打开"；**Pillow 13 会做截断校验**（`OSError: Truncated File
+    Read`），于是缩略图被标成 `corrupt image`、`/thumb` 返回 500，
+    `[3] 无 Python 环境` 这一步整条链路判失败 —— 失败的是**夹具**，不是产品。
+
+    用例的意图是"拍三张照片 → 索引 → 出缩略图"，所以必须造真图。用 Pillow
+    画 64x48 的纯色图（本来就在打包依赖里，`.venv` 里一定有）。
+    """
+    from PIL import Image
+
     (lib / "2024" / "2024-05").mkdir(parents=True, exist_ok=True)
-    for i in range(3):
-        (lib / "2024" / "2024-05" / f"IMG_{i}.jpg").write_bytes(
-            b"\xff\xd8\xff\xe0" + b"x" * 64)
+    colors = ((220, 90, 70), (70, 160, 120), (80, 110, 200))
+    for i, rgb in enumerate(colors):
+        im = Image.new("RGB", (64, 48), rgb)
+        im.save(lib / "2024" / "2024-05" / f"IMG_{i}.jpg", "JPEG", quality=85)
 
 
 def main() -> int:

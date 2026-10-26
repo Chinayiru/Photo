@@ -1,6 +1,6 @@
 # PhotoBridge 云端中继依赖锁（自动生成，勿手改）
 #
-# 生成：.venv/Scripts/python.exe build/_make_relay_lock.py
+# 生成：.venv/Scripts/python.exe packaging/make_relay_lock.py
 # 安装：python -m pip install --require-hashes -r cloud/requirements.lock
 #
 # ★ 为什么单独一份：中继只要 starlette + uvicorn + websockets，电脑端那套
