@@ -70,6 +70,11 @@ __all__ = [
     "HINT_NO",
     "PLAYABLE_CONTAINERS",
     "PLAYABLE_VCODECS",
+    "PLAYABLE_ACODECS",
+    "playback_hint",
+    "playback_reason",
+    "stream_content_type",
+    "moov_before_mdat",
     "row_kind",
 ]
 
@@ -137,6 +142,14 @@ PLAYABLE_VCODECS: Final[frozenset[str]] = frozenset(
     {"h264", "vp8", "vp9", "av1", "theora"}
 )
 
+#: 浏览器能直接解的音频编码。**音频同样会一票否决**：视频轨再标准，音频是
+#: `pcm_s16le` / `ac3` / `dts` 时 Chrome 直接 `MEDIA_ERR_SRC_NOT_SUPPORTED`，
+#: 用户看到的是"黑屏 + 没声音"，与视频编码无关。旧 iPhone 导出的 `.MOV`
+#: 大量是 H.264 + PCM，只看视频编码会误判成"能播"。
+PLAYABLE_ACODECS: Final[frozenset[str]] = frozenset(
+    {"aac", "mp3", "opus", "vorbis", "flac"}
+)
+
 #: 抽帧与探测的超时（秒）。见模块文档第 2 条。
 PROBE_TIMEOUT: Final[float] = 10.0
 FRAME_TIMEOUT: Final[float] = 30.0
@@ -164,6 +177,9 @@ class ProbeResult:
     height: int = 0
     vcodec: str = ""               # 'h264' / 'hevc' / 'vp9' / 'av1' / ...
     acodec: str = ""
+    #: moov 是否在 mdat 之前（1=是/faststart，0=否/在文件尾，None=判断不了）。
+    #: 不在前面的文件必须**先读完尾部**才能起播，跨网络时表现为长时间转圈。
+    faststart: int | None = None
     error: str = ""
 
     def as_db(self) -> dict[str, Any]:
@@ -175,6 +191,7 @@ class ProbeResult:
             "vcodec": self.vcodec or None,
             "acodec": self.acodec or None,
             "container": self.container or None,
+            "faststart": self.faststart,
         }
 
 
@@ -409,7 +426,53 @@ def probe(
     except json.JSONDecodeError:
         return ProbeResult(ok=False, error="ffprobe 输出不是 JSON")
 
-    return _parse_probe(data)
+    result = _parse_probe(data)
+    if result.ok:
+        result.faststart = moov_before_mdat(path)
+    return result
+
+
+def moov_before_mdat(path: str | Path) -> int | None:
+    """`moov` 是否在 `mdat` 之前（返回 1/0，判断不了返回 None）。
+
+    为什么需要它：未做 faststart 的 mp4 把索引（moov）放在文件**末尾**，
+    播放器必须先读到文件尾才能起播 —— 本地看不出差别，跨网络时就是"转圈
+    十几秒"，而用户会以为"手机播不了"。
+
+    为什么不读全文件：只按顶层 box 逐个 seek 读 8~16 字节的头，一个
+    22 MB 的视频也只读了几十个字节。`size == 0`（延伸到文件尾）与
+    `size == 1`（64 位长度）按 ISO/IEC 14496-12 处理。
+    """
+    try:
+        with open(path, "rb") as fh:
+            total = fh.seek(0, 2)
+            pos = 0
+            for _ in range(64):          # 顶层 box 通常 < 10 个；防个别文件失控
+                if pos + 8 > total:
+                    return None
+                fh.seek(pos)
+                head = fh.read(8)
+                if len(head) < 8:
+                    return None
+                size = int.from_bytes(head[:4], "big")
+                kind = head[4:8]
+                if kind == b"moov":
+                    return 1
+                if kind == b"mdat":
+                    return 0
+                if size == 1:            # largesize：后面 8 字节才是真长度
+                    ext = fh.read(8)
+                    if len(ext) < 8:
+                        return None
+                    size = int.from_bytes(ext, "big")
+                elif size == 0:          # 一直到文件尾
+                    return None
+                if size < 8:
+                    return None
+                pos += size
+    except OSError:
+        return None
+    return None
 
 
 def _parse_probe(data: dict[str, Any]) -> ProbeResult:
@@ -454,13 +517,18 @@ def _container_from_format(format_name: str) -> str:
     return sorted(names)[0]
 
 
-def is_playable(*, container: str, vcodec: str) -> bool:
-    """能不能直接交给 `<video>` 播（D2：按容器 + 编码判，不只看扩展名）。
+def is_playable(*, container: str, vcodec: str, acodec: str = "") -> bool:
+    """**Chrome 桌面**确定能播吗（D2：按容器 + 编码判，不只看扩展名）。
 
     `hevc`（H.265）必须判不可播：iPhone 默认录 HEVC，而 Chrome 桌面**不**支持
-    它 —— 这正是"我手机上明明能看"的典型来源。
+    它 —— 这正是"我手机上明明能看"的典型来源。音频轨同样参与判定，
+    `acodec` 为空表示没有音轨（静音视频，能播）。
     """
-    return container in PLAYABLE_CONTAINERS and vcodec in PLAYABLE_VCODECS
+    if container not in PLAYABLE_CONTAINERS:
+        return False
+    if acodec and acodec not in PLAYABLE_ACODECS:
+        return False
+    return vcodec in PLAYABLE_VCODECS
 
 
 #: `playback_hint()` 的三种结论。
@@ -474,14 +542,22 @@ HINT_MAYBE = "maybe"    # 容器对、编码看客户端（HEVC）
 HINT_NO = "no"          # 容器都不在白名单，别递给 <video> 了
 
 
-def playback_hint(*, container: str, vcodec: str) -> str:
+def playback_hint(*, container: str, vcodec: str, acodec: str = "") -> str:
     """播放建议：`ok` / `maybe` / `no`（前端据此决定是否渲染 `<video>`）。
 
-    判据只有一条：**容器**决定"值不值得试"。容器在 `mp4/mov/webm` 里就值得
-    递给 `<video>`（前端还会挂 error 兜底）；容器都不对（mkv/avi）就没必要
-    让用户对着黑屏等，直接给"下载原片"。
+    判定顺序就是**否决顺序**，先否掉的那些"试都别试"：
+
+    1. 容器不在 `mp4/mov/webm` → `no`（mkv/avi 所有浏览器都不解）；
+    2. 音频编码不在白名单 → `no`（PCM/AC3/DTS：Chrome 直接拒绝整个文件，
+       画面再标准也没用）；
+    3. 视频编码在 `PLAYABLE_VCODECS` → `ok`；
+    4. `hevc` → `maybe`（iOS Safari 能播，安卓/桌面 Chrome 看机型）；
+    5. 探不到编码 → `maybe`（别替用户下结论）；
+    6. 其余（mpeg4/rv40/theora 等）→ `no`。
     """
     if container not in PLAYABLE_CONTAINERS:
+        return HINT_NO
+    if acodec and acodec not in PLAYABLE_ACODECS:
         return HINT_NO
     if vcodec in PLAYABLE_VCODECS:
         return HINT_OK
@@ -492,6 +568,51 @@ def playback_hint(*, container: str, vcodec: str) -> str:
     if not vcodec:
         return HINT_MAYBE      # 没探到编码，别替用户下结论
     return HINT_NO             # mpeg4/rv40/theora 这类老编码
+
+
+def playback_reason(*, container: str, vcodec: str, acodec: str = "") -> str:
+    """为什么这个视频可能播不了（给用户看的**一句中文**，能播时为空串）。
+
+    这段文案由服务端出、前端照抄：判据和文案必须待在一起，否则改了判据
+    忘了改文案，用户会看到"编码为 h264，浏览器不支持 h264"这种自相矛盾。
+    """
+    if container not in PLAYABLE_CONTAINERS:
+        return f"容器 {container or '未知'} 浏览器不支持"
+    if acodec and acodec not in PLAYABLE_ACODECS:
+        return f"音频编码 {acodec} 浏览器不支持"
+    if vcodec in PLAYABLE_VCODECS:
+        return ""
+    if vcodec == "hevc":
+        return "HEVC（H.265）：iPhone 能播，部分安卓/桌面 Chrome 不能"
+    if not vcodec:
+        return "探测不到视频编码"
+    return f"视频编码 {vcodec} 浏览器不支持"
+
+
+#: 容器 → 播放用的 Content-Type。
+#:
+#: **不能按扩展名给**：库里 `.MOV` 绝大多数是 ISO BMFF（`ftyp` 里就是
+#: `qt  `/`mp42`），按扩展名会返回 `video/quicktime` —— 那是 Safari 的
+#: 说法，Chrome/安卓会把它当"不支持的源"。同一个容器，全平台统一报
+#: `video/mp4` 才播得起来。
+_CONTAINER_MIME: Final[dict[str, str]] = {
+    "mp4": "video/mp4",
+    "mov": "video/mp4",
+    "webm": "video/webm",
+    "mkv": "video/x-matroska",
+    "avi": "video/x-msvideo",
+}
+
+
+def stream_content_type(container: str, *, ext: str = "") -> str:
+    """播放视频时该回的 `Content-Type`（容器优先，判不出来才退回扩展名）。"""
+    ctype = _CONTAINER_MIME.get((container or "").lower())
+    if ctype:
+        return ctype
+    ext = ext.lower().lstrip(".")
+    if ext in {"mp4", "m4v", "mov"}:
+        return "video/mp4"
+    return "application/octet-stream"
 
 
 def extract_frame(

@@ -296,6 +296,14 @@ export interface VideoInfo {
   acodec: string;
   playable: boolean;
   hint: "ok" | "maybe" | "no";
+  /** 给用户看的一句中文：为什么可能播不了（能播时为空串）。由服务端出。 */
+  reason: string;
+  /**
+   * `moov` 是否在 `mdat` 之前。`false` = 未做 faststart：
+   * 播放器必须先读到文件尾才能起播，本地无感、跨网络就是"转圈十几秒"。
+   * `null` = 没探到（老库行、非 MP4 容器）。
+   */
+  faststart: boolean | null;
 }
 
 export interface MediaDetail {

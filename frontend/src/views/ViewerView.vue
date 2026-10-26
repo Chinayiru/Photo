@@ -804,9 +804,22 @@ async function doDelete(): Promise<void> {
             key="vnote"
             class="v-rawnote"
           >
-            这个视频的编码（{{ detail.video?.vcodec || "未知" }}）这个浏览器放不了，
+            {{ detail.video?.reason || `这个视频的编码（${detail.video?.vcodec || "未知"}）浏览器放不了` }}，
             <a class="v-dl" :href="safeUrl(`${detail.urls.raw}?download=1`)">下载原片</a>
             到手机上看
+          </div>
+
+          <!--
+            未做 faststart：文件尾才放索引，播放器必须先读到尾部才起播。
+            本地毫秒级察觉不到，走 VPN/5G 时这就是"点了没反应"的真实原因 ——
+            不说清楚用户会以为软件坏了。
+          -->
+          <div
+            v-if="isVideo && videoPlayable && !videoBroken && detail?.video?.faststart === false"
+            key="vslow"
+            class="v-rawnote"
+          >
+            这个视频没做 faststart，起播要先读文件尾，跨网络会更慢
           </div>
 
           <!--

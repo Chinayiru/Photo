@@ -92,6 +92,9 @@ CREATE TABLE IF NOT EXISTS media (
   vcodec      TEXT,                              -- 'h264'/'hevc'/'vp9'/'av1'
   acodec      TEXT,                              -- 'aac'/'opus'/...
   container   TEXT,                              -- 'mp4'/'mov'/'webm'/'mkv'/'avi'
+  -- moov 是否在 mdat 之前（1=是，0=否，NULL=未知/没探过）。0 表示未做
+  -- faststart：播放器得先读到文件尾才能起播，跨网络时表现为长时间转圈。
+  faststart   INTEGER CHECK (faststart IS NULL OR faststart IN (0,1)),
   thumb_state TEXT    NOT NULL DEFAULT 'pending'
                 CHECK (thumb_state IN ('pending','ok','failed')),
   thumb_etag  TEXT,                              -- 缩略图内容哈希（用于强 ETag + URL 版本参数）
@@ -603,6 +606,14 @@ class Database:
                 conn.execute("PRAGMA foreign_keys=ON")
             conn.executescript(SCHEMA)
             conn.execute("INSERT INTO media_fts(media_fts) VALUES('rebuild')")
+
+        # --- media：补 faststart 列（V0 诊断：moov 在不在 mdat 之前）---
+        # 为什么单独一列而不是塞进 detail JSON：播放页要按它决定"要不要提示
+        # 用户会等很久"，查询时不能为此再打开文件。
+        mcols = {r[1] for r in conn.execute("PRAGMA table_info(media)")}
+        if mcols and "faststart" not in mcols:
+            log.info("迁移 media：新增 faststart 列")
+            conn.execute("ALTER TABLE media ADD COLUMN faststart INTEGER")
 
         # --- audit_log：补齐 pair/revoke/upload_reject 动作 ---
         row = conn.execute(
