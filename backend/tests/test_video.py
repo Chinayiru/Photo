@@ -483,3 +483,45 @@ def test_system_info_reports_unavailable_when_ffmpeg_missing(tmp_path, monkeypat
     assert info["enabled"] is True and info["available"] is False
 
 
+
+
+# --------------------------------------------------------------------------
+# 10. 播放建议（hint）：比布尔值多一档"看客户端"
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("container,vcodec,hint", [
+    ("mp4", "h264", V.HINT_OK),
+    ("mov", "h264", V.HINT_OK),
+    ("webm", "vp9", V.HINT_OK),
+    ("mp4", "hevc", V.HINT_MAYBE),
+    ("mov", "hevc", V.HINT_MAYBE),
+    ("mp4", "", V.HINT_MAYBE),
+    ("mkv", "h264", V.HINT_NO),
+    ("avi", "mpeg4", V.HINT_NO),
+    ("mp4", "mpeg4", V.HINT_NO),
+])
+def test_playback_hint_matrix(container: str, vcodec: str, hint: str) -> None:
+    assert V.playback_hint(container=container, vcodec=vcodec) == hint
+
+
+def test_hevc_is_maybe_not_no() -> None:
+    """HEVC 在 iOS Safari 能播 —— 判 `no` 会让主客户端白白退回下载。"""
+    assert V.playback_hint(container="mov", vcodec="hevc") == V.HINT_MAYBE
+    # 但 `playable` 仍是 False：那是"Chrome 桌面确定能播"的结论
+    assert V.is_playable(container="mov", vcodec="hevc") is False
+
+
+def test_detail_carries_hint_for_video_rows() -> None:
+    from app.handlers.common import _video_block
+
+    row = {"kind": "video", "duration": 3.0, "container": "mov",
+           "vcodec": "hevc", "acodec": "aac"}
+    block = _video_block(row)
+    assert block["hint"] == V.HINT_MAYBE
+    assert block["playable"] is False
+
+
+def test_detail_video_block_is_none_for_images() -> None:
+    from app.handlers.common import _video_block
+
+    assert _video_block({"kind": "image"}) is None

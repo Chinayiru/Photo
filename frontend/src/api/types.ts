@@ -280,9 +280,14 @@ export interface ExifInfo {
 /**
  * 视频播放元信息（`common.py: _video_block()`）；图片为 `null`。
  *
- * `playable` 由服务端算：容器 + 视频编码 + 音频编码的组合决定浏览器能不能
- * 直接播（mp4/H.264 可以，HEVC 在多数安卓/Chrome 上不行，mkv 基本不行）。
- * 前端不要自己判断 —— 两份判断必然漂移，症状是"点了播放一直转圈"。
+ * 两个字段回答的是不同问题，别混用：
+ * - `playable`：**Chrome 桌面**确定能播吗（容器 + 编码都在白名单里）。
+ * - `hint`：该不该把地址递给 `<video>`。`ok` 放心给；`maybe` 是"容器对、
+ *   编码看客户端"（HEVC：iOS Safari 能播，Windows Chrome 多半不能）——
+ *   应当**试一下**并挂 `error` 兜底；`no` 是连容器都不对，直接给下载链接。
+ *
+ * 只按 `playable` 决定渲染的话，iPhone 录的 HEVC 在 iOS 上会被判"放不了"，
+ * 而它其实能播 —— 主客户端上白退一次。
  */
 export interface VideoInfo {
   duration: number | null;
@@ -290,6 +295,7 @@ export interface VideoInfo {
   vcodec: string;
   acodec: string;
   playable: boolean;
+  hint: "ok" | "maybe" | "no";
 }
 
 export interface MediaDetail {

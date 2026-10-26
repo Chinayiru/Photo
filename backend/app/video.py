@@ -64,6 +64,10 @@ __all__ = [
     "probe",
     "extract_frame",
     "is_playable",
+    "playback_hint",
+    "HINT_OK",
+    "HINT_MAYBE",
+    "HINT_NO",
     "PLAYABLE_CONTAINERS",
     "PLAYABLE_VCODECS",
     "row_kind",
@@ -457,6 +461,37 @@ def is_playable(*, container: str, vcodec: str) -> bool:
     它 —— 这正是"我手机上明明能看"的典型来源。
     """
     return container in PLAYABLE_CONTAINERS and vcodec in PLAYABLE_VCODECS
+
+
+#: `playback_hint()` 的三种结论。
+#:
+#: `is_playable()` 只能回答"Chrome 桌面确定能播吗"，而"确定不能播"和
+#: "取决于客户端"是两件事：iPhone 录的 HEVC 在 iOS Safari 里**能播**，
+#: 在 Windows Chrome 里通常不能。只看布尔值会让主客户端（手机）白白
+#: 退回到"下载原片"。
+HINT_OK = "ok"          # 绝大多数浏览器都能播
+HINT_MAYBE = "maybe"    # 容器对、编码看客户端（HEVC）
+HINT_NO = "no"          # 容器都不在白名单，别递给 <video> 了
+
+
+def playback_hint(*, container: str, vcodec: str) -> str:
+    """播放建议：`ok` / `maybe` / `no`（前端据此决定是否渲染 `<video>`）。
+
+    判据只有一条：**容器**决定"值不值得试"。容器在 `mp4/mov/webm` 里就值得
+    递给 `<video>`（前端还会挂 error 兜底）；容器都不对（mkv/avi）就没必要
+    让用户对着黑屏等，直接给"下载原片"。
+    """
+    if container not in PLAYABLE_CONTAINERS:
+        return HINT_NO
+    if vcodec in PLAYABLE_VCODECS:
+        return HINT_OK
+    if vcodec == "hevc":
+        # iOS/macOS Safari 原生支持；Windows Chrome 取决于系统是否装了
+        # HEVC 扩展。让浏览器自己试，失败时前端切兜底。
+        return HINT_MAYBE
+    if not vcodec:
+        return HINT_MAYBE      # 没探到编码，别替用户下结论
+    return HINT_NO             # mpeg4/rv40/theora 这类老编码
 
 
 def extract_frame(

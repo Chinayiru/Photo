@@ -190,10 +190,28 @@ const detail = computed(() => s.detail);
  *   - 左右滑动仍然翻页（换条视频/换张图都很自然）
  * ------------------------------------------------------------------ */
 const isVideo = computed(() => detail.value?.kind === "video");
-/** 浏览器能直接播时才给 `<video src>`；否则给"下载原片"的兜底。 */
+/** 浏览器试着播之后失败了（编码不被支持、文件损坏等）。 */
+const videoBroken = ref(false);
+/**
+ * 服务端的播放建议：`ok` / `maybe` / `no`（老后端没有 `hint` 时退回 `playable`）。
+ *
+ * ★ 不能只用 `playable`：它是"Chrome 桌面确定能播"的结论，而 iPhone 录的
+ *   HEVC 在 iOS Safari 里是能播的。只按它判会让主客户端（手机）白退一次。
+ */
+const videoHint = computed(() => {
+  const v = detail.value?.video;
+  if (!v) return "no";
+  return v.hint ?? (v.playable ? "ok" : "no");
+});
+/** 值得递给 `<video>` 的条件：容器对 + 有播放地址 + 之前没试崩过。 */
 const videoPlayable = computed(() => isVideo.value
-  && !!detail.value?.video?.playable && !!detail.value?.urls.video);
-const videoSrc = computed(() => (videoPlayable.value ? detail.value?.urls.video ?? "" : ""));
+  && videoHint.value !== "no" && !!detail.value?.urls.video);
+const videoSrc = computed(() => (videoPlayable.value && !videoBroken.value
+  ? detail.value?.urls.video ?? ""
+  : ""));
+
+/** 换条目时清掉"上一条播崩了"的标记（否则下一条视频会被误判）。 */
+watch(() => detail.value?.id, () => { videoBroken.value = false; });
 
 /**
  * 视频元信息到手（`loadedmetadata`）：等价于图片的 `onMainLoad`。
@@ -723,7 +741,7 @@ async function doDelete(): Promise<void> {
             `:key` 带 id：换视频时必须重建节点，否则会继续播上一条。
           -->
           <video
-            v-if="videoPlayable"
+            v-if="videoPlayable && !videoBroken"
             :key="`video-${detail?.id}`"
             class="v-img video"
             :class="{ drag: dragging }"
@@ -734,7 +752,7 @@ async function doDelete(): Promise<void> {
             playsinline
             preload="metadata"
             @loadedmetadata="onVideoMeta"
-            @error="s.error = '视频无法播放'"
+            @error="videoBroken = true"
           />
 
           <img
@@ -768,8 +786,11 @@ async function doDelete(): Promise<void> {
             @error="rawFailed = true"
           />
 
-          <div v-if="!s.imageReady && !s.error && !(isVideo && !videoPlayable)"
-               key="loading" class="v-loading">
+          <div
+            v-if="!s.imageReady && !s.error && !(isVideo && (!videoPlayable || videoBroken))"
+            key="loading"
+            class="v-loading"
+          >
             <span class="spinner big" />
           </div>
 
@@ -778,8 +799,12 @@ async function doDelete(): Promise<void> {
             可执行的动作 —— 原片是好的，只是这个浏览器解不了。
             用 `/raw?download=1` 下载：attachment 语义才能让手机"存到相册/文件"。
           -->
-          <div v-if="isVideo && !videoPlayable && detail" key="vnote" class="v-rawnote">
-            这个视频的编码（{{ detail.video?.vcodec || "未知" }}）浏览器放不了，
+          <div
+            v-if="isVideo && (!videoPlayable || videoBroken) && detail"
+            key="vnote"
+            class="v-rawnote"
+          >
+            这个视频的编码（{{ detail.video?.vcodec || "未知" }}）这个浏览器放不了，
             <a class="v-dl" :href="safeUrl(`${detail.urls.raw}?download=1`)">下载原片</a>
             到手机上看
           </div>
