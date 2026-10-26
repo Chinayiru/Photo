@@ -15,6 +15,7 @@ from ..handlers import auth as h_auth
 from ..handlers import browse as h_browse
 from ..handlers import events as h_events
 from ..handlers import system as h_system
+from ..handlers import transcode as h_transcode
 from ..handlers import uploads as h_uploads
 
 __all__ = ["build_router"]
@@ -53,6 +54,13 @@ def build_router() -> Router:
     # 换票：`<video>` 发不了 Authorization，前端先换一张短命票拼进播放地址
     r.add("GET", "/api/items/{media_id}/stream-ticket", h_browse.stream_ticket,
           name="browse.stream_ticket")
+    # 按需转码（ISSUE-058）：手机解不了 HEVC 时，让电脑先转成 h264 再播
+    r.add("POST", "/api/items/{media_id}/transcode", h_transcode.start,
+          name="transcode.start")
+    r.add("GET", "/api/items/{media_id}/transcode", h_transcode.status,
+          name="transcode.status")
+    r.add("GET", "/api/items/{media_id}/transcode/stream", h_transcode.stream,
+          name="transcode.stream")
 
     # --- 修改 ---------------------------------------------------------
     r.add("POST", "/api/items/delete", h_browse.delete_items, name="browse.delete")

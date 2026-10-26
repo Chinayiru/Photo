@@ -198,6 +198,13 @@ DEFAULT_CONFIG: Final[dict[str, Any]] = {
         "frame_at": 1.0,
         "probe_timeout": 10.0,
         "frame_timeout": 30.0,
+        # ── 按需转码（ISSUE-058 / V2）─────────────────────────────────
+        # 同时转几路。默认 1：libx264 自己就会用满多核，再叠并发只会让
+        # 每个任务都变慢，同时把封面抽取挤到没 CPU。
+        "transcode_concurrency": 1,
+        # 转码产物总量上限（MB）。超了按最久未使用淘汰到 80%。
+        # 产物是"播放用的临时文件"，不是备份，所以可以放心删；重看会重转。
+        "transcode_cache_mb": 2048,
     },
     "auth": {
         "require_pairing": True,
@@ -422,6 +429,29 @@ class Config:
         except (TypeError, ValueError):
             return 1.0
         return max(0.0, t)
+
+    @property
+    def video_ffmpeg_dir(self) -> str:
+        """ffmpeg/ffprobe 所在目录；空 = 自动找（程序旁 tools/ffmpeg/ → PATH）。"""
+        return str(self._raw["video"].get("ffmpeg_dir", "") or "").strip()
+
+    @property
+    def transcode_concurrency(self) -> int:
+        """同时转几路。默认 1：x264 自己就吃满多核，叠并发只会互相拖慢。"""
+        try:
+            n = int(self._raw["video"].get("transcode_concurrency", 1))
+        except (TypeError, ValueError):
+            return 1
+        return max(1, min(4, n))
+
+    @property
+    def transcode_cache_mb(self) -> int:
+        """转码产物总量上限（MB），<=0 表示不清理（不推荐）。"""
+        try:
+            n = int(self._raw["video"].get("transcode_cache_mb", 2048))
+        except (TypeError, ValueError):
+            return 2048
+        return n
 
     @property
     def allowed_index_exts(self) -> frozenset[str]:
