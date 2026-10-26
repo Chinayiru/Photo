@@ -305,12 +305,17 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str],
                     root.clipboard_append(text)
                     # 不 update 的话，有的系统在窗口销毁前读不到内容
                     root.update_idletasks()
-                    log.info("已复制%s：%s", what, text)
+                    # ★ 只记长度，不记内容（审查 R-M4-02）：`what` 可能是
+                    #   "配对码"，把它写进 INFO 日志等于把一次性的登录凭据
+                    #   抄进 `data/logs/*.log`，而日志会被用户随手发给别人。
+                    log.info("已复制%s（%d 字符）", what, len(text))
                 except Exception:       # noqa: BLE001
                     log.warning("复制%s失败", what, exc_info=True)
 
             def _open(u: str) -> None:
-                log.info("从二维码窗口打开：%s", u)
+                # 地址里带 `#code=123456` 片段（ISSUE-051 之后配对码在
+                # fragment 里），整条记下来同样会把码写进日志。
+                log.info("从二维码窗口打开：%s", u.split("#", 1)[0])
                 _open_path(u)
 
             def _url_row(parent: Any, label: str, u: str, *, primary: bool) -> None:

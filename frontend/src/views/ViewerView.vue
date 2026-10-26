@@ -13,7 +13,7 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { confirmDialog, setConfirmBusy } from "../stores/confirm";
-import { ApiError, api } from "../api/client";
+import { ApiError, absUrl, api } from "../api/client";
 import type { FolderEntry, FoldersResponse } from "../api/types";
 import {
   cameraText,
@@ -262,8 +262,15 @@ const transcodeOffer = computed(() => isVideo.value
 /** 转码产物的播放地址（就绪 + 有票才有值）。 */
 const transcodeSrc = computed(() => {
   if (transcodeState.value !== "ready" || !transcodedTicket.value) return "";
-  return `/api/items/${detail.value?.id}/transcode/stream?t=${
-    encodeURIComponent(transcodedTicket.value)}`;
+  const id = detail.value?.id;
+  if (!id) return "";
+  // ★ 必须走 `absUrl`（同源 + 当前部署前缀），不能写根相对的 `/api/...`
+  //   （审查 R-M6-04）。云端页面的地址是 `https://域名/d/{device_id}/`，
+  //   根相对的 `/api/items/1/transcode/stream` 会打到**中继自己**的根路径上，
+  //   结果 404。`urls.video` 之所以没这个问题，是因为它由后端按前缀拼好。
+  return absUrl(`/api/items/${id}/transcode/stream`, {
+    t: transcodedTicket.value,
+  });
 });
 
 function stopTranscodePolling(): void {

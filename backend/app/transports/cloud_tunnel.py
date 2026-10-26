@@ -99,9 +99,14 @@ FORWARD_RES_HEADERS: frozenset[str] = frozenset({
     "content-type",
     "etag",
     "last-modified",
+    # ★ 这两个不能丢（审查 R-M5-03）：`retry-after` 是限流/排队时手机端
+    #   唯一的退避依据；`x-upload-offset` 是分片上传 416 之后"服务端到底
+    #   收到多少"的答案，丢了就只能从头重传整个文件。
+    "retry-after",
     "vary",
     "x-content-type-options",
     "x-request-id",
+    "x-upload-offset",
 })
 
 

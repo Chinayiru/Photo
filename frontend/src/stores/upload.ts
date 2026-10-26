@@ -250,8 +250,18 @@ async function runTask(task: UploadTask): Promise<void> {
     task.rate = 0;
   } catch (e) {
     if (e instanceof UploadAborted || ctrl.signal.aborted) {
-      task.status = "CANCELED";
-      task.error = "";
+      // ★ 「全部暂停」也是 abort，但那不是取消（审查 R-M6-03）。
+      //   原来这里无条件置 CANCELED，把 `pauseAll()` 刚设好的 PAUSED 覆盖掉；
+      //   而 `resumeAll()` 只找 PAUSED → 「继续」按钮点了没反应，用户以为
+      //   上传坏了，只能一个个删掉重传。
+      // 走 `statusOf()` 而不是直接读字段：`task.status` 在本函数前面已被收窄成
+      // "UPLOADING"，直接比较会让 TS 判定为"两个不重叠的类型在做比较"。
+      if (statusOf(task) === "PAUSED") {
+        task.error = "";
+      } else {
+        task.status = "CANCELED";
+        task.error = "";
+      }
     } else if (statusOf(task) !== "PAUSED") {
       const err = e instanceof ApiError ? e : null;
       task.status = "FAILED";
@@ -454,10 +464,12 @@ export function pauseAll(): void {
   s.paused = true;
   for (const t of s.tasks) {
     if (t.status === "UPLOADING" || t.status === "COMPLETING") {
-      controllers.get(t.id)?.abort();
-      controllers.delete(t.id);
+      // 先置 PAUSED 再 abort：abort 会让在途的 catch 立刻跑起来，那里要靠
+      // 这个状态区分"暂停"和"取消"（审查 R-M6-03）。
       t.status = "PAUSED";
       t.rate = 0;
+      controllers.get(t.id)?.abort();
+      controllers.delete(t.id);
     }
   }
 }

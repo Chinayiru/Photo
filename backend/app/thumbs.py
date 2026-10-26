@@ -481,7 +481,10 @@ class ThumbEngine:
                 else:
                     self.skipped += 1
             except asyncio.CancelledError:
-                self.queue.task_done()
+                # ★ 不要在这里 `task_done()`：`finally` 已经会调一次，
+                #   重复调用会抛 `ValueError: task_done() called too many
+                #   times`，而它发生在取消路径上，表现为"关不掉的服务 +
+                #   一条被吞掉的异常"（审查 R-M3-07）。
                 raise
             except Exception as e:  # noqa: BLE001 —— 一个坏文件不能拖垮 worker
                 await self._on_failure(job, e)

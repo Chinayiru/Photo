@@ -175,7 +175,18 @@ check(db.get_setting("nope", "dflt") == "dflt", "settings 默认值")
 # db_size 必须用 str(path)+"-wal"，不是 with_suffix
 sz = db.db_size_bytes()
 check(sz > 0, "db_size_bytes > 0", f"{sz}B")
-check(Path(str(dbp) + "-wal").exists() or True, "WAL 文件路径拼接正确")
+# WAL 判据（审查 R-M7-02）：原来写的是 `... or True`，恒真 —— 等于没测。
+# 要验的是「`db_size_bytes()` 用的是 `str(path) + '-wal'`，不是 `with_suffix`」：
+# `with_suffix('.db-wal')` 在 `photobridge.db` 上会得到 `photobridge.db-wal` 之外的
+# 东西（把最后一段当后缀替换），路径拼错时大小会少算一整个 WAL。
+wal_path = Path(str(dbp) + "-wal")
+if wal_path.exists():
+    expect = dbp.stat().st_size + wal_path.stat().st_size
+    check(sz >= expect, "db_size_bytes 含 WAL（路径拼接正确）",
+          f"{sz}B vs 至少 {expect}B")
+else:
+    check(sz >= dbp.stat().st_size, "db_size_bytes 覆盖主库",
+          f"{sz}B")
 
 # 统计（前面的约束用例每次都是抛异常，不会留下脏数据；这里只应有 id=1 那一行）
 st = db.stats()

@@ -74,6 +74,10 @@ ALLOWED_REQUEST_HEADERS: tuple[str, ...] = (
     "if-none-match",
     "if-modified-since",
     "range",
+    # ★ 分片上传会带 `Content-Range`（`frontend/src/api/uploader.ts` 发，
+    #   见审查 R-M5-02）。少写一个的症状是预检通过、真实请求被浏览器拦掉，
+    #   DevTools 里只有一句 `Failed to fetch`。
+    "content-range",
 )
 
 #: 允许 JS **读取**的响应头。
@@ -89,6 +93,8 @@ EXPOSED_RESPONSE_HEADERS: tuple[str, ...] = (
     "retry-after",
     "x-pb-tunnel",
     "x-pb-device-online",
+    # 断点续传纠偏靠它：手机要知道"服务端已经有 N 字节"（416 响应头）。
+    "x-upload-offset",
 )
 
 #: 预检结果缓存秒数。1 小时：通路上偶尔才跨源，缓存久一点省掉往返。
