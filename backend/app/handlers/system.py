@@ -22,7 +22,7 @@ from ..state import AppState
 
 log = logging.getLogger(__name__)
 
-__all__ = ["ping", "info", "stats"]
+__all__ = ["ping", "info", "stats", "entrances"]
 
 
 def _masked_path(value: object) -> str:
@@ -441,3 +441,43 @@ def _host_app_info() -> dict[str, Any]:
     except Exception:       # noqa: BLE001
         pass
     return out
+
+# --------------------------------------------------------------------------
+# 候选入口地址
+# --------------------------------------------------------------------------
+
+def _served_port(ctx: Ctx, cfg: Any) -> int:
+    """这次请求是从哪个端口进来的。
+
+    用户就是从这个地址打开页面的，所以 Host 头里的端口最可信；取不到才退回
+    配置（`--port` 启动时配置里未必同步）。
+    """
+    host = (ctx.header("host") or "").strip()
+    if host:
+        tail = host.rpartition(":")[2]
+        if tail.isdigit() and tail.isascii():
+            return int(tail)
+    try:
+        return int(cfg.get("server.port", 8787) or 8787)
+    except (TypeError, ValueError):
+        return 8787
+
+
+async def entrances(ctx: Ctx) -> Reply:
+    """候选入口地址（匿名）。
+
+    配对页拿它把「家里 Wi-Fi / VPN / 云端」三条路都摆成可点即填，用户不必
+    知道家里电脑的 IP。匿名是**必须**的：配对页在拿到令牌之前就要渲染。
+    """
+    from .. import entrances as entrances_mod
+
+    st = _state(ctx)
+    cfg = st.cfg
+    data = entrances_mod.collect(cfg=cfg, port=_served_port(ctx, cfg))
+    base = _public_base(cfg)
+    data["cloud"] = (
+        {"label": entrances_mod.CLOUD_LABEL, "host": base.split("://", 1)[-1],
+         "url": f"{base.rstrip('/')}/"}
+        if base else None
+    )
+    return json_reply(data)
