@@ -192,6 +192,16 @@ def sweep(directory: Path, budget_bytes: int, *, protect: set[str] | None = None
     return freed
 
 
+#: 同时"在等 + 在转"的任务上限（审查 R-M3-06）。
+#:
+#: 为什么需要它：`start()` 每来一个请求就 `threading.Thread(...).start()`，
+#: 而 `_slots` 只限**真正跑的 ffmpeg**。于是 32 次点击 = 32 个线程全部
+#: 卡在 `with self._slots:` 上等着，每个都持有 job 对象与栈；再往上就是
+#: "点一下手机、电脑卡三秒"。超限必须**明确拒绝**（429 E4007），让客户端
+#: 知道"排队满了"，而不是静默地起第 33 个线程。
+MAX_PENDING_JOBS: Final[int] = 32
+
+
 @dataclass
 class TranscodeJob:
     """一次转码的公开状态（接口直接序列化它）。"""
@@ -362,8 +372,12 @@ class Transcoder:
 
     def _sweep(self) -> None:
         with self._lock:
+            # ★ 只保护"正在用"的产物（审查 R-M3-05）。原来把 ready 的也算进
+            #   保护集，等于**缓存永不淘汰**：`_cache_bytes` 预算彻底失效，
+            #   转码目录一路长到磁盘满。ready 的产物交给 atime + LRU 自然
+            #   淘汰，下次点播重新生成即可（转码是幂等的）。
             protect = {Path(j.path).name for j in self._jobs.values()
-                       if j.path}
+                       if j.path and j.state in (STATE_QUEUED, STATE_RUNNING)}
         try:
             sweep(cache_dir(self._cfg), self._cache_bytes, protect=protect)
         except OSError as exc:                    # pragma: no cover

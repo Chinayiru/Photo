@@ -32,6 +32,7 @@ from ..errors import (
     E1001,
     E1008,
     E3004,
+    E4007,
     AppError,
     Conflict,
     NotFound,
@@ -124,6 +125,16 @@ async def start(ctx: Ctx) -> Reply:
     row = _video_row(ctx)
     src = _source_path(st, row)
     ffmpeg = _ffmpeg(st)
+
+    # ★ 排队上限（审查 R-M3-06）：`_slots` 只限并发跑的 ffmpeg，不限"等着的
+    #   线程"。超限时明确 429，而不是再起第 33 个线程。
+    running = st.transcodes.running_count()
+    if running >= tcmod.MAX_PENDING_JOBS:
+        raise AppError(
+            E4007,
+            f"转码任务太多（{running} 个在排队或正在转），"
+            f"等前面的转完再试",
+        )
 
     job = st.transcodes.start(
         media_id=int(row["id"]),

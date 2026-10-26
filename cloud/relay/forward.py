@@ -113,9 +113,14 @@ FORWARD_RES_HEADERS: frozenset[str] = frozenset({
     "content-type",
     "etag",
     "last-modified",
+    # ★ 这两个不能丢（审查 R-M5-03）：`retry-after` 是限流/排队时手机端
+    #   唯一的退避依据；`x-upload-offset` 是分片上传 416 之后"服务端到底
+    #   收到多少"的答案，丢了就只能从头重传整个文件。
+    "retry-after",
     "vary",
     "x-content-type-options",
     "x-request-id",
+    "x-upload-offset",
 })
 
 #: 隧道错误码 → HTTP 状态码（`docs/04` §4.5）。
@@ -538,12 +543,18 @@ class Forwarder:
 
         async def body_iter() -> AsyncIterator[bytes]:
             sent = 0
+            # ★ 正常读完 vs 中途断（审查 R-M5-01）：只有正常读完才配 `_reap`。
+            #   手机锁屏/返回导致生成器被取消时，`_reap` 只清本地状态、**不发
+            #   CANCEL**，而电脑端的 handler 还在往一条没人读的响应里写，一直
+            #   写到它自己的总超时（30 分钟）才放手 —— 期间那条隧道连接被占着。
+            finished = False
             try:
                 async for chunk in pending.iter_body(
                         idle_timeout=idle, total_timeout=total):
                     sent += len(chunk)
                     conn.bytes_out_today += len(chunk)
                     yield chunk
+                finished = True
             except asyncio.CancelledError:
                 # 客户端自己走了（手机锁屏、用户返回）：静默收尾是对的，
                 # 此时往一个已经关掉的响应里写错误只会产生噪音。
@@ -575,7 +586,10 @@ class Forwarder:
                 release()
                 self.meter.add(device_id, bytes_in=up.total,
                                bytes_out=sent, requests=1)
-                _reap(pump, pending, conn, cancel)
+                if finished:
+                    _reap(pump, pending, conn, cancel)
+                else:
+                    await _abort(conn, pending, cancel, pump)
 
         media_type = headers.pop("content-type", None)
         resp = StreamingResponse(body_iter(), status_code=status,

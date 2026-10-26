@@ -213,9 +213,12 @@ async def complete_upload(ctx: Ctx) -> Reply:
     # 能把别人传了一半的文件提前归档进库。
     _owned_session(st, uid, ctx)
 
-    body: dict[str, Any] = {}
-    if ctx.header("content-length") not in (None, "0"):
-        body = await ctx.json(limit=16 * 1024)
+    # ★ 不能拿 `Content-Length` 当"有没有 body"的判据（审查 R-M4-01）：
+    #   云端隧道适配器转发请求时只带白名单里的头，`content-length` 不在
+    #   其中 —— 于是手机经云通路补的 `sha256`/`taken_at` 被**静默丢弃**，
+    #   同一次调用在局域网是 400/413、经云通路却是 201，客户端完全看不出。
+    #   `ctx.json()` 本身对空体返回 `{}`，所以无条件解析是安全的。
+    body: dict[str, Any] = await ctx.json(limit=16 * 1024)
 
     result = await uploads.complete_session_async(
         st.db,

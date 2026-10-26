@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
 import shutil
 import sqlite3
 import time
@@ -1434,8 +1435,21 @@ def _move_one_sync(src: Path, dst: Path, *, size: int) -> None:
     跨卷复制一个 2GB 文件会阻塞事件循环几十秒，那期间手机端所有请求
     全部卡住。
     """
-    if dst.exists():
-        raise FileExistsError(str(dst))
+    # ★ 目标名用 `O_CREAT|O_EXCL` **独占创建**，而不是先 `exists()` 再
+    #   `replace()`（审查 R-M3-01）。
+    #
+    #   `os.replace` 是**覆盖**语义：两个请求（并发移动、移动 + 改名同时打到
+    #   同一个目标目录）都能通过 `exists()` 检查，然后第二个 `replace` 直接把
+    #   第一个刚搬过去的文件**盖掉** —— 那是一张照片的永久丢失，且两边都返回
+    #   成功。`O_EXCL` 由文件系统原子保证"只有一个能抢到这个名字"，抢不到的
+    #   那一方拿到 `FileExistsError`，按"目标已存在"记失败（不丢任何字节）。
+    try:
+        os.close(os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except FileExistsError:
+        raise FileExistsError(str(dst)) from None
+    except OSError:
+        # 目录不可写之类的错误在这一步就能暴露，不必等复制完
+        raise
     try:
         os.replace(src, dst)
         return
@@ -1447,7 +1461,11 @@ def _move_one_sync(src: Path, dst: Path, *, size: int) -> None:
             raise
         log.info("跨卷移动，降级为复制+删除：%s → %s", src.name, dst.name)
 
-    tmp = dst.with_name(dst.name + ".pbmove")
+    # ★ 临时名必须唯一（审查 R-M3-01）：固定的 `.pbmove` 尾缀会让两个并发
+    #   的跨卷移动写进同一个临时文件，互相覆盖内容，再各自 `replace` 成目标
+    #   —— 结果谁都不完整。
+    tmp = dst.with_name(
+        f"{dst.name}.pbmove-{os.getpid()}-{secrets.token_hex(4)}")
     try:
         shutil.copy2(src, tmp)
         # ★ 校验通过才删源。只比大小（不重算 sha256）：移动的目标是
@@ -1458,12 +1476,18 @@ def _move_one_sync(src: Path, dst: Path, *, size: int) -> None:
             raise ArchiveError(f"复制后大小不符：期望 {size}，实际 {got}")
         os.replace(tmp, dst)
     except BaseException:
-        # 中途失败 → 删掉半成品，**源文件保持不动**。
+        # 中途失败 → 删掉半成品与**我们占位的空目标**，源文件保持不动。
+        # 占位文件必须一起清掉：留着它会让用户看到一张 0 字节的照片。
         try:
             if tmp.exists():
                 os.unlink(tmp)
         except OSError:
             log.warning("清理移动半成品失败：%s", tmp, exc_info=True)
+        try:
+            if dst.exists() and dst.stat().st_size == 0:
+                os.unlink(dst)
+        except OSError:
+            log.warning("清理移动占位失败：%s", dst, exc_info=True)
         raise
     os.unlink(src)
 

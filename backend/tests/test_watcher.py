@@ -255,7 +255,7 @@ def test_eviction_never_drops_delete_even_when_deletes_are_old() -> None:
     c.on_event("deleted", root, "oldest_delete.jpg")
     for i in range(watcher_mod.MAX_PENDING * 2):
         c.on_event("created", root, f"flood{i}.jpg")
-    assert "oldest_delete.jpg" in c._pending, "最早的删除事件被丢弃了"
+    assert ("r", "oldest_delete.jpg") in c._pending, "最早的删除事件被丢弃了"
 
 
 def test_eviction_drops_newest_upserts_first() -> None:
@@ -269,19 +269,19 @@ def test_eviction_drops_newest_upserts_first() -> None:
     root = RootConfig(id="r", path=Path("."), mode="readwrite")
     c = WatchCollector(debounce_sec=0.0)
     c._pending.clear()
-    # 手工填满，due 递增，便于判断谁被丢
+    # 手工填满，due 递增，便于判断谁被丢。键是 `(root_id, rel)`（审查 R-M3-04）。
     for i in range(watcher_mod.MAX_PENDING):
-        c._pending[f"a{i}.jpg"] = watcher_mod._Pending(
+        c._pending[("r", f"a{i}.jpg")] = watcher_mod._Pending(
             action="created", due=float(i), root=root)
     c.on_event("created", root, "newcomer.jpg")
 
-    assert "a0.jpg" in c._pending, "最旧的不该被丢"
-    assert "newcomer.jpg" in c._pending, "刚来的事件不该被丢"
+    assert ("r", "a0.jpg") in c._pending, "最旧的不该被丢"
+    assert ("r", "newcomer.jpg") in c._pending, "刚来的事件不该被丢"
     # 一次腾出一批（1/EVICT_FRACTION），不是精确的一个。
     assert c.dropped >= 1
     assert c.depth <= watcher_mod.MAX_PENDING
     # 丢的是最新的那些：due 最大的已经不在表里。
-    assert f"a{watcher_mod.MAX_PENDING - 1}.jpg" not in c._pending
+    assert ("r", f"a{watcher_mod.MAX_PENDING - 1}.jpg") not in c._pending
 
 
 # ==========================================================================

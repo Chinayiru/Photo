@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -41,6 +42,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -200,6 +202,7 @@ class Service:
 
         async def runner() -> None:
             def on_ready(transport, st, _loop, _stop):
+                self.state["transport"] = transport
                 self.state["st"] = st
                 self.state["base"] = transport.urls[0]
                 self.state["stop_event"] = _stop
@@ -241,10 +244,58 @@ class Service:
     def kill(self) -> None:
         """★ 不优雅关闭 —— 模拟断电/被任务管理器强杀。
 
-        直接让线程留在那里（daemon），不 set stop_event、不等它收尾。
-        数据库里会留下 WAL，正是我们要测的场景。
+        **必须先真的停掉监听**（审查 R-M7-01）。原来只写 `self.thread = None`
+        就返回：旧服务仍在同一个进程里活着、继续 accept 请求，随后 `start()`
+        起来的"重启后服务"其实抢不到端口或者请求全打到旧实例上 —— 我们要测的
+        "断电后 WAL 里数据还在、新进程能接着传"就完全没被测到，用例是假的绿。
+
+        做法：不 set stop_event（不跑优雅收尾），直接关监听 socket 并让
+        `serve()` 退出，然后**等端口真的拒绝连接**再返回。
         """
+        lp = self.state.get("loop")
+        transport = self.state.get("transport")
+        base = self.state.get("base", "")
+        if lp is not None and transport is not None:
+            lp.call_soon_threadsafe(_hard_kill, transport)
+            deadline = time.time() + 15.0
+            while time.time() < deadline and _port_open(base):
+                time.sleep(0.05)
+        if self.thread is not None:
+            self.thread.join(timeout=5.0)
         self.thread = None
+        self.state = {}
+
+
+def _hard_kill(transport) -> None:
+    """在服务自己的事件循环里执行：关监听、断在途连接、不跑优雅收尾。"""
+    srv = getattr(transport, "_server", None)
+    if srv is None:                                   # pragma: no cover
+        return
+    for s in list(getattr(srv, "servers", None) or []):
+        try:
+            s.close()                                # 关监听 socket
+        except Exception:                            # noqa: BLE001
+            pass
+    srv.should_exit = True                           # 让 serve() 尽快返回
+
+
+def _port_open(base: str) -> bool:
+    """`base` 形如 `http://127.0.0.1:8123`；能连上就说明服务还活着。"""
+    try:
+        u = urlsplit(base)
+    except ValueError:                               # pragma: no cover
+        return False
+    if not u.hostname or not u.port:
+        return False
+    s = socket.socket()
+    s.settimeout(0.3)
+    try:
+        s.connect((u.hostname, u.port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
 
 
 def pair(service: Service, name: str) -> str:

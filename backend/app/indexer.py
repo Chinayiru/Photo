@@ -67,6 +67,13 @@ class ScanStats:
     started_at: float = field(default_factory=time.time)
     finished_at: float = 0.0
     aborted: str | None = None
+    #: 本轮遍历是否**不完整**（有目录/文件读不到）。
+    #:
+    #: 为什么必须单独记：`_mark_missing` 的依据是"本轮没见到这个路径"。
+    #: 遍历中途遇到 `OSError` 只是跳过那个目录，于是**里面所有照片都
+    #: "没见到"** —— 一次权限抖动就会把整个目录的照片标记成丢失，它们
+    #: 从时间线消失（审查 R-M3-03）。见到的不完整，不清算。
+    partial: bool = False
     #: 本轮**在磁盘上确实存在**的相对路径集合，`_mark_missing` 的唯一依据。
     #:
     #: ⚠️ 它**故意不参与 `as_dict()` / `summary()`**：增量监听时这个集合是
@@ -261,6 +268,7 @@ def _walk(
             entries = list(os.scandir(cur))
         except OSError as e:
             stats.errors += 1
+            stats.partial = True
             consecutive_errors += 1
             log.warning("scandir failed rel=%s: %s", rel_prefix or ".", e)
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
@@ -282,6 +290,7 @@ def _walk(
                 st = entry.stat(follow_symlinks=False)
             except OSError:
                 stats.errors += 1
+                stats.partial = True
                 continue
 
             if entry.is_dir(follow_symlinks=False):
@@ -441,8 +450,12 @@ class Indexer:
                 root, _walk(root, stats, exts=self.cfg.allowed_index_exts), stats,
                 progress=True,
             )
-            if not self._cancel.is_set():
+            if not self._cancel.is_set() and not stats.partial:
                 stats.missing = self._mark_missing(root.id, stats.seen_rels)
+            elif stats.partial:
+                log.warning(
+                    "本轮遍历不完整（%d 个错误），跳过 missing 清算 root=%s",
+                    stats.errors, root.id)
             # ★ 收尾必推一条最终进度。
             #
             # 按"每 batch_size 个推进度"的话，**比 batch_size 小的库
@@ -813,6 +826,17 @@ class Indexer:
             gps_lat    = excluded.gps_lat,
             gps_lon    = excluded.gps_lon,
             orientation= excluded.orientation,
+            -- ★ 内容变了（mtime/size 不同）就把 `sha256` 置空（审查 R-M3-02）。
+            --
+            -- 少了这一句的后果不是"去重不准"这么轻：`sha256` 是上传秒传与
+            -- 去重的唯一依据。用户把 a.jpg 换成 b.jpg（同名同尺寸、内容不同）
+            -- 之后重扫，库里仍留着 a 的哈希 —— 下次他传 b 的第二份时，
+            -- `find_duplicate` 命中 a 那一行、大小又正好相等，于是**把刚传
+            -- 上来的正确文件删掉**，回答"已存在"。用户看到"上传成功"，
+            -- 打开却是另一张照片。
+            sha256     = CASE
+                WHEN media.mtime <> excluded.mtime OR media.size <> excluded.size
+                THEN NULL ELSE media.sha256 END,
             -- 视频元数据只在探测成功时覆盖；探测失败（ok=False）时
             -- excluded 里是 NULL，会把已有的好值冲掉 —— 所以用 COALESCE
             -- 保住旧值。场景：ffmpeg 被临时挪走，重扫一遍不该把全库视频

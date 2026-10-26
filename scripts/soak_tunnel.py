@@ -355,14 +355,24 @@ class Soak:
             cur = await self._active_reqs()
             peak = max(peak, cur)
             await asyncio.sleep(0.05)
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         peak = max(peak, await self._active_reqs())
 
-        bad = [c for c in codes if c is None or c >= 500]
+        # ★ 两处都别漏（审查 R-M7-03）：
+        #   ① `return_exceptions=True` 把异常吞进返回值，不检查等于"请求全炸了
+        #      也算通过"；
+        #   ② `bad` 原来只挑 `None` 与 `>=500` —— 业务全是 401（令牌失效、被
+        #      撤销、频率限制）时 soak 依然报告"通过"，而这正是最该发现的退化。
+        boom = [r for r in results if isinstance(r, BaseException)]
+        if boom:
+            self.failures.append(
+                f"round {idx}: 请求组抛异常 {type(boom[0]).__name__}: {boom[0]}")
+        bad = [c for c in codes if c is None or c >= 400]
         if bad:
             detail = errors[0] if errors else ""
             self.failures.append(
-                f"round {idx}: 5xx/连接失败 {bad[:5]}；首个错误={detail[:200]}")
+                f"round {idx}: 非成功状态（4xx/5xx/连接失败）{bad[:5]}；"
+                f"首个错误={detail[:200]}")
 
         health = await ahttp_json(f"{base}/api/health")
         tun = await self._tunnel_status()

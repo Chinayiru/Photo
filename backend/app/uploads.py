@@ -333,8 +333,8 @@ def find_duplicate(
     if not sha256:
         return None
     sql = (
-        "SELECT id, root_id, rel_path, file_name, size, taken_at FROM media "
-        "WHERE sha256 = ? AND missing = 0"
+        "SELECT id, root_id, rel_path, file_name, size, mtime, taken_at "
+        "FROM media WHERE sha256 = ? AND missing = 0"
     )
     params: list[Any] = [sha256]
     if root_id:
@@ -354,6 +354,17 @@ def find_duplicate(
         if st.st_size != row["size"]:
             # 同名文件被换成别的内容：不能复用
             log.warning("去重目标大小不符，跳过：%s", row["rel_path"])
+            continue
+        # ★ 大小相同还不够：同尺寸不同内容（改了 EXIF 重存、换了一张同分辨率
+        #   的图）大小常常一模一样。库里记着 `mtime`，对不上就说明**磁盘上
+        #   这个路径已经不是当初算哈希的那个文件**，不能拿它当"已有副本"
+        #   —— 否则调用方会丢掉刚上传的正确文件（审查 R-M3-02）。
+        try:
+            db_mtime = float(row["mtime"] or 0.0)
+        except (TypeError, ValueError):
+            db_mtime = 0.0
+        if db_mtime and abs(st.st_mtime - db_mtime) > 1e-6:
+            log.warning("去重目标 mtime 与索引记录不符，跳过：%s", row["rel_path"])
             continue
         return {
             "media_id": int(row["id"]),

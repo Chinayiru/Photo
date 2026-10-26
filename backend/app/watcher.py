@@ -148,7 +148,12 @@ class WatchCollector:
     __slots__ = ("_pending", "_lock", "_dropped", "_debounce")
 
     def __init__(self, debounce_sec: float = DEBOUNCE_SEC) -> None:
-        self._pending: dict[str, _Pending] = {}
+        # ★ 键必须是 `(root_id, rel)`，不能只用 `rel`（审查 R-M3-04）。
+        #   两个库根出现同名相对路径（`2024/a.jpg` 在两个盘上都很常见）时，
+        #   后一个事件会覆盖前一个待办：`_Pending.root` 被换成后登记的根，
+        #   于是"磁盘 A 上的照片被删"变成了"扫描磁盘 B 的同名路径" ——
+        #   A 那条记录永远停在 missing=0，用户点开是坏的，且没有后续触发点。
+        self._pending: dict[tuple[str, str], _Pending] = {}
         self._lock = threading.Lock()
         self._dropped = 0
         # ★ 静默期必须**由构造方注入**，不能直接读模块常量。
@@ -187,10 +192,11 @@ class WatchCollector:
                 return
             now = time.monotonic()
             due = now if action == "deleted" else now + self._debounce
+            key = (root.id, rel)
             with self._lock:
-                if len(self._pending) >= MAX_PENDING and rel not in self._pending:
+                if len(self._pending) >= MAX_PENDING and key not in self._pending:
                     self._evict_oldest_locked()
-                self._pending[rel] = _Pending(action=action, due=due, root=root)
+                self._pending[key] = _Pending(action=action, due=due, root=root)
         except Exception:       # noqa: BLE001 —— 见 docstring
             log.warning("登记监听事件失败 rel=%s", rel, exc_info=True)
 
@@ -230,8 +236,8 @@ class WatchCollector:
             # 让它短暂超出 MAX_PENDING 远好过丢掉它们。
             return
         victims.sort(key=lambda k: self._pending[k].due, reverse=True)
-        for rel in victims[:max(1, len(victims) // EVICT_FRACTION)]:
-            del self._pending[rel]
+        for key in victims[:max(1, len(victims) // EVICT_FRACTION)]:
+            del self._pending[key]
             self._dropped += 1
 
     # --- 消费者（事件循环线程）-------------------------------------------
@@ -248,15 +254,23 @@ class WatchCollector:
             # 删除优先，其余按到期时间（先到先处理）
             ready.sort(key=lambda k: (self._pending[k].action != "deleted",
                                       self._pending[k].due))
-            for rel in ready[:limit]:
-                p = self._pending.pop(rel)
-                out.append((p.action, rel, p.root))
+            for key in ready[:limit]:
+                p = self._pending.pop(key)
+                out.append((p.action, key[1], p.root))
         return out
 
-    def drop(self, rel: str) -> None:
-        """丢弃一个待办（处理失败且不值得重试时用）。"""
+    def drop(self, rel: str, root_id: str | None = None) -> None:
+        """丢弃一个待办（处理失败且不值得重试时用）。
+
+        `root_id` 省略时丢掉**所有**根下同路径的待办 —— 这是"这个文件不值得
+        再试"的语义（例如它已被判定为非媒体），与具体哪个根无关。
+        """
         with self._lock:
-            self._pending.pop(rel, None)
+            if root_id is not None:
+                self._pending.pop((root_id, rel), None)
+                return
+            for key in [k for k in self._pending if k[1] == rel]:
+                del self._pending[key]
 
     @property
     def depth(self) -> int:

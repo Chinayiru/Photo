@@ -246,14 +246,24 @@ def encode_frame(
     return _HEADER.pack(int(type), pack_req_id(req_id, flags)) + body
 
 
-def decode_frame(data: bytes) -> Frame:
+def decode_frame(data: bytes, *, max_frame: int = MAX_FRAME) -> Frame:
     """把一条完整的 WebSocket 二进制消息解码成 Frame。
 
     前置条件：data 恰好是一条完整帧（WebSocket 已保证消息边界）。
     半包/粘包是 FrameParser 的职责（见下）。
+
+    ★ **必须校验 payload 上限**（审查 R-M1-01）。`encode_frame` 一直卡在
+    `MAX_FRAME`，但解码侧没有 —— 而解码侧面对的恰恰是不可信的对端。两处
+    接收点（`backend/app/tunnel.py`、`cloud/relay/tunnel.py`）都是"整条
+    WS 消息已在内存里"才走到这里：云端把 `max_size` 设成 None（一条消息
+    = 一帧，靠我们自己限），于是对端发一条 512 MB 的帧，进程就先被内存
+    打死了。上限检查必须在**解析出 payload 之后、留用之前**。
     """
     if len(data) < HEADER_SIZE:
         raise ProtocolError(f"frame too short: {len(data)} < {HEADER_SIZE}")
+    if len(data) - HEADER_SIZE > int(max_frame):
+        raise ProtocolError(
+            f"payload {len(data) - HEADER_SIZE}B exceeds max_frame {max_frame}")
     raw_type, raw_rid = _HEADER.unpack_from(data, 0)
     try:
         ftype = FrameType(raw_type)

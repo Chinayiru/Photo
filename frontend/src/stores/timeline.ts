@@ -69,6 +69,17 @@ export const timelineStore = createStore(initial);
 let inflight: Promise<void> | null = null;
 
 /**
+ * 列表"代号"：换目录 / 换浏览方式时 +1。
+ *
+ * 为什么必须有它（审查 R-M6-02）：`inflight` 是模块级的，只表示"有一个请求
+ * 在路上"，完全不区分请求属于哪个目录。用户点 A 目录、照片还没回来就点 B，
+ * B 的 `loadMore` 直接命中 `if (inflight) return inflight` 拿回 A 的 Promise；
+ * 就算绕过了共享，A 的响应晚到也会 `s.items = s.items.concat(A的照片)`，
+ * 屏幕上就是"B 目录里显示着 A 的照片"——用户会以为文件被搬错了。
+ */
+let generation = 0;
+
+/**
  * 加载下一页。`reset` 为 true 时从头开始（下拉刷新 / 切 Tab 回来）。
  *
  * 幂等：并发调用会共享同一个 in-flight Promise，不会重复请求同一游标。
@@ -88,13 +99,16 @@ export function loadMore(reset = false): Promise<void> {
 
   s.loading = true;
   const cursor = s.nextCursor;
+  // 请求发出时就把"我是哪一代、哪个目录"钉住：await 之后 `s` 可能已经变了。
+  const gen = generation;
+  const folderMode = s.mode === "folder";
+  const folderAtStart = s.folder;
 
   inflight = (async () => {
     try {
-      const folderMode = s.mode === "folder";
       const r = folderMode
         ? await api.get<TimelineResponse>("/api/folders/media", {
-            query: { dir: s.folder, limit: PAGE_SIZE, cursor: cursor ?? undefined },
+            query: { dir: folderAtStart, limit: PAGE_SIZE, cursor: cursor ?? undefined },
             retry: 1,
             timeoutMs: 20_000,
           })
@@ -104,6 +118,7 @@ export function loadMore(reset = false): Promise<void> {
             retry: 1,
             timeoutMs: 20_000,
           });
+      if (gen !== generation) return;   // 已经换了目录/模式：这包不属于当前列表
       s.items = s.items.concat(r.items ?? []);
       // ★ 以服务端返回为准；某些实现会返回空 next_cursor 但 has_more=true
       s.nextCursor = r.next_cursor ?? null;
@@ -116,13 +131,18 @@ export function loadMore(reset = false): Promise<void> {
       s.error = "";
       trim();
     } catch (e) {
+      if (gen !== generation) return;
       const err = e instanceof ApiError ? e : null;
       s.error = err?.friendly ?? "加载失败";
       // 失败时不要置 hasMore=false：用户滚到底还能再试
       s.loaded = true;
     } finally {
-      s.loading = false;
-      inflight = null;
+      // 只有"当前这一代"才有权清状态：旧请求晚回来时新请求已经占着
+      // `inflight`，这时清掉会让下一次 loadMore 再发一个同游标请求。
+      if (gen === generation) {
+        s.loading = false;
+        inflight = null;
+      }
     }
   })();
 
@@ -170,6 +190,11 @@ function changeFolder(rel: string, opts: { reload: boolean }): void {
   s.hasMore = true;
   s.loaded = false;
   s.error = "";
+  // 换列表 = 换一代，并放开 `inflight`：否则新的目录会被"已有在途请求"
+  // 挡回去，界面上永远停在空白（审查 R-M6-02）。
+  generation += 1;
+  inflight = null;
+  s.loading = false;
   void loadMore(true);
 }
 
@@ -213,7 +238,14 @@ function trim(): void {
   const s = timelineStore.state;
   if (s.items.length > MAX_ITEMS) {
     s.items = s.items.slice(0, MAX_ITEMS);
-    // 被截断说明用户已经翻得很深了，但还有更多：保持 hasMore 原样
+    // ★ 触到上限就**停止翻页**（审查 R-M6-01）。
+    //
+    // 原来这里保留 `hasMore` 原样，于是：游标跟着新取的一页前进了 100，但
+    // 那 100 条当场被 `slice` 丢掉 —— 用户滚到底看到的最后一条永远停在第
+    // 1500 条，`lastVisible` 也就永远推不动，而加载还在继续，每滚一次白丢
+    // 100 条。要么停，要么给"只增不减"的虚拟列表，这里选停（1500 条已
+    // 远超任何人的实际浏览深度）。
+    s.hasMore = false;
   }
 }
 
