@@ -37,11 +37,11 @@ class AppState:
     """一次进程生命周期内的共享依赖。"""
 
     __slots__ = ("cfg", "db", "thumbs", "indexer", "bus", "watcher", "started_at",
-                 "_device_id", "_device_name")
+                 "transcoder", "_device_id", "_device_name")
 
     def __init__(self, cfg: Config | None = None, db: Database | None = None, *,
                  thumbs: Any = None, indexer: Any = None, bus: Any = None,
-                 watcher: Any = None) -> None:
+                 watcher: Any = None, transcoder: Any = None) -> None:
         self.cfg = cfg if cfg is not None else get_config()
         if db is not None:
             self.db = db
@@ -57,6 +57,9 @@ class AppState:
                 self.db = get_db()
         self.thumbs = thumbs
         self.indexer = indexer
+        # 按需转码器（ISSUE-058）。懒建：只读用户可能永远不点"转码播放"，
+        # 那就不该在启动时创建 data/transcodes 目录。
+        self.transcoder = transcoder
         # 文件系统监听器。为 None 时 /api/system/info 里如实报"未运行"，
         # 而不是假装 watch=true 就有监听 —— 那个谎言让 AC-2.15 长期
         # 无法验证（配置写着开、实际没有任何实现）。
@@ -71,6 +74,19 @@ class AppState:
     # ------------------------------------------------------------------
     # 设备标识
     # ------------------------------------------------------------------
+
+    @property
+    def transcodes(self) -> Any:
+        """转码器（懒建）。第一次用到时才创建，并沿用 `video.*` 的配置。"""
+        if self.transcoder is None:
+            from .transcode import Transcoder
+
+            self.transcoder = Transcoder(
+                self.cfg,
+                concurrency=self.cfg.transcode_concurrency,
+                cache_mb=self.cfg.transcode_cache_mb,
+            )
+        return self.transcoder
 
     @property
     def device_id(self) -> str:

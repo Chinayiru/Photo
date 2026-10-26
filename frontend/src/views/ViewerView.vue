@@ -236,12 +236,115 @@ const videoSrc = computed(() => {
   return `${base}?t=${encodeURIComponent(videoTicket.value)}`;
 });
 
+/* ------------------------------------------------------------------
+ * 按需转码（ISSUE-058）
+ *
+ * 场景：iPhone 直出的是 HEVC，很多安卓机（含用户的 vivo iQOO）没有 HEVC
+ * 解码器。V0 只能"诚实地说播不了"，V2 给一条出路——让电脑转成 h264 再播。
+ *
+ * 三条边界：
+ *   - **必须用户点**：转码吃满 CPU 几分钟，不能因为翻到这条就偷偷开始；
+ *   - **只有播不了才显示**：`hint === "ok"` 时多一个按钮只是噪音；
+ *   - **离开页面就停轮询**：否则用户翻了十条视频会留下十个定时器。
+ * ------------------------------------------------------------------ */
+const transcodeState = ref<"" | "queued" | "running" | "ready" | "failed">("");
+const transcodeProgress = ref(0);
+const transcodeError = ref("");
+/** 转码产物也要票：`<video>` 发不了 Authorization，理由同 `videoTicket`。 */
+const transcodedTicket = ref("");
+let transcodeTimer: number | undefined;
+
+/** 什么时候给"转码播放"这个动作：编码可能不支持，或者已经试崩过。 */
+const transcodeOffer = computed(() => isVideo.value
+  && videoHint.value !== "ok"
+  && transcodeState.value !== "ready");
+
+/** 转码产物的播放地址（就绪 + 有票才有值）。 */
+const transcodeSrc = computed(() => {
+  if (transcodeState.value !== "ready" || !transcodedTicket.value) return "";
+  return `/api/items/${detail.value?.id}/transcode/stream?t=${
+    encodeURIComponent(transcodedTicket.value)}`;
+});
+
+function stopTranscodePolling(): void {
+  if (transcodeTimer !== undefined) {
+    window.clearTimeout(transcodeTimer);
+    transcodeTimer = undefined;
+  }
+}
+
+/** 轮询一次状态；`ready` 时顺手换票。 */
+async function pollTranscode(id: number): Promise<void> {
+  stopTranscodePolling();
+  try {
+    const r = await api.get<{
+      state: "none" | "queued" | "running" | "ready" | "failed";
+      progress: number;
+      error: string;
+    }>(`/api/items/${id}/transcode`);
+    // 用户可能已经翻页：把结果安到下一条头上是最难查的 bug。
+    if (s.detail?.id !== id) return;
+    if (r.state === "none") {
+      transcodeState.value = "";
+      return;
+    }
+    transcodeState.value = r.state === "failed" ? "failed" : r.state;
+    transcodeProgress.value = r.progress ?? 0;
+    transcodeError.value = r.error || "";
+    if (r.state === "ready") {
+      const t = await api.get<{ ticket: string }>(
+        `/api/items/${id}/stream-ticket`);
+      if (s.detail?.id === id) {
+        transcodedTicket.value = t.ticket;
+        s.imageReady = true;
+      }
+      return;
+    }
+    if (r.state === "failed") return;
+  } catch {
+    /* 网络抖动：下个周期再问 */
+  }
+  transcodeTimer = window.setTimeout(() => { void pollTranscode(id); }, 1500);
+}
+
+async function startTranscode(): Promise<void> {
+  const id = s.detail?.id;
+  if (id == null) return;
+  transcodeError.value = "";
+  transcodeProgress.value = 0;
+  transcodeState.value = "queued";
+  try {
+    await api.post(`/api/items/${id}/transcode`, {});
+  } catch (e) {
+    transcodeState.value = "failed";
+    transcodeError.value = (e as { userHint?: string }).userHint
+      || "启动转码失败";
+    return;
+  }
+  void pollTranscode(id);
+}
+/** 换条目时清掉"上一条"的转码状态与轮询（否则会串到下一条头上）。 */
+function resetTranscode(): void {
+  stopTranscodePolling();
+  transcodeState.value = "";
+  transcodeProgress.value = 0;
+  transcodeError.value = "";
+  transcodedTicket.value = "";
+}
+
 /** 换条目时清掉"上一条播崩了"的标记（否则下一条视频会被误判）。 */
 watch(() => detail.value?.id, (id) => {
   videoBroken.value = false;
   videoTicket.value = "";
-  if (id != null && isVideo.value) void loadVideoTicket(id);
+  resetTranscode();
+  if (id != null && isVideo.value) {
+    void loadVideoTicket(id);
+    // 顺手问一次：可能是上次转到一半就关掉了，或者产物早就好了。
+    void pollTranscode(id);
+  }
 }, { immediate: true });
+
+onBeforeUnmount(stopTranscodePolling);
 
 /**
  * 视频元信息到手（`loadedmetadata`）：等价于图片的 `onMainLoad`。
@@ -253,6 +356,8 @@ function onVideoMeta(): void {
   s.imageReady = true;
   if (s.id) markPreviewLoaded(s.id);
 }
+
+
 
 /* ------------------------------------------------------------------ *
  * 改名 / 移动
@@ -785,6 +890,22 @@ async function doDelete(): Promise<void> {
             @error="videoBroken = true"
           />
 
+          <!--
+            转码产物（ISSUE-058）。就绪后自动替换掉"播不了"的提示：
+            用户点了"转码播放"，转完就该直接播，不该再点一次。
+          -->
+          <video
+            v-if="transcodeSrc"
+            :key="`transcode-${detail?.id}`"
+            class="v-img video"
+            :src="safeUrl(transcodeSrc)"
+            :poster="safeUrl(currentThumbUrl)"
+            controls
+            playsinline
+            preload="metadata"
+            @loadedmetadata="onVideoMeta"
+          />
+
           <img
             v-else-if="detail"
             :key="detail.id"
@@ -825,12 +946,37 @@ async function doDelete(): Promise<void> {
           </div>
 
           <!--
+            转码动作（ISSUE-058）。只有"编码可能不支持"或"已经试崩过"才出现：
+            能播的视频上多一个按钮只是噪音，而转码是会把 CPU 吃满的重活，
+            必须由用户明确点。
+          -->
+          <div
+            v-if="isVideo && transcodeOffer && detail"
+            key="vtrans"
+            class="v-rawnote"
+          >
+            <template v-if="transcodeState === ''">
+              <button class="v-trbtn" type="button" @click="startTranscode">转码播放</button>
+              <span class="v-trnote">让电脑转成手机能播的格式，几十秒到几分钟</span>
+            </template>
+            <template v-else-if="transcodeState === 'failed'">
+              <button class="v-trbtn" type="button" @click="startTranscode">再试一次</button>
+              <span class="v-trnote">转码失败：{{ transcodeError || "未知原因" }}</span>
+            </template>
+            <template v-else>
+              <span class="v-trnote">
+                正在转码 {{ Math.round(transcodeProgress * 100) }}%，转好会自动播放
+              </span>
+            </template>
+          </div>
+
+          <!--
             编码放不了（HEVC/mkv/avi 很常见）：不能只显示"播放失败"，得给出
             可执行的动作 —— 原片是好的，只是这个浏览器解不了。
             用 `/raw?download=1` 下载：attachment 语义才能让手机"存到相册/文件"。
           -->
           <div
-            v-if="isVideo && (!videoPlayable || videoBroken) && detail"
+            v-if="isVideo && (!videoPlayable || videoBroken) && detail && !transcodeSrc"
             key="vnote"
             class="v-rawnote"
           >
@@ -1125,6 +1271,23 @@ async function doDelete(): Promise<void> {
 .v-dl {
   color: var(--accent);
   text-decoration: underline;
+}
+
+/* 转码按钮（ISSUE-058）：胶囊形，和提示条同一行不至于跳出来 */
+.v-trbtn {
+  margin-right: 8px;
+  padding: 3px 12px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.v-trnote {
+  vertical-align: middle;
 }
 
 /* 原图格式不支持时的提示条：贴在底部，不挡图片中心 */
