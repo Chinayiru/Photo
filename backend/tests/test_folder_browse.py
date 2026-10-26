@@ -366,3 +366,17 @@ def test_folders_reports_direct_and_recursive_counts(tmp_path) -> None:
     assert dirs["dir"]["direct"] == 3, "dir/ 直属 3 张"
     assert dirs["dir"]["count"] == 4, "dir/ 递归 4 张（含 sub/）"
     assert dirs["dir"]["count"] > dirs["dir"]["direct"]
+
+def test_indexed_directory_is_listed_once(tmp_path) -> None:
+    """库里已有的目录不能被"磁盘补齐"再补一遍。
+
+    `buckets` 的键是相对当前位置的路径，磁盘补齐那段最初用了含 base 的完整
+    路径 —— 同一个目录于是出现两次：一条带张数、一条全 0。真实库上表现为
+    "七彩丹霞" 并排两行，其中一行永远是空的。
+    """
+    st = _state(tmp_path)
+    _seed(st)
+    body = _body(_call(st, "GET", "/api/folders", query={"dir": "dir"}))
+    paths = [f["path"] for f in body["folders"]]
+    assert paths == sorted(set(paths)), f"目录重复：{paths}"
+    assert "dir/sub" in paths

@@ -884,7 +884,11 @@ def _merge_disk_dirs(root: Any, base: str, buckets: dict[str, dict[str, Any]],
     prefix = base + "/" if base else ""
     for name, abs_child in entries:
         rel = prefix + name
-        if rel in buckets:
+        # ⚠️ `buckets` 的键是**相对 base** 的路径（见上面 `sub = "/".join(...)`），
+        # 不是含 base 的完整路径。两处用一个键，否则"库里有的目录"会被这里
+        # 再补一遍 —— 症状是同一层出现两个同名目录，一个带张数、一个全是 0。
+        key = rel[len(prefix):]
+        if key in buckets:
             continue
         if sandbox.excluded_dir_segment(rel, root, last_is_file=False):
             continue
@@ -893,7 +897,7 @@ def _merge_disk_dirs(root: Any, base: str, buckets: dict[str, dict[str, Any]],
                 continue
         except OSError:
             continue
-        buckets[rel] = {"name": name, "path": rel, "count": 0, "direct": 0,
+        buckets[key] = {"name": name, "path": rel, "count": 0, "direct": 0,
                         "has_children": _has_any_child(abs_child),
                         "cover_id": None}
 
