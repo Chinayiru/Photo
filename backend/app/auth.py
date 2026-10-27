@@ -1078,6 +1078,42 @@ def panel_http_enabled(cfg: Any = None) -> bool:
         return False
 
 
+#: 游客**允许**的非只读请求。全部在 `/api/uploads/` 之下：
+#: init（POST）/ 分片（PATCH）/ 完成（POST）/ 中止（POST）。
+#:
+#: 白名单而不是黑名单：新增一个写接口时，默认对游客是**关闭**的。
+#: 反过来（默认放行、逐个禁）在漏一条时就是"游客能删主人的照片"。
+GUEST_WRITE_PREFIXES: tuple[str, ...] = ("/api/uploads/",)
+
+
+def guest_may_write(method: str, path: str) -> bool:
+    """游客这个请求能不能发。
+
+    只读方法一律放行（读路径已按可见根收口，见 `handlers/common.py`）；
+    写方法只认上传三件套。
+    """
+    m = (method or "").upper()
+    if m in ("GET", "HEAD", "OPTIONS"):
+        return True
+    if m in ("POST", "PATCH"):
+        return any(path.startswith(prefix) for prefix in GUEST_WRITE_PREFIXES)
+    return False
+
+
+def _enforce_guest_scope(ctx: Ctx, client: dict[str, Any] | None) -> None:
+    """游客越界就当场拒（403 E2003），并留一条审计级的告警。
+
+    为什么放在中间件而不是各 handler 里：handler 有二十多个，
+    漏一个就是一条越权路径；而"游客能做什么"是一条**全局性质**的规则。
+    """
+    if not client or client.get("role") != "guest":
+        return
+    if guest_may_write(ctx.method, ctx.path):
+        return
+    log.warning("游客越界被拒：%s %s", ctx.method, ctx.path)
+    raise AppError(E2003, "游客只能查看与上传，不能修改或删除")
+
+
 async def auth_middleware(ctx: Ctx, nxt: Any):
     """鉴权中间件。
 
@@ -1154,5 +1190,6 @@ async def auth_middleware(ctx: Ctx, nxt: Any):
     if not require_pairing:
         return await nxt(ctx)
 
-    require_client(ctx)
+    client = require_client(ctx)
+    _enforce_guest_scope(ctx, client)
     return await nxt(ctx)

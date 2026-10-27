@@ -19,6 +19,7 @@ from ..config import WILDCARD_HOSTS
 from ..core import Ctx, Reply, json_reply
 from ..errors import E1001, BadRequest
 from ..state import AppState
+from . import common
 
 log = logging.getLogger(__name__)
 
@@ -176,8 +177,14 @@ def _bind_scope(host: str) -> str:
 
 
 async def info(ctx: Ctx) -> Reply:
-    """手机端首页所需的全部元信息（一次请求拿全，减少弱网往返）。"""
+    """手机端首页所需的全部元信息（一次请求拿全，减少弱网往返）。
+
+    ⚠️ 游客只看到**自己那个根**，且拿不到局域网 IP / 托盘状态 / 监视器状态：
+    这些是主人的机器画像（家里网段、盘符、目录树），与"看照片"无关。
+    """
     st = _state(ctx)
+    guest = common.is_guest(ctx)
+    visible = set(common.visible_root_ids(ctx, st))
     cfg = st.cfg
     host = str(cfg.get("server.host", "127.0.0.1"))
     sizes = st.thumb_sizes()
@@ -201,12 +208,13 @@ async def info(ctx: Ctx) -> Reply:
         "roots": [
             {**root, "path": _masked_path(root.get("path"))}
             for root in st.roots_info()
+            if not guest or root.get("id") in visible
         ],
         "index": st.index_info(),
         # 视频能力（ISSUE-055）。`ffmpeg` 为空串 = 没找到可执行文件，
         # 那台机器上视频全是占位图；用户需要知道"这是缺依赖，不是文件坏了"。
         "video": _video_info(cfg),
-        "watch": st.watch_info(),
+        "watch": {} if guest else st.watch_info(),
         "thumbs": {
             "cache_bytes": cache_bytes,
             "cache_files": cache_files,
@@ -217,14 +225,14 @@ async def info(ctx: Ctx) -> Reply:
         "server": {
             "host": host,
             "port": int(cfg.get("server.port", 8787)),
-            "lan_ips": _lan_ips(),
+            "lan_ips": [] if guest else _lan_ips(),
             # 由实际监听地址推导，不是常量（SEC-17）
             "bind_scope": _bind_scope(host),
         },
         "limits": st.limits_info(),
         # 电脑端外壳的状态。手机端在"设置 → 电脑端"里展示，
         # 让用户知道自启有没有生效（他没法直接看电脑的注册表）。
-        "host_app": _host_app_info(),
+        "host_app": {} if guest else _host_app_info(),
         "time": {
             "server_time": time.time(),
             "tz_offset_minutes": int(cfg.tz_offset_minutes),
@@ -240,13 +248,26 @@ async def stats(ctx: Ctx) -> Reply:
     def _count(sql: str, *params: Any) -> int:
         return int(db.scalar(sql, params, default=0) or 0)
 
-    images = _count("SELECT COUNT(*) FROM media WHERE missing = 0 AND kind = 'image'")
-    videos = _count("SELECT COUNT(*) FROM media WHERE missing = 0 AND kind = 'video'")
+    # 游客的数字只能是"他自己那个根"的：把全库总量报回去等于告诉他
+    # "这台电脑上有 5000 张照片"，与"只让他看这次旅行的相册"相悖。
+    guest = common.is_guest(ctx)
+    visible = common.visible_root_ids(ctx, st)
+    scope = " AND root_id = ?" if guest and visible else ""
+    args: tuple[Any, ...] = (visible[0],) if scope else ()
+
+    images = _count(
+        "SELECT COUNT(*) FROM media WHERE missing = 0 AND kind = 'image'" + scope, *args)
+    videos = _count(
+        "SELECT COUNT(*) FROM media WHERE missing = 0 AND kind = 'video'" + scope, *args)
     total = images + videos
-    missing = _count("SELECT COUNT(*) FROM media WHERE missing = 1")
-    pending = _count("SELECT COUNT(*) FROM media WHERE thumb_state='pending' AND missing=0")
-    ok = _count("SELECT COUNT(*) FROM media WHERE thumb_state='ok' AND missing=0")
-    failed = _count("SELECT COUNT(*) FROM media WHERE thumb_state='failed' AND missing=0")
+    missing = _count(
+        "SELECT COUNT(*) FROM media WHERE missing = 1" + scope, *args)
+    pending = _count(
+        "SELECT COUNT(*) FROM media WHERE thumb_state='pending' AND missing=0" + scope, *args)
+    ok = _count(
+        "SELECT COUNT(*) FROM media WHERE thumb_state='ok' AND missing=0" + scope, *args)
+    failed = _count(
+        "SELECT COUNT(*) FROM media WHERE thumb_state='failed' AND missing=0" + scope, *args)
     open_uploads = _count(
         "SELECT COUNT(*) FROM upload_sessions WHERE status IN ('open','uploading')")
     cache_files, cache_bytes = await _thumb_cache_stats(st)
@@ -266,7 +287,7 @@ async def stats(ctx: Ctx) -> Reply:
             "cache_bytes": cache_bytes,
             "cache_files": cache_files,
         },
-        "db": _db_stats(st),
+        "db": {} if guest else _db_stats(st),
         "uploads": {
             "open_sessions": open_uploads,
             "received_bytes": _count(

@@ -44,10 +44,17 @@ def test_pair_only_persists_the_base_after_the_server_accepts() -> None:
         "否则失败的候选地址会覆盖掉能用的地址（SEC-23）"
     )
 
-    ping = src.index('api.get<PingResponse>("/api/system/ping"')
     post = src.index('api.post<PairResponse>("/api/pair"')
-    saved = src.index("savePairing({")
-    assert ping < post < saved, "落盘必须先于请求之外的顺序被打乱了"
+    fn_start = src.rindex("export async function", 0, post)
+    body = src[fn_start:post]
+    # 只看"真的调用"（`savePairing({`）：注释里提到 `savePairing()` 是正常的。
+    assert "savePairing({" not in body, (
+        "配对请求之前就落盘了：失败的候选地址会覆盖掉能用的地址（SEC-23）"
+    )
+    ping = body.index('api.get<PingResponse>("/api/system/ping"')
+    saved = src.index("savePairing({", post)
+    assert ping < len(body), "探活必须在消费配对码之前"
+    assert post < saved, "落盘必须发生在服务端接受之后"
     # 两个请求都得带上候选基址，否则它们会打到 localStorage 里的旧地址
     assert src.count("base: cleanBase") >= 2
 

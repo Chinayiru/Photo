@@ -6,6 +6,7 @@ import time
 
 from ..core import Ctx, Reply, stream_reply
 from ..events import ensure_capacity, get_bus, stream_events
+from . import common
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +37,14 @@ async def events(ctx: Ctx) -> Reply:
         # 开流之前就要判：一旦开始写响应头，状态码只能是 200。
         ensure_capacity(bus)
 
+    # ★ 审计 07f03d S-06：游客只该收到自己那个根的事件。
+    keep = None
+    if st is not None and common.is_guest(ctx):
+        allowed = set(common.visible_root_ids(ctx, st))
+
+        def keep(item: dict) -> bool:
+            return str(item.get("root") or "") in allowed
+
     hello = {
         "device_id": getattr(st, "device_id", None) if st is not None else None,
         "via": ctx.via,
@@ -52,7 +61,7 @@ async def events(ctx: Ctx) -> Reply:
         )
     else:
         reply = stream_reply(
-            stream_events(bus, hello=hello),
+            stream_events(bus, hello=hello, keep=keep),
             "text/event-stream; charset=utf-8",
         )
 

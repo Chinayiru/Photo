@@ -35,7 +35,7 @@ from typing import Any
 from .. import audit, guest as guestmod
 from ..core import Ctx, Reply, empty_reply, json_reply
 from ..core.ctx import CLOUD
-from ..errors import E1020, AppError, BadRequest, NotFound, Unauthorized
+from ..errors import E1020, E2003, AppError, BadRequest, NotFound, Unauthorized
 from ..auth import require_owner
 
 log = logging.getLogger(__name__)
@@ -91,6 +91,18 @@ async def create_invite(ctx: Ctx) -> Reply:
     """
     st = _st(ctx)
     me = require_owner(ctx)
+
+    # ★ 审计 07f03d S-01：邀请**只能**在组网直连上生成。
+    #
+    # 云端通路也能打到这台电脑。如果不在服务端就地拒掉，任何一枚已配对
+    # 的令牌（包括设备表里 role=viewer 的旧客户端）都能远程给自己发新邀请，
+    # 于是「分享」这一步再也不需要碰这台机器。docs/11 拍板的是**服务端**
+    # 强制「主账号 + 组网连接」，页面隐藏只是顺带的 UX 约束。
+    if ctx.via == CLOUD:
+        log.warning("拒绝在云端生成游客邀请 via=%s", ctx.via)
+        raise AppError(
+            E2003, "邀请只能在局域网内生成：请在家里用局域网入口打开后再生成"
+        )
     body = await ctx.json(limit=4 * 1024)
     label = str(body.get("label") or "")[:64]
     minutes = body.get("minutes", 1440)

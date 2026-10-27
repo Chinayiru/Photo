@@ -101,6 +101,11 @@ async def init_upload(ctx: Ctx) -> Reply:
         declared_taken_at=_opt_float(body.get("declared_taken_at") or body.get("taken_at")),
         client_chunk_size=body.get("client_chunk_size"),
         client_id=_client_id(ctx),
+        # ★ 审计 07f03d S-03：游客身份必须传进业务层。不传的话
+        #   `create_session` 走默认 guest=False，就会**按请求里的 root**
+        #   建普通会话 —— 游客于是能往主库写文件，且 uploader_client_id
+        #   为空，后面「只看自己传的」也跟着失效。
+        guest=common.is_guest(ctx),
     )
 
     payload: dict[str, Any] = {
@@ -228,6 +233,7 @@ async def complete_upload(ctx: Ctx) -> Reply:
         thumbs=getattr(st, "thumbs", None),
         sha256=_opt_str(body.get("sha256")),
         taken_at=_opt_float(body.get("taken_at")),
+        guest=common.is_guest(ctx),
     )
 
     if result.get("media_id") is not None and getattr(st, "thumbs", None) is not None:

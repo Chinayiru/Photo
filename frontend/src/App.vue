@@ -20,9 +20,11 @@ import UploadView from "./views/UploadView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import ViewerView from "./views/ViewerView.vue";
 import SelectionBar from "./components/SelectionBar.vue";
-import { onAuthLost } from "./api/client";
+import { ApiError, onAuthLost } from "./api/client";
 import { closeEvents, connectEvents, reconnectEvents } from "./api/events";
-import { authStore, isPaired, probe } from "./stores/auth";
+import { authStore, guestInviteFromLocation, isPaired, probe, redeemGuest } from "./stores/auth";
+import { isGuest } from "./api/storage";
+import { toastError, toastOk } from "./stores/toast";
 import { exit as exitSelect, selectionStore } from "./stores/selection";
 import { openFolder } from "./stores/timeline";
 import { startEvents, stopEvents } from "./stores/system";
@@ -38,6 +40,61 @@ const TABS: { key: Tab; label: string; icon: string }[] = [
 ];
 
 const tab = ref<Tab>("timeline");
+
+/**
+ * 游客身份：只读 + 只能往"游客上传"里加。
+ * 界面层面收起「我的」（那里全是主人操作：设备管理、邀请管理、退出配对）。
+ */
+const guest = ref(isGuest());
+const tabs = computed(() => (guest.value ? TABS.filter((t) => t.key !== "settings") : TABS));
+
+/** 正在用邀请链接换令牌：这期间别闪配对页，否则用户会以为链接失效了。 */
+const redeeming = ref(false);
+
+/**
+ * 处理地址栏里的游客邀请。
+ *
+ * ★ 与配对码同一条通路（`#guest=`），但**必须先兑换再判 `paired`**：
+ *   `paired` 由 `isPaired()` 算，游客兑换成功后令牌才落盘，
+ *   顺序反了会先渲染配对页再跳走，手机上看起来像闪了一下。
+ */
+async function handleGuestLink(): Promise<void> {
+  const invite = guestInviteFromLocation();
+  if (!invite) return;
+  redeeming.value = true;
+  try {
+    const r = await redeemGuest(invite);
+    guest.value = true;
+    paired.value = true;
+    startEvents();
+    connectEvents();
+    void probe();
+    toastOkGuest(r.label);
+  } catch (exc) {
+    toastError(guestErrorMessage(exc));
+  } finally {
+    redeeming.value = false;
+    // 换完就把码从地址栏抹掉：截图/分享地址栏时不该带上它。
+    const url = window.location.pathname + window.location.search;
+    window.history.replaceState(null, "", url);
+  }
+}
+
+function toastOkGuest(label: string): void {
+  toastOk(label ? `已进入「${label}」的相册` : "已进入相册（游客）");
+}
+
+function guestErrorMessage(exc: unknown): string {
+  if (exc instanceof ApiError) {
+    // 无痕模式常见 `SecurityError`；限额/过期是服务端的 E102x。
+    if (exc.code === "E1021") return "这条邀请已过期，请让主人重新发一条";
+    if (exc.code === "E1022") return "这条邀请已经被用过了（一次性）";
+    if (exc.code === "E1023") return "主人已收回这条邀请";
+    if (exc.code === "E1020") return "邀请链接不完整，请让主人重新复制";
+    return exc.message || "打不开这条邀请链接";
+  }
+  return "打不开这条邀请链接";
+}
 
 /**
  * 用 `<KeepAlive>` 缓存 Tab 面板：切到「上传」再切回来时，
@@ -135,6 +192,8 @@ onMounted(() => {
   }
 
   // 切回前台探活一次：手机锁屏/切 App 回来，局域网 IP 可能已经变了
+  void handleGuestLink();
+
   onVisible = () => {
     if (document.visibilityState !== "visible") return;
     if (isPaired()) void probe();
@@ -154,10 +213,14 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <PairView v-if="!paired" />
+  <PairView v-if="!paired && !redeeming" />
 
   <template v-else>
     <StatusBar :title="title" />
+
+    <div v-if="guest" class="guestbar" role="status">
+      游客身份 · 只能查看与上传，不能删除或修改
+    </div>
 
     <main class="body">
       <KeepAlive>
@@ -167,7 +230,7 @@ onBeforeUnmount(() => {
 
     <nav v-if="!selActive" class="tabbar">
       <button
-        v-for="t in TABS"
+        v-for="t in tabs"
         :key="t.key"
         class="tab"
         type="button"
@@ -196,6 +259,16 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.guestbar {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #7a4b00;
+  background: #fff4d6;
+  border-bottom: 1px solid #f0dcae;
+}
+
 .body {
   flex: 1 1 auto;
   min-height: 0;

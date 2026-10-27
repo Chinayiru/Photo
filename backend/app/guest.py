@@ -84,6 +84,14 @@ _INVITE_PREFIX: Final = "pbg1."
 # ---------------------------------------------------------------------------
 
 
+#: 邀请/兑换请求体的上限（字节）。
+#:
+#: `handlers/guest.redeem` 用 `ctx.json(limit=GUEST_BODY_LIMIT)` 读 body ——
+#: 这里曾经漏定义，于是兑换请求直接 500/E3001（审计 07f03d 的发证链缺陷）。
+#: 邀请码本身只有一百多字节，给到和 uploads/complete 同档的 16 KB 足够。
+GUEST_BODY_LIMIT = 16 * 1024
+
+
 def _now() -> float:
     return time.time()
 
