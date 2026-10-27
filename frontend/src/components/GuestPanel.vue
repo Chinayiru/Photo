@@ -48,6 +48,15 @@ interface CreateResp {
   expires_at: number;
 }
 
+/**
+ * 服务端 `guest.list_sessions()` 的字段。
+ *
+ * ★ BUG-3 的根因就在这里：以前写的是 `revoked: boolean`，而接口从来没发
+ *   过这个字段（发的是 `revoked_at` 与现算的 `online`），于是 `s.revoked`
+ *   恒 undefined → 每一行都画成"在线 + 踢出按钮" → 点已撤销的那行必然
+ *   命中 0 行更新 → 后端只能回 not_found。字段名对不上，症状跑到后端去
+ *   了。
+ */
 interface SessionRow {
   client_id: string;
   invite_id: string;
@@ -55,7 +64,8 @@ interface SessionRow {
   created_at: number;
   expires_at: number;
   last_seen: number | null;
-  revoked: boolean;
+  revoked_at: number | null;
+  online: boolean;
 }
 
 const invites = ref<InviteRow[]>([]);
@@ -138,17 +148,36 @@ const stateText: Record<string, string> = {
   expired: "已过期",
 };
 
-const online = computed(() => sessions.value.filter((s) => !s.revoked).length);
+const online = computed(() => sessions.value.filter((s) => s.online).length);
+
+/**
+ * 列表一次铺几条（`guest.max_visible`，由 `/api/system/info` 回显）。
+ *
+ * ★ BUG-2：折叠是**展示层**的事，后端照旧返回全部会话（含已退出）。
+ *   主人拍了 P1 = "在线上限与展示上限都是 3"：在线人数永远撞不到折叠线，
+ *   但列表里还有历史会话（实测 17 行），所以折叠照样看得见。
+ */
+const maxVisible = ref(3);
+const showAllSessions = ref(false);
+const visibleSessions = computed(() =>
+  showAllSessions.value ? sessions.value : sessions.value.slice(0, maxVisible.value),
+);
+const hiddenSessions = computed(() =>
+  Math.max(0, sessions.value.length - visibleSessions.value.length),
+);
 
 async function load(): Promise<void> {
   loading.value = true;
   try {
-    const [inv, ses] = await Promise.all([
+    const [inv, ses, sys] = await Promise.all([
       api.get<{ items: InviteRow[] }>("/api/guest/invites"),
       api.get<{ items: SessionRow[] }>("/api/guest/sessions"),
+      api.get<{ guest?: { max_visible?: number } }>("/api/system/info"),
     ]);
     invites.value = inv.items;
     sessions.value = ses.items;
+    const vis = Number(sys.guest?.max_visible ?? 3);
+    maxVisible.value = Number.isFinite(vis) && vis > 0 ? Math.floor(vis) : 3;
   } catch (e) {
     // 没配游客根时这里会是 400 E1001：主人还没准备好，不该当错误弹。
     if (!(e instanceof ApiError) || e.code !== "E1001") {
@@ -203,6 +232,13 @@ async function kick(clientId: string): Promise<void> {
     toastOk("已让这台设备退出");
     await load();
   } catch (e) {
+    // E1026 = 这位游客已经不在线（列表是几秒前的快照）。这不是操作失败，
+    // 刷一次列表把他挪到"已退出"就行，别弹一句让人以为按钮坏了。
+    if (e instanceof ApiError && e.code === "E1026") {
+      toastOk("这位游客已经不在线了");
+      await load();
+      return;
+    }
     toastError(guestError(e, "踢出失败"));
   } finally {
     busy.value = false;
@@ -353,20 +389,26 @@ onMounted(() => {
 
     <h3 class="sec sub">正在访问的游客 · {{ online }}</h3>
     <div v-if="!sessions.length" class="empty">暂时没有游客在线</div>
-    <div v-for="s in sessions" :key="s.client_id" class="inv">
+    <div v-for="s in visibleSessions" :key="s.client_id" class="inv">
       <div class="inv-top">
         <span class="inv-label ellipsis">{{ s.label || "游客" }}</span>
-        <span v-if="s.revoked" class="tag warn">已退出</span>
+        <span v-if="!s.online" class="tag warn">已退出</span>
       </div>
       <div class="inv-meta">
         <span>进来于 {{ fmtTime(s.created_at) }}</span>
         <span>最近活动 {{ fmtTime(s.last_seen) }}</span>
       </div>
-      <div v-if="!s.revoked" class="inv-acts">
+      <div v-if="s.online" class="inv-acts">
         <button class="btn danger" type="button" :disabled="busy" @click="kick(s.client_id)">
           让这台设备退出
         </button>
       </div>
+    </div>
+    <div v-if="hiddenSessions" class="fold">
+      <span class="hint sm">还有 {{ hiddenSessions }} 个未展开</span>
+      <button class="btn" type="button" @click="showAllSessions = !showAllSessions">
+        {{ showAllSessions ? "收起" : "展开全部" }}
+      </button>
     </div>
   </div>
 </template>
@@ -380,6 +422,20 @@ onMounted(() => {
 
 .sec.sub {
   margin-top: 16px;
+}
+
+/* 折叠条：只在"超出展示上限"时出现（BUG-2）。 */
+.fold {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.hint.sm {
+  margin: 0;
+  font-size: 12px;
+  color: var(--fg-2);
 }
 
 .hint {

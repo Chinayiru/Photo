@@ -35,8 +35,9 @@ from typing import Any
 from .. import audit, guest as guestmod
 from ..core import Ctx, Reply, empty_reply, json_reply
 from ..core.ctx import CLOUD
-from ..errors import E1020, E2003, AppError, BadRequest, NotFound, Unauthorized
-from ..auth import require_owner
+from ..errors import (E1020, E1026, E2011, AppError, BadRequest,
+                      Unauthorized)
+from ..auth import require_owner, token_device_claim
 
 log = logging.getLogger(__name__)
 
@@ -92,22 +93,31 @@ async def create_invite(ctx: Ctx) -> Reply:
     st = _st(ctx)
     me = require_owner(ctx)
 
-    # ★ 审计 07f03d S-01：邀请**只能**在组网直连上生成。
+    # ★ BUG-1：这里以前按"通路"一刀切 —— `ctx.via == CLOUD` 直接 403，
+    #   而且用的是 `E2003 token_resource_mismatch`（"账号/设备/角色"三种
+    #   不匹配共用一个码，用户看不出该找谁）。主人的实际路径是**扫云端
+    #   二维码进"我的"页面**，于是这条规则把正常用法也挡了。
     #
-    # 云端通路也能打到这台电脑。如果不在服务端就地拒掉，任何一枚已配对
-    # 的令牌（包括设备表里 role=viewer 的旧客户端）都能远程给自己发新邀请，
-    # 于是「分享」这一步再也不需要碰这台机器。docs/11 拍板的是**服务端**
-    # 强制「主账号 + 组网连接」，页面隐藏只是顺带的 UX 约束。
-    if ctx.via == CLOUD:
-        log.warning("拒绝在云端生成游客邀请 via=%s", ctx.via)
-        raise AppError(
-            E2003, "邀请只能在局域网内生成：请在家里用局域网入口打开后再生成"
-        )
+    #   真正的边界分两层，都在这里和闸门里落实：
+    #     1) 角色：`require_owner` 现在要求 `role == "owner"`（E2007）；
+    #     2) 设备：凭证里的 `dev` 必须就是这台电脑（下面 E2008）。
+    #   通路不再是判据 —— 云端与组网走的是同一套身份，拒绝谁只取决于
+    #   他是谁、持有哪台电脑的凭证。
     body = await ctx.json(limit=4 * 1024)
     label = str(body.get("label") or "")[:64]
     minutes = body.get("minutes", 1440)
 
     device_id = _device_id(st)
+    # ★ BUG-1：身份与设备必须同源。凭证自报的 `dev` 与这台电脑不一致时，
+    #   拼出来的链接会指向**别人的**设备（扫码的人进不去，或者进到别人家）。
+    #   凭证缺失时 `token_dev` 为空串，交给下面的 `device_id` 判据处理，
+    #   不在这里凭空报错。
+    token_dev = token_device_claim(ctx, st.db, st.cfg)
+    if token_dev and device_id and token_dev != device_id:
+        # 不把凭证里的设备 id 写进日志（`check_lint` 规则 4）：它由令牌
+        # 派生，属于凭据取值。够用的事实是"两者不一致"。
+        log.warning("生成邀请的设备不符：凭证声明的设备不是这台电脑")
+        raise AppError(E2011, "这个凭证不属于这台电脑，请重新配对")
     if not device_id:
         # 没有云端设备 id 就没有"游客从哪儿进来"的地址。这不是用法问题，
         # 是配置问题：直接说清楚，别让用户对着"链接无效"猜。
@@ -199,7 +209,10 @@ async def kick_session(ctx: Ctx) -> Reply:
     if not client_id:
         raise BadRequest("缺少 client_id")
     if not guestmod.kick_session(st.db, client_id):
-        raise NotFound(client_id)
+        # ★ BUG-3：会话已撤销/已过期时原来回 404 not_found —— 用户点的是
+        #   列表里的一行，看起来就是"按钮坏了"。改成 409 + 明确文案，
+        #   前端据此刷新列表把它挪到"已退出"。
+        raise AppError(E1026, "这位游客已经不在线了")
     audit.record(
         st.db, st.cfg, audit.ACTION_GUEST_REVOKE,
         device=st.device_name, client_id=str(me.get("id") or ""),

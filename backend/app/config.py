@@ -68,6 +68,26 @@ ROOT_VISIBILITIES: Final[tuple[str, ...]] = ("owner", "guest")
 GUEST_MAX_ONLINE_DEFAULT: Final[int] = 3
 GUEST_MAX_ONLINE_MIN: Final[int] = 1
 GUEST_MAX_ONLINE_MAX: Final[int] = 10
+#: 「正在访问的游客」列表一次铺几条，超出的折叠（BUG-2）。
+#:
+#: 与 `guest.max_online` 是两件事：那个管「能不能进来」（服务端闸门），
+#: 这个只管「页面铺多长」（展示层）。主人拍了 P1 = 两者都是 3，因此在线
+#: 人数本身永远撞不到折叠线 —— 但列表里还包含**已退出**的历史会话
+#: （实测 17 行），折叠在那里就已经生效；等 `max_online` 放宽到 5 时
+#: 它同样立即生效。改这个值不需要动代码。
+GUEST_MAX_VISIBLE_DEFAULT: Final[int] = 3
+GUEST_MAX_VISIBLE_MIN: Final[int] = 1
+GUEST_MAX_VISIBLE_MAX: Final[int] = 10
+#: 「正在访问的游客」列表一次铺几条，超出的折叠（BUG-2）。
+#:
+#: 与 `guest.max_online` 是两件事：那个管「能不能进来」（服务端闸门），
+#: 这个只管「页面铺多长」（展示层）。主人拍了 P1 = 两者都是 3，因此在线
+#: 人数本身永远撞不到折叠线 —— 但列表里还包含**已退出**的历史会话
+#: （实测 17 行），折叠在那里就已经生效；等 `max_online` 放宽到 5 时
+#: 它同样立即生效。改这个值不需要动代码。
+GUEST_MAX_VISIBLE_DEFAULT: Final[int] = 3
+GUEST_MAX_VISIBLE_MIN: Final[int] = 1
+GUEST_MAX_VISIBLE_MAX: Final[int] = 10
 ROOT_MODES: Final[frozenset[str]] = frozenset({"readonly", "upload", "readwrite"})
 
 # --------------------------------------------------------------------------
@@ -179,6 +199,8 @@ DEFAULT_CONFIG: Final[dict[str, Any]] = {
     # 合法 1–10，越界钳制（见 `Config.guest_max_online`）。
     "guest": {
         "max_online": 3,
+        "max_visible": 3,
+        "max_visible": 3,
     },
     "roots": [],                    # [{id, path, label, mode, enabled, ...}]
     "upload": {
@@ -607,6 +629,36 @@ class Config:
         except (TypeError, ValueError):
             n = GUEST_MAX_ONLINE_DEFAULT
         return max(GUEST_MAX_ONLINE_MIN, min(GUEST_MAX_ONLINE_MAX, n))
+
+    @property
+    def guest_max_visible(self) -> int:
+        """「正在访问的游客」列表的展示上限（默认 3，合法 1–10）。
+
+        与 `guest_max_online` 同样钳制不抛错：这是运行期展示参数，
+        手误写成 30 的代价不该是服务起不来。实际生效值由
+        `/api/system/info` 回显，前端据此折叠。
+        """
+        raw = self.get("guest.max_visible", GUEST_MAX_VISIBLE_DEFAULT)
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            n = GUEST_MAX_VISIBLE_DEFAULT
+        return max(GUEST_MAX_VISIBLE_MIN, min(GUEST_MAX_VISIBLE_MAX, n))
+
+    @property
+    def guest_max_visible(self) -> int:
+        """「正在访问的游客」列表的展示上限（默认 3，合法 1–10）。
+
+        与 `guest_max_online` 同样钳制不抛错：这是运行期展示参数，
+        手误写成 30 的代价不该是服务起不来。实际生效值由
+        `/api/system/info` 回显，前端据此折叠。
+        """
+        raw = self.get("guest.max_visible", GUEST_MAX_VISIBLE_DEFAULT)
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            n = GUEST_MAX_VISIBLE_DEFAULT
+        return max(GUEST_MAX_VISIBLE_MIN, min(GUEST_MAX_VISIBLE_MAX, n))
 
     @property
     def guest_root(self) -> RootConfig | None:

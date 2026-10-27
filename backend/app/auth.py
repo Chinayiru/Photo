@@ -50,6 +50,7 @@ from .errors import (
     E1023,
     E2002,
     E2003,
+    E2010,
     E2004,
     E4004,
     AppError,
@@ -747,9 +748,35 @@ def require_owner(ctx: Ctx) -> dict[str, Any]:
     client = ctx.state.get("client")
     if not isinstance(client, dict):
         raise Unauthorized("缺少凭证")
-    if client.get("guest") or client.get("role") == "guest":
-        raise AppError(E2003, "游客无权执行该操作")
+    role = str(client.get("role") or "owner")
+    if client.get("guest") or role != "owner":
+        # ★ 审计 BUG-1：这里以前只挡 `guest`，于是**`role=viewer` 的旧客户端
+        #   令牌能通过**——那正是 S-01 当初按"通路"一刀切的真实动机。
+        #   角色在闸门处收干净之后，通路就不再需要当判据了（云端页面点
+        #   "生成邀请"是完全正常的用法：主人扫的就是云端二维码）。
+        log.warning("拒绝非主人调用主人接口 role=%s client=%s",
+                    role, client.get("id"))
+        raise AppError(E2010, "该操作只对这台电脑的主人开放")
     return client
+
+
+def token_device_claim(ctx: Ctx, db: Any, cfg: Any = None) -> str:
+    """取当前请求凭证里的 `dev` claim（**只验签，不比对设备**）。
+
+    BUG-1 需要它：`require_client` 用"这台电脑的 id"去验签，设备不匹配
+    时只会得到 None（→ 401 E2002），根本区分不出"设备不对"。这里把
+    同一个凭证再解一次，拿它自己声明的设备 id，交给调用方比对并报
+    E2011 —— 两条判断用的是同一枚令牌、同一组密钥，不存在"换个字段
+    再试一次"的兜底。
+    """
+    token = ctx.bearer_token() or ctx.cookie_token("pb_token") or ""
+    if not token:
+        return ""
+    for secret in _candidate_secrets(db, cfg):
+        claims = token_mod.verify_token(secret, token, device_id=None)
+        if claims is not None:
+            return str(claims.get("dev") or "")
+    return ""
 
 
 def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
