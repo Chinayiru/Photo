@@ -4,7 +4,7 @@
 
 | 编号 | 问题 | 这里的判据 |
 |---|---|---|
-| S-01 | 云端通路也能生成邀请 | `create_invite` 在 `via=cloud` 下 403，且**不写库** |
+| S-01 | 云端通路也能生成邀请 | 已由角色闸门（E2007）与设备校验（E2008）接管，见 `test_guest_three_bugs.py`；通路本身不再是判据 |
 | S-02 | 游客能改/删主库文件 | 中间件闸门把非 `/api/uploads/` 的写请求全部 403 |
 | S-03 | 游客上传落主库 | init 里请求的 `root` 被忽略，会话根 = 游客根 |
 | S-04 | 游客能读别的游客传的 | 列表按 `uploader_client_id` 收口；按 id 读越界 → 404 |
@@ -127,16 +127,25 @@ def _guest_session(st: AppState, client_id: str) -> None:
 
 # ---------------------------------------------------------------- S-01
 
-def test_invite_creation_is_rejected_on_the_cloud_path(tmp_path: Path) -> None:
+def test_invite_creation_works_from_the_cloud_page(tmp_path: Path) -> None:
+    """BUG-1：云端通路上生成邀请**必须成功**。
+
+    ★ 这条用例以前断言的正是"云端通路 → 403 E2003"，也就是 BUG-1 的病灶。
+      主人扫的二维码就是云端链接，"我的"页面本来就在云端页面上，那条规则
+      等于把唯一的正常入口封了；而错误码 `token_resource_mismatch` 又让人
+      以为是令牌坏了。S-01 要防的是"任何一枚已配对令牌都能远程发邀请"，
+      现在由 `require_owner`（role 必须 owner，E2007）与设备校验（E2008）
+      负责 —— 与走哪条通路无关。
+    """
     st = _state(tmp_path)
     ctx = _ctx(st, role="owner", via=CLOUD, method="POST",
                path="/api/guest/invites", body={"label": "x", "minutes": 60})
-    with pytest.raises(AppError) as exc:
-        asyncio.run(h_guest.create_invite(ctx))
-    assert exc.value.status == 403
-    assert exc.value.code == "E2003"
-    # 关键：拒绝发生在写库之前，库里不能留下半条邀请
-    assert st.db.query("SELECT id FROM guest_invites") == []
+    reply = asyncio.run(h_guest.create_invite(ctx))
+    assert reply.status == 200
+    body = json.loads(reply.body)
+    assert body["token"].startswith("pbg1.")
+    assert "#guest=" in body["link"]
+    assert st.db.query("SELECT id FROM guest_invites") != []
 
 
 def test_invite_creation_still_works_on_lan(tmp_path: Path) -> None:

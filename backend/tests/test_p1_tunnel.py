@@ -1037,7 +1037,10 @@ def test_tunnel_requires_client_token(rig_factory) -> None:
         assert body["error"]["code"] == "E2002", (name, body)
     assert out["bad_token"][0] == 401, out["bad_token"]
     assert out["other_device"][0] == 403, out["other_device"]
-    assert out["other_device"][1]["error"]["code"] == "E2003", \
+    # 中继把 E2003 细分成 E2011（同账号别的设备）/ E2012（别的账号），
+    # 审计 BUG-1 要求这三种"不匹配"可区分。测试装置里的设备不属于同一
+    # 账号，因此这里应当是 E2009。
+    assert out["other_device"][1]["error"]["code"] == "E2012", \
         out["other_device"]
     assert out["ok"][0] == 200, out["ok"]
 

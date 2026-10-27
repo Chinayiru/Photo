@@ -245,11 +245,38 @@ def test_slots_are_released_when_the_relay_raises(rig, monkeypatch) -> None:
 
 
 def test_token_for_another_device_is_still_403(rig) -> None:
-    """形状检查不能把归属校验（`row["device_id"] != 路径`) 挤掉。"""
+    """形状检查不能把归属校验（`row["device_id"] != 路径`) 挤掉。
+
+    ★ 码从 E2003 细化成 E2009（另一个账号的设备）：审计 BUG-1 要求"账号
+      不匹配/设备不匹配/角色不符"可区分，一个 `token_resource_mismatch`
+      盖住三种，用户不知道该找谁。这是一句诊断细分，不是放宽拒绝。
+    """
     rig.row = {"id": CLIENT, "device_id": "b" * 32}
     resp = rig.handle(f"/d/{DEV}/api/timeline", token=GOOD)
     assert resp.status_code == 403
-    assert _err(resp)["code"] == "E2003"
+    assert _err(resp)["code"] == "E2012"
+
+
+class _AccountDb:
+    """只回答"这台设备属于哪个账号"的最小 DB 替身。"""
+
+    def __init__(self, accounts: dict) -> None:
+        self._accounts = accounts
+
+    def query_one(self, sql: str, args=()):
+        if "FROM devices" not in sql or not args:
+            return None
+        acct = self._accounts.get(str(args[0]))
+        return {"account_id": acct} if acct else None
+
+
+def test_another_device_of_the_same_account_is_E2008(rig) -> None:
+    """同一账号下的另一台电脑 → E2008（他大概点错了设备）。"""
+    rig.row = {"id": CLIENT, "device_id": "b" * 32}
+    rig.f.db = _AccountDb({"b" * 32: "acct-1", DEV: "acct-1"})
+    resp = rig.handle(f"/d/{DEV}/api/timeline", token=GOOD)
+    assert resp.status_code == 403
+    assert _err(resp)["code"] == "E2011"
 
 
 # --------------------------------------------------------------- 阈值本身

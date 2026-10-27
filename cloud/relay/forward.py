@@ -283,6 +283,26 @@ class Forwarder:
         self.uploads = UploadLimiter()
         self.meter = TrafficMeter(db)
 
+    def _accounts_match(self, a: str, b: str) -> bool:
+        """两台设备是否属于同一个账号（只用于把 403 拆成 E2011/E2012）。
+
+        ★ 只做"结论细分"，不做放行判断：调用点已经在拒绝分支里了，
+          这个函数回答的只是"该说哪一种不对"。所以查不到账号、或
+          测试替身根本没有 DB（`db=object()`）时一律按"不同账号"报，
+          宁可让文案偏严，也不让一次诊断查询把拒绝变成 500。
+        """
+        q = getattr(self.db, "query_one", None)
+        if q is None:
+            return False
+        try:
+            mine = q("SELECT account_id FROM devices WHERE id = ?", (a,))
+            theirs = q("SELECT account_id FROM devices WHERE id = ?", (b,))
+        except Exception:  # noqa: BLE001 - 诊断失败不该改变"拒绝"这个结论
+            return False
+        if not mine or not theirs:
+            return False
+        return str(mine["account_id"]) == str(theirs["account_id"])
+
     async def handle(self, request: Request, device_id: str) -> Response:
         rid = request.headers.get("x-request-id") or ""
 
@@ -341,7 +361,16 @@ class Forwarder:
         if str(row["device_id"]) != device_id:
             # ★ 没有这一步，手机上任何一次配对都能读**别的**设备。
             # 令牌里的 device_id 是唯一可信的归属，路径里的只是它想访问的。
-            return _error(403, "E2003", "无权访问该设备", request_id=rid)
+            #
+            # ★ 审计 BUG-1：两种"不对"要分开报，否则只剩一句含糊的
+            #   `token_resource_mismatch`：
+            #     · 同一账号下的另一台电脑 → E2011（他大概点错了设备）
+            #     · 另一个账号的电脑       → E2012（这枚令牌不是这个账号的）
+            if self._accounts_match(str(row["device_id"]), device_id):
+                return _error(403, "E2011", "配对不属于这台电脑",
+                              request_id=rid)
+            return _error(403, "E2012", "登录的账号无权访问这台电脑",
+                          request_id=rid)
         client_id = str(row["id"])
 
         # ---- 4 频率 ----

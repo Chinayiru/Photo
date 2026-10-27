@@ -230,6 +230,13 @@ async def info(ctx: Ctx) -> Reply:
             "bind_scope": _bind_scope(host),
         },
         "limits": st.limits_info(),
+        # 游客面板的两个数字：能进来几个人（`max_online`，服务端闸门）
+        # 与列表铺几条（`max_visible`，超出折叠）。游客面板要按它渲染，
+        # 所以只给主人；游客自己是看不见这节的。
+        "guest": {} if guest else {
+            "max_online": cfg.guest_max_online,
+            "max_visible": cfg.guest_max_visible,
+        },
         # 电脑端外壳的状态。手机端在"设置 → 电脑端"里展示，
         # 让用户知道自启有没有生效（他没法直接看电脑的注册表）。
         "host_app": {} if guest else _host_app_info(),

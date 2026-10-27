@@ -89,6 +89,13 @@ E1024: Final = ErrorSpec(
 E1025: Final = ErrorSpec(
     "E1025", 429, "guest_invite_quota_full",
     "未使用的邀请已达上限，请先撤销一条再生成")
+#: 踢出时这位游客已经不在线（会话已撤销或已过期）。
+#:
+#: ★ 为什么不用 E1004 not_found：主人点的是列表里的一行，那个 client_id
+#:   必然存在过，"找不到"在语义上是错的（用户会以为按钮坏了）；而且 404
+#:   顺带泄露"这个 id 在不在库里"。409 + 一句能读懂的话两头都顾到。
+E1026: Final = ErrorSpec(
+    "E1026", 409, "guest_session_offline", "这位游客已经不在线了")
 
 # --- E2xxx 认证/授权类 ------------------------------------------------------
 E2001: Final = ErrorSpec("E2001", 401, "account_token_invalid", "登录已过期，请重新登录")
@@ -97,6 +104,20 @@ E2003: Final = ErrorSpec("E2003", 403, "token_resource_mismatch", "无权访问�
 E2004: Final = ErrorSpec("E2004", 403, "token_revoked", "该设备已被移除，请重新配对")
 E2005: Final = ErrorSpec("E2005", 401, "bad_credentials", "邮箱或密码错误")
 E2006: Final = ErrorSpec("E2006", 403, "device_revoked", "该电脑已从账号中移除")
+#: 下面三个都表示"凭证本身有效，但用途不对"，必须分开报（BUG-1）：
+#: 合成一个码的结果是用户和日志都只能看到 `token_resource_mismatch`，
+#: 既不知道该找账号、找设备还是找权限，也分不清是"我点错电脑了"还是
+#: "我拿的是别人的链接"。
+#:
+#: ★ 编号从 E2010 起，不用 E2007–E2009：E2007 已被中继的
+#:   "电脑当前不在线"（503）占用，同一号两种语义会让排障更乱。
+E2010: Final = ErrorSpec(
+    "E2010", 403, "owner_required", "该操作只对这台电脑的主人开放")
+E2011: Final = ErrorSpec(
+    "E2011", 403, "device_mismatch", "这个凭证不属于这台电脑，请重新配对")
+E2012: Final = ErrorSpec(
+    "E2012", 403, "account_mismatch", "登录的账号不是这台电脑的主人")
+
 
 # --- E3xxx 服务端/资源类 ----------------------------------------------------
 E3001: Final = ErrorSpec("E3001", 500, "internal_error", "服务器开小差了，请重试", retryable=True)
@@ -148,7 +169,7 @@ SPECS: Final[dict[str, ErrorSpec]] = {
     for s in (
         E1001, E1002, E1003, E1004, E1005, E1006, E1007, E1008, E1009,
         E1010, E1011, E1012, E1013, E1014, E1015, E1016, E1017, E1018,
-        E1019, E1020, E1021, E1022, E1023, E1024, E1025,
+        E1019, E1020, E1021, E1022, E1023, E1024, E1025, E1026, E2010, E2011, E2012,
         E2001, E2002, E2003, E2004, E2005, E2006,
         E3001, E3002, E3003, E3004, E3005, E3006, E3007, E3008, E3009,
         E3010, E3011, E3012,
