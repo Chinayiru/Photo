@@ -64,6 +64,8 @@ class Route:
     pattern: str
     handler: Handler
     name: str = ""
+    # 谁能调：`owner` 只有主人，`guest` 游客也允许（只读 + 上传）。
+    audience: str = "owner"
     regex: Pattern[str] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -135,8 +137,15 @@ class Router:
     # ------------------------------------------------------------------
 
     def add(self, method: str, pattern: str, handler: Handler,
-            *, name: str = "") -> Route:
-        r = Route(method.upper(), pattern, handler, name or handler.__name__)
+            *, name: str = "", audience: str = "owner") -> Route:
+        # 默认 `owner`（只有主人）：漏标的下场是"游客少个功能"，
+        # 反过来默认 `guest` 漏标一次就是越权。所以默认值往保守里取。
+        if audience not in ("owner", "guest"):
+            raise ValueError(
+                f"路由 {name or pattern} 的 audience={audience!r} 非法（只能 owner/guest）"
+            )
+        r = Route(method.upper(), pattern, handler, name or handler.__name__,
+                  audience=audience)
         self._routes.append(r)
         if "{" not in pattern:
             self._exact[(r.method, pattern.rstrip("/") or "/")] = r
@@ -255,6 +264,14 @@ class Router:
     # ------------------------------------------------------------------
     # 匹配
     # ------------------------------------------------------------------
+
+    def audience_of(self, method: str, path: str) -> str:
+        """这条路径属于谁。匹配不到时按 `owner`（宁可多挡）。"""
+        try:
+            route, _ = self.match(method, path)
+        except NotFoundRoute:
+            return "owner"
+        return route.audience
 
     def match(self, method: str, path: str) -> tuple[Route, dict[str, str]]:
         """返回 (路由, 路径参数)。匹配不到抛 NotFoundRoute。"""
