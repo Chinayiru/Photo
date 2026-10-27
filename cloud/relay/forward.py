@@ -623,7 +623,15 @@ class Forwarder:
                 if finished:
                     _reap(pump, pending, conn, cancel)
                 else:
-                    await _abort(conn, pending, cancel, pump)
+                    # ★ 不能在**已取消**的生成器的 finally 里 `await`：取消传播
+                    #   中任何 await 都会立刻再抛 CancelledError，`_abort` 半途
+                    #   而废 —— CANCEL 帧发不出去，电脑端那条流继续写到它自己的
+                    #   总超时，隧道连接一直占着。实测「打开再关掉」32 次之后，
+                    #   新的合法订阅就开始 429。
+                    #   改成独立任务：它与这次取消无关地跑完，异常只记日志。
+                    _abort_task = asyncio.create_task(
+                        _abort(conn, pending, cancel, pump))
+                    _abort_task.add_done_callback(_swallow_abort_error)
 
         media_type = headers.pop("content-type", None)
         resp = StreamingResponse(body_iter(), status_code=status,
@@ -903,6 +911,15 @@ class _ByteCounter:
 
     def __init__(self) -> None:
         self.total = 0
+
+
+def _swallow_abort_error(task: "asyncio.Task[None]") -> None:
+    """`_abort` 是收尾动作：失败只记日志，不能冒泡成未处理的任务异常。"""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.warning("取消订阅时向电脑端发 CANCEL 失败：%s", exc)
 
 
 def _release_with_body(resp: Response, release: "_Once") -> Response:
