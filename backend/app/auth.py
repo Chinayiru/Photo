@@ -1144,8 +1144,10 @@ def _enforce_audience(ctx: Ctx, client: dict[str, Any]) -> None:
     """
     if not client.get("guest"):
         return
+    from .core.dispatch import active_router
+
     audience = "owner"
-    router = getattr(ctx.app, "router", None)
+    router = active_router()
     if router is not None:
         try:
             audience = router.audience_of(ctx.method, ctx.path)

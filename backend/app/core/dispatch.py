@@ -94,6 +94,19 @@ class NotFoundRoute(Exception):
     """内部信号：路径没匹配到任何路由（用于区分 404 与 405）。"""
 
 
+_ACTIVE_ROUTER: "Router | None" = None
+
+
+def active_router() -> "Router | None":
+    """最近一次 `bind_app()` 的路由表。
+
+    ★ 为什么不从 `ctx.app.router` 取：`AppState` 上没有这个属性（路由表是用
+      `router.bind_app(st)` 绑进去的），`getattr` 会拿 None，于是 audience 一律
+      退化成 `owner` —— 2026-10-28 游客后续接口全 404 就是这么来的。
+    """
+    return _ACTIVE_ROUTER
+
+
 class Router:
     """路由集合 + 中间件 + 统一异常收敛。
 
@@ -451,6 +464,8 @@ class Router:
 
     def bind_app(self, app: Any) -> None:
         """注入共享依赖容器。装配顺序上 Router 可能先于 AppState 建好。"""
+        global _ACTIVE_ROUTER
+        _ACTIVE_ROUTER = self
         self.app = app
 
     def describe(self) -> list[str]:
