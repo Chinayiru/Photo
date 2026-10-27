@@ -138,15 +138,19 @@ def test_same_request_on_lan_still_works(tmp_path: Path) -> None:
     assert asyncio.run(h_guest.create_invite(ctx)).status == 200
 
 
-def test_viewer_role_gets_owner_required_not_the_old_generic_code(tmp_path: Path) -> None:
-    """角色不符 → E2010（旧码 E2003 把三种不匹配都盖住了）。"""
+def test_viewer_role_can_still_manage_invites(tmp_path: Path) -> None:
+    """`viewer` 必须能用。
+
+    ★ 这条用例原本断言 `viewer → E2010`，是错的：配对时只有**第一台**
+      设备拿到 `role="owner"`，之后每台都是 `viewer`，于是"主人的第二部
+      手机"会被挡在邀请管理之外 —— 那正是 BUG-1 要修的场景（手机从云端
+      页面点"生成邀请"）。真要防的是"别的设备/别的账号"，由 E2011/E2012
+      与 `token_device_claim` 守。
+    """
     st = _state(tmp_path)
     ctx = _ctx(st, role="viewer", method="POST",
                path="/api/guest/invites", body={"label": "x", "minutes": 60})
-    with pytest.raises(AppError) as exc:
-        asyncio.run(h_guest.create_invite(ctx))
-    assert (exc.value.status, exc.value.code) == (403, "E2010")
-    assert st.db.query("SELECT id FROM guest_invites") == []
+    assert asyncio.run(h_guest.create_invite(ctx)).status == 200
 
 
 def test_guest_role_gets_owner_required(tmp_path: Path) -> None:

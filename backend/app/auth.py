@@ -749,12 +749,17 @@ def require_owner(ctx: Ctx) -> dict[str, Any]:
     if not isinstance(client, dict):
         raise Unauthorized("缺少凭证")
     role = str(client.get("role") or "owner")
-    if client.get("guest") or role != "owner":
-        # ★ 审计 BUG-1：这里以前只挡 `guest`，于是**`role=viewer` 的旧客户端
-        #   令牌能通过**——那正是 S-01 当初按"通路"一刀切的真实动机。
-        #   角色在闸门处收干净之后，通路就不再需要当判据了（云端页面点
-        #   "生成邀请"是完全正常的用法：主人扫的就是云端二维码）。
-        log.warning("拒绝非主人调用主人接口 role=%s client=%s",
+    if client.get("guest") or role == "guest":
+        # ★ 这里只挡**游客**，不挡 `viewer`。理由是被实践推翻过一次：
+        #   配对时只有第一台设备拿到 `role="owner"`，之后每台都是
+        #   `viewer`（`backend/app/auth.py` 的配对分支按"是否已有 owner"
+        #   决定）。把 `viewer` 一起挡掉的结果是**主人的第二部手机发不出
+        #   邀请**——而"从手机云端页面点生成邀请"正是 BUG-1 的现场。
+        #   `viewer` 的语义是"这台电脑上后来的只读客户端"，它仍然是主人
+        #   拿本机配对码加进来的，与"外来的陌生人"不是一回事。
+        #   跨设备/跨账号由 `E2011`/`E2012` 与 `create_invite` 里的
+        #   `token_device_claim` 校验守着，那些才是真正的越权面。
+        log.warning("拒绝游客调用主人接口 role=%s client=%s",
                     role, client.get("id"))
         raise AppError(E2010, "该操作只对这台电脑的主人开放")
     return client
