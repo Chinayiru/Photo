@@ -65,6 +65,11 @@ __all__ = [
     "ACTIONS",
     "ACTION_CONFIG",
     "ACTION_DELETE",
+    "ACTION_GUEST_DENIED",
+    "ACTION_GUEST_ENTER",
+    "ACTION_GUEST_INVITE",
+    "ACTION_GUEST_REVOKE",
+    "ACTION_GUEST_UPLOAD",
     "ACTION_MOVE",
     "ACTION_PAIR",
     "ACTION_RENAME",
@@ -93,6 +98,16 @@ ACTION_PAIR: Final = "pair"
 ACTION_REVOKE: Final = "revoke"
 ACTION_UPLOAD_REJECT: Final = "upload_reject"
 
+#: 游客访问（ISSUE-063）。六类事件在库里收敛成五个动作：
+#: 生成链接 / 兑换链接 / 游客上传 / 撤销（含踢出）/ 越权被拒。
+#: 只在 `detail` 里区分"撤销邀请"与"踢出会话"，因为两者对审计读者的意义
+#: 完全一样（某个游客的访问被终止了），多一个动作只会多一处要同步的 CHECK。
+ACTION_GUEST_INVITE: Final = "guest_invite"
+ACTION_GUEST_ENTER: Final = "guest_enter"
+ACTION_GUEST_UPLOAD: Final = "guest_upload"
+ACTION_GUEST_REVOKE: Final = "guest_revoke"
+ACTION_GUEST_DENIED: Final = "guest_denied"
+
 #: 必须与 `db.py` 的 `audit_log.action` CHECK 约束**逐字一致**。
 #: 往表里写一个 CHECK 不接受的动作会抛 IntegrityError，
 #: 而写表失败是被容忍的（只记日志）—— 于是记录静默消失。
@@ -107,6 +122,11 @@ ACTIONS: Final[frozenset[str]] = frozenset({
     ACTION_PAIR,
     ACTION_REVOKE,
     ACTION_UPLOAD_REJECT,
+    ACTION_GUEST_INVITE,
+    ACTION_GUEST_ENTER,
+    ACTION_GUEST_UPLOAD,
+    ACTION_GUEST_REVOKE,
+    ACTION_GUEST_DENIED,
 })
 
 #: 文件与表都是多线程可达的：handlers 在事件循环上跑，

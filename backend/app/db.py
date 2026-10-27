@@ -98,6 +98,9 @@ CREATE TABLE IF NOT EXISTS media (
   -- moov 是否在 mdat 之前（1=是，0=否，NULL=未知/没探过）。0 表示未做
   -- faststart：播放器得先读到文件尾才能起播，跨网络时表现为长时间转圈。
   faststart   INTEGER CHECK (faststart IS NULL OR faststart IN (0,1)),
+  -- 上传者（ISSUE-063 G4）：游客只能看到自己上传的。主人自己上传的为空串，
+  -- 因为"主人"不是一根可以跨设备比较的身份 —— 主人本来就该看到全部。
+  uploader_client_id TEXT NOT NULL DEFAULT '',
   thumb_state TEXT    NOT NULL DEFAULT 'pending'
                 CHECK (thumb_state IN ('pending','ok','failed')),
   thumb_etag  TEXT,                              -- 缩略图内容哈希（用于强 ETag + URL 版本参数）
@@ -226,7 +229,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
   client_id   TEXT,
   action      TEXT NOT NULL
                 CHECK (action IN ('upload','delete','move','rename','rescan',
-                                  'config','pair','revoke','upload_reject')),
+                                  'config','pair','revoke','upload_reject',
+                                  'guest_invite','guest_enter','guest_upload',
+                                  'guest_revoke','guest_denied')),
   rel_path    TEXT,
   detail      TEXT
 );
@@ -295,6 +300,68 @@ CREATE INDEX IF NOT EXISTS idx_pair_codes_expires ON pair_codes(expires_at);
 CREATE INDEX IF NOT EXISTS idx_pair_codes_device  ON pair_codes(device_id, used_at);
 
 -- ============================================================
+-- guest_invites / guest_sessions / guest_upload_log：游客访问（ISSUE-063）
+--
+-- 为什么三张表而不是往 devices 里塞 role='guest'：
+--   `devices` 的语义是"我有权限的手机"，它会进「我的设备」列表、参与令牌撤销
+--   与 last_seen 统计。游客是**别人**的手机，撤一次邀请不该出现在
+--   "已配对设备"里，也不该继承那套"每台设备一枚长命令牌"的心智。
+--
+-- 为什么邀请与会话分开：
+--   邀请（guest_invites）是**链接**，一次性、可撤销；会话（guest_sessions）是
+--   **浏览器**，一个链接换一根，各自有 TTL。合并成一张表就没法表达
+--   "链接已用掉但会话还在跑"（G11 解释 A）。
+-- ============================================================
+-- >>> guest-schema（由 guest_schema() 原样取出供迁移 9 复用，勿手工移除标记）
+CREATE TABLE IF NOT EXISTS guest_invites (
+  id              TEXT PRIMARY KEY,              -- 32 hex
+  device_id       TEXT NOT NULL,                 -- 哪台电脑（绑定，不可换）
+  token_hash      TEXT NOT NULL UNIQUE,          -- sha256(明文 token)，明文不落库
+  label           TEXT NOT NULL DEFAULT '',      -- 主人给的备注，如"给老王"
+  created_at      REAL NOT NULL,
+  expires_at      REAL NOT NULL,                 -- 从**生成时刻**起算（G12）
+  first_used_at   REAL,                          -- 首次兑换时间；非空即"已使用"
+  revoked_at      REAL,
+  guest_client_id TEXT,                          -- 首次兑换时绑定的会话
+  created_via     TEXT NOT NULL DEFAULT 'lan'
+                    CHECK (created_via IN ('lan','cloud'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_guest_invites_expires ON guest_invites(expires_at);
+
+CREATE TABLE IF NOT EXISTS guest_sessions (
+  client_id  TEXT PRIMARY KEY,                   -- 32 hex，等于令牌的 sub
+  token_hash TEXT NOT NULL UNIQUE,
+  invite_id  TEXT NOT NULL REFERENCES guest_invites(id) ON DELETE CASCADE,
+  device_id  TEXT NOT NULL,
+  label      TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  expires_at REAL NOT NULL,
+  last_seen  REAL,
+  revoked_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_guest_sessions_invite
+  ON guest_sessions(invite_id);
+
+-- 游客上传台账：用于「每日字节配额」与「谁传了什么」的审计追溯。
+-- media_id 置空是**故意**的：游客删不了文件，但主人可能把媒体记录清掉，
+-- 台账要留下"某天某人传过多大一个文件"这件事本身。
+CREATE TABLE IF NOT EXISTS guest_upload_log (
+  id         INTEGER PRIMARY KEY,
+  client_id  TEXT NOT NULL,
+  root_id    TEXT NOT NULL,
+  media_id   INTEGER REFERENCES media(id) ON DELETE SET NULL,
+  rel_path   TEXT NOT NULL,
+  size       INTEGER NOT NULL CHECK (size >= 0),
+  created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_guest_upload_client
+  ON guest_upload_log(client_id, created_at);
+-- <<< guest-schema
+
+-- ============================================================
 -- albums / tags：一期建表不暴露接口，二期启用
 -- ============================================================
 CREATE TABLE IF NOT EXISTS albums (
@@ -349,6 +416,40 @@ def media_ddl(table: str = "media") -> str:
         raise RuntimeError("SCHEMA 里找不到 media 表定义")
     return m.group(0).replace(
         "CREATE TABLE IF NOT EXISTS media", f"CREATE TABLE {table}", 1
+    )
+
+
+#: 游客三表的建表语句，从 `SCHEMA` 里**就地取出**（与 `media_ddl()` 同理）。
+#:
+#: 为什么不在迁移里再写一份 DDL：新库走 `executescript(SCHEMA)`、老库走迁移，
+#: 两条路必须是同一段文本。分开写就会漂移，而漂移只在"老库升级"时暴露。
+_GUEST_SCHEMA_RE: Final[re.Pattern[str]] = re.compile(
+    r"-- >>> guest-schema.*?\n(.*?)-- <<< guest-schema", re.DOTALL
+)
+
+
+def guest_schema() -> str:
+    """`SCHEMA` 里游客三张表的建表语句（供迁移 9 复用）。"""
+    m = _GUEST_SCHEMA_RE.search(SCHEMA)
+    if m is None:  # pragma: no cover —— 只会在有人删掉标记时发生
+        raise RuntimeError("SCHEMA 里找不到 guest-schema 标记")
+    return m.group(1)
+
+
+#: audit_log 的建表语句，同样就地取出：迁移 11 重建表时 CHECK 必须与新库一致，
+#: 否则会出现"新库能记 guest_upload、升级库记不进去"的静默丢审计。
+_AUDIT_DDL_RE: Final[re.Pattern[str]] = re.compile(
+    r"CREATE TABLE IF NOT EXISTS audit_log \(.*?\n\);", re.DOTALL
+)
+
+
+def audit_ddl(table: str = "audit_log") -> str:
+    """`SCHEMA` 里 audit_log 的建表语句（可改表名，供迁移重建用）。"""
+    m = _AUDIT_DDL_RE.search(SCHEMA)
+    if m is None:  # pragma: no cover
+        raise RuntimeError("SCHEMA 里找不到 audit_log 表定义")
+    return m.group(0).replace(
+        "CREATE TABLE IF NOT EXISTS audit_log", f"CREATE TABLE {table}", 1
     )
 
 
@@ -578,6 +679,55 @@ def _m_008_audit_log_actions(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m_009_guest_tables(conn: sqlite3.Connection) -> None:
+    """新建游客三表（ISSUE-063）。新库由 `SCHEMA` 建，老库在这里补。"""
+    conn.executescript(guest_schema())
+
+
+def _m_010_media_uploader_client_id(conn: sqlite3.Connection) -> None:
+    """media 增 `uploader_client_id`（G4：游客只看自己上传的）+ 过滤索引。
+
+    索引必须建在**补完列之后**：`executescript(SCHEMA)` 跑在迁移之前，把索引
+    写进 `SCHEMA` 会让老库启动时报 `no such column`（`idx_devices_expires`
+    就是这么踩过的，见 `SCHEMA` 里那段注释）。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(media)")}
+    if "uploader_client_id" not in cols:
+        log.info("迁移 media：新增 uploader_client_id 列")
+        conn.execute(
+            "ALTER TABLE media ADD COLUMN uploader_client_id TEXT NOT NULL"
+            " DEFAULT ''"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_media_uploader"
+        "  ON media(root_id, uploader_client_id, taken_at DESC, id DESC)"
+    )
+
+
+def _m_011_audit_log_guest_actions(conn: sqlite3.Connection) -> None:
+    """audit_log 补齐 guest_* 动作（CHECK 约束只能重建表）。"""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='audit_log'"
+    ).fetchone()
+    if not (row and row[0] and "'guest_invite'" not in row[0]):
+        return
+    log.info("迁移 audit_log：新增 guest_* 动作")
+    ddl = audit_ddl("audit_log").rstrip().rstrip(";")
+    conn.executescript(
+        "ALTER TABLE audit_log RENAME TO audit_log_old;"
+        + ddl
+        + ";"
+        "INSERT INTO audit_log(id, ts, device_name, client_id, action,"
+        "                      rel_path, detail)"
+        "  SELECT id, ts, device_name, client_id, action, rel_path, detail"
+        "    FROM audit_log_old;"
+        "DROP TABLE audit_log_old;"
+        "CREATE INDEX IF NOT EXISTS idx_audit_ts     ON audit_log(ts DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action, ts DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_audit_path   ON audit_log(rel_path, ts DESC);"
+    )
+
+
 #: 全部迁移，**按版本号严格递增**。新增迁移只能往后追加，已发布的迁移禁止修改
 #: （checksum 会拦住）。
 MIGRATIONS: Final[tuple[Migration, ...]] = (
@@ -596,6 +746,11 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
               _m_007_media_faststart),
     Migration(8, "008_audit_log_actions", "fbcd4a3c839e07a1",
               _m_008_audit_log_actions),
+    Migration(9, "009_guest_tables", "67f9ec25e570c954", _m_009_guest_tables),
+    Migration(10, "010_media_uploader_client_id", "bfccd1785448bf2f",
+              _m_010_media_uploader_client_id),
+    Migration(11, "011_audit_log_guest_actions", "57e00ff588f9b20a",
+              _m_011_audit_log_guest_actions),
 )
 
 #: 当前 schema 版本 = 账本里最后一版。`init()` 跑完后 `schema_version()` 应等于它。
