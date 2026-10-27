@@ -33,6 +33,7 @@ import type {
   UploadStatusResponse,
 } from "../api/types";
 import { createStore } from "./index";
+import { errorText } from "../api/errorText";
 
 export type TaskStatus =
   | "PENDING"    // 等待调度
@@ -265,7 +266,7 @@ async function runTask(task: UploadTask): Promise<void> {
     } else if (statusOf(task) !== "PAUSED") {
       const err = e instanceof ApiError ? e : null;
       task.status = "FAILED";
-      task.error = err?.friendly ?? (e instanceof Error ? e.message : "上传失败");
+      task.error = errorText(e, "上传失败");
       // ★ 失败后把服务端的会话还回去（审计 F6）。
       //
       // 服务端 `MAX_OPEN_SESSIONS = 3`，数的是 `status='open'` 的行。

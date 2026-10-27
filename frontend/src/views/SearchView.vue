@@ -12,7 +12,7 @@
  */
 import { computed, onBeforeUnmount, ref } from "vue";
 import PhotoGrid from "../components/PhotoGrid.vue";
-import { ApiError, api } from "../api/client";
+import { api } from "../api/client";
 import type { MediaItem, SearchResponse } from "../api/types";
 import { groupByDay } from "../stores/timeline";
 import { open as openViewer } from "../stores/viewer";
@@ -24,6 +24,7 @@ import {
   selectionStore,
   toggle as toggleSelect,
 } from "../stores/selection";
+import { errorText } from "../api/errorText";
 
 const q = ref("");
 const from = ref("");
@@ -165,7 +166,7 @@ async function run(reset = true): Promise<void> {
     hasMore.value = Boolean(r.has_more) && Boolean(r.next_cursor);
     searched.value = true;
   } catch (e) {
-    error.value = e instanceof ApiError ? e.friendly : "搜索失败";
+    error.value = errorText(e, "搜索失败");
   } finally {
     loading.value = false;
   }

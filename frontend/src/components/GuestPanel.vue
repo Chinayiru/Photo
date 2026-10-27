@@ -25,6 +25,7 @@ import { computed, onMounted, ref } from "vue";
 import { ApiError, api } from "../api/client";
 import { copyText } from "../api/clipboard";
 import { toastError, toastOk, toastWarn } from "../stores/toast";
+import { errorText } from "../api/errorText";
 
 interface InviteRow {
   invite_id: string;
@@ -273,7 +274,7 @@ async function copy(text: string): Promise<void> {
 function guestError(e: unknown, fallback: string): string {
   if (!(e instanceof ApiError)) return fallback;
   if (e.code === "E1012") return "还没配置游客目录，请先在电脑上设好 visibility=guest 的根";
-  return e.message || fallback;
+  return errorText(e, fallback);
 }
 
 function fmtTime(sec: number | null): string {

@@ -29,6 +29,7 @@ import { ApiError, api } from "../api/client";
 import type { DeleteResponse } from "../api/types";
 import { createStore } from "./index";
 import { toastError, toastOk, toastWarn } from "./toast";
+import { errorText } from "../api/errorText";
 
 /**
  * 一次最多能选多少张。
@@ -153,9 +154,9 @@ export function deleteErrorMessage(e: unknown): string {
     if (e.code === "E1015") {
       return "电脑端没开「允许手机删除」，请到电脑上打开这个开关";
     }
-    return e.userHint || e.friendly || "删除失败";
+    return errorText(e, "删除失败");
   }
-  return e instanceof Error ? e.message : "删除失败";
+  return errorText(e, "删除失败");
 }
 
 /** 删除结果的一句话总结。 */
