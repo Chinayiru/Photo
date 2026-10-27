@@ -723,9 +723,16 @@ async def stream_video(ctx: Ctx) -> Reply:
     if ticket and not streamticket.verify(st.db, ticket, mid):
         raise Unauthorized("播放票无效或已过期，请重新打开视频")
 
-    row = st.db.query_one("SELECT kind FROM media WHERE id = ?", (mid,))
-    if row is not None and videomod.row_kind(row) != "video":
-        raise AppError(E1001, "该条目不是视频")
+    # ★ 顺序有讲究：**先判归属，再判类型**。反过来（先判 kind）会让游客
+    #   用 400「该条目不是视频」与 404「不存在」的差别试探出哪些 id 存在 ——
+    #   这正是 BUG-2 要求"越权响应与不存在不可区分"要堵的洞。
+    row = st.db.query_one(
+        "SELECT id, root_id, kind, missing FROM media WHERE id = ?", (mid,))
+    if row is not None:
+        st.cfg.root_by_id(row["root_id"], allow_disabled=False)
+        common.check_media_visible(ctx, st, row)
+        if videomod.row_kind(row) != "video":
+            raise AppError(E1001, "该条目不是视频")
     return await get_raw(ctx)
 
 
