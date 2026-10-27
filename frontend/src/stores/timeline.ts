@@ -14,9 +14,10 @@
  */
 
 import { computed } from "vue";
-import { ApiError, api } from "../api/client";
+import { api } from "../api/client";
 import type { FolderEntry, FoldersResponse, MediaItem, TimelineResponse } from "../api/types";
 import { createStore } from "./index";
+import { errorText } from "../api/errorText";
 
 /** 内存里最多保留的条目数（docs/03 §5.3.2）。超过就丢最旧的。 */
 const MAX_ITEMS = 1500;
@@ -132,8 +133,7 @@ export function loadMore(reset = false): Promise<void> {
       trim();
     } catch (e) {
       if (gen !== generation) return;
-      const err = e instanceof ApiError ? e : null;
-      s.error = err?.friendly ?? "加载失败";
+      s.error = errorText(e, "加载失败");
       // 失败时不要置 hasMore=false：用户滚到底还能再试
       s.loaded = true;
     } finally {

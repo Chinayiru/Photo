@@ -31,6 +31,7 @@ import {
 } from "../stores/system";
 import { clearTimeline } from "../stores/timeline";
 import { toastError, toastOk, toastWarn } from "../stores/toast";
+import { errorText } from "../api/errorText";
 
 const s = systemStore.state;
 const info = computed(() => s.info);
@@ -110,7 +111,7 @@ async function onRescan(): Promise<void> {
     } else if (e instanceof ApiError && e.message === "刚刚已经触发过了") {
       toastWarn("刚刚已经触发过了，稍等一下");
     } else {
-      toastError(e instanceof Error ? e.message : "扫描失败");
+      toastError(errorText(e, "扫描失败"));
     }
   }
 }

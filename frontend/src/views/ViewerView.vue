@@ -37,6 +37,7 @@ import {
 } from "../stores/viewer";
 import { toastError, toastOk, toastWarn } from "../stores/toast";
 import { safeUrl } from "../lib/safeUrl";
+import { errorText } from "../api/errorText";
 
 const s = viewerStore.state;
 const isOpen = computed(() => s.open);
@@ -324,7 +325,7 @@ async function startTranscode(): Promise<void> {
     await api.post(`/api/items/${id}/transcode`, {});
   } catch (e) {
     transcodeState.value = "failed";
-    transcodeError.value = (e as { userHint?: string }).userHint
+    transcodeError.value = errorText(e, "转码失败")
       || "启动转码失败";
     return;
   }
@@ -439,9 +440,9 @@ async function doRename(): Promise<void> {
   } catch (e) {
     // 弹窗内显示错误而不是关掉弹窗：用户输的名字还在，改一下就能重试
     if (e instanceof ApiError) {
-      renameError.value = e.userHint || e.friendly || "改名失败";
+      renameError.value = errorText(e, "改名失败");
     } else {
-      renameError.value = e instanceof Error ? e.message : "改名失败";
+      renameError.value = errorText(e, "改名失败");
     }
   } finally {
     renameBusy.value = false;
@@ -460,7 +461,7 @@ async function loadFolders(path: string): Promise<void> {
     moveBrowsePath.value = r.path;
     moveFolders.value = r.folders;
   } catch (e) {
-    moveError.value = e instanceof ApiError ? (e.friendly || "读取目录失败") : "读取目录失败";
+    moveError.value = errorText(e, "读取目录失败");
     moveFolders.value = [];
   } finally {
     moveLoading.value = false;
@@ -518,9 +519,9 @@ async function doMoveHere(): Promise<void> {
     }
   } catch (e) {
     if (e instanceof ApiError) {
-      moveError.value = e.userHint || e.friendly || "移动失败";
+      moveError.value = errorText(e, "移动失败");
     } else {
-      moveError.value = e instanceof Error ? e.message : "移动失败";
+      moveError.value = errorText(e, "移动失败");
     }
   } finally {
     moveBusy.value = false;
@@ -798,7 +799,7 @@ async function doDownload(): Promise<void> {
     downloadRaw();
     toastOk("已开始下载原图");
   } catch (e) {
-    toastError(e instanceof Error ? e.message : "下载失败");
+    toastError(errorText(e, "下载失败"));
   }
 }
 
@@ -827,7 +828,7 @@ async function doDelete(): Promise<void> {
     if (e instanceof ApiError && e.code === "E1015") {
       toastError("电脑端没开「允许手机删除」，请到电脑上打开这个开关");
     } else {
-      toastError(e instanceof Error ? e.message : "删除失败");
+      toastError(errorText(e, "删除失败"));
     }
   } finally {
     setConfirmBusy(false);
