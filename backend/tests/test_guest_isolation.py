@@ -178,3 +178,86 @@ def test_owner_stats_count_the_whole_library(tmp_path: Path) -> None:
     body = json.loads(asyncio.run(system.stats(_ctx(st, role="owner"))).body)
     assert body["media"]["total"] == 10
     assert body["db"], "主人仍应拿到库统计"
+
+
+# ------------------------------------------------------- 默认根与未知根
+
+def _ctx_q(st, *, role: str, query: dict[str, list[str]] | None = None,
+           path: str = "/api/folders"):
+    """带 query 的 ctx（`_ctx` 固定空 query，验 `?root=` 时不够用）。"""
+    from app.core import Ctx
+
+    ctx = Ctx(method="GET", path=path, query=query or {}, headers={},
+              body=None, params={}, app=st)
+    ctx.state["client"] = {"id": "c" * 32, "name": "t", "role": role}
+    return ctx
+
+
+def test_folders_defaults_to_the_guest_root_for_guests(tmp_path: Path) -> None:
+    """游客不带 root 要落在**自己的**根上，不能是主人的默认根。
+
+    实测症状：返回 `{"root": "library"}` —— 游客把自己的视角里根本没有的根名
+    看到了；而面板是空的，日志里毫无异常，用户只会以为"目录没了"。
+    """
+    import asyncio
+
+    from app.handlers import browse
+
+    st = _state(tmp_path)
+    body = json.loads(asyncio.run(browse.folders(_ctx_q(st, role="guest"))).body)
+    assert body["root"] == "share"
+
+
+def test_folders_defaults_to_the_owner_default_for_owners(tmp_path: Path) -> None:
+    """主人不受影响：默认仍是 `library`。"""
+    import asyncio
+
+    from app.handlers import browse
+
+    st = _state(tmp_path)
+    body = json.loads(asyncio.run(browse.folders(_ctx_q(st, role="owner"))).body)
+    assert body["root"] == "library"
+
+
+def test_folders_hides_an_invisible_root_from_guests(tmp_path: Path) -> None:
+    """点名看不见的根 → 404（与 `/api/folders/media` 同口径，不泄露存在性）。"""
+    import asyncio
+
+    from app.handlers import browse
+    from app.errors import AppError
+
+    st = _state(tmp_path)
+    ctx = _ctx_q(st, role="guest", query={"root": ["library"]})
+    with pytest.raises(AppError) as ei:
+        asyncio.run(browse.folders(ctx))
+    assert ei.value.status == 404
+
+
+def test_timeline_for_a_guest_shows_only_their_own_uploads(tmp_path: Path) -> None:
+    """游客根是**共享**的：同一个根下别人传的照片也不能给他看（S-04）。
+
+    这条纠正了一个容易想当然的口径：把行插进游客根 ≠ 游客就能看见。真正的
+    判据是 `media.uploader_client_id`，游客只看得见"自己传的"。
+    """
+    import asyncio
+
+    from app.handlers import browse
+
+    st = _state(tmp_path)
+    now = 1_700_000_000.0
+    mine = "c" * 32
+    for rid, name, uploader in [
+        ("share", "mine.jpg", mine),          # 我自己传的 → 可见
+        ("share", "other.jpg", "d" * 32),     # 别人传的 → 不可见
+        ("library", "owner.jpg", ""),         # 主人的库 → 本来就不可见
+    ]:
+        st.db.execute(
+            "INSERT INTO media(root_id, rel_path, file_name, ext, kind, size,"
+            " mtime, taken_at, thumb_state, uploader_client_id)"
+            " VALUES (?, ?, ?, ?, ?, 10, ?, ?, ?, ?)",
+            (rid, name, name, "jpg", "image", now, now, "ok", uploader),
+        )
+    body = json.loads(asyncio.run(
+        browse.timeline(_ctx_q(st, role="guest", path="/api/timeline"))
+    ).body)
+    assert [it["name"] for it in body["items"]] == ["mine.jpg"]
