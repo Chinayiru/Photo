@@ -174,7 +174,9 @@ def test_active_invites_are_capped(tmp_path) -> None:
     with pytest.raises(AppError) as ei:
         guest.create_invite(db, device_id=DEVICE, label="", minutes=60,
                             via="cloud")
-    assert "最多同时保留" in str(ei.value.detail)
+    # 主人侧的"手上剩几条"用 E1025（E1024 是游客侧"人满了"），话术不带数字。
+    assert ei.value.spec.code == "E1025"
+    assert ei.value.spec.status == 429
 
 
 def test_online_guests_are_capped(tmp_path) -> None:

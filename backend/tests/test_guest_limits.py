@@ -285,5 +285,6 @@ def test_unused_invites_are_capped_by_the_same_number(tmp_path: Path) -> None:
         _invite(st)
     with pytest.raises(AppError) as ei:
         _invite(st)
-    assert ei.value.spec.code == "E1021"
-    assert "最多同时保留 3 条" in str(ei.value.detail)
+    assert ei.value.spec.code == "E1025"
+    assert ei.value.spec.status == 429
+    assert not any(ch.isdigit() for ch in str(ei.value.detail))

@@ -33,7 +33,7 @@ from typing import Any, Final
 
 from shared import client_token as token_mod
 
-from .errors import AppError, E1020, E1021, E1022, E1023, E1024
+from .errors import AppError, E1020, E1021, E1022, E1023, E1024, E1025
 
 log = logging.getLogger(__name__)
 
@@ -163,10 +163,10 @@ def create_invite(db: Any, *, device_id: str, label: str, minutes: int,
     cap = max(1, int(max_active))
     with db.transaction() as conn:
         if _active_invites(conn, now) >= cap:
-            raise AppError(
-                E1021,
-                f"最多同时保留 {cap} 条未使用的邀请，请先在电脑上撤销一条",
-            )
+            # 专用错误码（E1025）：这是"你手上还有几条没发出去"，与游客侧
+            # "人满了"（E1024）是两件事。话术**不带数字** —— 上限是主人的配置，
+            # 报"还剩几条"没帮助，截图分享时反而把配置泄出去。
+            raise AppError(E1025)
         invite_id = secrets.token_hex(16)
         token = new_invite_token()
         expires_at = now + minutes * 60
