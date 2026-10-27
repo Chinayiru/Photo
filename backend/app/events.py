@@ -216,6 +216,7 @@ async def stream_events(
     *,
     heartbeat: float = HEARTBEAT_SEC,
     hello: dict[str, Any] | None = None,
+    keep: Any = None,
 ) -> AsyncIterator[bytes]:
     """把事件总线变成 SSE 字节流。
 
@@ -235,6 +236,10 @@ async def stream_events(
                 continue
             if item is None:
                 break
+            # ★ 审计 07f03d S-06：订阅者各有各的可见范围。事件里带
+            #   `root`（watcher 的 media_changed 就有），越界的整条丢掉。
+            if keep is not None and not keep(item):
+                continue
             yield format_sse(item)
     finally:
         # 客户端断开（协程被取消）时也会走到这里。不清理的话，

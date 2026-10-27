@@ -183,7 +183,12 @@ PUBLIC_PATHS: frozenset[str] = frozenset({
 #: `PUT/DELETE /d/{id}/api/pair` 也免鉴权进隧道 —— 虽然电脑端只有
 #: POST 路由、其余会 405，但"白名单只管路径不管方法"是一条下次会被
 #: 复制的坏模式（`docs/06` 规则 15 对 CORS 前缀匹配的批评同源）。
-PUBLIC_POST_PATHS: frozenset[str] = frozenset({"/api/pair"})
+PUBLIC_POST_PATHS: frozenset[str] = frozenset({
+    "/api/pair",
+    # 游客兑换邀请：朋友点开链接时手里只有邀请码（pbg1.…），还没有会话令牌，
+    # 而这一步本身就是在换令牌。与 `/api/pair` 同构，所以同样只放行 POST。
+    "/api/guest/redeem",
+})
 
 #: 匿名探活的限流（每个来源 IP，每秒）。比鉴权路径的 120/s 宽，因为
 #: 它不读库、不落盘，且状态机的探活频率天然更高。

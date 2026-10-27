@@ -1275,7 +1275,12 @@ def test_system_info_exposes_watch() -> None:
     """
     p = (Path(__file__).resolve().parent.parent / "app" / "handlers"
          / "system.py")
-    assert '"watch": st.watch_info()' in p.read_text(encoding="utf-8")
+    src = p.read_text(encoding="utf-8")
+    # 字段必须在接口里回，且回的是"真实监听状态"而不是配置值。
+    assert '"watch":' in src
+    assert "st.watch_info()" in src
+    # 游客看到的必须是空对象：监听目录属于主人的机器细节（ISSUE-063）。
+    assert '{} if guest else st.watch_info()' in src
 
 
 def test_watch_info_reports_disabled_without_watcher(tmp_path: Path) -> None:

@@ -14,6 +14,7 @@ from ..core import Router
 from ..handlers import auth as h_auth
 from ..handlers import browse as h_browse
 from ..handlers import events as h_events
+from ..handlers import guest as h_guest
 from ..handlers import system as h_system
 from ..handlers import transcode as h_transcode
 from ..handlers import uploads as h_uploads
@@ -39,6 +40,21 @@ def build_router() -> Router:
     r.add("GET", "/api/clients/me", h_auth.me, name="auth.me")
     r.add("GET", "/api/devices", h_auth.list_devices, name="auth.devices")
     r.add("DELETE", "/api/devices/{client_id}", h_auth.revoke_device, name="auth.revoke")
+
+    # --- 游客访问（ISSUE-063） ----------------------------------------
+    # 主人侧：生成/查看/撤销邀请、看在线、踢人（`require_owner` 把关）
+    r.add("POST", "/api/guest/invites", h_guest.create_invite,
+          name="guest.invite_create")
+    r.add("GET", "/api/guest/invites", h_guest.list_invites,
+          name="guest.invite_list")
+    r.add("DELETE", "/api/guest/invites/{invite_id}", h_guest.revoke_invite,
+          name="guest.invite_revoke")
+    r.add("GET", "/api/guest/sessions", h_guest.list_sessions,
+          name="guest.session_list")
+    r.add("DELETE", "/api/guest/sessions/{client_id}", h_guest.kick_session,
+          name="guest.session_kick")
+    # 游客侧：邀请码换令牌。`PUBLIC_PATHS` 里有它（见 `auth.py` 的注释）。
+    r.add("POST", "/api/guest/redeem", h_guest.redeem, name="guest.redeem")
 
     # --- 浏览 ---------------------------------------------------------
     r.add("GET", "/api/timeline", h_browse.timeline, name="browse.timeline")

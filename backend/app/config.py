@@ -55,6 +55,14 @@ CONFIG_PATH: Final[Path] = DATA_DIR / "config.json"
 SECRETS_PATH: Final[Path] = DATA_DIR / "secrets.json"
 
 RootMode = Literal["readonly", "upload", "readwrite"]
+
+#: 根的可见性（ISSUE-063）。
+#:
+#: `owner`（默认）：主人自己的库，主人侧的时间线/搜索/目录聚合都看得到。
+#: `guest`：游客访问用的隔离根，**只有游客能看到**；主人侧查询一律排除，
+#: 否则朋友的合影会混进主人自己的时间线（风险 R-063-03）。
+RootVisibility = Literal["owner", "guest"]
+ROOT_VISIBILITIES: Final[tuple[str, ...]] = ("owner", "guest")
 ROOT_MODES: Final[frozenset[str]] = frozenset({"readonly", "upload", "readwrite"})
 
 # --------------------------------------------------------------------------
@@ -262,6 +270,9 @@ class RootConfig:
     path: Path
     label: str = ""
     mode: RootMode = "readonly"
+    #: 见 `RootVisibility`。游客根必须 `enabled=True`、`mode != "readwrite"`，
+    #: 且全局至多一个（`Config.roots` 里校验）。
+    visibility: RootVisibility = "owner"
     enabled: bool = True
     recursive: bool = True
     include_exts: frozenset[str] = field(default_factory=lambda: ALLOWED_IMAGE_EXTS)
@@ -520,11 +531,67 @@ class Config:
                 ok, why = check_root_safety(r, self)
                 if not ok:
                     raise ConfigError(f"{why}。请修改 config.json 的 roots")
+            self._check_guest_roots()
         return self._roots
+
+    def _check_guest_roots(self) -> None:
+        """游客根的三条不变量（ISSUE-063 G4 / G6 / G14）。
+
+        为什么在 `roots` 里硬拦而不是只写文档：游客根配错的表现是"功能坏了但
+        没人报错" —— 配成 `readwrite` 时游客仍然能看图、能上传，只是**也能删**
+        （`can_modify` 只认 readwrite），而"能不能删"不会有人主动去试。
+        配出两个游客根时，`allowed_root_ids` 会同时放行两块目录，
+        隔离边界从"一块专用目录"退化成"两块目录"。
+        """
+        guests = [r for r in self._roots if r.visibility == "guest"]
+        if len(guests) > 1:
+            raise ConfigError(
+                "只允许配置一个 visibility=\"guest\" 的根目录，当前有 "
+                + ", ".join(repr(r.id) for r in guests)
+            )
+        for r in guests:
+            if r.mode == "readwrite":
+                raise ConfigError(
+                    f"游客根 {r.id!r} 的 mode 不能是 readwrite："
+                    "游客只能查看与添加，删除/移动/改名必须不可能（G6）"
+                )
+            if not r.enabled:
+                raise ConfigError(
+                    f"游客根 {r.id!r} 被停用了：游客访问会整体不可用，"
+                    "请改成 enabled=true 或删掉这一项"
+                )
 
     @property
     def enabled_roots(self) -> list[RootConfig]:
         return [r for r in self.roots if r.enabled]
+
+    @property
+    def owner_roots(self) -> list[RootConfig]:
+        """主人可见的根（不含游客根）。"""
+        return [r for r in self.roots if r.visibility == "owner"]
+
+    @property
+    def owner_root_ids(self) -> list[str]:
+        """主人请求能碰到哪些根。中间件把它注入 `ctx.allowed_root_ids`。
+
+        包含**停用**的根：停用是"取根时 404"（F01 的 `RootDisabledError`），
+        不是"从白名单里消失"。两者混起来会让停用根在过滤层被当成不存在，
+        于是 `?root=` 的报错从 404 变成静默空列表 —— 用户分不清"这块没照片"
+        还是"这块被停了"。
+        """
+        return [r.id for r in self.owner_roots]
+
+    @property
+    def guest_root(self) -> RootConfig | None:
+        for r in self.roots:
+            if r.visibility == "guest":
+                return r
+        return None
+
+    @property
+    def guest_root_ids(self) -> list[str]:
+        r = self.guest_root
+        return [r.id] if r is not None and r.enabled else []
 
     def root_by_id(self, root_id: str | None,
                    *, allow_disabled: bool = False) -> RootConfig:
@@ -631,6 +698,14 @@ def _root_from_dict(d: Mapping[str, Any], app_mode: str) -> RootConfig:
     if mode not in ROOT_MODES:
         raise ConfigError(f"根目录 {rid!r} 的 mode={mode!r} 非法，可选 {sorted(ROOT_MODES)}")
 
+    vis_raw = d.get("visibility")
+    visibility = str(vis_raw if vis_raw is not None else "owner").strip().lower()
+    if visibility not in ROOT_VISIBILITIES:
+        raise ConfigError(
+            f"根目录 {rid!r} 的 visibility={visibility!r} 非法，可选 "
+            f"{list(ROOT_VISIBILITIES)}"
+        )
+
     include = d.get("include_exts")
     exts = (
         frozenset(str(e).lower().lstrip(".") for e in include)
@@ -648,6 +723,7 @@ def _root_from_dict(d: Mapping[str, Any], app_mode: str) -> RootConfig:
         path=Path(os.path.expandvars(os.path.expanduser(raw_path))),
         label=str(d.get("label") or ""),
         mode=mode,  # type: ignore[arg-type]
+        visibility=visibility,  # type: ignore[arg-type]
         enabled=bool(d.get("enabled", True)),
         recursive=bool(d.get("recursive", True)),
         include_exts=exts,
@@ -1336,4 +1412,7 @@ __all__ = [
     "WILDCARD_HOSTS", "UnknownRootError",
     "bootstrap_default_root", "check_bind_safety", "ensure_dirs", "get",
     "is_first_run", "is_loopback_host", "load", "local_ipv4_addresses",
+
+    "ROOT_VISIBILITIES",
+    "RootVisibility",
 ]

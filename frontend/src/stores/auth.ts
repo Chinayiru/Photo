@@ -48,6 +48,7 @@ import {
   normalizeBase,
   relayRootBase,
   savePairing,
+  setGuest,
 } from "../api/storage";
 import {
   installTransport,
@@ -222,6 +223,60 @@ export function reconnect(): Promise<boolean> {
  * @param expectedDid 二维码里带的 `device_id`（AC-5.2）。给了就先 ping
  *   核对，**不一致直接拒绝**，一个字节的配对请求都不发。
  */
+/** 兑换游客邀请的响应（`POST /api/guest/redeem`）。 */
+export interface GuestRedeemResponse {
+  client_token: string;
+  client_id: string;
+  device_id: string;
+  device_name: string;
+  label: string;
+  expires_at: number;
+}
+
+/**
+ * 从地址栏 `#guest=pbg1.xxx.yyy` 里取邀请码。
+ *
+ * 放 fragment 而不是 query：fragment 不会发给服务器、不会进访问日志、
+ * 也不会出现在 Referer 里（与配对码同一套理由，见 ISSUE-052）。
+ */
+export function guestInviteFromLocation(): string {
+  const raw = String(window.location.hash || "").replace(/^#/, "");
+  if (!raw) return "";
+  const sp = new URLSearchParams(raw);
+  const v = (sp.get("guest") || "").trim();
+  return /^pbg1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(v) ? v : "";
+}
+
+/**
+ * 游客：用邀请码换一枚会话令牌。
+ *
+ * ★ 必须 `auth: "none"`：这一步之前这台浏览器什么都还没有，带上任何旧令牌
+ *   都会让电脑端按"另一个身份"处理（而且会 401 E2002 把人挡在门外）。
+ */
+export async function redeemGuest(invite: string): Promise<GuestRedeemResponse> {
+  const here = cloudBaseFromLocation();
+  const base = here || activeBase();
+  if (!base) {
+    throw new ApiError({
+      status: 0, code: "E1001", message: "打不开这条邀请链接",
+      userHint: "链接要在电脑的云端页面里打开（形如 https://域名/d/xxxx/#guest=…）",
+    });
+  }
+  const r = await api.post<GuestRedeemResponse>(
+    "/api/guest/redeem", { token: invite },
+    { auth: "none", skipAuthLost: true, timeoutMs: 15_000, base },
+  );
+  savePairing({
+    token: r.client_token,
+    deviceId: r.device_id,
+    deviceName: r.device_name,
+    base,
+    cloudBase: here || undefined,
+  });
+  setGuest(true);
+  return r;
+}
+
 export async function pair(base: string, code: string,
                            expectedDid = ""): Promise<PairResponse> {
   const s = authStore.state;

@@ -563,6 +563,7 @@ def create_session(
     declared_taken_at: float | None = None,
     client_chunk_size: int | None = None,
     client_id: str = "",
+    guest: bool = False,
 ) -> dict[str, Any]:
     """创建或复用上传会话。
 
@@ -603,15 +604,29 @@ def create_session(
 
     ext = check_extension(cfg, name)
 
-    root = cfg.root_by_id(root_id, allow_disabled=False) if root_id else None
-    if root is None:
-        root = cfg.root_by_id(cfg.default_root_id, allow_disabled=False)
-    if root is None:
-        raise AppError(E1012, "尚未配置媒体根目录")
-    if not root.can_write:
-        from .errors import ReadonlyError
+    if guest:
+        # 游客：根写死，客户端传什么都不看（见本文件顶部 S4 说明）。
+        root = cfg.guest_root
+        if root is None:
+            raise AppError(E1012, "主人尚未开启游客访问")
+        if not root.can_write:
+            # 游客根的 `mode` 必须是 `upload`（可新增、不可删/改）。
+            # `readonly` 时沙箱会在归档那一步抛 write_not_permitted，
+            # 报出来只是"路径不合法"，主人根本看不出是配置问题。
+            raise AppError(
+                E1012,
+                "游客区当前是只读模式，无法接收上传：请把该根目录的 mode 改成 upload",
+            )
+    else:
+        root = cfg.root_by_id(root_id, allow_disabled=False) if root_id else None
+        if root is None:
+            root = cfg.root_by_id(cfg.default_root_id, allow_disabled=False)
+        if root is None:
+            raise AppError(E1012, "尚未配置媒体根目录")
+        if not root.can_write:
+            from .errors import ReadonlyError
 
-        raise ReadonlyError("当前媒体根为只读，无法上传")
+            raise ReadonlyError("当前媒体根为只读，无法上传")
 
     if sha256 is not None:
         sha256 = sha256.strip().lower() or None
@@ -619,9 +634,15 @@ def create_session(
             raise BadRequest("sha256 格式不正确")
 
     # 子目录：显式指定优先，否则用配置里的 upload.subdir
-    subdir = archive.subdir_prefix(
-        target_dir if target_dir is not None else cfg.upload.get("subdir")
-    )
+    if guest:
+        from .guest import GUEST_SUBDIR
+
+        # 游客的字节只进这个固定子目录，不受 `upload.subdir` 配置影响。
+        subdir = archive.subdir_prefix(GUEST_SUBDIR)
+    else:
+        subdir = archive.subdir_prefix(
+            target_dir if target_dir is not None else cfg.upload.get("subdir")
+        )
     # ★ 审计 F14：`subdir_prefix` 只做形态/字符/保留名检查，不看 `exclude_dirs`。
     # 于是 `target_dir="data"` 能一路走到归档，照片落在 `data/2026/2026-10/…`：
     # complete 时 `index_one_file` 照收（它只看文件名）→ 照片**立刻出现在时间线**，
@@ -631,7 +652,11 @@ def create_session(
     sandbox.reject_excluded(subdir, root, last_is_file=False)
 
     # --- 1) 秒传：init 阶段就判，能省掉全部字节 ---
-    dup = find_duplicate(db, cfg, sha256, root_id=root.id) if _dedup_on(cfg) else None
+    # 游客关掉秒传（见顶部说明 ③）：命中会回 media_id/rel_path。
+    dup = (
+        find_duplicate(db, cfg, sha256, root_id=root.id)
+        if (_dedup_on(cfg) and not guest) else None
+    )
     if dup is not None:
         log.info("秒传命中：%s -> media#%d", name, dup["media_id"])
         return {
@@ -968,6 +993,7 @@ def complete_session(
     thumbs=None,
     sha256: str | None = None,
     taken_at: float | None = None,
+    guest: bool = False,
 ) -> dict[str, Any]:
     """校验 → 去重 → 归档 → 索引。
 
@@ -977,6 +1003,9 @@ def complete_session(
     用户在时间线上看到一张永远打不开的图。
     """
     sess = get_session(db, upload_id)
+    # 游客上传的归属：用会话里记下的 `client_id`（create 时写入），不从请求体读
+    # —— 会话一旦被别人接手，归属仍应算发起人。
+    owner_client_id = str(sess.get("client_id") or "")
     if sess["status"] == "completed":
         # 客户端没收到响应就重试了 complete。幂等返回，不能报错 ——
         # 报错会让手机以为上传失败，而照片其实已经进库了。
@@ -1044,7 +1073,10 @@ def complete_session(
         raise AppError(E1013, f"文件校验失败：期望 {declared[:12]}…，实际 {digest[:12]}…")
 
     # --- 去重（第二次判）：覆盖"客户端没带 sha256"与并发上传 ---
-    dup = find_duplicate(db, cfg, digest, root_id=root.id) if _dedup_on(cfg) else None
+    dup = (
+        find_duplicate(db, cfg, digest, root_id=root.id)
+        if (_dedup_on(cfg) and not guest) else None
+    )
     if dup is not None and dup["size"] == total:
         _unlink_temp(str(temp))
         db.execute(
@@ -1132,6 +1164,31 @@ def complete_session(
             db.execute("UPDATE media SET sha256 = ? WHERE id = ?", (digest, media_id))
         except Exception:      # noqa: BLE001
             log.debug("回写 sha256 失败：%s", rel_path, exc_info=True)
+
+    # 游客上传的归属与流水（G4「只看自己上传的」的前提）。
+    # 失败不能让上传失败：照片已经进库，归属缺一列最多是"这张游客自己看不到"，
+    # 报错则会让用户重传几百 MB。
+    if guest and media_id is not None:
+        try:
+            db.execute(
+                "UPDATE media SET uploader_client_id = ? WHERE id = ?",
+                (owner_client_id, media_id),
+            )
+            db.execute(
+                "INSERT INTO guest_upload_log(client_id, root_id, media_id, rel_path, "
+                "size, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (owner_client_id, root.id, media_id, rel_path, size, time.time()),
+            )
+        except Exception:      # noqa: BLE001
+            log.exception("游客上传记账失败：%s", rel_path)
+        try:
+            _audit(db, cfg, audit.ACTION_GUEST_UPLOAD, rel_path, {
+                "upload_id": upload_id,
+                "client_id": owner_client_id,
+                "size": size,
+            })
+        except Exception:      # noqa: BLE001
+            log.debug("游客上传审计失败：%s", rel_path, exc_info=True)
 
     # ★ 到这里照片已经安全落盘、也已经进库。下面的 DB 更新若失败，
     # 文件还在（下次扫描会收录），但**会话会卡在 open**：
@@ -1222,6 +1279,7 @@ def asyncio_run_sync(coro):
 async def complete_session_async(
     db: Database, cfg: Config, upload_id: str, *, indexer=None, thumbs=None,
     sha256: str | None = None, taken_at: float | None = None,
+    guest: bool = False,
 ) -> dict[str, Any]:
     """异步包装：把重活（哈希、归档）丢进线程池。
 
@@ -1235,7 +1293,7 @@ async def complete_session_async(
         None,
         lambda: complete_session(
             db, cfg, upload_id, indexer=indexer, thumbs=thumbs,
-            sha256=sha256, taken_at=taken_at,
+            sha256=sha256, taken_at=taken_at, guest=guest,
         ),
     )
 

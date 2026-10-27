@@ -30,8 +30,11 @@ import {
   exit,
   selectionStore,
 } from "../stores/selection";
+import { isGuest } from "../api/storage";
 import { toastError } from "../stores/toast";
 
+/** 游客没有删除权（服务端也会 403），这里直接不给按钮。 */
+const guest = isGuest();
 const n = count;
 const busy = computed(() => selectionStore.state.busy);
 
@@ -83,7 +86,10 @@ async function onDelete(): Promise<void> {
       已选 <b>{{ n }}</b> 张
     </span>
 
+    <span v-if="guest" class="sb-count">游客只能查看</span>
+
     <button
+      v-else
       class="sb-btn danger"
       type="button"
       :disabled="busy"

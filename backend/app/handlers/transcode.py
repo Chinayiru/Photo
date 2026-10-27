@@ -46,6 +46,7 @@ from ..transports.base import (
     range_length,
     unsatisfied_range_header,
 )
+from . import common
 from .common import iter_file
 
 __all__ = ["start", "status", "stream"]
@@ -67,12 +68,16 @@ def _video_row(ctx: Ctx) -> dict:
     mid = ctx.param_int("media_id")
     row = st.db.query_one(
         "SELECT id, root_id, rel_path, file_name, ext, size, mtime, kind,"
-        "       missing, container, duration"
+        "       missing, container, duration, uploader_client_id"
         "  FROM media WHERE id = ?",
         (mid,),
     )
     if row is None:
         raise NotFound(f"media id={mid}")
+    # ★ 审计 07f03d S-05：转码流是**独立入口**，raw 有的媒体授权这里
+    #   也必须有一次 —— 否则游客拿主人视频的 id 就能直取转码产物，
+    #   而同一 id 的 /raw 与 /stream-ticket 都是 404（自相矛盾即漏洞）。
+    common.check_media_visible(ctx, st, row)
     if row["missing"]:
         raise NotFound(f"源文件已丢失 media_id={mid}")
     if videomod.row_kind(row) != "video":

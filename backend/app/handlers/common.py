@@ -21,6 +21,77 @@ from ..thumbs import source_signature
 
 log = logging.getLogger(__name__)
 
+def is_guest(ctx: Any) -> bool:
+    """这次请求是不是游客发起的（判据是令牌里的角色，不是有没有 cookie）。
+
+    主人自己点开朋友的邀请链接时，浏览器里两种凭证可能同时存在；
+    此时应以**本次请求实际使用的那枚令牌**为准 —— 中间件把验过的角色
+    放在 `ctx.state["client"]["role"]`，这里只读它。
+    """
+    client = (getattr(ctx, "state", None) or {}).get("client") or {}
+    return client.get("role") == "guest"
+
+
+def visible_root_ids(ctx: Any, st: Any) -> list[str]:
+    """本请求能看到的根 id 集合（主人/游客隔离的**唯一**事实来源）。
+
+    主人：`enabled_roots`（停用的根看不见 —— 审计 F01）。
+    游客：`guest_root_ids`（只有一个，见 `Config._check_guest_roots`）。
+    """
+    client = ctx.state.get("client") or {}
+    if client.get("guest") or client.get("role") == "guest":
+        return list(st.cfg.guest_root_ids)
+    return [r.id for r in st.cfg.enabled_roots]
+
+
+def check_visible_root(ctx: Any, st: Any, root_id: str) -> None:
+    """点名一个本身份看不见的根 → 当"不存在"处理（404）。
+
+    为什么是 404 而不是 403：403 等于告诉对方"这个根存在，只是你没权限"，
+    而根 id（`library` / `guest`）是可以猜的短字符串。游客一次猜测就能
+    确认主人配了哪些库，接着只需要猜 id 就能枚举 —— 这条边界必须与
+    "配置里根本没有这个根"表现完全一致。
+    """
+    rid = (root_id or "").strip()
+    if not rid:
+        return
+    if rid in visible_root_ids(ctx, st):
+        return
+    from ..errors import NotFound
+
+    raise NotFound(None)
+
+
+def guest_uploader_id(ctx: Any) -> str:
+    """游客自己的 client_id；主人返回空串。
+
+    ★ 审计 07f03d S-04：游客根是**共享**的（大家的照片都落在
+    `游客上传/` 下），所以「看得见这个根」不等于「看得见这些照片」。
+    归属的正确事实来源是 `media.uploader_client_id`（上传完成时写入），
+    不是请求参数 —— 后者等于让调用方自己声明「我是谁」。
+    """
+    if not is_guest(ctx):
+        return ""
+    client = ctx.state.get("client") or {}
+    return str(client.get("id") or "")
+
+
+def check_media_visible(ctx: Any, st: Any, row: Any) -> None:
+    """这条 media 能不能给本请求看：先看根，再（游客）看上传者。
+
+    两处都用 404：`/api/items/{id}/raw` 返回 403 就等于确认「这个 id 存在」，
+    游客拿 1…9999 扫一遍就能把主人的 id 空间探出来。
+    """
+    check_visible_root(ctx, st, row["root_id"])
+    if not is_guest(ctx):
+        return
+    mine = guest_uploader_id(ctx)
+    if (row["uploader_client_id"] or "") != mine:
+        from ..errors import NotFound
+
+        raise NotFound(None)
+
+
 __all__ = [
     "TIMELINE_COLUMNS",
     "DETAIL_COLUMNS",
@@ -36,6 +107,11 @@ __all__ = [
     "thumb_etag",
     "normalize_dir",
     "parse_ts",
+    "is_guest",
+    "visible_root_ids",
+    "check_visible_root",
+    "guest_uploader_id",
+    "check_media_visible",
     "parse_size",
     "etag_matches",
     "root_id_param",
@@ -277,6 +353,7 @@ def timeline_where(*, root_id: str | None = None, ts_from: float | None = None,
                    has_gps: bool | None = None,
                    allow_video: bool = True,
                    enabled_root_ids: Sequence[str] | None = None,
+                   uploader_client_id: str | None = None,
                    ) -> tuple[str, list[Any]]:
     """构造 WHERE 子句 + 参数。
 
@@ -320,6 +397,11 @@ def timeline_where(*, root_id: str | None = None, ts_from: float | None = None,
     if root_id is not None:
         sql += " AND root_id = ?"
         params.append(root_id)
+    if uploader_client_id is not None:
+        # ★ 审计 07f03d S-04：游客只看自己传的。这个条件**不能**由调用方
+        #   从请求参数里取，必须来自已验证身份（中间件写进 ctx.state）。
+        sql += " AND uploader_client_id = ?"
+        params.append(uploader_client_id)
     if ts_from is not None:
         sql += " AND taken_at >= ?"
         params.append(ts_from)

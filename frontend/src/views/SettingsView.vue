@@ -9,6 +9,7 @@
  * 误触的代价比多点一次大。
  */
 import { computed, onActivated, onMounted } from "vue";
+import GuestPanel from "../components/GuestPanel.vue";
 import { confirmDialog, setConfirmBusy } from "../stores/confirm";
 import { ApiError } from "../api/client";
 import { copyText } from "../api/clipboard";
@@ -264,6 +265,9 @@ const pairing = computed(() => {
         </div>
       </div>
     </div>
+
+    <!-- 游客访问（邀请链接 + 在线游客） -->
+    <GuestPanel />
 
     <!-- 技术细节（折叠，默认不打扰） -->
     <details class="card tech">

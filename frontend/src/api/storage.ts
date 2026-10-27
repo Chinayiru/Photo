@@ -24,6 +24,16 @@ export const K_VIA = "pb.via";
 export const K_DEVICE_NAME = "pb.device_name";
 /** 本机自定义的客户端名，作为 `X-PB-Client` 头发给电脑端审计日志。 */
 export const K_CLIENT_NAME = "pb.client_name";
+/**
+ * 游客标记：`"1"` = 当前浏览器是**以游客身份**进来的。
+ *
+ * 为什么不用"令牌里有没有 role=guest"来判断：令牌是不透明字符串，
+ * 前端解它就得知道 payload 结构（那是服务端契约，改一次就全错）。
+ * 这个标记在兑换成功的响应里由服务端明确告诉我们，比解令牌可靠。
+ * 它不是安全边界 —— 真正的拦截在电脑端（游客令牌调删除接口一律 403），
+ * 这里只决定界面显示什么。
+ */
+export const K_GUEST = "pb.guest";
 
 /** 两条通路。命名与后端 `ctx.via`（`lan`/`cloud`）对齐。 */
 export type Via = "lan" | "cloud";
@@ -205,6 +215,7 @@ export function clearPairing(): void {
   write(K_BASE, "");
   write(K_CLOUD, "");
   write(K_VIA, "");
+  write(K_GUEST, "");
   clearTokenCookie();
 }
 
@@ -218,6 +229,15 @@ export function setClientName(name: string): void {
 
 export function getClientName(): string {
   return read(K_CLIENT_NAME);
+}
+
+/** 当前浏览器是否处于游客身份。 */
+export function isGuest(): boolean {
+  return read(K_GUEST) === "1";
+}
+
+export function setGuest(on: boolean): void {
+  write(K_GUEST, on ? "1" : "");
 }
 
 /* ------------------------------------------------------------------ *
