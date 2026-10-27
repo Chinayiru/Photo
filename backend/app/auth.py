@@ -1132,6 +1132,33 @@ def guest_may_write(method: str, path: str) -> bool:
     return False
 
 
+def _enforce_audience(ctx: Ctx, client: dict[str, Any]) -> None:
+    """游客只能碰 `audience="guest"` 的路由。
+
+    为什么要单独一道，而不是只靠 `_enforce_guest_scope` 的路径黑名单：
+    黑名单是"命名要挡的"，漏一个就是越权；白名单是"命名能用的"，漏一个
+    只是功能少一点。2026-10-28 的隔离缺陷（游客的删除按钮点了没反应、
+    主人反倒删不掉游客照片）就是黑名单 + 目录 mode 两处各自为政的结果。
+
+    拒绝时回 404 —— 与"这个路径不存在"不可区分，不告诉游客这里有写接口。
+    """
+    if not client.get("guest"):
+        return
+    audience = "owner"
+    router = getattr(ctx.app, "router", None)
+    if router is not None:
+        try:
+            audience = router.audience_of(ctx.method, ctx.path)
+        except Exception:  # noqa: BLE001 —— 路由表异常不该变成 500
+            audience = "owner"
+    if audience != "guest":
+        from .errors import NotFound
+
+        log.warning("游客访问了主人专属路径，已按不存在处理：%s %s",
+                    ctx.method, ctx.path)
+        raise NotFound(ctx.path)
+
+
 def _enforce_guest_scope(ctx: Ctx, client: dict[str, Any] | None) -> None:
     """游客越界就当场拒（403 E2003），并留一条审计级的告警。
 
@@ -1224,4 +1251,5 @@ async def auth_middleware(ctx: Ctx, nxt: Any):
 
     client = require_client(ctx)
     _enforce_guest_scope(ctx, client)
+    _enforce_audience(ctx, client)
     return await nxt(ctx)

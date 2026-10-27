@@ -27,83 +27,83 @@ def build_router() -> Router:
     r = Router()
 
     # --- 系统 ---------------------------------------------------------
-    r.add("GET", "/api/system/ping", h_system.ping, name="system.ping")
-    r.add("GET", "/api/system/info", h_system.info, name="system.info")
+    r.add("GET", "/api/system/ping", h_system.ping, name="system.ping", audience="guest")
+    r.add("GET", "/api/system/info", h_system.info, name="system.info", audience="guest")
     r.add(
-        "GET", "/api/system/entrances", h_system.entrances, name="system.entrances",
+        "GET", "/api/system/entrances", h_system.entrances, name="system.entrances", audience="guest",
     )
-    r.add("GET", "/api/system/stats", h_system.stats, name="system.stats")
-    r.add("GET", "/api/events", h_events.events, name="system.events")
+    r.add("GET", "/api/system/stats", h_system.stats, name="system.stats", audience="owner")
+    r.add("GET", "/api/events", h_events.events, name="system.events", audience="guest")
 
     # --- 配对与设备 ---------------------------------------------------
-    r.add("POST", "/api/pair", h_auth.pair, name="auth.pair")
-    r.add("GET", "/api/clients/me", h_auth.me, name="auth.me")
-    r.add("GET", "/api/devices", h_auth.list_devices, name="auth.devices")
-    r.add("DELETE", "/api/devices/{client_id}", h_auth.revoke_device, name="auth.revoke")
+    r.add("POST", "/api/pair", h_auth.pair, name="auth.pair", audience="owner")
+    r.add("GET", "/api/clients/me", h_auth.me, name="auth.me", audience="guest")
+    r.add("GET", "/api/devices", h_auth.list_devices, name="auth.devices", audience="owner")
+    r.add("DELETE", "/api/devices/{client_id}", h_auth.revoke_device, name="auth.revoke", audience="owner")
 
     # --- 游客访问（ISSUE-063） ----------------------------------------
     # 主人侧：生成/查看/撤销邀请、看在线、踢人（`require_owner` 把关）
     r.add("POST", "/api/guest/invites", h_guest.create_invite,
-          name="guest.invite_create")
+          name="guest.invite_create", audience="owner")
     r.add("GET", "/api/guest/invites", h_guest.list_invites,
-          name="guest.invite_list")
+          name="guest.invite_list", audience="owner")
     r.add("DELETE", "/api/guest/invites/{invite_id}", h_guest.revoke_invite,
-          name="guest.invite_revoke")
+          name="guest.invite_revoke", audience="owner")
     r.add("GET", "/api/guest/sessions", h_guest.list_sessions,
-          name="guest.session_list")
+          name="guest.session_list", audience="owner")
     r.add("DELETE", "/api/guest/sessions/{client_id}", h_guest.kick_session,
-          name="guest.session_kick")
+          name="guest.session_kick", audience="owner")
     # 游客侧：邀请码换令牌。`PUBLIC_PATHS` 里有它（见 `auth.py` 的注释）。
-    r.add("POST", "/api/guest/redeem", h_guest.redeem, name="guest.redeem")
+    r.add("POST", "/api/guest/redeem", h_guest.redeem, name="guest.redeem", audience="guest")
 
     # --- 浏览 ---------------------------------------------------------
-    r.add("GET", "/api/timeline", h_browse.timeline, name="browse.timeline")
-    r.add("GET", "/api/search", h_browse.search, name="browse.search")
-    r.add("GET", "/api/folders", h_browse.folders, name="browse.folders")
+    r.add("GET", "/api/timeline", h_browse.timeline, name="browse.timeline", audience="guest")
+    r.add("GET", "/api/search", h_browse.search, name="browse.search", audience="guest")
+    r.add("GET", "/api/folders", h_browse.folders, name="browse.folders", audience="guest")
     # 「按文件夹」视图的正文：某一层目录里**直接**存放的条目（游标分页）。
     # 独立端点而非给 /api/folders 加参数：前者是一页媒体、后者是目录列表，
     # 两者的分页语义不同（一个按 taken_at 游标、一个按目录名字典序）。
     r.add("GET", "/api/folders/media", h_browse.folder_media,
-          name="browse.folder_media")
-    r.add("GET", "/api/items/{media_id}", h_browse.get_item, name="browse.item")
-    r.add("GET", "/api/items/{media_id}/thumb", h_browse.get_thumb, name="browse.thumb")
-    r.add("GET", "/api/items/{media_id}/preview", h_browse.get_preview, name="browse.preview")
-    r.add("GET", "/api/items/{media_id}/raw", h_browse.get_raw, name="browse.raw")
+          name="browse.folder_media", audience="guest")
+    r.add("GET", "/api/items/{media_id}", h_browse.get_item, name="browse.item", audience="guest")
+    r.add("GET", "/api/items/{media_id}/thumb", h_browse.get_thumb, name="browse.thumb", audience="guest")
+    r.add("GET", "/api/items/{media_id}/preview", h_browse.get_preview, name="browse.preview", audience="guest")
+    r.add("GET", "/api/items/{media_id}/raw", h_browse.get_raw, name="browse.raw", audience="guest")
     # 视频播放流：与 /raw 同一实现，只是前端据此选 <video>（ISSUE-055）
     r.add("GET", "/api/items/{media_id}/stream", h_browse.stream_video,
-          name="browse.stream")
+          name="browse.stream", audience="guest")
     # 换票：`<video>` 发不了 Authorization，前端先换一张短命票拼进播放地址
     r.add("GET", "/api/items/{media_id}/stream-ticket", h_browse.stream_ticket,
-          name="browse.stream_ticket")
+          name="browse.stream_ticket", audience="guest")
     # 按需转码（ISSUE-058）：手机解不了 HEVC 时，让电脑先转成 h264 再播
     r.add("POST", "/api/items/{media_id}/transcode", h_transcode.start,
-          name="transcode.start")
+          name="transcode.start", audience="guest")
     r.add("GET", "/api/items/{media_id}/transcode", h_transcode.status,
-          name="transcode.status")
+          name="transcode.status", audience="guest")
     r.add("GET", "/api/items/{media_id}/transcode/stream", h_transcode.stream,
-          name="transcode.stream")
+          name="transcode.stream", audience="guest")
 
     # --- 修改 ---------------------------------------------------------
-    r.add("POST", "/api/items/delete", h_browse.delete_items, name="browse.delete")
-    r.add("POST", "/api/items/move", h_browse.move_items, name="browse.move")
-    r.add("POST", "/api/items/rename", h_browse.rename_item, name="browse.rename")
-    r.add("POST", "/api/index/rescan", h_browse.rescan, name="browse.rescan")
+    r.add("POST", "/api/items/delete", h_browse.delete_items, name="browse.delete", audience="owner")
+    r.add("POST", "/api/items/move", h_browse.move_items, name="browse.move", audience="owner")
+    r.add("POST", "/api/items/rename", h_browse.rename_item, name="browse.rename", audience="owner")
+    r.add("POST", "/api/index/rescan", h_browse.rescan, name="browse.rescan", audience="owner")
 
     # --- 上传 ---------------------------------------------------------
-    r.add("POST", "/api/uploads/init", h_uploads.init_upload, name="upload.init")
-    r.add("GET", "/api/uploads/{upload_id}", h_uploads.get_upload, name="upload.get")
-    r.add("PATCH", "/api/uploads/{upload_id}", h_uploads.patch_upload, name="upload.patch")
+    r.add("POST", "/api/uploads/init", h_uploads.init_upload, name="upload.init", audience="guest")
+    r.add("GET", "/api/uploads/{upload_id}", h_uploads.get_upload, name="upload.get", audience="guest")
+    r.add("PATCH", "/api/uploads/{upload_id}", h_uploads.patch_upload, name="upload.patch", audience="guest")
     r.add(
         "POST",
         "/api/uploads/{upload_id}/complete",
         h_uploads.complete_upload,
-        name="upload.complete",
+        name="upload.complete", audience="guest",
     )
-    r.add("DELETE", "/api/uploads/{upload_id}", h_uploads.abort_upload, name="upload.abort")
+    r.add("DELETE", "/api/uploads/{upload_id}", h_uploads.abort_upload, name="upload.abort", audience="guest")
 
     # --- 本机管理面板（仅回环，中间件已强制） --------------------------
-    r.add("POST", "/panel/pair-code", h_auth.panel_pair_code, name="panel.pair_code")
-    r.add("GET", "/panel/devices", h_auth.panel_devices, name="panel.devices")
-    r.add("GET", "/panel/audit", h_auth.panel_audit, name="panel.audit")
+    r.add("POST", "/panel/pair-code", h_auth.panel_pair_code, name="panel.pair_code", audience="owner")
+    r.add("GET", "/panel/devices", h_auth.panel_devices, name="panel.devices", audience="owner")
+    r.add("GET", "/panel/audit", h_auth.panel_audit, name="panel.audit", audience="owner")
 
     return r
