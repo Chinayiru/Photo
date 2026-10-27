@@ -176,6 +176,19 @@ def test_guest_upload_ignores_the_requested_root(tmp_path: Path) -> None:
     assert row["target_rel"].startswith(guest.GUEST_SUBDIR)
 
 
+def test_invite_refuses_to_hand_out_an_empty_link(tmp_path: Path, monkeypatch) -> None:
+    """没有云端基址时不能"成功"返回一个空链接（主人在面板上只会看到空框）。"""
+    st = _state(tmp_path)
+    # `_public_base` 读的是 `cloud.base_url`；这里直接让它返回空串，
+    # 模拟"还没配云端"的那台电脑。
+    monkeypatch.setattr(h_guest, "_public_base", lambda *a, **k: "")
+    ctx = _ctx(st, role="owner", method="POST", path="/api/guest/invites",
+               body={"label": "x", "minutes": 60})
+    with pytest.raises(AppError) as ei:
+        asyncio.run(h_guest.create_invite(ctx))
+    assert ei.value.status == 400
+    assert "云端" in str(ei.value.detail or ei.value)
+
 # ---------------------------------------------------------------- S-04
 
 def test_timeline_where_filters_by_uploader_when_asked() -> None:

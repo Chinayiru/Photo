@@ -120,7 +120,14 @@ async def create_invite(ctx: Ctx) -> Reply:
         via="cloud" if ctx.via == CLOUD else "lan",
     )
     base = _public_base(st.cfg, device_id)
-    link = f"{base}/#guest={inv['token']}" if base else ""
+    if not base:
+        # 没有云端基址就拼不出链接：这时发出去的邀请是**废纸** ——
+        # 之前这里静默给 `link=""`，主人在面板上只看到一个空框，
+        # 会以为功能坏了。当场说清楚该先做什么。
+        raise BadRequest(
+            "还没有连上云端，无法生成游客链接：请先在电脑上完成云端配对"
+        )
+    link = f"{base}/#guest={inv['token']}"
     audit.record(
         st.db, st.cfg, audit.ACTION_GUEST_INVITE,
         device=st.device_name, client_id=str(me.get("id") or ""),
