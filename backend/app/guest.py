@@ -33,7 +33,7 @@ from typing import Any, Final
 
 from shared import client_token as token_mod
 
-from .errors import AppError, E1020, E1021, E1022, E1023
+from .errors import AppError, E1020, E1021, E1022, E1023, E1024
 
 log = logging.getLogger(__name__)
 
@@ -64,8 +64,8 @@ GUEST_COOKIE: Final = "pb_guest"
 GUEST_MAX_TTL: Final = 7200.0
 
 #: G14：有效邀请 ≤ 5，在线游客 ≤ 10。
-MAX_ACTIVE_INVITES: Final = 5
-MAX_ONLINE_GUESTS: Final = 10
+MAX_ACTIVE_INVITES: Final = 3   # 默认值；实际由 config.guest_max_online 传入
+MAX_ONLINE_GUESTS: Final = 3    # 默认值；实际由 config.guest_max_online 传入
 
 #: G12：自定义分钟数钳制区间（5 分钟 ~ 7 天）。
 MIN_MINUTES: Final = 5
@@ -152,16 +152,20 @@ def _active_invites(conn: sqlite3.Connection | Any, now: float) -> int:
 
 
 def create_invite(db: Any, *, device_id: str, label: str, minutes: int,
-                  via: str) -> dict[str, Any]:
-    """生成一条邀请。返回**唯一一次**能看到明文的字典。"""
+                  via: str, max_active: int = MAX_ACTIVE_INVITES) -> dict[str, Any]:
+    """生成一条邀请。返回**唯一一次**能看到明文的字典。
+
+    `max_active` 由调用方从配置传入（`Config.guest_max_online`）。条数判定与
+    插入在同一个 `BEGIN IMMEDIATE` 事务里：并发生成时只有一个能过线。
+    """
     now = _now()
     minutes = clamp_minutes(minutes)
+    cap = max(1, int(max_active))
     with db.transaction() as conn:
-        if _active_invites(conn, now) >= MAX_ACTIVE_INVITES:
+        if _active_invites(conn, now) >= cap:
             raise AppError(
                 E1021,
-                f"最多同时保留 {MAX_ACTIVE_INVITES} 条未使用的邀请，"
-                "请先在电脑上撤销一条",
+                f"最多同时保留 {cap} 条未使用的邀请，请先在电脑上撤销一条",
             )
         invite_id = secrets.token_hex(16)
         token = new_invite_token()
@@ -184,12 +188,27 @@ def create_invite(db: Any, *, device_id: str, label: str, minutes: int,
     }
 
 
-def list_invites(db: Any) -> list[dict[str, Any]]:
+def list_invites(db: Any, *, include_revoked: bool = False) -> list[dict[str, Any]]:
+    """邀请列表。**默认不返回已撤销的条目**。
+
+    ★ 过滤放在查询层而不是前端：撤销是终态、不可恢复，撤销项对主人没有操作
+      价值；但留在响应里让前端 `v-if` 隐藏，等于仍然把"这条存在过"发给浏览器。
+    ★ 记录本身**保留**（`revoked_at` + 审计 `guest_revoke`）：撤销要留痕，物理
+      删除会断审计链。排障时用 `include_revoked=True`。
+    """
     now = _now()
-    rows = db.query(
-        "SELECT id, label, created_at, expires_at, first_used_at, revoked_at,"
-        " guest_client_id, created_via FROM guest_invites"
-        " ORDER BY created_at DESC")
+    # 两条**字面量** SQL，不拼字符串：`check_lint` 规则 3 禁止把非占位符内容拼进
+    # SQL 首参（拼接是注入的唯一入口，哪怕是内部常量也不开口子）。
+    if include_revoked:
+        rows = db.query(
+            "SELECT id, label, created_at, expires_at, first_used_at, revoked_at,"
+            " guest_client_id, created_via FROM guest_invites"
+            " ORDER BY created_at DESC")
+    else:
+        rows = db.query(
+            "SELECT id, label, created_at, expires_at, first_used_at, revoked_at,"
+            " guest_client_id, created_via FROM guest_invites"
+            " WHERE revoked_at IS NULL ORDER BY created_at DESC")
     out = []
     for r in rows:
         out.append({
@@ -231,7 +250,8 @@ def _session_ttl(invite_expires_at: float, now: float) -> float:
     return min(float(invite_expires_at) - now, GUEST_MAX_TTL)
 
 
-def redeem(db: Any, *, token: str, device_id: str, via: str) -> dict[str, Any]:
+def redeem(db: Any, *, token: str, device_id: str, via: str,
+           max_online: int = MAX_ONLINE_GUESTS) -> dict[str, Any]:
     """用邀请码换一个会话。一次性：第二次调用报"已被使用"（G11 A）。"""
     now = _now()
     th = hash_token(token)
@@ -253,14 +273,17 @@ def redeem(db: Any, *, token: str, device_id: str, via: str) -> dict[str, Any]:
         if ttl <= 0:  # pragma: no cover —— 上面已判过期
             raise AppError(E1021, "该链接已过期")
 
+        # ★ 计数与插入必须落在**同一个** BEGIN IMMEDIATE 事务里。先查数量再
+        #   插入的两步写法，在"两个游客几乎同时兑换"时会双双读到 2、双双插入，
+        #   最后 4 人在线。IMMEDIATE 立刻取写锁，后者排队等前者提交后再读，
+        #   于是被下面这句挡下。
         online = conn.execute(
             "SELECT COUNT(*) AS n FROM guest_sessions"
             " WHERE revoked_at IS NULL AND expires_at > ?", (now,)).fetchone()
-        if int(online["n"]) >= MAX_ONLINE_GUESTS:
-            raise AppError(
-                E1021,
-                f"当前已在线 {MAX_ONLINE_GUESTS} 位游客，请稍后再试",
-            )
+        cap = max(1, int(max_online))
+        if int(online["n"]) >= cap:
+            # 消息里**不带人数**：还没进门的人没资格知道主人家里有几个客人。
+            raise AppError(E1024, "当前访问人数已满，请稍后再试")
 
         client_id = secrets.token_hex(16)
         session_token = issue_session_token(
