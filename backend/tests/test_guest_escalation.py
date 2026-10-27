@@ -49,7 +49,7 @@ def _cfg(tmp_path: Path) -> Config:
         "app": {"mode": "readwrite"},
         "roots": [
             {"id": "library", "path": str(owner), "mode": "readwrite"},
-            {"id": "share", "path": str(share), "mode": "upload",
+            {"id": "share", "path": str(share), "mode": "readwrite",
              "visibility": "guest"},
         ],
         "thumbs": {"sizes": [320, 1600]},

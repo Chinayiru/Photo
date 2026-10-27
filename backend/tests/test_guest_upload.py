@@ -54,7 +54,7 @@ def cfg(tmp_path: Path) -> Config:
                 {"id": OWNER_ROOT, "path": str(owner), "label": "主人的库",
                  "mode": "readwrite", "recursive": True},
                 {"id": GUEST_ROOT, "path": str(gdir), "label": "游客区",
-                 "mode": "upload", "visibility": "guest", "recursive": True},
+                 "mode": "readwrite", "visibility": "guest", "recursive": True},
             ],
             "upload": {
                 "subdir": "手机上传",
@@ -135,23 +135,27 @@ def test_guest_upload_without_a_guest_root_is_refused(cfg: Config) -> None:
     assert "游客" in str(exc.value) or "E1012" in str(exc.value)
 
 
-def test_view_only_guest_root_refuses_uploads_with_a_clear_reason(tmp_path: Path) -> None:
-    """`readonly` 游客根（只看不给发）要给出 "改 mode" 的提示，而不是路径错误。"""
+def test_view_only_guest_root_is_rejected_at_config_time(tmp_path: Path) -> None:
+    """"只看不给发" 的游客根现在是**配置错误**，不再是上传时才报错。
+
+    Q2（2026-10-28）把游客根钉成 `readwrite`：主人要能在自己视图里删掉游客
+    上传的内容。所以 `readonly`/`upload` 的游客根在 `Config.roots` 就被拒，
+    上传路径上的 `can_write` 检查退化成防御性代码（不再有可触发的用例，
+    由 `test_config_guest_root.py` 覆盖配置层）。
+    """
+    from backend.app.config import ConfigError
+
     (tmp_path / "lib").mkdir()
     (tmp_path / "guests").mkdir()
-    c = Config(
-        {"roots": [
-            {"id": OWNER_ROOT, "path": str(tmp_path / "lib"), "mode": "readwrite"},
-            {"id": GUEST_ROOT, "path": str(tmp_path / "guests"),
-             "mode": "readonly", "visibility": "guest"},
-        ], "upload": {"subdir": "手机上传", "chunk_mb_lan": 1, "max_file_mb": 4}},
-        path=tmp_path / "c.json", data_dir=tmp_path / "data",
-    )
-    d = Database(c.db_path)
-    d.init()
-    with pytest.raises(AppError) as exc:
-        uploads.create_session(d, c, name="a.jpg", size=len(JPEG), guest=True)
-    assert "upload" in str(exc.value)
+    with pytest.raises(ConfigError, match="readwrite"):
+        _ = Config(
+            {"roots": [
+                {"id": OWNER_ROOT, "path": str(tmp_path / "lib"), "mode": "readwrite"},
+                {"id": GUEST_ROOT, "path": str(tmp_path / "guests"),
+                 "mode": "readonly", "visibility": "guest"},
+            ], "upload": {"subdir": "手机上传", "chunk_mb_lan": 1, "max_file_mb": 4}},
+            path=tmp_path / "c.json", data_dir=tmp_path / "data",
+        ).roots
 
 # ------------------------------------------------------------------ 秒传
 

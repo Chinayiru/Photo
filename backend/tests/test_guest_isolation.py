@@ -49,7 +49,7 @@ def _cfg(tmp_path: Path, *, with_guest: bool = True) -> Config:
     if with_guest:
         guest = tmp_path / "guest"
         guest.mkdir(exist_ok=True)
-        roots.append({"id": "share", "path": str(guest), "mode": "upload",
+        roots.append({"id": "share", "path": str(guest), "mode": "readwrite",
                       "visibility": "guest"})
     data = tmp_path / "data"
     data.mkdir(exist_ok=True)

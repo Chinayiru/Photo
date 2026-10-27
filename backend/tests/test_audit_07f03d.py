@@ -64,7 +64,7 @@ def _cfg(tmp_path: Path) -> Config:
         "app": {"mode": "readwrite"},
         "roots": [
             {"id": "library", "path": str(owner), "mode": "readwrite"},
-            {"id": "guest", "path": str(gst), "mode": "upload", "visibility": "guest"},
+            {"id": "guest", "path": str(gst), "mode": "readwrite", "visibility": "guest"},
         ],
         "thumbs": {"sizes": [320, 1600]},
         "cloud": {"enabled": True, "base_url": "https://example.com",

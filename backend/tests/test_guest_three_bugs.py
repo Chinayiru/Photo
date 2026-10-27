@@ -67,7 +67,7 @@ def _state(tmp_path: Path) -> AppState:
         "app": {"mode": "readwrite"},
         "roots": [
             {"id": "library", "path": str(tmp_path / "owner"), "mode": "readwrite"},
-            {"id": "guest", "path": str(tmp_path / "guest"), "mode": "upload",
+            {"id": "guest", "path": str(tmp_path / "guest"), "mode": "readwrite",
              "visibility": "guest"},
         ],
         "thumbs": {"sizes": [320, 1600]},
@@ -268,7 +268,7 @@ def test_visible_limit_is_clamped_not_fatal(raw, expected, tmp_path: Path) -> No
         "app": {"mode": "readwrite"},
         "roots": [
             {"id": "library", "path": str(tmp_path / "owner"), "mode": "readwrite"},
-            {"id": "guest", "path": str(tmp_path / "guest"), "mode": "upload",
+            {"id": "guest", "path": str(tmp_path / "guest"), "mode": "readwrite",
              "visibility": "guest"},
         ],
         "guest": {"max_visible": raw} if raw is not None else {},

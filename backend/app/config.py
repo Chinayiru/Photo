@@ -584,10 +584,16 @@ class Config:
                 + ", ".join(repr(r.id) for r in guests)
             )
         for r in guests:
-            if r.mode == "readwrite":
+            # Q2（2026-10-28 拍板）：主人对游客库有**全部权限**（含删除/改名/移动），
+            # 所以游客根必须是 `readwrite` —— `upload` 会让主人自己也删不掉，
+            # 表现就是"看得见、点删除只回一句删除失败"。
+            # 游客的"不能删/不能改"由**路由层没有那些能力**保证（C3），不靠 mode：
+            # mode 是"这个目录允许被写成什么样"，对谁都一样（硬约束 4）。
+            if r.mode != "readwrite":
                 raise ConfigError(
-                    f"游客根 {r.id!r} 的 mode 不能是 readwrite："
-                    "游客只能查看与添加，删除/移动/改名必须不可能（G6）"
+                    f"游客根 {r.id!r} 的 mode 必须是 readwrite（当前 {r.mode!r}）："
+                    "主人对游客库有全部权限，需能删除/改名/移动；"
+                    "只读或缺删除权限的 mode 会让主人自己也清不掉游客内容"
                 )
             if not r.enabled:
                 raise ConfigError(
