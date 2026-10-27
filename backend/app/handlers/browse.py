@@ -781,9 +781,11 @@ async def folders(ctx: Ctx) -> Reply:
     st = _st(ctx)
     db = st.db
 
-    root_id = common.root_id_param(ctx) or st.cfg.default_root_id
+    root_id = common.root_id_param(ctx) or common.default_root_id(ctx, st)
     if not root_id or not st.cfg.has_root(root_id):
         raise AppError(E1001, f"未知的 root：{root_id}")
+    # 游客点名一个看不见的根 → 当「不存在」处理（404），与 /api/folders/media 一致
+    common.check_visible_root(ctx, st, root_id)
     root = st.cfg.root_by_id(root_id, allow_disabled=False)
     assert root is not None
 
@@ -1059,7 +1061,7 @@ async def folder_media(ctx: Ctx) -> Reply:
         # ConfigError —— 对客户端应当表现为"内容不存在"（E1004），
         # 与"这个根被停用"一致，而不是一个 500 或"配置错误"。
         try:
-            root_id = st.cfg.default_root_id or ""
+            root_id = common.default_root_id(ctx, st) or ""
         except Exception:
             raise AppError(E1004) from None
     if not root_id or not st.cfg.has_root(root_id):
@@ -1161,7 +1163,7 @@ async def search(ctx: Ctx) -> Reply:
     if ctx.q("dir"):
         # 先用**已经过上面校验**的 root（点名且存在），否则退回默认根。
         candidate = root_id if (root_id and st.cfg.has_root(root_id)) \
-            else st.cfg.default_root_id
+            else common.default_root_id(ctx, st)
         probe_root = st.cfg.root_by_id(candidate, allow_disabled=False) if candidate else None
         if probe_root is None:
             raise AppError(E1001, "按目录搜索需要先有一个可用的库")

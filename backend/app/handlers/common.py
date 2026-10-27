@@ -62,6 +62,24 @@ def check_visible_root(ctx: Any, st: Any, root_id: str) -> None:
     raise NotFound(None)
 
 
+def default_root_id(ctx: Any, st: Any) -> str:
+    """没点名 root 时的默认根 —— 必须在**本身份可见**的根里挑。
+
+    为什么不能直接用 `st.cfg.default_root_id`：那是主人的默认根（真实库里是
+    `library`）。游客看不见它，用它当默认会让 `GET /api/folders` 报出一个
+    游客根本不存在于其视野里的根名（实测：`{"root": "library"}`），而内容
+    又因为后面的过滤是空的 —— 用户看到"目录面板空了"，日志里却毫无异常。
+
+    候选为空（例如全库被停用、或游客根没配）时返回空串，由调用方按
+    "未知 root" 处理。
+    """
+    ids = visible_root_ids(ctx, st)
+    want = str(getattr(st.cfg, "default_root_id", "") or "")
+    if want and want in ids:
+        return want
+    return ids[0] if ids else ""
+
+
 def guest_uploader_id(ctx: Any) -> str:
     """游客自己的 client_id；主人返回空串。
 
@@ -110,6 +128,7 @@ __all__ = [
     "is_guest",
     "visible_root_ids",
     "check_visible_root",
+    "default_root_id",
     "guest_uploader_id",
     "check_media_visible",
     "parse_size",
