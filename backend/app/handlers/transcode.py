@@ -73,7 +73,7 @@ def _video_row(ctx: Ctx) -> dict:
         (mid,),
     )
     if row is None:
-        raise NotFound(f"media id={mid}")
+        raise NotFound(None)
     # ★ 审计 07f03d S-05：转码流是**独立入口**，raw 有的媒体授权这里
     #   也必须有一次 —— 否则游客拿主人视频的 id 就能直取转码产物，
     #   而同一 id 的 /raw 与 /stream-ticket 都是 404（自相矛盾即漏洞）。

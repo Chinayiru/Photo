@@ -215,7 +215,7 @@ async def get_item(ctx: Ctx) -> Reply:
 
     row = db.query_one("SELECT * FROM media WHERE id = ?", (mid,))
     if row is None:
-        raise NotFound(f"media id={mid}")
+        raise NotFound(None)   # ★ 不带 id：与“无权访问”的响应必须逐字一致
 
     # ★ 审计 F01：详情也是"列表/详情"这条授权线上的一个出口。不加这一行，
     #   管理员停用根之后，手机上仍能按 id 拉到 EXIF、路径、拍摄地点 ——
@@ -296,7 +296,7 @@ async def _serve_thumb(st: AppState, ctx: Ctx, mid: int) -> Reply:
         (mid,),
     )
     if row is None:
-        raise NotFound(f"media id={mid}")
+        raise NotFound(None)   # ★ 不带 id：与“无权访问”的响应必须逐字一致
 
     # ★ 审计 F01：缓存命中也要过授权。缩略图/预览都是"先看磁盘有没有缓存
     #   文件"，而那些文件在管理员停用根之后**不会消失** —— 只在生成路径上
@@ -507,7 +507,7 @@ async def get_preview(ctx: Ctx) -> Reply:
         (mid,),
     )
     if row is None:
-        raise NotFound(f"media id={mid}")
+        raise NotFound(None)   # ★ 不带 id：与“无权访问”的响应必须逐字一致
 
     # ★ 审计 F01：同 `_serve_thumb` —— 停用根的预览缓存文件仍在磁盘上，
     #   必须在 304/缓存分支之前就拒绝，而不是等到重新生成时才拒。
@@ -614,14 +614,16 @@ async def get_raw(ctx: Ctx) -> Reply:
         (mid,),
     )
     if row is None:
-        raise NotFound(f"media id={mid}")
-    if row["missing"]:
-        raise NotFound(f"源文件已丢失 media_id={mid}")
+        raise NotFound(None)   # ★ 不带 id：与“无权访问”的响应必须逐字一致
 
     root = st.cfg.root_by_id(row["root_id"], allow_disabled=False)
     # ★ `/raw` 与 `/stream` 共用这条路径 —— 视频流也必须卡在这里，
     #   否则"列表里看不到、但能按 id 拉整段原片"。
     common.check_media_visible(ctx, st, row)
+    # ★ missing 的判断放在授权**之后**：反过来，游客对"主人家的 id + 文件已丢失"
+    #   会拿到另一句 detail，与真正的 404 不同 → 又能探出 id 是否存在。
+    if row["missing"]:
+        raise NotFound(f"源文件已丢失 media_id={mid}")
     # ★ 即使路径来自我们自己的数据库，也要过沙箱：配置可能已经改过，
     # 旧行的 rel_path 现在可能指向库外（或变成 junction）。
     src = sandbox.resolve(root, row["rel_path"], "read", cfg=st.cfg)
@@ -749,7 +751,7 @@ async def stream_ticket(ctx: Ctx) -> Reply:
     row = st.db.query_one(
         "SELECT id, root_id, kind, missing FROM media WHERE id = ?", (mid,))
     if row is None or row["missing"]:
-        raise NotFound(f"media id={mid}")
+        raise NotFound(None)   # ★ 不带 id：与“无权访问”的响应必须逐字一致
     st.cfg.root_by_id(row["root_id"], allow_disabled=False)
     common.check_media_visible(ctx, st, row)
     ticket = streamticket.mint(st.db, mid)
