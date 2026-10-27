@@ -51,13 +51,13 @@ def test_visibility_defaults_to_owner(tmp_path) -> None:
 
 def test_guest_visibility_is_parsed(tmp_path) -> None:
     cfg = _cfg(tmp_path, [_root(tmp_path, "guest", visibility="guest",
-                               mode="upload")])
+                               mode="readwrite")])
     assert cfg.roots[0].visibility == "guest"
 
 
 def test_visibility_is_case_insensitive_and_stripped(tmp_path) -> None:
     cfg = _cfg(tmp_path, [_root(tmp_path, "guest", visibility=" GUEST ",
-                               mode="upload")])
+                               mode="readwrite")])
     assert cfg.roots[0].visibility == "guest"
 
 
@@ -71,30 +71,37 @@ def test_unknown_visibility_is_rejected(tmp_path) -> None:
 
 def test_only_one_guest_root_is_allowed(tmp_path) -> None:
     cfg = _cfg(tmp_path, [
-        _root(tmp_path, "g1", visibility="guest", mode="upload"),
-        _root(tmp_path, "g2", visibility="guest", mode="upload"),
+        _root(tmp_path, "g1", visibility="guest", mode="readwrite"),
+        _root(tmp_path, "g2", visibility="guest", mode="readwrite"),
     ])
     with pytest.raises(ConfigError, match="只允许配置一个"):
         _ = cfg.roots
 
 
-def test_guest_root_may_not_be_readwrite(tmp_path) -> None:
+def test_guest_root_must_be_readwrite(tmp_path) -> None:
+    """Q2（2026-10-28 拍板）：主人对游客库有全部权限。
+
+    `upload` 模式下 `can_modify`/`can_delete` 都是假，主人自己删不掉游客
+    上传的照片 —— 线上表现就是"看得见、点删除只回一句删除失败"。
+    游客的"不能删"改成由**路由层没有那条能力**保证（C3），不再借 `mode`。
+    """
     cfg = _cfg(tmp_path, [_root(tmp_path, "guest", visibility="guest",
                                mode="readwrite")])
+    assert cfg.guest_root is not None
+    assert cfg.guest_root.mode == "readwrite"
+    assert cfg.guest_root.can_delete is True
+
+
+@pytest.mark.parametrize("mode", ["readonly", "upload"])
+def test_guest_root_rejects_modes_that_block_owner(tmp_path, mode: str) -> None:
+    cfg = _cfg(tmp_path, [_root(tmp_path, "guest", visibility="guest", mode=mode)])
     with pytest.raises(ConfigError, match="readwrite"):
         _ = cfg.roots
 
 
-@pytest.mark.parametrize("mode", ["readonly", "upload"])
-def test_guest_root_accepts_safe_modes(tmp_path, mode: str) -> None:
-    cfg = _cfg(tmp_path, [_root(tmp_path, "guest", visibility="guest", mode=mode)])
-    assert cfg.guest_root is not None
-    assert cfg.guest_root.mode == mode
-
-
 def test_disabled_guest_root_is_rejected(tmp_path) -> None:
     cfg = _cfg(tmp_path, [_root(tmp_path, "guest", visibility="guest",
-                               mode="upload", enabled=False)])
+                               mode="readwrite", enabled=False)])
     with pytest.raises(ConfigError, match="停用"):
         _ = cfg.roots
 
@@ -105,7 +112,7 @@ def test_owner_root_ids_exclude_the_guest_root(tmp_path) -> None:
     cfg = _cfg(tmp_path, [
         _root(tmp_path, "library"),
         _root(tmp_path, "archive"),
-        _root(tmp_path, "guest", visibility="guest", mode="upload"),
+        _root(tmp_path, "guest", visibility="guest", mode="readwrite"),
     ])
     assert cfg.owner_root_ids == ["library", "archive"]
     assert cfg.guest_root_ids == ["guest"]

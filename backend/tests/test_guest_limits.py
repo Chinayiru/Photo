@@ -59,7 +59,7 @@ def _cfg(tmp_path: Path, **guest_cfg) -> Config:
         "app": {"mode": "readwrite"},
         "roots": [
             {"id": "library", "path": str(owner), "mode": "readwrite"},
-            {"id": "share", "path": str(share), "mode": "upload",
+            {"id": "share", "path": str(share), "mode": "readwrite",
              "visibility": "guest"},
         ],
         "cloud": {"enabled": True, "base_url": "https://example.com",
