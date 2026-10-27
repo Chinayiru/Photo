@@ -242,6 +242,14 @@ async def redeem(ctx: Ctx) -> Reply:
         "invite_id": sess["invite_id"],
         "label": sess["label"],
         "expires_at": sess["expires_at"],
+        # ★ 前端要靠它写 `pb.device_id`（"连到了另一台电脑"的判定依据）。
+        #   以前只回 token/label，前端就自己去猜，猜错就落一个空 id ——
+        #   症状是游客每次刷新都被判成"连到了另一台电脑"。
+        # ★ 必须是**本地** device_id（与 /api/system/ping 同一个值），
+        #   不是云端那串 32 位。前端用它跟自己存的 pb.device_id 比对，
+        #   填错了第一次探活就会判成“连到了另一台电脑”，把人踢回配对页。
+        "device_id": str(getattr(st, "device_id", "") or ""),
+        "device_name": str(getattr(st, "device_name", "") or ""),
     })
     ttl = max(int(sess["expires_at"] - ctx.started_at), 60)
     r.set_cookie(guestmod.GUEST_COOKIE, sess["token"], max_age=ttl)
