@@ -223,14 +223,28 @@ export function reconnect(): Promise<boolean> {
  * @param expectedDid 二维码里带的 `device_id`（AC-5.2）。给了就先 ping
  *   核对，**不一致直接拒绝**，一个字节的配对请求都不发。
  */
-/** 兑换游客邀请的响应（`POST /api/guest/redeem`）。 */
+/** 从云端基址里取电脑的云端 device_id（`https://域名/d/<32hex>`）。 */
+export function deviceIdFromBase(base: string): string {
+  const m = /\/d\/([0-9a-fA-F]{32})(?:\/|$)/.exec(String(base || ""));
+  return m ? m[1]!.toLowerCase() : "";
+}
+
+/**
+ * 兑换游客邀请的响应（`POST /api/guest/redeem`，契约见 `docs/04` §2.13.1）。
+ *
+ * ★ 字段名以**服务端**为准：`token` 不是 `client_token`。这里曾经按
+ *   `client_token` 读，而接口一直返回 `token` —— 于是"兑换成功"之后存进去的
+ *   是一枚 `undefined` 令牌，界面上表现为"链接点了没反应/又要输配对码"。
+ */
 export interface GuestRedeemResponse {
-  client_token: string;
+  token: string;
   client_id: string;
-  device_id: string;
-  device_name: string;
+  invite_id: string;
   label: string;
   expires_at: number;
+  /** 电脑端会带上，缺省时由云端基址 `/d/<id>` 推出来。 */
+  device_id?: string;
+  device_name?: string;
 }
 
 /**
@@ -244,7 +258,11 @@ export function guestInviteFromLocation(): string {
   if (!raw) return "";
   const sp = new URLSearchParams(raw);
   const v = (sp.get("guest") || "").trim();
-  return /^pbg1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(v) ? v : "";
+  // ★ 真实邀请码是**两段**：`pbg1.<base64url>`（见 `backend/app/guest.py`
+  //   的 `new_invite_token()`）。这里原来要求三段，于是每一条合法邀请都被
+  //   判成"格式不对"直接丢掉 —— 邀请链接因此从来没有被兑换过。
+  //   仍然要求足够长的随机段，挡住 `#guest=pbg1.x` 这类垃圾。
+  return /^pbg1\.[A-Za-z0-9_-]{16,}(?:\.[A-Za-z0-9_-]+)?$/.test(v) ? v : "";
 }
 
 /**
@@ -266,10 +284,20 @@ export async function redeemGuest(invite: string): Promise<GuestRedeemResponse> 
     "/api/guest/redeem", { token: invite },
     { auth: "none", skipAuthLost: true, timeoutMs: 15_000, base },
   );
+  if (!r || typeof r.token !== "string" || !r.token) {
+    // 服务端 200 但没给令牌：宁可当成失败，也不要落一个空令牌进 localStorage
+    // （那会让界面停在"已配对"却每个请求都 401）。
+    throw new ApiError({
+      status: 0, code: "E1020", message: "邀请链接没有换到会话令牌",
+      userHint: "请让主人重新发一条邀请链接",
+    });
+  }
   savePairing({
-    token: r.client_token,
-    deviceId: r.device_id,
-    deviceName: r.device_name,
+    token: r.token,
+    // 响应里没有 device_id 时从云端基址 `/d/<32hex>` 里取，用于"连到了另一台
+    // 电脑"的判定；两者都没有就留空（游客只有一个基址，不会误判）。
+    deviceId: r.device_id || deviceIdFromBase(base),
+    deviceName: r.device_name || "电脑",
     base,
     cloudBase: here || undefined,
   });

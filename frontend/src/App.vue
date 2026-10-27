@@ -52,6 +52,16 @@ const tabs = computed(() => (guest.value ? TABS.filter((t) => t.key !== "setting
 const redeeming = ref(false);
 
 /**
+ * 邀请链接兑换失败的提示（空串 = 没有失败）。
+ *
+ * ★ 为什么要有这个态：兑换失败时 `redeeming` 变回 false，模板就掉回
+ *   `<PairView>` —— 用户拿着一条**过期/被撤销**的邀请链接，却看到"请输入
+ *   配对码"，会以为要问主人要那 6 位数字。正确表现是"这条链接不能用了"
+ *   并且**不再给配对入口**（他本来就不是主人）。
+ */
+const guestFail = ref("");
+
+/**
  * 处理地址栏里的游客邀请。
  *
  * ★ 与配对码同一条通路（`#guest=`），但**必须先兑换再判 `paired`**：
@@ -62,6 +72,7 @@ async function handleGuestLink(): Promise<void> {
   const invite = guestInviteFromLocation();
   if (!invite) return;
   redeeming.value = true;
+  guestFail.value = "";
   try {
     const r = await redeemGuest(invite);
     guest.value = true;
@@ -71,12 +82,15 @@ async function handleGuestLink(): Promise<void> {
     void probe();
     toastOkGuest(r.label);
   } catch (exc) {
-    toastError(guestErrorMessage(exc));
+    guestFail.value = guestErrorMessage(exc);
+    toastError(guestFail.value);
   } finally {
     redeeming.value = false;
-    // 换完就把码从地址栏抹掉：截图/分享地址栏时不该带上它。
-    const url = window.location.pathname + window.location.search;
-    window.history.replaceState(null, "", url);
+    // 成功才把码从地址栏抹掉：失败时留着用户才能核对/重试（也才能截图给主人看）。
+    if (!guestFail.value) {
+      const url = window.location.pathname + window.location.search;
+      window.history.replaceState(null, "", url);
+    }
   }
 }
 
@@ -174,6 +188,14 @@ onMounted(() => {
   window.addEventListener("pb:goto-folder", onGotoFolder as EventListener);
   // token 失效（401 E2002 / 403 E2004）→ client 会回调这里，踢回配对页
   onAuthLost(() => {
+    // ★ 游客的凭证过期/被踢，不能掉回配对页：他手里没有、也不该有配对码。
+    //   给一句能照做的提示（"让主人重发邀请"），比一个他填不了的输入框有用。
+    if (isGuest()) {
+      guestFail.value = "游客会话已结束，请让主人重新发一条邀请链接";
+      stopEvents();
+      closeEvents();
+      return;
+    }
     paired.value = false;
     authStore.state.conn = "UNAUTHORIZED";
     // ★ 鉴权都没了就别再维持 SSE 长连接：服务端会一直重试推送、
@@ -213,7 +235,13 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <PairView v-if="!paired && !redeeming" />
+  <!-- 邀请链接没换到会话：明确说"这条链接不能用了"，不给配对码入口 -->
+  <section v-if="!paired && !redeeming && guestFail" class="linkfail">
+    <h2>打不开这条邀请链接</h2>
+    <p class="lf-msg">{{ guestFail }}</p>
+    <p class="lf-hint">邀请链接是一次性的，过期或被主人收回后就不能再用。请让主人重新生成一条。</p>
+  </section>
+  <PairView v-else-if="!paired && !redeeming" />
 
   <template v-else>
     <StatusBar :title="title" />
@@ -329,4 +357,15 @@ onBeforeUnmount(() => {
   background: var(--accent);
   box-shadow: 0 0 0 2px var(--bg-1);
 }
+
+/* 邀请链接失败态：与配对页区分开，别让人以为要输配对码 */
+.linkfail {
+  max-width: 30rem;
+  margin: 18vh auto 0;
+  padding: 0 1.25rem;
+  text-align: center;
+}
+.linkfail h2 { font-size: 1.05rem; margin-bottom: .6rem; }
+.lf-msg { font-size: .95rem; line-height: 1.5; margin-bottom: .5rem; }
+.lf-hint { font-size: .82rem; color: var(--muted, #8a8a8a); line-height: 1.5; }
 </style>
