@@ -187,7 +187,9 @@ def test_online_guests_are_capped(tmp_path) -> None:
                               via="cloud")
     with pytest.raises(AppError) as ei:
         guest.redeem(db, token=inv["token"], device_id=DEVICE, via="cloud")
-    assert "已在线" in str(ei.value.detail)
+    # 上限达满时用专门的错误码，且话术里不带人数（B-5）。
+    assert ei.value.spec.code == "E1024"
+    assert "已满" in str(ei.value.detail)
 
 
 def test_revoking_the_invite_kills_its_sessions(tmp_path) -> None:

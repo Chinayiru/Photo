@@ -63,6 +63,11 @@ RootMode = Literal["readonly", "upload", "readwrite"]
 #: 否则朋友的合影会混进主人自己的时间线（风险 R-063-03）。
 RootVisibility = Literal["owner", "guest"]
 ROOT_VISIBILITIES: Final[tuple[str, ...]] = ("owner", "guest")
+
+#: 游客上限的默认值与合法区间（B3：可配置，硬上限 10）。
+GUEST_MAX_ONLINE_DEFAULT: Final[int] = 3
+GUEST_MAX_ONLINE_MIN: Final[int] = 1
+GUEST_MAX_ONLINE_MAX: Final[int] = 10
 ROOT_MODES: Final[frozenset[str]] = frozenset({"readonly", "upload", "readwrite"})
 
 # --------------------------------------------------------------------------
@@ -167,6 +172,13 @@ DEFAULT_CONFIG: Final[dict[str, Any]] = {
         # 开发期 Vite 在 5173，加 "http://localhost:5173" 即可；
         # 写 ["*"] = 显式通配，仅本机调试用。
         "cors_origins": [],
+    },
+    # 游客访问（ISSUE-063）。上限只有一个旋钮，同时约束两件事：
+    #   1) 未使用邀请的条数（生成时）—— 一张截图不该换来无数个入口；
+    #   2) 同时可访问的游客数（兑换时）—— 每个会话都是一条常驻订阅。
+    # 合法 1–10，越界钳制（见 `Config.guest_max_online`）。
+    "guest": {
+        "max_online": 3,
     },
     "roots": [],                    # [{id, path, label, mode, enabled, ...}]
     "upload": {
@@ -580,6 +592,21 @@ class Config:
         还是"这块被停了"。
         """
         return [r.id for r in self.owner_roots]
+
+    @property
+    def guest_max_online(self) -> int:
+        """同时可访问的游客上限（默认 3，合法 1–10）。
+
+        ★ 越界**钳制**而不是抛错：这是运行期参数，抛错会让整个服务起不来，
+        主人只是手误把 3 写成 30，代价不该是"照片桥打不开"。钳制后由
+        `/api/system/info` 回显实际生效值，用户看得见。
+        """
+        raw = self.get("guest.max_online", GUEST_MAX_ONLINE_DEFAULT)
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            n = GUEST_MAX_ONLINE_DEFAULT
+        return max(GUEST_MAX_ONLINE_MIN, min(GUEST_MAX_ONLINE_MAX, n))
 
     @property
     def guest_root(self) -> RootConfig | None:

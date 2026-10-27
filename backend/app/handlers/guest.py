@@ -118,6 +118,8 @@ async def create_invite(ctx: Ctx) -> Reply:
         st.db, device_id=device_id, label=label,
         minutes=guestmod.clamp_minutes(minutes),
         via="cloud" if ctx.via == CLOUD else "lan",
+        # 未使用邀请的条数与同时在线人数共用同一个上限（B1/B3）。
+        max_active=st.cfg.guest_max_online,
     )
     base = _public_base(st.cfg, device_id)
     if not base:
@@ -144,7 +146,12 @@ async def create_invite(ctx: Ctx) -> Reply:
 
 
 async def list_invites(ctx: Ctx) -> Reply:
-    """`GET /api/guest/invites` —— 主人的邀请列表（**不含明文码**）。"""
+    """`GET /api/guest/invites` —— 主人的邀请列表（**不含明文码**）。
+
+    ★ 默认**不返回已撤销的邀请**（A 项）：撤销是终态、不可恢复，留着只会让
+      页面越用越长。记录仍在库里与审计日志里（`guest.list_invites(...,
+      include_revoked=True)` 可取）。
+    """
     st = _st(ctx)
     require_owner(ctx)
     return json_reply({"items": guestmod.list_invites(st.db)})
@@ -230,7 +237,9 @@ async def redeem(ctx: Ctx) -> Reply:
         raise AppError(E1020, "邀请链接无效，请向主人索取新的链接")
 
     sess = guestmod.redeem(
-        st.db, token=token, device_id=_device_id(st), via="cloud")
+        st.db, token=token, device_id=_device_id(st), via="cloud",
+        # 同时可访问的游客上限：判定在 guest.redeem 的 BEGIN IMMEDIATE 事务里。
+        max_online=st.cfg.guest_max_online)
     audit.record(
         st.db, st.cfg, audit.ACTION_GUEST_ENTER,
         device=st.device_name, client_id=sess["client_id"],
