@@ -23,7 +23,8 @@
  */
 import { computed, onMounted, ref } from "vue";
 import { ApiError, api } from "../api/client";
-import { toastError, toastOk } from "../stores/toast";
+import { copyText } from "../api/clipboard";
+import { toastError, toastOk, toastWarn } from "../stores/toast";
 
 interface InviteRow {
   invite_id: string;
@@ -32,8 +33,19 @@ interface InviteRow {
   created_at: number;
   expires_at: number;
   first_used_at: number | null;
-  link: string;
+  /** 只在 `POST /api/guest/invites` 的响应里有；列表接口拿不到（库里只存哈希） */
+  link?: string;
   client_id: string;
+}
+
+/** `POST /api/guest/invites` 的响应。`link` 是**唯一一次**能拿到明文的地方。 */
+interface CreateResp {
+  invite_id: string;
+  token: string;
+  link: string;
+  label: string;
+  minutes: number;
+  expires_at: number;
 }
 
 interface SessionRow {
@@ -52,6 +64,65 @@ const loading = ref(false);
 const busy = ref(false);
 const label = ref("");
 const minutes = ref(1440);
+
+/** 刚生成的那一条：明文链接只在这一刻存在，得让用户看得见、复制得到。 */
+const created = ref<{ invite_id: string; link: string; expires_at: number } | null>(null);
+/** 展开过完整链接的 invite_id 集合（默认折叠为"前 26 + … + 后 8"）。 */
+const expanded = ref<Set<string>>(new Set());
+
+/**
+ * 生成过的链接留在本机，按 invite_id 索引。
+ *
+ * 为什么需要它：服务端只存 `token_hash`，`GET /api/guest/invites` 永远
+ * 给不回明文。没有这份缓存，列表里那条"复制链接"就只能是复制 `undefined`。
+ * 存本机也符合直觉 —— 令牌本来就该由发出去的那台设备保管。
+ */
+const LINKS_KEY = "pb.guestLinks";
+
+function readSavedLinks(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(LINKS_KEY);
+    const obj = raw ? JSON.parse(raw) : {};
+    return obj && typeof obj === "object" ? obj as Record<string, string> : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveLink(inviteId: string, link: string): void {
+  try {
+    const all = readSavedLinks();
+    all[inviteId] = link;
+    localStorage.setItem(LINKS_KEY, JSON.stringify(all));
+  } catch {
+    // 隐私模式下 localStorage 会抛；不影响本次会话（内存里还有 created）
+  }
+}
+
+function linkOf(it: InviteRow): string {
+  return it.link || readSavedLinks()[it.invite_id] || "";
+}
+
+/** 截断显示：前 26 + … + 后 8。足够辨认，又不至于把手机屏幕撑爆。 */
+function maskLink(u: string): string {
+  if (u.length <= 36) return u;
+  return `${u.slice(0, 26)}…${u.slice(-8)}`;
+}
+
+function toggle(id: string): void {
+  const s = new Set(expanded.value);
+  if (s.has(id)) s.delete(id);
+  else s.add(id);
+  expanded.value = s;
+}
+
+/** 复制失败时：把能展开的都展开，用户至少能长按选中。 */
+function revealAll(): void {
+  const s = new Set(expanded.value);
+  if (created.value) s.add(created.value.invite_id);
+  for (const it of invites.value) if (linkOf(it)) s.add(it.invite_id);
+  expanded.value = s;
+}
 
 const MINUTES: { v: number; t: string }[] = [
   { v: 60, t: "1 小时" },
@@ -92,12 +163,16 @@ async function create(): Promise<void> {
   if (busy.value) return;
   busy.value = true;
   try {
-    await api.post("/api/guest/invites", {
+    const r = await api.post<CreateResp>("/api/guest/invites", {
       label: label.value.trim(),
       minutes: minutes.value,
     });
     label.value = "";
-    toastOk("邀请链接已生成，发给朋友即可");
+    // ★ 明文链接只在这一次响应里，此后服务端再也给不回来
+    created.value = { invite_id: r.invite_id, link: r.link, expires_at: r.expires_at };
+    saveLink(r.invite_id, r.link);
+    expanded.value = new Set([...expanded.value, r.invite_id]);
+    toastOk("邀请链接已生成，下面是完整链接");
     await load();
   } catch (e) {
     toastError(guestError(e, "生成邀请失败"));
@@ -134,14 +209,29 @@ async function kick(clientId: string): Promise<void> {
   }
 }
 
+/**
+ * 复制一条链接。
+ *
+ * ★ 必须走 `api/clipboard.ts` 的 `copyText()`：它先试 `navigator.clipboard`，
+ *   再退回 `document.execCommand("copy")`。局域网明文 HTTP 下前者是
+ *   `undefined`（非安全上下文），只有后者能用；自己写 `navigator.clipboard`
+ *   等于在手机上必然失败 —— 这正是本 bug 的成因。
+ * ★ 用户名下的 `execCommand` 兜底必须在**点击手势的同步栈**里：`copyText`
+ *   在 clipboard 不存在时**不会 await**，因此兜底是同步执行的。
+ */
 async function copy(text: string): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(text);
-    toastOk("链接已复制");
-  } catch {
-    // 非 HTTPS 或用户拒绝授权时会抛；把文本塞进输入框让用户手选。
-    toastError("复制失败，请长按链接手动复制");
+  if (!text) {
+    toastWarn("这条邀请的链接已无法取回（只在生成时显示），请重新生成一条");
+    return;
   }
+  const ok = await copyText(text);
+  if (ok) {
+    toastOk(`已复制：${text.slice(0, 32)}…`);
+    return;
+  }
+  // 失败不静默：明确告诉用户要怎么做，并把链接摊开给他长按
+  revealAll();
+  toastError("复制失败：请长按下面的链接手动复制（已为你展开）");
 }
 
 function guestError(e: unknown, fallback: string): string {
@@ -190,6 +280,34 @@ onMounted(() => {
       </button>
     </div>
 
+    <div v-if="created" class="newlink">
+      <div class="inv-top">
+        <span class="inv-label">刚生成的链接</span>
+        <span class="tag">仅此一次可见</span>
+      </div>
+      <div
+        class="link-show"
+        :class="{ full: expanded.has(created.invite_id) }"
+        @click="toggle(created.invite_id)"
+      >
+        <span class="link-text">{{
+          expanded.has(created.invite_id) ? created.link : maskLink(created.link)
+        }}</span>
+      </div>
+      <div class="inv-acts">
+        <button class="btn primary" type="button" @click="copy(created.link)">
+          复制链接
+        </button>
+        <button class="btn" type="button" @click="toggle(created.invite_id)">
+          {{ expanded.has(created.invite_id) ? "收起" : "展开" }}
+        </button>
+      </div>
+      <div class="hint sm">
+        有效期至 {{ fmtTime(created.expires_at) }}。关掉本页后这条链接在这里
+        只能看到缩略；手机复制失败时可长按上面那行手动选中。
+      </div>
+    </div>
+
     <div v-if="loading" class="empty">读取中…</div>
     <div v-else-if="!invites.length" class="empty">还没有邀请</div>
 
@@ -204,8 +322,23 @@ onMounted(() => {
         <span>有效期至 {{ fmtTime(it.expires_at) }}</span>
         <span v-if="it.first_used_at">首次使用 {{ fmtTime(it.first_used_at) }}</span>
       </div>
+      <div
+        v-if="linkOf(it)"
+        class="link-show"
+        :class="{ full: expanded.has(it.invite_id) }"
+        @click="toggle(it.invite_id)"
+      >
+        <span class="link-text">{{
+          expanded.has(it.invite_id) ? linkOf(it) : maskLink(linkOf(it))
+        }}</span>
+      </div>
       <div class="inv-acts">
-        <button class="btn" type="button" @click="copy(it.link)">复制链接</button>
+        <button v-if="linkOf(it)" class="btn" type="button" @click="copy(linkOf(it))">
+          复制链接
+        </button>
+        <span v-else class="hint sm">
+          链接只在生成时显示（服务端只存哈希），要再发请重新生成
+        </span>
         <button
           v-if="it.state === 'active'"
           class="btn danger"
@@ -357,6 +490,46 @@ onMounted(() => {
 .tag.warn {
   background: var(--bad-dim);
   color: var(--bad);
+}
+
+.newlink {
+  margin-top: 12px;
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--acc, #3b82f6);
+  background: var(--bg-2);
+}
+
+/**
+ * 链接就必须"看得见、选得中"。
+ * 不用 `display:none` / `opacity:0`：看不见的文本等于没给用户兜底。
+ */
+.link-show {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--bg-3, rgba(0, 0, 0, 0.06));
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--fg-1);
+  cursor: pointer;
+  user-select: text;
+  -webkit-user-select: text;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.link-show.full {
+  background: var(--bg-3, rgba(0, 0, 0, 0.09));
+}
+
+.user-select-none { user-select: none; }
+
+.hint.sm {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--fg-2);
 }
 
 .ellipsis {
