@@ -233,8 +233,9 @@ def test_kick_removes_the_row_from_the_online_list(tmp_path: Path) -> None:
     ctx = _ctx(st, method="DELETE", path=f"/api/guest/sessions/{GUEST_A}",
                params={"client_id": GUEST_A})
     asyncio.run(h_guest.kick_session(ctx))
-    row = guest.list_sessions(st.db)[0]
-    assert row["online"] is False and row["revoked_at"]
+    # 踢掉之后**整行都不在"正在访问"列表里了**（2026-10-28 用户口径：
+    # 已退出的前端不再显示），不是"标成离线继续留在列表里"。
+    assert guest.list_sessions(st.db) == []
 
 
 def test_session_rows_expose_online_and_revoked_at(tmp_path: Path) -> None:
@@ -246,7 +247,8 @@ def test_session_rows_expose_online_and_revoked_at(tmp_path: Path) -> None:
     assert set(rows[GUEST_A]) >= {"online", "revoked_at", "created_at", "last_seen"}
     assert "revoked" not in rows[GUEST_A]
     assert rows[GUEST_A]["online"] is True
-    assert rows["c" * 32]["online"] is False
+    # 已撤销的会话不再出现在列表里（字段仍保留，供 include_* 排障路径使用）
+    assert "c" * 32 not in rows
 
 
 # ---------------------------------------------------------------- BUG-2

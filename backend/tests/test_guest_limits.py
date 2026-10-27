@@ -168,8 +168,12 @@ def test_list_handler_returns_unrevoked_items_only(tmp_path: Path) -> None:
     assert [i["invite_id"] for i in items] == [b["invite_id"]]
 
 
-def test_expired_and_used_invites_are_still_listed(tmp_path: Path) -> None:
-    """只有「撤销」才消失：过期/已用还能说明"这人进来过"，得留着。"""
+def test_used_invites_hide_by_default_but_stay_retrievable(tmp_path: Path) -> None:
+    """已使用的邀请默认不展示（2026-10-28 用户要求），但记录与状态仍在。
+
+    ★ 过期但未使用的邀请**仍然列出**：它还能说明"这条没被用掉，要不要重发"，
+      属于主人要看的活信息；用完作废的那条则只剩一个点不动的"已使用"行。
+    """
     st = _state(tmp_path)
     used = _invite(st)
     guest.redeem(st.db, token=used["token"], device_id=DEVICE, via="cloud")
@@ -177,8 +181,14 @@ def test_expired_and_used_invites_are_still_listed(tmp_path: Path) -> None:
     st.db.execute("UPDATE guest_invites SET expires_at = ? WHERE id = ?",
                   (time.time() - 1, expired["invite_id"]))
 
-    states = {r["state"] for r in guest.list_invites(st.db)}
-    assert {"used", "expired"} <= states
+    default = guest.list_invites(st.db)
+    ids = {r["invite_id"] for r in default}
+    assert used["invite_id"] not in ids          # 已使用 → 不展示
+    assert expired["invite_id"] in ids           # 过期未使用 → 仍展示
+    assert {r["invite_id"]: r["state"] for r in default}[expired["invite_id"]] == "expired"
+
+    with_used = guest.list_invites(st.db, include_used=True)
+    assert used["invite_id"] in {r["invite_id"] for r in with_used}
 
 
 def test_revoked_link_still_says_it_was_revoked(tmp_path: Path) -> None:

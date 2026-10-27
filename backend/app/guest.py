@@ -188,27 +188,38 @@ def create_invite(db: Any, *, device_id: str, label: str, minutes: int,
     }
 
 
-def list_invites(db: Any, *, include_revoked: bool = False) -> list[dict[str, Any]]:
+def list_invites(db: Any, *, include_revoked: bool = False,
+                 include_used: bool = False) -> list[dict[str, Any]]:
     """邀请列表。**默认不返回已撤销的条目**。
 
     ★ 过滤放在查询层而不是前端：撤销是终态、不可恢复，撤销项对主人没有操作
       价值；但留在响应里让前端 `v-if` 隐藏，等于仍然把"这条存在过"发给浏览器。
     ★ 记录本身**保留**（`revoked_at` + 审计 `guest_revoke`）：撤销要留痕，物理
       删除会断审计链。排障时用 `include_revoked=True`。
+    ★ 同理**已使用的邀请默认也不返回**（2026-10-28 用户要求）：一次性邀请用过
+      就作废，留在列表里只剩一个点不动的"已使用"行，页面越用越长。留痕靠
+      `include_used=True` 与审计 `guest_enter`。
     """
     now = _now()
     # 两条**字面量** SQL，不拼字符串：`check_lint` 规则 3 禁止把非占位符内容拼进
     # SQL 首参（拼接是注入的唯一入口，哪怕是内部常量也不开口子）。
+    # 三条**字面量** SQL，不拼字符串（`check_lint` 规则 3）。
     if include_revoked:
         rows = db.query(
             "SELECT id, label, created_at, expires_at, first_used_at, revoked_at,"
             " guest_client_id, created_via FROM guest_invites"
             " ORDER BY created_at DESC")
-    else:
+    elif include_used:
         rows = db.query(
             "SELECT id, label, created_at, expires_at, first_used_at, revoked_at,"
             " guest_client_id, created_via FROM guest_invites"
             " WHERE revoked_at IS NULL ORDER BY created_at DESC")
+    else:
+        rows = db.query(
+            "SELECT id, label, created_at, expires_at, first_used_at, revoked_at,"
+            " guest_client_id, created_via FROM guest_invites"
+            " WHERE revoked_at IS NULL AND first_used_at IS NULL"
+            " ORDER BY created_at DESC")
     out = []
     for r in rows:
         out.append({
@@ -364,12 +375,20 @@ def issue_session_token(db: Any, *, client_id: str, invite_id: str,
 
 
 def list_sessions(db: Any) -> list[dict[str, Any]]:
+    """**只列"正在访问"的游客**：已退出（撤销）与已过期的都不返回。
+
+    用户口径（2026-10-28）：「已退出的链接或者用户，前端不再显示」。
+    过滤同样放在查询层：让前端 `v-if` 隐藏等于仍把"这个人来过"发给浏览器，
+    而"谁来过"恰恰是游客访问里最不该留在前端的东西。历史上的会话记录仍在
+    库里（`revoked_at`），排障时直接查库。
+    """
     now = _now()
     rows = db.query(
         "SELECT s.client_id, s.invite_id, s.label, s.created_at, s.expires_at,"
         " s.last_seen, s.revoked_at, i.label AS inv_label"
         "  FROM guest_sessions s JOIN guest_invites i ON i.id = s.invite_id"
-        " ORDER BY s.created_at DESC")
+        " WHERE s.revoked_at IS NULL AND s.expires_at > ?"
+        " ORDER BY s.created_at DESC", (now,))
     out = []
     for r in rows:
         out.append({
