@@ -1252,6 +1252,10 @@ async def auth_middleware(ctx: Ctx, nxt: Any):
         return await nxt(ctx)
 
     client = require_client(ctx)
-    _enforce_guest_scope(ctx, client)
+    # ★ 顺序：先按路由白名单（audience）判，再按路径黑名单（guest_scope）。
+    # 反过来时，游客打 `/api/items/delete` 会先被 scope 拦成 403「游客只能查看
+    # 与上传」，等于告诉对方"这个接口存在、只是你没权限"；先过 audience 就只
+    # 剩 404，与"路径不存在"不可区分（硬约束 3）。
     _enforce_audience(ctx, client)
+    _enforce_guest_scope(ctx, client)
     return await nxt(ctx)
