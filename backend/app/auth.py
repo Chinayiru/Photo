@@ -46,12 +46,18 @@ from .errors import (
     E1002,
     E1003,
     E1005,
+    E1022,
+    E1023,
     E2002,
+    E2003,
     E2004,
     E4004,
     AppError,
     Unauthorized,
 )
+# 游客的 cookie 名（ISSUE-063）。`guest` 只在 `issue_session_token()` 里
+# 反向 import 本模块，所以这条 import 不会成环。
+from .guest import GUEST_COOKIE
 
 log = logging.getLogger(__name__)
 
@@ -212,6 +218,11 @@ PUBLIC_PATHS: frozenset[str] = frozenset({
     #: 拿到的东西，藏起来没有意义（判据见 `entrances.py` 的模块注释）。
     "/api/system/entrances",
     "/api/pair",
+    #: 游客兑换（ISSUE-063）：朋友点链接时**还没有任何凭证**，手上的
+    #: 邀请码也不是令牌（`looks_like_token()` 会把它判成垃圾，正确地拦在
+    #: 回源之前）。所以这个端点必须匿名 —— 它的安全依赖"邀请码是一次性
+    #: 的 32 字节随机串 + 只在云端通路接受 + 按 IP 限速"。
+    "/api/guest/redeem",
 })
 
 #: 只能从本机访问的路径前缀。
@@ -692,6 +703,55 @@ def legacy_tunnel_secret(cfg: Any = None) -> str:
     return token_mod.secret_for_agent_token(raw)
 
 
+def _admit_guest(ctx: Ctx, db: Any, claims: dict[str, Any]) -> dict[str, Any]:
+    """游客令牌 → 请求身份。三道判据：通路、会话、邀请。
+
+    ★ 为什么通路要卡：游客进的是**云端链接**，而链接里的主机名/端口是
+      公网可见的。同一条 wss 隧道同时承载局域网口径的请求（同一台电脑
+      的 8799 也在监听），不卡通路就等于"邀请链接顺便开了这个人在你家
+      Wi-Fi 里的出入口"。G2 要求"游客只能走云端"，这里就是那条线。
+    """
+    from . import guest as guest_mod
+    from .core.ctx import CLOUD
+
+    if ctx.via != CLOUD:
+        log.warning("游客令牌来自非云端通路 via=%s（已拒绝）", ctx.via)
+        raise Unauthorized("游客只能从云端入口访问")
+
+    client_id = str(claims["sub"])
+    invite_id = str(claims.get("inv") or "")
+    ok, reason = guest_mod.session_active(db, client_id)
+    if not ok:
+        ctx.set_cookies.append((guest_mod.GUEST_COOKIE, "", 0))
+        if reason == "revoked":
+            raise AppError(E1023, f"guest session revoked client={client_id}")
+        raise AppError(E1022, f"guest session {reason} client={client_id}")
+    guest_mod.touch_session(db, client_id)
+    return {
+        "id": client_id,
+        "name": "游客",
+        "role": "guest",
+        "guest": True,
+        "invite_id": invite_id,
+        "expires_at": float(claims["exp"]),
+    }
+
+
+def require_owner(ctx: Ctx) -> dict[str, Any]:
+    """主人专用接口的闸门（生成邀请、看会话、踢人）。
+
+    ★ 用 403 E2003 而不是 401：游客的凭证是**有效的**，只是没这个权限。
+      回 401 会让前端把游客踢回配对页（那里他也进不来，只能看到
+      "邀请链接无效"），而正确表现是"你没这个权限"。
+    """
+    client = ctx.state.get("client")
+    if not isinstance(client, dict):
+        raise Unauthorized("缺少凭证")
+    if client.get("guest") or client.get("role") == "guest":
+        raise AppError(E2003, "游客无权执行该操作")
+    return client
+
+
 def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
     """二期路径：验签云端签发的 HMAC 令牌，成功则落一行缓存并返回设备信息。
 
@@ -733,6 +793,11 @@ def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
             break
     if claims is None:
         return None
+    # ★ ISSUE-063：游客令牌走独立分支。它不在本地 `devices` 表里，也
+    #   **不能**写 `cloud_clients` —— 那张表是"这台手机被配对过"的记录，
+    #   写进去会让 `GET /api/devices` 里凭空多出一堆游客。
+    if str(claims.get("rl") or "owner") == "guest":
+        return _admit_guest(ctx, db, claims)
 
     client_id = str(claims["sub"])
     name = str(claims.get("nam") or "")[:64] or "手机"
@@ -863,6 +928,11 @@ def require_client(ctx: Ctx) -> dict[str, Any]:
     via_header = ctx.bearer_token()
     token = via_header or ctx.cookie_token(CLIENT_COOKIE)
     if not token:
+        # ★ 游客的 cookie 是**另一个名字**（`pb_guest`）。同一个浏览器
+        #   既可能是主人又刚点过朋友的链接，共用一个 cookie 名会互相
+        #   覆盖 —— 最坏的方向是游客身份被写进主人的 `pb_token`。
+        token = ctx.cookie_token(GUEST_COOKIE)
+    if not token:
         raise Unauthorized("缺少凭证：Authorization 头或 pb_token cookie")
 
     row = _lookup_device(st.db, token)
@@ -876,6 +946,17 @@ def require_client(ctx: Ctx) -> dict[str, Any]:
         #   * 反过来的顺序（先验签）在**没配云端**的机器上每次都要先
         #     算一次空密钥短路，再落回查库，等于给常见路径加了一层。
         info = _verify_cloud_token(ctx, st.db, token)
+        if info is not None and info.get("guest"):
+            ctx.state["client"] = info
+            ctx.state["via_cookie"] = not via_header
+            if via_header:
+                # 游客的 `<img>` / `<video>` 也要能带凭证，所以补的是
+                # `pb_guest` —— 绝不能补到 `pb_token`（那会让浏览器从此
+                # 以游客身份访问自己的库，症状是"突然只能看一个文件夹"）。
+                ctx.set_cookies.append(
+                    (GUEST_COOKIE, token,
+                     cookie_max_age_for(info.get("expires_at"))))
+            return info
         if info is not None:
             ctx.state["client"] = info
             ctx.state["via_cookie"] = not via_header

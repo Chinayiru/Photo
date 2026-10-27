@@ -21,6 +21,66 @@ from ..thumbs import source_signature
 
 log = logging.getLogger(__name__)
 
+def visible_root_ids(ctx: Any, st: Any) -> list[str]:
+    """本请求能看到的根 id 集合（主人/游客隔离的**唯一**事实来源）。
+
+    主人：`enabled_roots`（停用的根看不见 —— 审计 F01）。
+    游客：`guest_root_ids`（只有一个，见 `Config._check_guest_roots`）。
+    """
+    client = ctx.state.get("client") or {}
+    if client.get("guest") or client.get("role") == "guest":
+        return list(st.cfg.guest_root_ids)
+    return [r.id for r in st.cfg.enabled_roots]
+
+
+def check_visible_root(ctx: Any, st: Any, root_id: str) -> None:
+    """点名一个本身份看不见的根 → 当"不存在"处理（404）。
+
+    为什么是 404 而不是 403：403 等于告诉对方"这个根存在，只是你没权限"，
+    而根 id（`library` / `guest`）是可以猜的短字符串。游客一次猜测就能
+    确认主人配了哪些库，接着只需要猜 id 就能枚举 —— 这条边界必须与
+    "配置里根本没有这个根"表现完全一致。
+    """
+    rid = (root_id or "").strip()
+    if not rid:
+        return
+    if rid in visible_root_ids(ctx, st):
+        return
+    from ..errors import NotFound
+
+    raise NotFound(None)
+
+
+def visible_root_ids(ctx: Any, st: Any) -> list[str]:
+    """本请求能看到的根 id 集合（主人/游客隔离的**唯一**事实来源）。
+
+    主人：`enabled_roots`（停用的根看不见 —— 审计 F01）。
+    游客：`guest_root_ids`（只有一个，见 `Config._check_guest_roots`）。
+    """
+    client = ctx.state.get("client") or {}
+    if client.get("guest") or client.get("role") == "guest":
+        return list(st.cfg.guest_root_ids)
+    return [r.id for r in st.cfg.enabled_roots]
+
+
+def check_visible_root(ctx: Any, st: Any, root_id: str) -> None:
+    """点名一个本身份看不见的根 → 当"不存在"处理（404）。
+
+    为什么是 404 而不是 403：403 等于告诉对方"这个根存在，只是你没权限"，
+    而根 id（`library` / `guest`）是可以猜的短字符串。游客一次猜测就能
+    确认主人配了哪些库，接着只需要猜 id 就能枚举 —— 这条边界必须与
+    "配置里根本没有这个根"表现完全一致。
+    """
+    rid = (root_id or "").strip()
+    if not rid:
+        return
+    if rid in visible_root_ids(ctx, st):
+        return
+    from ..errors import NotFound
+
+    raise NotFound(None)
+
+
 __all__ = [
     "TIMELINE_COLUMNS",
     "DETAIL_COLUMNS",
@@ -36,6 +96,10 @@ __all__ = [
     "thumb_etag",
     "normalize_dir",
     "parse_ts",
+    "visible_root_ids",
+    "check_visible_root",
+    "visible_root_ids",
+    "check_visible_root",
     "parse_size",
     "etag_matches",
     "root_id_param",

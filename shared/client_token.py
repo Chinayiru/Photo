@@ -159,7 +159,9 @@ def secret_for_agent_token(agent_token: str) -> str:
 def issue_token(secret: str, *, client_id: str, device_id: str,
                 ttl_days: int = TOKEN_TTL_DAYS,
                 now: float | None = None,
-                client_name: str = "") -> str:
+                client_name: str = "",
+                role: str = "owner",
+                invite_id: str = "") -> str:
     """签发一枚绑定 `(client_id, device_id)` 的令牌。
 
     `client_name` 是可选的展示名（claim `nam`）。带上它的理由：电脑端
@@ -176,6 +178,18 @@ def issue_token(secret: str, *, client_id: str, device_id: str,
         "iat": issued,
         "exp": issued + int(ttl_days * 86400),
     }
+    if role and role != "owner":
+        # ★ 只在非主人令牌上写这两个 claim：主人的令牌保持逐字节不变，
+        #   这样升级前后"同一枚令牌"仍能被旧代码验过（线上不会有半秒的
+        #   401 窗口），也省掉一次全量重签。
+        #
+        # `inv` 是**必需**的：撤销与过期都靠"这枚令牌属于哪次邀请"回答，
+        # 缺了它就只剩令牌自己的 `exp`，而主人的"立刻结束访问"（G13）
+        # 会变成"等 2 小时自然过期"。
+        if not invite_id:
+            raise ValueError("游客令牌必须带 invite_id")
+        payload["rl"] = str(role)[:16]
+        payload["inv"] = str(invite_id)
     if client_name:
         # 截到 64 与云端 `clients.name` 的 CHECK 一致；不截会让一个
         # 超长名字把令牌顶到 TOKEN_MAX_LEN 之上，于是一枚刚签发的令牌
@@ -230,4 +244,13 @@ def verify_token(secret: str, token: str, *, device_id: str | None = None,
     # ★ 设备绑定校验。少了这一行，一台电脑的令牌能读另一台的照片。
     if device_id is not None and dev != device_id:
         return None
+    # ★ ISSUE-063：`rl` 缺省 `owner`。白名单而不是黑名单 —— 以后加角色
+    #   时，旧版本代码遇到不认识的 `rl` 会**拒绝**（安全的那一侧）。
+    role = claims.get("rl", "owner")
+    if role not in ("owner", "guest"):
+        return None
+    if role == "guest":
+        inv = claims.get("inv")
+        if not isinstance(inv, str) or not inv:
+            return None
     return claims

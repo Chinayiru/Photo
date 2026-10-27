@@ -149,6 +149,8 @@ async def timeline(ctx: Ctx) -> Reply:
         # RootDisabledError，由 errors.to_app_error 归一）。不点名时靠
         # 下面的 enabled_root_ids 过滤，禁用根的照片一条都不出现。
         st.cfg.root_by_id(root_id, allow_disabled=False)
+        # ★ 游客点名一个主人的根 → 404（与"根不存在"同表现）。
+        common.check_visible_root(ctx, st, root_id)
 
     ts_from = parse_ts(ctx.q("from"), what="from")
     ts_to = parse_ts(ctx.q("to"), what="to")
@@ -163,7 +165,7 @@ async def timeline(ctx: Ctx) -> Reply:
         # 视频开关关掉时，`kind=all` 也只给图片：看得见但点开播不了，
         # 比看不见更让人困惑。
         allow_video=bool(st.cfg.video_enabled),
-        enabled_root_ids=[r.id for r in st.cfg.enabled_roots],
+        enabled_root_ids=common.visible_root_ids(ctx, st),
     )
 
     cursor = ctx.q("cursor")
@@ -217,6 +219,10 @@ async def get_item(ctx: Ctx) -> Reply:
     #   管理员停用根之后，手机上仍能按 id 拉到 EXIF、路径、拍摄地点 ——
     #   而这正是当初共享那块照片时最敏感的那部分元数据。
     st.cfg.root_by_id(row["root_id"], allow_disabled=False)
+    # ★ 停用根之外还要看"这个身份能不能看这个根"：游客按 id 猜到了
+    #   主人家照片的媒体 id，列表里虽然不出现，但 `/api/items/{id}` 是
+    #   一个可以逐号试探的入口。
+    common.check_visible_root(ctx, st, row["root_id"])
 
     # 前后邻居用于查看器左右滑动。这里各查一次而不是等到滑动时再查，
     # 是因为滑动时的额外往返在弱网下会明显卡顿，而两次主键索引查询
@@ -295,6 +301,7 @@ async def _serve_thumb(st: AppState, ctx: Ctx, mid: int) -> Reply:
     #   校验，等于"停用之前已经生成过的图全部继续可读"。这一行必须在任何
     #   `dst.exists()` 之前，否则有等于没有。
     st.cfg.root_by_id(row["root_id"], allow_disabled=False)
+    common.check_visible_root(ctx, st, row["root_id"])
 
     if not row["missing"] and row["thumb_state"] == "failed":
         # 已判定失败的图不再反复重试：每次请求都重试会让一张坏图
@@ -503,6 +510,7 @@ async def get_preview(ctx: Ctx) -> Reply:
     # ★ 审计 F01：同 `_serve_thumb` —— 停用根的预览缓存文件仍在磁盘上，
     #   必须在 304/缓存分支之前就拒绝，而不是等到重新生成时才拒。
     st.cfg.root_by_id(row["root_id"], allow_disabled=False)
+    common.check_visible_root(ctx, st, row["root_id"])
 
     dst = thumb_path(st.cfg, row["root_id"], row["rel_path"], size)
     sig = f"p{size}-{int(row['mtime'])}-{int(row['size'])}"
@@ -609,6 +617,9 @@ async def get_raw(ctx: Ctx) -> Reply:
         raise NotFound(f"源文件已丢失 media_id={mid}")
 
     root = st.cfg.root_by_id(row["root_id"], allow_disabled=False)
+    # ★ `/raw` 与 `/stream` 共用这条路径 —— 视频流也必须卡在这里，
+    #   否则"列表里看不到、但能按 id 拉整段原片"。
+    common.check_visible_root(ctx, st, row["root_id"])
     # ★ 即使路径来自我们自己的数据库，也要过沙箱：配置可能已经改过，
     # 旧行的 rel_path 现在可能指向库外（或变成 junction）。
     src = sandbox.resolve(root, row["rel_path"], "read", cfg=st.cfg)
@@ -724,6 +735,14 @@ async def stream_ticket(ctx: Ctx) -> Reply:
     """
     st = _st(ctx)
     mid = ctx.param_int("media_id")
+    # ★ 票是"无 Bearer 也能过闸"的凭证，所以"能不能换"必须在签发前判定：
+    #   否则游客对主人家任意 id 换一张票，`?t=` 那条放行分支就把它放进来了。
+    row = st.db.query_one(
+        "SELECT id, root_id, kind, missing FROM media WHERE id = ?", (mid,))
+    if row is None or row["missing"]:
+        raise NotFound(f"media id={mid}")
+    st.cfg.root_by_id(row["root_id"], allow_disabled=False)
+    common.check_visible_root(ctx, st, row["root_id"])
     ticket = streamticket.mint(st.db, mid)
     r = json_reply({"ticket": ticket,
                     "expires_in": int(streamticket.STREAM_TICKET_TTL)})
@@ -844,7 +863,7 @@ async def folders(ctx: Ctx) -> Reply:
 
     # 「当前这一层直接有多少张」——面包屑旁的数字用它。
     # 和上面的 `count`（递归）分开算，理由见 buckets 那段注释。
-    files_here = _count_direct(st, root_id, base)
+    files_here = _count_direct(st, ctx, root_id, base)
 
     return json_reply({
         "root": root_id,
@@ -903,12 +922,12 @@ def _merge_disk_dirs(root: Any, base: str, buckets: dict[str, dict[str, Any]],
                         "cover_id": None}
 
 
-def _count_direct(st: AppState, root_id: str, base: str) -> int:
+def _count_direct(st: AppState, ctx: Ctx, root_id: str, base: str) -> int:
     """某一层目录里**直接**存放的媒体数量（不含子目录）。"""
     where, params = common.timeline_where(
         root_id=root_id,
         allow_video=bool(st.cfg.video_enabled),
-        enabled_root_ids=[r.id for r in st.cfg.enabled_roots],
+        enabled_root_ids=common.visible_root_ids(ctx, st),
     )
     where += _DIRECT_ONLY if not base else _DIRECT_ONLY_NESTED
     if base:
@@ -1036,6 +1055,7 @@ async def folder_media(ctx: Ctx) -> Reply:
     # 停用的根 → 404 E1004（root_by_id 抛 RootDisabledError）
     root = st.cfg.root_by_id(root_id, allow_disabled=False)
     assert root is not None
+    common.check_visible_root(ctx, st, root_id)
 
     base = _dir_param(ctx, st, root)
 
@@ -1045,7 +1065,7 @@ async def folder_media(ctx: Ctx) -> Reply:
         root_id=root_id,
         kind=ctx.q("kind"),
         allow_video=bool(st.cfg.video_enabled),
-        enabled_root_ids=[r.id for r in st.cfg.enabled_roots],
+        enabled_root_ids=common.visible_root_ids(ctx, st),
     )
     where += _DIRECT_ONLY if not base else _DIRECT_ONLY_NESTED
     if base:
@@ -1139,6 +1159,7 @@ async def search(ctx: Ctx) -> Reply:
         raise AppError(E1001, f"未知的 root：{root_id}")
     if root_id is not None:
         st.cfg.root_by_id(root_id, allow_disabled=False)      # 审计 F01：停用根 → 404 E1004
+        common.check_visible_root(ctx, st, root_id)
     if not any([q, root_id, ts_from is not None, ts_to is not None,
                 camera, dir_prefix, has_gps is not None]):
         raise AppError(E1001, "至少需要一个筛选条件")
@@ -1151,7 +1172,7 @@ async def search(ctx: Ctx) -> Reply:
         allow_video=bool(st.cfg.video_enabled),
         # 审计 F01：搜索不带 root 时是查全库，必须显式限定在启用根里 ——
         # 否则管理员停掉的那块照片照样能搜出来。
-        enabled_root_ids=[r.id for r in st.cfg.enabled_roots],
+        enabled_root_ids=common.visible_root_ids(ctx, st),
     )
     if q:
         # 一期用 LIKE 而非 FTS5：文件名匹配是"包含"语义，
