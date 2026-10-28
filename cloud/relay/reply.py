@@ -77,18 +77,26 @@ CODES: dict[str, tuple[int, str, bool, str]] = {
 
 
 def error_body(code: str, *, message: str | None = None,
-               request_id: str = "") -> dict[str, Any]:
-    """构造标准错误体。未登记的码按 500 处理，绝不放行未知码当成功。"""
+               request_id: str = "", detail: str | None = None,
+               user_hint: str | None = None) -> dict[str, Any]:
+    """构造标准错误体。未登记的码按 500 处理，绝不放行未知码当成功。
+
+    `detail` / `user_hint` 的默认值是"安全值"（detail 恒为 None、user_hint
+    取码表文案）。只有**云端本地要镜像电脑端同一句话**时才显式传入，
+    见 `forward._reject_no_token()`：同一条路径经隧道与直连必须给出同一段
+    文案（`docs/01` AC-6.7、`docs/04` §1.4.3 M7-023）。传进来的必须是
+    **固定文案**，绝不能拼接令牌、路径或内部 id。
+    """
     status, default_msg, retryable, hint = CODES.get(
         code, (500, "服务器处理失败", True, "稍后再试"))
     return {
         "error": {
             "code": code,
             "message": message or default_msg,
-            "detail": None,             # ★ 永不外泄
+            "detail": detail,           # ★ 默认永不外泄
             "retryable": retryable,
             "request_id": request_id,
-            "user_hint": hint,
+            "user_hint": hint if user_hint is None else user_hint,
         }
     }
 

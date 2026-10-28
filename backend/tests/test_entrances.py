@@ -113,3 +113,110 @@ def _call(*, host: str) -> dict:
     reply = asyncio.run(h_system.entrances(ctx))
     assert reply.status == 200
     return json.loads(reply.body.decode("utf-8"))
+
+
+# --------------------------------------------------------------- 入口二维码
+
+def _qr(*, kind: str | None = "lan", host: str = "192.0.2.10:8877",
+        extra_cfg: dict | None = None):
+    """跑 `entrances_qr`，返回 Reply。`kind=None` 表示不带查询参数。"""
+    import asyncio
+
+    from backend.app.core import Ctx, Headers
+    from backend.app.handlers import system as h_system
+
+    cfg = {"server.host": "0.0.0.0", "server.port": 8877}
+    cfg.update(extra_cfg or {})
+
+    class _App:
+        pass
+
+    app = _App()
+    app.cfg = cfg
+    headers = Headers({"host": host} if host else {})
+    query = {} if kind is None else {"kind": [kind]}
+    ctx = Ctx(method="GET", path="/api/system/entrances/qr", query=query,
+              headers=headers, app=app)
+    return asyncio.run(h_system.entrances_qr(ctx))
+
+
+def test_qr_is_a_png_with_the_lan_entry(monkeypatch) -> None:
+    """默认 `kind` 走局域网第一条地址，回 PNG + 可读的 `X-PB-QR-Text`。"""
+    from backend.app import entrances
+
+    monkeypatch.setattr(entrances, "mesh_ipv4_addresses", lambda: [])
+    reply = _qr()
+    assert reply.status == 200
+    assert reply.body[:8] == b"\x89PNG\r\n\x1a\n"
+    assert reply.headers.get("content-type") == "image/png"
+    # 二维码里是用户自己的地址，不能被中间代理缓存
+    assert reply.headers.get("cache-control") == "no-store"
+    text = reply.headers.get("x-pb-qr-text")
+    assert text.startswith("http://192.0.2.10:8877")
+    assert text.endswith("/")
+
+
+def test_qr_never_carries_a_token(monkeypatch) -> None:
+    """码里只有地址：扫到的人仍然要配对。
+
+    托盘窗口那边的配对码（`#code=…`）是另一回事，A3 的入口码不该带任何
+    凭证 —— 否则一张截图就等于一把钥匙。
+    """
+    from backend.app import entrances
+
+    monkeypatch.setattr(entrances, "mesh_ipv4_addresses", lambda: [])
+    text = _qr().headers.get("x-pb-qr-text")
+    assert "pbc1" not in text
+    assert "pbg1" not in text
+    assert "code=" not in text
+    assert "token" not in text.lower()
+
+
+def test_qr_cloud_kind_uses_the_configured_public_base(monkeypatch) -> None:
+    from backend.app import entrances
+
+    monkeypatch.setattr(entrances, "mesh_ipv4_addresses", lambda: [])
+    dev = "a" * 32
+    reply = _qr(kind="cloud", extra_cfg={
+        "cloud.base_url": "https://pb.example.com", "cloud.device_id": dev})
+    assert reply.status == 200
+    assert reply.headers["x-pb-qr-text"] == f"https://pb.example.com/d/{dev}/"
+
+
+def test_qr_rejects_unknown_kind(monkeypatch) -> None:
+    import pytest
+
+    from backend.app import entrances
+    from backend.app.errors import AppError
+
+    monkeypatch.setattr(entrances, "mesh_ipv4_addresses", lambda: [])
+    with pytest.raises(AppError) as exc:
+        _qr(kind="vpn")
+    assert exc.value.code == "E1001"
+
+
+def test_qr_cloud_without_base_url_is_a_clear_error(monkeypatch) -> None:
+    """没配云端时给出可读的 400，而不是发一张空码或 500。"""
+    import pytest
+
+    from backend.app import entrances
+    from backend.app.errors import AppError
+
+    monkeypatch.setattr(entrances, "mesh_ipv4_addresses", lambda: [])
+    with pytest.raises(AppError) as exc:
+        _qr(kind="cloud")
+    assert exc.value.code == "E1001"
+    assert exc.value.status == 400
+    assert "云端" in (exc.value.detail or "")
+
+
+def test_qr_endpoint_is_owner_only() -> None:
+    """「我这台电脑的入口清单」是主人视图，游客没有理由拿到。"""
+    from backend.app import routers
+
+    found = [r for r in routers.build_router().routes
+             if r.pattern == "/api/system/entrances/qr"]
+    assert len(found) == 1
+    assert found[0].audience == "owner"
+    assert found[0].method == "GET"
+

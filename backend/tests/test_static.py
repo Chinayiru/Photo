@@ -242,6 +242,26 @@ def test_html_csp_uses_configured_lan_port(tmp_path) -> None:
     assert "http://*:8787" not in csp
 
 
+def test_cloud_origin_lands_inside_connect_src(tmp_path) -> None:
+    """云端基址必须进 `connect-src`，不能吊在整串的尾巴上。
+
+    吊尾巴时（`csp + " " + add`）那一串不属于任何指令，浏览器直接忽略：
+    CSP 看起来"改了"，跨源 `fetch` 照样被拦。审计 F13 / M10-004 的现象就是
+    "页面能开、走云端通路全红"。
+    """
+    s = StaticFiles(_dist(tmp_path), lan_port=8877,
+                    extra_connect=["http://127.0.0.1:8888"])
+    csp = _run(s, _ctx("/")).headers["content-security-policy"]
+    connect = [d for d in csp.split(";") if d.strip().startswith("connect-src")]
+    assert len(connect) == 1
+    assert "http://127.0.0.1:8888" in connect[0]
+    # 整串的最后一条必须还是 `object-src 'none'`（说明没多出野指针）
+    assert csp.strip().endswith("object-src 'none'")
+    # 端口替换仍然生效，且不能因为加了云端就回退到 8787
+    assert "http://*:8877" in connect[0]
+    assert "http://*:8787" not in csp
+
+
 def test_assets_get_nosniff_but_no_csp(tmp_path) -> None:
     """静态资源不需要 CSP（CSP 只管文档），但 `nosniff` 必须有。"""
     s = StaticFiles(_dist(tmp_path))

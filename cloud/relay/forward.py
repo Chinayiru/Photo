@@ -152,6 +152,23 @@ _FLUSH_BYTES: int = 1 << 20
 _FLUSH_REQS: int = 32
 _FLUSH_SEC: float = 30.0
 
+#: 认证失败的 401 体，**逐字段镜像电脑端**（`docs/01` AC-6.7、`docs/04`
+#: §1.4.3 M7-023）：同一条路径经隧道与直连，手机看到的必须是同一段文案，
+#: 否则 `api/client.ts` 按 code/message 分支处理的逻辑被迫分叉。
+#:
+#: 这四个字面量对应电脑端 `backend/app/errors.py` + `auth.py` 的输出：
+#:   `{"code":"E2002","message":"client_token_invalid",
+#:     "detail":"缺少凭证：Authorization 头"|"token 不存在",
+#:     "retryable":false,"request_id":"…","user_hint":"配对已失效，请重新配对"}`
+#:
+#: ★ 只能是**固定常量**。把令牌、client_id、路径拼进 `detail` 就是在错误
+#: 响应里外泄内部标识（上一轮 F11 的形状），而且会让"越权"与"不存在"
+#: 变得可区分。
+_DEVICE_AUTH_MESSAGE: str = "client_token_invalid"
+_DEVICE_AUTH_HINT: str = "配对已失效，请重新配对"
+_DEVICE_NO_TOKEN_DETAIL: str = "缺少凭证：Authorization 头"
+_DEVICE_BAD_TOKEN_DETAIL: str = "token 不存在"
+
 #: 云端 `/d/**` 上**不需要 client_token** 的路径（`docs/04` §1.2 与 §4.1.2）。
 #:
 #: 与电脑端 `backend/app/auth.py` 的 `PUBLIC_PATHS` 同一份语义，但**故意
@@ -334,7 +351,22 @@ class Forwarder:
 
         token = _client_token(request)
         if not token:
-            return self._reject_auth(ip, rid)
+            # ★ F08 / M7-023：**完全没带凭证时不自作回答、也不回源**。
+            #
+            #   两条约束同时成立才叫"对"：
+            #   1. 同一条路径经隧道与直连必须给出同一段文案（`docs/01`
+            #      AC-6.7、`docs/04` §1.4.3）。所以这里的 401 体逐字段
+            #      镜像电脑端：`message` 用 `client_token_invalid`、`detail`
+            #      用 `缺少凭证：Authorization 头`、`user_hint` 也照抄 ——
+            #      不能用码表里那句中文 message（那是电脑端的 user_hint）。
+            #   2. 不能为了"同形"把匿名请求转给电脑端。审计 F03 明确写了
+            #      "形状检查必须在回源之前"：云端不认识的令牌会触发
+            #      `_adopt_token_via_agent()`，一次隧道往返让家里的电脑替
+            #      陌生人验签。匿名请求同理 —— 它连验签的资格都没有，不该
+            #      占用电脑的一条在途额度（`tests/test_audit_f03_forward.py`
+            #      的 `test_missing_token_is_rejected_without_asking_the_device`
+            #      守的就是这条）。
+            return self._reject_auth(ip, rid, detail=_DEVICE_NO_TOKEN_DETAIL)
         # ★ 审计 F03：形状检查必须在**回源之前**。云端不认识的令牌会触发
         #   `_adopt_token_via_agent()` —— 一次隧道往返，让家里的电脑替陌生人
         #   验签，验过还会往 `clients` 里插一行。`Bearer a` 这种垃圾值不该
@@ -371,12 +403,27 @@ class Forwarder:
             return _error(403, "E2012", "登录的账号无权访问这台电脑",
                           request_id=rid)
         client_id = str(row["id"])
+        return await self._forward(request, device_id, rid,
+                                   client_id=client_id,
+                                   client_ip=_client_ip(request),
+                                   rate_key=client_id)
 
+    async def _forward(self, request: Request, device_id: str, rid: str, *,
+                       client_id: str, client_ip: str,
+                       rate_key: str) -> Response:
+        """配额 + 并发闸门 + 回源。
+
+        `rate_key` 是 client 级频率桶的键 —— 一律用 `client_id`，**不要**
+        拿空串或占位值当键：那会把所有请求挤进同一个桶，一个人就能把别人
+        的额度吃光。匿名请求根本走不到这里（在 `handle()` 里就被 401 挡掉
+        了，见 M7-023 那段注释）。
+        """
         # ---- 4 频率 ----
-        ok, retry = self.rate.hit(client_id)
-        if not ok:
-            return _error(429, "E4001", "请求太频繁", request_id=rid,
-                          retry_after=max(1, int(retry)))
+        if rate_key:
+            ok, retry = self.rate.hit(rate_key)
+            if not ok:
+                return _error(429, "E4001", "请求太频繁", request_id=rid,
+                              retry_after=max(1, int(retry)))
         # ★ 审计 F03：全局并发闸门在设备闸门**之前**。顺序反过来时，
         #   一台设备刷满自己 64 个额度后就不再碰全局计数，全局上限形同虚设。
         if not self.inflight_total.take(_INFLIGHT_ALL):
@@ -403,7 +450,7 @@ class Forwarder:
             # `"cloud"` 一个桶。
             resp = await self._relay(request, device_id, rid,
                                      client_id=client_id,
-                                     client_ip=_client_ip(request))
+                                     client_ip=client_ip)
         except BaseException:
             release()
             raise
@@ -420,15 +467,23 @@ class Forwarder:
         self.inflight_total.release(_INFLIGHT_ALL)
 
     def _reject_auth(self, ip: str, rid: str, *,
-                     clear_cookie: bool = False) -> Response:
-        """一次认证失败：先记账，超限改判 429，否则按原样 401。"""
+                     clear_cookie: bool = False,
+                     detail: str = _DEVICE_BAD_TOKEN_DETAIL) -> Response:
+        """一次认证失败：先记账，超限改判 429，否则按原样 401。
+
+        401 体逐字段镜像电脑端（`M7-023`）：`message`/`user_hint` 两处与
+        电脑端 `backend/app/errors.py` 保持字面一致，只有 `detail` 随情形
+        变（没带凭证 vs 令牌不可用）。`detail` 只会是下面两个常量之一，
+        不拼接任何令牌、client_id 或路径。
+        """
         allowed, retry = self.auth_fail.hit(ip)
         if not allowed:
             log.warning("来源 IP 认证失败过多 ip=%s", ip)
             return _error(429, "E4001", "认证失败次数过多，请稍后再试",
                           request_id=rid, retry_after=max(1, int(retry)))
-        return _error(401, "E2002", "配对已失效，请重新配对", request_id=rid,
-                      clear_cookie=clear_cookie)
+        return _error(401, "E2002", _DEVICE_AUTH_MESSAGE, request_id=rid,
+                      clear_cookie=clear_cookie, detail=detail,
+                      user_hint=_DEVICE_AUTH_HINT)
 
     async def _adopt_token_via_agent(self, token: str,
                                      device_id: str) -> Any:
@@ -716,7 +771,8 @@ def _with_cookies(resp: Response, cookies: list[str]) -> Response:
 
 def _error(status: int, code: str, message: str, *,
            retry_after: int | None = None, request_id: str = "",
-           clear_cookie: bool = False) -> Response:
+           clear_cookie: bool = False, detail: str | None = None,
+           user_hint: str | None = None) -> Response:
     """云端的错误响应，**与电脑端逐字段同形**。
 
     形状一致不是审美问题：`docs/01` AC-6.7 要求同一路径在两条通路上
@@ -733,7 +789,8 @@ def _error(status: int, code: str, message: str, *,
     if request_id:
         headers["x-request-id"] = request_id
     body = json.dumps(error_body(code, message=message,
-                                 request_id=request_id),
+                                 request_id=request_id, detail=detail,
+                                 user_hint=user_hint),
                       ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     resp = Response(body, status_code=status, headers=headers)
     if clear_cookie:

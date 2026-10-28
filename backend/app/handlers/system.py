@@ -16,14 +16,14 @@ from pathlib import Path
 from typing import Any, Final
 
 from ..config import WILDCARD_HOSTS
-from ..core import Ctx, Reply, json_reply
+from ..core import Ctx, Reply, bytes_reply, json_reply
 from ..errors import E1001, BadRequest
 from ..state import AppState
 from . import common
 
 log = logging.getLogger(__name__)
 
-__all__ = ["ping", "info", "stats", "entrances"]
+__all__ = ["ping", "info", "stats", "entrances", "entrances_qr"]
 
 
 def _masked_path(value: object) -> str:
@@ -541,3 +541,85 @@ async def entrances(ctx: Ctx) -> Reply:
         if base else None
     )
     return json_reply(data)
+
+
+def _entry_url(data: dict[str, Any], kind: str) -> str:
+    """从 `entrances` 的返回值里取一条可以直接扫的地址。
+
+    `lan` 取第一条局域网地址，`cloud` 取云端入口 —— 两者都是**带尾斜杠
+    的完整 origin**，与 `docs/04` §2.5 里 `entrances` 的 `url` 字段一致。
+    """
+    if kind == "cloud":
+        cloud = data.get("cloud") or {}
+        url = str(cloud.get("url") or "")
+        if not url:
+            raise BadRequest("未配置云端入口（cloud.base_url 为空）")
+        return url
+    for group in ("lan", "vpn"):
+        for item in data.get(group) or ():
+            url = str(item.get("url") or "")
+            if url:
+                return url
+    raise BadRequest("没有探测到可用地址（检查网络连接）")
+
+
+def _qr_png(text: str, *, box: int = 6, border: int = 3) -> bytes:
+    """把一段文本编成 PNG 二维码。
+
+    与桌面托盘窗口用的是同一套参数（`qrcode` + 纠错级别 M + 白底），
+    这样两处扫出来观感一致。`box` 比托盘小：网页里显示得小一些。
+    """
+    import io
+
+    import qrcode        # 延迟导入：没装 qrcode 的环境不该在 import 阶段挂掉
+
+    qr = qrcode.QRCode(
+        box_size=int(box),
+        border=int(border),
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+    )
+    qr.add_data(text)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+async def entrances_qr(ctx: Ctx) -> Reply:
+    """入口地址的二维码（`?kind=lan|cloud`）。
+
+    「我的」页把两条入口并排摆出来（`docs/04` §2.5 与 A3 用例）：一条
+    局域网、一条云端，各自配一个码，另一台手机扫一下就进对应的地址。
+
+    **为什么由电脑端生成而不是前端画**：前端只依赖 `vue`，为了一个二维码
+    引进一个编码库（几百 KB 且要维护掩码/纠错表）不划算；电脑端已经有
+    `qrcode`（托盘窗口在用）。图由 `<img src>` 直接取，走的是普通 GET，
+    不需要在页面里跑 JS 解码。
+
+    权限：`owner`。这是"我这台电脑的入口清单"，游客既看不到也不需要。
+    码里**只有地址本身**，不含任何令牌 —— 谁扫到都只拿到一个入口 URL，
+    仍然要配对。
+    """
+    st = _state(ctx)
+    cfg = st.cfg
+    kind = (ctx.q("kind") or "lan").strip().lower()
+    if kind not in ("lan", "cloud"):
+        raise BadRequest("kind 只能是 lan 或 cloud")
+
+    from .. import entrances as entrances_mod
+
+    data = entrances_mod.collect(cfg=cfg, port=_served_port(ctx, cfg))
+    base = _public_base(cfg)
+    data["cloud"] = (
+        {"label": entrances_mod.CLOUD_LABEL, "host": base.split("://", 1)[-1],
+         "url": f"{base.rstrip('/')}/"}
+        if base else None
+    )
+    url = _entry_url(data, kind)
+    png = _qr_png(url)
+    reply = bytes_reply(png, "image/png")
+    reply.set("Cache-Control", "no-store")
+    # 码里是用户自己的内网/云端地址，别让中间的代理拿去缓存。
+    reply.set("X-PB-QR-Text", url)
+    return reply

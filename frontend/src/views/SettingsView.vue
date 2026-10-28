@@ -8,10 +8,10 @@
  * 退出配对要二次确认 —— 手机上重新输入 IP 和 6 位码并不轻松，
  * 误触的代价比多点一次大。
  */
-import { computed, onActivated, onMounted } from "vue";
+import { computed, onActivated, onMounted, ref } from "vue";
 import GuestPanel from "../components/GuestPanel.vue";
 import { confirmDialog, setConfirmBusy } from "../stores/confirm";
-import { ApiError } from "../api/client";
+import { ApiError, absUrl, api } from "../api/client";
 import { copyText } from "../api/clipboard";
 import { getClientName, getDeviceId, getToken } from "../api/storage";
 import { authStore, currentBase, isPaired, unpair } from "../stores/auth";
@@ -94,12 +94,55 @@ const liveOff = computed(() => isPaired() && !s.live);
 
 onMounted(() => {
   if (!s.lastLoadedAt) void refresh();
+  void loadEntries();
 });
 
 onActivated(() => {
   // 每次切回设置页刷一次：用户来这里就是想看"现在怎么样了"
   void refresh();
+  void loadEntries();
 });
+
+/**
+ * 这台电脑的两条入口（局域网 / 云端），「我的」页把它们并排摆出来。
+ *
+ * 为什么放在这里：用户换手机、给家人开一台设备时，需要"另一台手机怎么
+ * 连上这台电脑"。以前只能靠电脑上的托盘窗口，而用户此刻正拿着手机看
+ * 这个页面 —— 让他在两个界面之间来回切是没必要的摩擦。
+ *
+ * 数据来自 `GET /api/system/entrances`（匿名，配对页也在用同一个接口），
+ * 二维码由 `GET /api/system/entrances/qr` 现画，码里**只有地址**，
+ * 不含令牌（见 `backend/app/handlers/system.py: entrances_qr`）。
+ */
+type EntryItem = { label: string; host: string; url: string };
+const lanEntry = ref<EntryItem | null>(null);
+const cloudEntry = ref<EntryItem | null>(null);
+
+async function loadEntries(): Promise<void> {
+  try {
+    const d = await api.get<{
+      lan?: EntryItem[];
+      vpn?: EntryItem[];
+      cloud?: EntryItem | null;
+    }>("/api/system/entrances", { retry: 0, timeoutMs: 8000 });
+    // 局域网优先：同一个 Wi-Fi 下它比走云端快得多，也不吃上行带宽。
+    lanEntry.value = (d.lan ?? [])[0] ?? (d.vpn ?? [])[0] ?? null;
+    cloudEntry.value = d.cloud ?? null;
+  } catch {
+    // 探测失败不影响本页其它信息（统计、目录、游客面板都照常显示）
+  }
+}
+
+function qrSrc(kind: "lan" | "cloud"): string {
+  return absUrl("/api/system/entrances/qr", { kind });
+}
+
+function copyEntry(it: EntryItem): void {
+  void copyText(it.url).then(
+    (ok) => (ok ? toastOk("已复制") : toastWarn("复制失败，请手动选中地址")),
+    () => toastWarn("复制失败，请手动选中地址"),
+  );
+}
 
 async function onRescan(): Promise<void> {
   try {
@@ -248,6 +291,47 @@ const pairing = computed(() => {
       <div v-if="diskTotal" class="diskbar" :title="`已用 ${diskUsedPct.toFixed(1)}%`">
         <div class="diskbar-in" :class="diskClass" :style="{ width: `${diskUsedPct}%` }" />
       </div>
+    </div>
+
+    <!-- 入口：给"另一台手机怎么连上这台电脑"用 -->
+    <div v-if="lanEntry || cloudEntry" class="card entries">
+      <h3 class="sec">入口</h3>
+
+      <div v-if="lanEntry" class="entry">
+        <div class="entry-main">
+          <div class="entry-label ellipsis">{{ lanEntry.label || "局域网" }}</div>
+          <a class="entry-link mono ellipsis" :href="lanEntry.url">{{ lanEntry.url }}</a>
+        </div>
+        <img
+          class="qr"
+          :src="qrSrc('lan')"
+          :alt="`${lanEntry.label || '局域网'} 入口二维码`"
+          width="96"
+          height="96"
+          loading="lazy"
+        />
+        <button class="mini" type="button" @click="copyEntry(lanEntry)">复制</button>
+      </div>
+
+      <div v-if="cloudEntry" class="entry">
+        <div class="entry-main">
+          <div class="entry-label ellipsis">{{ cloudEntry.label || "云端" }}</div>
+          <a class="entry-link mono ellipsis" :href="cloudEntry.url">{{ cloudEntry.url }}</a>
+        </div>
+        <img
+          class="qr"
+          :src="qrSrc('cloud')"
+          :alt="`${cloudEntry.label || '云端'} 入口二维码`"
+          width="96"
+          height="96"
+          loading="lazy"
+        />
+        <button class="mini" type="button" @click="copyEntry(cloudEntry)">复制</button>
+      </div>
+
+      <p class="entry-tip dim">
+        另一台手机扫上面的码即可打开对应入口；扫码只带地址，进入后仍需配对。
+      </p>
     </div>
 
     <!-- 照片目录 -->
@@ -512,6 +596,66 @@ const pairing = computed(() => {
   color: var(--fg-2);
   font-weight: 500;
   margin-bottom: 10px;
+}
+
+/* 入口卡片：左边一条可点/可复制的地址，右边是二维码 */
+.entry {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.entry + .entry {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.entry-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.entry-label {
+  font-size: 13px;
+  color: var(--fg);
+  margin-bottom: 2px;
+}
+
+.entry-link {
+  font-size: 12px;
+  color: var(--accent, #3b82f6);
+  text-decoration: none;
+}
+
+.entry-link:active {
+  text-decoration: underline;
+}
+
+/* 二维码必须是白底：主题是深色时，透明底会把码扫不出来 */
+.qr {
+  flex: 0 0 auto;
+  width: 96px;
+  height: 96px;
+  border-radius: 6px;
+  background: #fff;
+  padding: 4px;
+}
+
+.mini {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--bg-3);
+  color: var(--fg-2);
+  font-size: 12px;
+}
+
+.entry-tip {
+  margin-top: 10px;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .root + .root {

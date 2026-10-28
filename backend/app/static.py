@@ -98,15 +98,21 @@ def _apply_cache(reply: Reply, rel: str, *, is_index: bool) -> None:
 
 
 def _apply_security(reply: Reply, path: Path, *,
-                    lan_port: int | None = None) -> Reply:
+                    lan_port: int | None = None,
+                    extra_connect: list[str] | None = None) -> Reply:
     """贴上安全响应头，并把同一个 `reply` 返回（便于 `return _apply_security(…)`）。
 
     头本身定义在 `shared/security_headers.py`，云端伺服
     （`cloud/relay/pages.py`）发的是同一套 —— 因为这是**同一个页面**的
     两条路径。修之前这里一个头都没有（连 `nosniff` 都没有），而手机在
     家里 Wi-Fi 下走的正是这条路径。
+
+    `extra_connect` 是本页面的**已知来源**（云端基址）：页面由电脑端伺服、
+    却要回云端取图与请求时，`connect-src` 必须点名那个 origin，否则
+    浏览器直接拦掉（审计 F13 / M10-004）。
     """
-    for key, value in headers_for(_content_type(path), lan_port=lan_port):
+    for key, value in headers_for(_content_type(path), lan_port=lan_port,
+                                  extra_connect=extra_connect):
         reply.set(key, value)
     return reply
 
@@ -118,11 +124,13 @@ class StaticFiles:
     比 `<function <locals>.<lambda> at 0x...>` 有用得多。
     """
 
-    __slots__ = ("root", "index", "enabled", "lan_port")
+    __slots__ = ("root", "index", "enabled", "lan_port", "extra_connect")
 
     def __init__(self, dist: str | Path | None = None, *,
-                 lan_port: int | None = None) -> None:
+                 lan_port: int | None = None,
+                 extra_connect: list[str] | None = None) -> None:
         self.lan_port = lan_port
+        self.extra_connect = list(extra_connect or [])
         self.root: Path | None = None
         self.index: Path | None = None
         self.enabled = False
@@ -202,7 +210,8 @@ class StaticFiles:
             r = empty_reply(304)
             r.set_etag(etag)
             _apply_cache(r, rel, is_index=path == self.index)
-            return _apply_security(r, path, lan_port=self.lan_port)
+            return _apply_security(r, path, lan_port=self.lan_port,
+                                   extra_connect=self.extra_connect)
 
         if path == self.index:
             # 外壳不缓存（见模块文档第 3 点）。
@@ -213,12 +222,14 @@ class StaticFiles:
             )
             _apply_cache(reply, rel, is_index=True)
             reply.set_etag(etag)
-            return _apply_security(reply, path, lan_port=self.lan_port)
+            return _apply_security(reply, path, lan_port=self.lan_port,
+                                   extra_connect=self.extra_connect)
 
         reply = file_reply(iter_file(path), _content_type(path), st.st_size)
         reply.set_etag(etag)
         _apply_cache(reply, rel, is_index=False)
-        return _apply_security(reply, path, lan_port=self.lan_port)
+        return _apply_security(reply, path, lan_port=self.lan_port,
+                              extra_connect=self.extra_connect)
 
     def __repr__(self) -> str:
         return f"StaticFiles(root={self.root!r}, enabled={self.enabled})"

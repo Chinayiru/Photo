@@ -32,6 +32,12 @@ def build_router() -> Router:
     r.add(
         "GET", "/api/system/entrances", h_system.entrances, name="system.entrances", audience="guest",
     )
+    # 入口二维码（`?kind=lan|cloud`）。`owner`：「我的」页是主人视角，
+    # 游客看不到这台电脑的入口清单，也就不该能取到它的二维码。
+    r.add(
+        "GET", "/api/system/entrances/qr", h_system.entrances_qr,
+        name="system.entrances_qr", audience="owner",
+    )
     r.add("GET", "/api/system/stats", h_system.stats, name="system.stats", audience="owner")
     r.add("GET", "/api/events", h_events.events, name="system.events", audience="guest")
 

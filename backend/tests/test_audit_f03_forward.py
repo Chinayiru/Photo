@@ -145,6 +145,39 @@ def test_missing_token_is_rejected_without_asking_the_device(rig) -> None:
     assert rig.agent.calls == 0
 
 
+def test_missing_token_body_is_the_device_body(rig) -> None:
+    """M7-023：云端本地拒，但文案必须和电脑端**逐字段一致**。
+
+    两条约束要同时满足，少一条就不算修好：
+
+    * 不回源 —— 匿名请求不该让家里的电脑跑一次验签（见上一个用例）；
+    * 但同一条路径经隧道与直连必须给出同一段 JSON（`docs/01` AC-6.7），
+      否则前端按 `code`/`message` 分支处理的逻辑被迫分叉。
+
+    电脑端（`backend/app/errors.py` + `auth.py`）在没带凭证时回的是这一段。
+    """
+    err = _err(rig.handle(f"/d/{DEV}/api/timeline"))
+    assert err["code"] == "E2002"
+    assert err["message"] == "client_token_invalid"
+    assert err["detail"] == "缺少凭证：Authorization 头"
+    assert err["retryable"] is False
+    assert err["user_hint"] == "配对已失效，请重新配对"
+    assert set(err) == {"code", "message", "detail", "retryable",
+                        "request_id", "user_hint"}
+
+
+def test_rejected_token_body_never_leaks_internals(rig) -> None:
+    """`detail` 只能是固定文案：不能把令牌、client_id 或路径漏进错误体。
+
+    上一轮 F11 的形状（`detail: "guest session revoked client=<32 位>"`）
+    就是把内部标识写进了用户可见的响应里。
+    """
+    err = _err(rig.handle(f"/d/{DEV}/api/timeline", token="Bearer.not-a-token"))
+    assert err["detail"] == "token 不存在"
+    assert "pbc1" not in json.dumps(err, ensure_ascii=False)
+    assert DEV not in err["detail"]
+
+
 def test_well_formed_but_unknown_token_does_ask_once(rig) -> None:
     """形状对了就必须照旧问电脑端——别把形状检查做成"凡是可疑就拒"。"""
     resp = rig.handle(f"/d/{DEV}/api/timeline", token=GOOD)

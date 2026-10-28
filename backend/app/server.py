@@ -29,6 +29,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import events as events_mod
 from . import uploads
@@ -168,8 +169,15 @@ def build_app(cfg: Config | None = None, *, state: AppState | None = None) -> An
     # 用 set_fallback 而不是再注册一条 `/{path:path}` 路由 —— 后者会
     # 与所有 API 路由竞争匹配，一旦正则顺序变化就可能把 API 请求
     # 吃掉交给前端外壳，表现为"接口返回 index.html"。
+    #
+    # `extra_connect`：这个页面由**电脑端**伺服，而"云端入口"是另一个
+    # origin（`http://<中继>:<端口>/d/<id>`）。CSP 的 `connect-src` 必须
+    # 点名它，否则浏览器直接拦掉这一次跨源请求 —— 审计 F13 / M10-004：
+    # 页面能渲染，但走云端通路时所有 `fetch` 都失败，控制台里是
+    # `violates … Content Security Policy directive: "connect-src …"`。
     router.set_fallback(StaticFiles(
-        _dist_dir(cfg), lan_port=int(cfg.get("server.port", 8787))))
+        _dist_dir(cfg), lan_port=int(cfg.get("server.port", 8787)),
+        extra_connect=_page_connect_sources(cfg)))
 
     # ★ 由配置决定用哪条通路，而不是写死局域网。
     # 二期的 cloud_tunnel 只要在 transports/ 里 register() 一下，
@@ -195,6 +203,31 @@ def _cors_origins(cfg: Config) -> tuple[str, ...]:
             continue
         out.append(s)
     return tuple(out)
+
+
+def _page_connect_sources(cfg: Config) -> list[str]:
+    """前端外壳的 CSP 里要额外放行的**确切**来源（目前只有云端基址）。
+
+    为什么需要：局域网页面由电脑端伺服，`connect-src 'self'` 只覆盖
+    "同一个 origin"。而"云端入口"是另一个 origin
+    （`http://<中继>:<端口>/d/<id>`），页面走云端通路时每一次 `fetch`
+    都是跨源的 —— 不点名它就被浏览器拦下（审计 F13 / M10-004）。
+
+    为什么只放这一个而不是继续用通配：这个值来自用户自己的配置
+    （`cloud.base_url`），是**已知且有限**的；而 `http://*:8787` 那种
+    通配是为了照顾"中继域名运行时才知道"，在电脑端没有这个借口。
+    配置为空（没接云端）时返回空列表，CSP 维持原样。
+    """
+    raw = str(cfg.get("cloud.base_url", "") or "").strip()
+    if not raw:
+        return []
+    # 允许用户只写 `host:port`（`scripts/cloud_init.py` 写的是完整 URL，
+    # 但手改配置的人常常省掉 scheme）。
+    parts = urlsplit(raw if "://" in raw else f"http://{raw}")
+    if not parts.scheme or not parts.netloc:
+        log.warning("cloud.base_url=%r 解析不出 origin，CSP 不放行它", raw)
+        return []
+    return [f"{parts.scheme}://{parts.netloc}"]
 
 
 def _dist_dir(cfg: Config) -> Path | None:
