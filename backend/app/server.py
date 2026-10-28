@@ -239,6 +239,17 @@ async def _request_log_middleware(ctx, nxt):
     ms = (time.perf_counter() - t0) * 1000
     if ms >= 300 or reply.status >= 400:
         log.info("%s %s -> %s %.0fms", ctx.method, ctx.path, reply.status, ms)
+    # ★ 游客拿到的媒体响应一律不许落地缓存（现象 4/硬约束 6）。
+    #   缩略图 URL 是 `/api/items/{id}/thumb?v=...`，不含身份；同一台手机上
+    #   先当主人浏览过，浏览器就把这些字节按 URL 存住了 —— 之后游客身份再来
+    #   不是"被拒绝"，而是**压根没发请求**，直接回放主人的图。这也是"点进去
+    #   查无此图、缩略图却可见、刷新一下又正常"的机械原因。
+    try:
+        client = ctx.state.get("client") if hasattr(ctx.state, "get") else None
+    except Exception:  # noqa: BLE001
+        client = None
+    if client and client.get("guest") and ctx.path.startswith("/api/items/"):
+        reply.headers["cache-control"] = "no-store"
     return reply
 
 

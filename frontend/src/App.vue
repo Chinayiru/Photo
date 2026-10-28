@@ -26,7 +26,7 @@ import { authStore, guestInviteFromLocation, isPaired, probe, redeemGuest } from
 import { isGuest } from "./api/storage";
 import { toastError, toastOk } from "./stores/toast";
 import { exit as exitSelect, selectionStore } from "./stores/selection";
-import { openFolder } from "./stores/timeline";
+import { clearTimeline, openFolder } from "./stores/timeline";
 import { startEvents, stopEvents } from "./stores/system";
 import { requeueInterrupted, uploadStore } from "./stores/upload";
 
@@ -75,6 +75,13 @@ async function handleGuestLink(): Promise<void> {
   guestFail.value = "";
   try {
     const r = await redeemGuest(invite);
+    // ★ 身份切换必须先把上一位身份的数据清干净（硬约束 6，现象 4）：
+    //   这台设备可能几秒前还是主人（localStorage 里是主人的 pb.token、
+    //   store 里是主人的列表、浏览器 HTTP 缓存里是主人的缩略图）。
+    //   只切 `guest` 标志会让首屏仍按旧身份渲染 —— 用户看到的就是
+    //   "游客页面上出现主账号缩略图、点进去查无此图、刷新后正常"。
+    clearTimeline();
+    uploadStore.reset();
     guest.value = true;
     paired.value = true;
     startEvents();
