@@ -32,6 +32,10 @@ import {
   selectionStore,
   toggle as toggleSelect,
 } from "../stores/selection";
+import { isGuest } from "../api/storage";
+
+// 游客不提供「按文件夹」（ISSUE-071）：模板里那个按钮 v-if 用它。
+const guestMode = isGuest();
 
 const grid = ref<InstanceType<typeof PhotoGrid> | null>(null);
 
@@ -344,7 +348,11 @@ onDeactivated(() => {
           :aria-selected="mode === 'all'"
           @click="switchMode('all')"
         >全部图片</button>
+        <!-- ★ 游客不提供「按文件夹分类」（硬约束 7/8）：目录名本身也是信息，
+             即使取不到内容也不暴露主库结构。后端 `/api/folders` 同时对游客
+             关闭（audience=owner → 404），两边都做才算修复。 -->
         <button
+          v-if="!guestMode"
           class="seg-btn"
           :class="{ on: mode === 'folder' }"
           type="button"
