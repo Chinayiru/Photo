@@ -26,7 +26,7 @@ from .. import archive, uploads
 from . import common
 from ..core import Ctx, Reply, json_reply
 from ..errors import AppError, BadRequest, E1001, E1007, E1010, E1012, NotFound
-from ..transports.base import parse_range, RangeNotSatisfiable
+from ..core.httpmedia import parse_range, RangeNotSatisfiable
 
 log = logging.getLogger(__name__)
 

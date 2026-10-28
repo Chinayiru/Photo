@@ -39,7 +39,7 @@ from ..errors import (
     Unauthorized,
 )
 from ..state import AppState
-from ..transports.base import (
+from ..core.httpmedia import (
     RangeNotSatisfiable,
     content_range_header,
     parse_range,

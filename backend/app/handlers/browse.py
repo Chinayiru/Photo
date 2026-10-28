@@ -43,7 +43,7 @@ from ..errors import (
 )
 from ..state import AppState
 from ..thumbs import placeholder_webp, source_signature, thumb_path
-from ..transports.base import (
+from ..core.httpmedia import (
     RangeNotSatisfiable,
     content_range_header,
     content_type_for,
