@@ -160,6 +160,75 @@ def test_auto_pair_issues_a_token_the_agent_can_verify(tmp_path: Path) -> None:
     assert str(row["token_hash"]) != str(body["client_token"])
 
 
+def test_client_me_and_token_refresh_endpoints(tmp_path: Path, monkeypatch) -> None:
+    client = TestClient(_app(tmp_path))
+    token = _account(client)
+    device_id, _agent_token = _device(client)
+    _online(client.app, device_id)
+    paired = _auto(client, device_id, token).json()
+    client_token = paired["client_token"]
+
+    info = client.get("/api/clients/me",
+                      headers={"Authorization": f"Bearer {client_token}"})
+    assert info.status_code == 200, info.text
+    assert info.json()["client_id"] == paired["client_id"]
+    assert info.json()["device_id"] == device_id
+
+    db = client.app.state.db
+    db.execute("UPDATE clients SET expires_at = ? WHERE id = ?",
+               (time.time() + 3600, paired["client_id"]))
+
+    async def refresh_agent(_conn, action, payload):
+        assert action == "refresh_client"
+        assert payload["client_id"] == paired["client_id"]
+        return {
+            "client_id": paired["client_id"],
+            "token": "rotated-token-for-test",
+            "expires_at": time.time() + 90 * 86400,
+        }
+
+    monkeypatch.setattr(cloud_control, "call_agent", refresh_agent)
+    refreshed = client.post(
+        "/api/clients/token/refresh",
+        headers={"Authorization": f"Bearer {client_token}"})
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["client_token"] == "rotated-token-for-test"
+    assert db.query_one("SELECT token_hash FROM clients WHERE id = ?",
+                        (paired["client_id"],))["token_hash"] == security.hash_token(
+                            "rotated-token-for-test")
+
+
+def test_relay_rejects_unlisted_http_host(tmp_path: Path) -> None:
+    client = TestClient(_app(tmp_path))
+    response = client.get("/api/health", headers={"Host": "evil.example"})
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "E1004"
+    assert response.json()["error"]["request_id"]
+    assert response.headers["x-request-id"] == response.json()["error"]["request_id"]
+    method_dir = tmp_path / "method"
+    method_dir.mkdir()
+    wrong_method = TestClient(_app(method_dir)).post("/api/clients/me")
+    assert wrong_method.status_code == 405
+    assert wrong_method.json()["error"]["code"] == "E1018"
+
+
+def test_guest_redeem_uses_public_not_pair_rate_bucket() -> None:
+    from starlette.requests import Request
+
+    from cloud.relay.forward import _is_pair
+
+    def request(path: str) -> Request:
+        return Request({
+            "type": "http", "method": "POST", "path": path,
+            "headers": [], "query_string": b"", "scheme": "https",
+            "server": ("relay.example", 443), "client": ("192.0.2.1", 1234),
+            "http_version": "1.1",
+        })
+
+    assert _is_pair(request("/d/device/api/pair")) is True
+    assert _is_pair(request("/d/device/api/guest/redeem")) is False
+
+
 def test_auto_pair_works_twice_for_the_same_phone(tmp_path: Path) -> None:
     """重装 App / 清缓存后再登一次，应该直接再配一枚新令牌。
 

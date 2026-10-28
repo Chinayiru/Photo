@@ -97,7 +97,8 @@ def _apply_cache(reply: Reply, rel: str, *, is_index: bool) -> None:
         reply.set_cache(3600)
 
 
-def _apply_security(reply: Reply, path: Path) -> Reply:
+def _apply_security(reply: Reply, path: Path, *,
+                    lan_port: int | None = None) -> Reply:
     """贴上安全响应头，并把同一个 `reply` 返回（便于 `return _apply_security(…)`）。
 
     头本身定义在 `shared/security_headers.py`，云端伺服
@@ -105,7 +106,7 @@ def _apply_security(reply: Reply, path: Path) -> Reply:
     两条路径。修之前这里一个头都没有（连 `nosniff` 都没有），而手机在
     家里 Wi-Fi 下走的正是这条路径。
     """
-    for key, value in headers_for(_content_type(path)):
+    for key, value in headers_for(_content_type(path), lan_port=lan_port):
         reply.set(key, value)
     return reply
 
@@ -117,9 +118,11 @@ class StaticFiles:
     比 `<function <locals>.<lambda> at 0x...>` 有用得多。
     """
 
-    __slots__ = ("root", "index", "enabled")
+    __slots__ = ("root", "index", "enabled", "lan_port")
 
-    def __init__(self, dist: str | Path | None = None) -> None:
+    def __init__(self, dist: str | Path | None = None, *,
+                 lan_port: int | None = None) -> None:
+        self.lan_port = lan_port
         self.root: Path | None = None
         self.index: Path | None = None
         self.enabled = False
@@ -199,7 +202,7 @@ class StaticFiles:
             r = empty_reply(304)
             r.set_etag(etag)
             _apply_cache(r, rel, is_index=path == self.index)
-            return _apply_security(r, path)
+            return _apply_security(r, path, lan_port=self.lan_port)
 
         if path == self.index:
             # 外壳不缓存（见模块文档第 3 点）。
@@ -210,12 +213,12 @@ class StaticFiles:
             )
             _apply_cache(reply, rel, is_index=True)
             reply.set_etag(etag)
-            return _apply_security(reply, path)
+            return _apply_security(reply, path, lan_port=self.lan_port)
 
         reply = file_reply(iter_file(path), _content_type(path), st.st_size)
         reply.set_etag(etag)
         _apply_cache(reply, rel, is_index=False)
-        return _apply_security(reply, path)
+        return _apply_security(reply, path, lan_port=self.lan_port)
 
     def __repr__(self) -> str:
         return f"StaticFiles(root={self.root!r}, enabled={self.enabled})"

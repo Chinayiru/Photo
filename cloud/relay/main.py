@@ -63,6 +63,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 from starlette.applications import Starlette
+from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -75,17 +76,24 @@ from ..relay.cors import cors_headers, is_preflight, origin_of, preflight_header
 from ..relay.db import CloudDB, open_db
 from ..relay.devices import DeviceRegistry, find_device_by_agent_token
 from ..relay.devices_api import (
+    client_me,
     delete_client,
     device_status,
     list_devices,
     revoked_clients,
+    refresh_client_token,
 )
 from ..relay import netutil
 from ..relay.forward import Forwarder
-from ..relay.headers import AccessLogMiddleware, SecurityHeadersMiddleware
+from ..relay.headers import (
+    AccessLogMiddleware,
+    HostAllowlistMiddleware,
+    RequestIdMiddleware,
+    SecurityHeadersMiddleware,
+)
 from ..relay.pages import StaticPages
 from ..relay.pairing import issue_pair_code, purge_expired_codes, redeem_pair_code
-from ..relay.reply import json_error, json_reply, no_content, text_reply
+from ..relay.reply import json_error, json_reply, no_content
 from ..relay.tunnel import TunnelServer
 
 __all__ = ["create_app", "CLOUD_VERSION"]
@@ -121,7 +129,8 @@ def create_app(db: CloudDB | None = None, *,
     database = db if db is not None else open_db()
     database.init()
     registry = DeviceRegistry()
-    tunnel = TunnelServer(database, registry, host_allowlist=hosts or _hosts())
+    configured_hosts = hosts if hosts is not None else _hosts()
+    tunnel = TunnelServer(database, registry, host_allowlist=configured_hosts)
     forwarder = Forwarder(registry, database)
     pages = StaticPages(dist if dist is not None else _web_dir())
 
@@ -206,7 +215,7 @@ def create_app(db: CloudDB | None = None, *,
         """
         raw = request.url.path
         if raw == "/api" or raw.startswith("/api/") or raw.startswith("/agent/"):
-            return _with_cors(request, text_reply("not found", status=404))
+            return _with_cors(request, json_error("E1004", request_id=_rid(request)))
         if is_preflight(request):
             return _preflight(request)
         return _with_cors(request, await pages(request))
@@ -228,6 +237,9 @@ def create_app(db: CloudDB | None = None, *,
         Route("/api/devices/{device_id}/clients/{client_id}",
               _bind(delete_client, database), methods=["DELETE"]),
         Route("/api/clients/revoked", revoke_list, methods=["GET"]),
+        Route("/api/clients/me", _bind(client_me, database, registry), methods=["GET"]),
+        Route("/api/clients/token/refresh",
+              _bind(refresh_client_token, database, registry), methods=["POST"]),
         WebSocketRoute("/agent/ws", agent_ws),
         # ★ `/d/{device_id}/{path:path}` 必须放在 `/api/*` **之后**：
         # Starlette 按顺序匹配，把通配放前面会让 `/api/devices` 变成
@@ -253,9 +265,8 @@ def create_app(db: CloudDB | None = None, *,
         # ★ 只在这里起后台任务。同时传 `on_startup=[...]` 会让应用启动时
         # 跑两遍（Starlette 把 on_startup 与 lifespan 都执行），于是流量
         # 每秒被落库两次——统计翻倍，而且没人看得出来。
-        if not _hosts():
-            log.warning("PB_CLOUD_HOSTS 未设置：Host 头不做校验。"
-                        "生产部署**必须**设成自己的域名")
+        if not configured_hosts:
+            log.warning("PB_CLOUD_HOSTS 未设置：仅允许本机测试 Host，公网 Host 将被拒绝")
         # 受信代理没配 = 所有人共用 `127.0.0.1` 一个限流桶（cloudflared
         # 与 80 端口转发都从回环连入）。这个失败模式不会报错，只会让
         # "一个人刷满登录次数 → 所有人登不上"，所以必须在启动时说一次。
@@ -285,12 +296,26 @@ def create_app(db: CloudDB | None = None, *,
     middleware = [
         Middleware(AccessLogMiddleware),
         Middleware(SecurityHeadersMiddleware),
+        Middleware(HostAllowlistMiddleware, allowed_hosts=configured_hosts),
+        Middleware(RequestIdMiddleware),
     ]
+
+    async def http_error(request: Request, exc: HTTPException) -> Response:
+        if exc.status_code == 404:
+            response = json_error("E1004", request_id=_rid(request))
+        elif exc.status_code == 405:
+            response = json_error("E1018", request_id=_rid(request))
+        else:
+            response = json_error("E3001", request_id=_rid(request))
+        if exc.headers:
+            response.headers.update(exc.headers)
+        return response
 
     # 把 registry 挂到 app.state 上：测试要能「伪造一台在线电脑」才测得了
     # 自动配对（真实场景里它由 `/agent/ws` 注册）。不放这里的话，测试要么
     # 起真隧道（重），要么去摸闭包变量（脆）。
-    app = Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
+    app = Starlette(routes=routes, middleware=middleware, lifespan=lifespan,
+                    exception_handlers={404: http_error, 405: http_error})
     app.state.registry = registry
     app.state.db = database
     return app

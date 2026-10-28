@@ -538,6 +538,25 @@ def test_cors_allowlist_accepts_listed_origin(router: Router) -> None:
     assert r.headers["Vary"] == "Origin"
 
 
+def test_cors_preflight_returns_204_for_supported_method(router: Router) -> None:
+    router.enable_cors(allow_origins=["http://localhost:5173"])
+    headers = {
+        "Origin": "http://localhost:5173",
+        "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "authorization",
+    }
+    r = run(router.dispatch(Ctx("OPTIONS", "/api/system/ping", headers=headers)))
+    assert r.status == 204
+    assert r.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
+    assert "GET" in r.headers["Access-Control-Allow-Methods"]
+
+    bad = run(router.dispatch(Ctx(
+        "OPTIONS", "/api/system/ping",
+        headers={**headers, "Access-Control-Request-Method": "DELETE"})))
+    assert bad.status == 204
+    assert bad.headers.get("Access-Control-Allow-Methods") is None
+
+
 def test_cors_no_origin_gets_no_headers(router: Router) -> None:
     """没有 Origin 的请求（curl / `<img>` / 顶层导航）不参与 CORS。"""
     router.enable_cors(allow_origins=["http://localhost:5173"])

@@ -168,7 +168,8 @@ def build_app(cfg: Config | None = None, *, state: AppState | None = None) -> An
     # 用 set_fallback 而不是再注册一条 `/{path:path}` 路由 —— 后者会
     # 与所有 API 路由竞争匹配，一旦正则顺序变化就可能把 API 请求
     # 吃掉交给前端外壳，表现为"接口返回 index.html"。
-    router.set_fallback(StaticFiles(_dist_dir(cfg)))
+    router.set_fallback(StaticFiles(
+        _dist_dir(cfg), lan_port=int(cfg.get("server.port", 8787))))
 
     # ★ 由配置决定用哪条通路，而不是写死局域网。
     # 二期的 cloud_tunnel 只要在 transports/ 里 register() 一下，

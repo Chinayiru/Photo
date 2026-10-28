@@ -40,6 +40,7 @@ from . import netutil
 
 import logging
 import time
+import uuid
 from typing import Any
 
 # 头的定义在 `shared/security_headers.py`：云端伺服（本模块 + `pages.py`）
@@ -145,6 +146,82 @@ class SecurityHeadersMiddleware:
             await send(message)
 
         await self.app(scope, receive, _send)
+
+
+class HostAllowlistMiddleware:
+    """Reject HTTP requests whose Host is not an explicitly configured name."""
+
+    def __init__(self, app: Any, *, allowed_hosts: list[str] | tuple[str, ...]) -> None:
+        self.app = app
+        configured = {_normalize_host(h) for h in allowed_hosts if h}
+        self.allowed = configured | {"localhost", "127.0.0.1", "::1", "testserver"}
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        raw = next((v.decode("latin-1") for k, v in scope.get("headers", [])
+                    if k.lower() == b"host"), "")
+        if _normalize_host(raw) not in self.allowed:
+            from starlette.responses import JSONResponse
+
+            request_id = uuid.uuid4().hex[:16]
+            response = JSONResponse({
+                "error": {
+                    "code": "E1004",
+                    "message": "not_found",
+                    "detail": None,
+                    "request_id": request_id,
+                }
+            }, status_code=404, headers={"cache-control": "no-store",
+                                        "x-request-id": request_id})
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+class RequestIdMiddleware:
+    """Ensure every relay response carries a non-empty correlation id."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = list(scope.get("headers") or [])
+        raw = next((v.decode("latin-1") for k, v in headers
+                    if k.lower() == b"x-request-id"), "")
+        if not raw or len(raw) > 64 or not raw.isascii() \
+                or not all(ch.isalnum() or ch in "-_" for ch in raw):
+            raw = uuid.uuid4().hex[:16]
+            headers = [(k, v) for k, v in headers
+                       if k.lower() != b"x-request-id"]
+            headers.append((b"x-request-id", raw.encode("ascii")))
+            scope = dict(scope, headers=headers)
+
+        async def send_with_id(message: dict) -> None:
+            if message["type"] == "http.response.start":
+                response_headers = list(message.get("headers") or [])
+                if not any(k.lower() == b"x-request-id" for k, _ in response_headers):
+                    response_headers.append((b"x-request-id", raw.encode("ascii")))
+                    message = dict(message, headers=response_headers)
+            await send(message)
+
+        await self.app(scope, receive, send_with_id)
+
+
+def _normalize_host(value: str) -> str:
+    from urllib.parse import urlsplit
+
+    raw = (value or "").strip().lower().rstrip(".")
+    if not raw:
+        return ""
+    try:
+        return (urlsplit("//" + raw).hostname or "").rstrip(".")
+    except ValueError:
+        return ""
 
 
 class AccessLogMiddleware:

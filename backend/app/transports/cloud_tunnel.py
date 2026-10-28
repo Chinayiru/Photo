@@ -413,7 +413,7 @@ def _cookie_line(name: str, value: str, max_age: int) -> str:
     Headers 的 dict 语义折叠掉）。"""
     from ..core.ctx import cookie_header_value
 
-    return cookie_header_value(name, value, max_age)
+    return cookie_header_value(name, value, max_age, secure=True)
 
 
 class CloudTunnelTransport(ServerTransport):

@@ -69,7 +69,7 @@ MAX_BODY = 4096
 SECRET_KEY = "client_signing_secret"
 
 #: 允许的动作。
-ACTIONS = ("ping", "mint_client", "verify_client", "revoke_clients")
+ACTIONS = ("ping", "mint_client", "refresh_client", "verify_client", "revoke_clients")
 
 
 class ControlError(Exception):
@@ -146,6 +146,8 @@ def handle(state: Any, cfg: Any, action: str, payload: dict[str, Any],
         }
     if action == "mint_client":
         return _mint_client(state, cfg, payload, moment)
+    if action == "refresh_client":
+        return _refresh_client(state, cfg, payload, moment)
     if action == "verify_client":
         return _verify_client(state, cfg, payload)
     if action == "revoke_clients":
@@ -199,6 +201,34 @@ def _mint_client(state: Any, cfg: Any, payload: dict[str, Any],
     # 二是“谁决定 role”变成两处实现。
     return {"client_id": client_id, "token": token, "name": name,
             "expires_at": expires_at}
+
+
+def _refresh_client(state: Any, cfg: Any, payload: dict[str, Any],
+                    now: float) -> dict[str, Any]:
+    """Rotate an active owner's token while preserving its client identity."""
+    from shared import client_token as token_mod
+
+    old_token = payload.get("token")
+    wanted_id = str(payload.get("client_id") or "")
+    device_id = _local_device_id(state, cfg)
+    if not isinstance(old_token, str) or not wanted_id or not device_id:
+        raise ControlError("E5001", "续期请求无效")
+    claims = None
+    for secret in _candidate_secrets(state):
+        claims = token_mod.verify_token(secret, old_token, device_id=device_id,
+                                        now=now)
+        if claims is not None:
+            break
+    if (claims is None or str(claims.get("sub") or "") != wanted_id
+            or str(claims.get("rl") or "owner") == "guest"):
+        raise ControlError("E5001", "续期令牌无效", 401)
+    name = str(claims.get("nam") or "手机")[:64]
+    ttl_days = int(token_mod.TOKEN_TTL_DAYS)
+    token = token_mod.issue_token(
+        secret, client_id=wanted_id, device_id=device_id, ttl_days=ttl_days,
+        now=now, client_name=name)
+    return {"client_id": wanted_id, "token": token,
+            "name": name, "expires_at": now + ttl_days * 86400}
 
 
 def _verify_client(state: Any, cfg: Any, payload: dict[str, Any]) -> dict[str, Any]:

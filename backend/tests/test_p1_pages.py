@@ -454,7 +454,7 @@ def test_cloud_pages_do_not_require_a_token(live_rig) -> None:
 
 
 def test_unknown_api_path_is_not_swallowed_by_the_spa(live_rig) -> None:
-    """`/api/**` 不存在时必须回 404 纯文本，不能被单页回退吃成 200 HTML。
+    """`/api/**` 不存在时必须回 404 JSON，不能被单页回退吃成 200 HTML。
 
     被吃掉的症状是前端 `JSON.parse("<html>")` 抛异常，却看不出是"接口
     没实现"还是"接口返回了怪东西"。`docs/04` 规划的 `/api/clients/me`
@@ -464,12 +464,13 @@ def test_unknown_api_path_is_not_swallowed_by_the_spa(live_rig) -> None:
 
     async def main():
         return await asyncio.to_thread(
-            _http, live_rig.cloud_port, "GET", "/api/clients/me")
+            _http, live_rig.cloud_port, "GET", "/api/clients/unknown")
 
     status, body, hdrs = asyncio.run(main())
     assert status == 404, (status, body[:120])
-    assert "text/html" not in hdrs.get("content-type", "")
+    assert hdrs.get("content-type", "").startswith("application/json")
     assert b"<!doctype" not in body.lower()
+    assert json.loads(body)["error"]["code"] == "E1004"
 
 
 def test_pairing_works_on_the_cloud_origin(live_rig) -> None:

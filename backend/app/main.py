@@ -17,6 +17,7 @@ import logging
 import sys
 
 from .autostart import ensure_enabled as ensure_autostart
+from .config import ConfigError
 from .config import get as get_config
 from .config import load as load_config
 from .server import run
@@ -54,18 +55,25 @@ def main(argv: list[str] | None = None) -> int:
         print(f"PhotoBridge {__version__}")
         return 0
 
-    if args.config:
-        from pathlib import Path
+    try:
+        if args.config:
+            from pathlib import Path
 
-        from .config import Config, _read_json      # noqa: PLC0415
+            from .config import Config, _read_json      # noqa: PLC0415
 
-        cfg = Config(_read_json(Path(args.config)), path=Path(args.config))
-    else:
-        # load_config() 会读磁盘并缓存，get_config() 拿缓存。
-        # 必须用 get_config() 而不是 load_config()：后者返回的是
-        # 一个**新对象**，下面改 host/port 就只改到临时副本上。
-        load_config()
-        cfg = get_config()
+            config_path = Path(args.config)
+            if not config_path.is_file():
+                raise ConfigError("指定的配置文件不存在")
+            cfg = Config(_read_json(config_path), path=config_path)
+        else:
+            # load_config() 会读磁盘并缓存，get_config() 拿缓存。
+            # 必须用 get_config() 而不是 load_config()：后者返回的是
+            # 一个**新对象**，下面改 host/port 就只改到临时副本上。
+            load_config()
+            cfg = get_config()
+    except ConfigError as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return 2
 
     if args.host:
         cfg._raw.setdefault("server", {})["host"] = args.host

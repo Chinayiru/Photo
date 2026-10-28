@@ -26,10 +26,12 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from ..relay import control as cloud_control
+from ..relay import security
 from ..relay.auth import require_account
 from ..relay.db import CloudDB
 from ..relay.devices import (
     DeviceRegistry,
+    find_client_by_token,
     today_utc,
     traffic_today,
 )
@@ -39,6 +41,8 @@ __all__ = [
     "DEVICE_ID_RE",
     "list_devices",
     "device_status",
+    "client_me",
+    "refresh_client_token",
     "delete_client",
     "revoked_clients",
     "device_public",
@@ -216,6 +220,74 @@ async def device_status(request: Request, db: CloudDB,
         "tunnel": tunnel,
         "clients": clients,
     }, request_id=_rid(request))
+
+
+async def client_me(request: Request, db: CloudDB,
+                    registry: DeviceRegistry) -> Response:
+    token = _bearer(request.headers.get("authorization"))
+    client = find_client_by_token(db, token)
+    if client is None:
+        return json_error("E2002", request_id=_rid(request))
+    device = db.query_one(
+        "SELECT id, name, last_lan, revoked FROM devices WHERE id = ?",
+        (str(client["device_id"]),))
+    if device is None or int(device["revoked"] or 0):
+        return json_error("E2002", request_id=_rid(request))
+    try:
+        lan_ips = json.loads(device["last_lan"] or "[]")
+    except (TypeError, ValueError):
+        lan_ips = []
+    if not isinstance(lan_ips, list):
+        lan_ips = []
+    return json_reply({
+        "client_id": str(client["id"]),
+        "name": str(client["name"]),
+        "device_id": str(device["id"]),
+        "device_name": str(device["name"]),
+        "device_online": registry.get(str(device["id"])) is not None,
+        "lan_ips": [str(value) for value in lan_ips][:16],
+        "expires_at": float(client["expires_at"] or 0),
+        "revoked": False,
+    }, request_id=_rid(request))
+
+
+async def refresh_client_token(request: Request, db: CloudDB,
+                               registry: DeviceRegistry) -> Response:
+    old_token = _bearer(request.headers.get("authorization"))
+    client = find_client_by_token(db, old_token)
+    if client is None:
+        return json_error("E2002", request_id=_rid(request))
+    expires = float(client["expires_at"] or 0)
+    if expires > time.time() + 7 * 86400:
+        return json_error("E1001", message="令牌尚未进入续期窗口",
+                          request_id=_rid(request))
+    device_id = str(client["device_id"])
+    conn = cloud_control.conn_for(registry, device_id)
+    minted = await cloud_control.call_agent(
+        conn, "refresh_client",
+        {"token": old_token, "client_id": str(client["id"])})
+    if not isinstance(minted, dict):
+        return json_error("E2007", request_id=_rid(request))
+    new_token = str(minted.get("token") or "")
+    new_expiry = float(minted.get("expires_at") or 0)
+    if (minted.get("client_id") != str(client["id"]) or not new_token
+            or new_expiry <= time.time()):
+        return json_error("E3001", request_id=_rid(request))
+    changed = db.execute(
+        "UPDATE clients SET token_hash = ?, expires_at = ? "
+        "WHERE id = ? AND token_hash = ? AND revoked = 0 "
+        "AND (expires_at IS NULL OR expires_at <= ?)",
+        (security.hash_token(new_token), new_expiry, str(client["id"]),
+         security.hash_token(old_token), time.time() + 7 * 86400))
+    if not changed:
+        return json_error("E2002", request_id=_rid(request))
+    return json_reply({"client_token": new_token, "expires_at": new_expiry},
+                      request_id=_rid(request))
+
+
+def _bearer(raw: str | None) -> str:
+    value = (raw or "").strip()
+    return value[7:].strip() if value.lower().startswith("bearer ") else ""
 
 
 async def delete_client(request: Request, db: CloudDB,

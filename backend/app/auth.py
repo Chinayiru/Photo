@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import re
 import secrets
 import time
 from typing import Any, Final
@@ -725,8 +726,8 @@ def _admit_guest(ctx: Ctx, db: Any, claims: dict[str, Any]) -> dict[str, Any]:
     if not ok:
         ctx.set_cookies.append((guest_mod.GUEST_COOKIE, "", 0))
         if reason == "revoked":
-            raise AppError(E1023, f"guest session revoked client={client_id}")
-        raise AppError(E1022, f"guest session {reason} client={client_id}")
+            raise AppError(E1023)
+        raise AppError(E1022)
     guest_mod.touch_session(db, client_id)
     return {
         "id": client_id,
@@ -958,14 +959,22 @@ def require_client(ctx: Ctx) -> dict[str, Any]:
         raise Unauthorized("state 未注入")
 
     via_header = ctx.bearer_token()
-    token = via_header or ctx.cookie_token(CLIENT_COOKIE)
-    if not token:
+    # Cookie authentication is a transport fallback only for browser APIs that
+    # cannot attach Authorization. It must never authorize a state change.
+    cookie_allowed = ctx.method.upper() in ("GET", "HEAD") and (
+        ctx.path == "/api/events"
+        or bool(re.fullmatch(
+            r"/api/items/[0-9]+/(?:thumb|preview|raw)", ctx.path)))
+    token = via_header
+    if not token and cookie_allowed:
+        token = ctx.cookie_token(CLIENT_COOKIE)
+    if not token and cookie_allowed:
         # ★ 游客的 cookie 是**另一个名字**（`pb_guest`）。同一个浏览器
         #   既可能是主人又刚点过朋友的链接，共用一个 cookie 名会互相
         #   覆盖 —— 最坏的方向是游客身份被写进主人的 `pb_token`。
         token = ctx.cookie_token(GUEST_COOKIE)
     if not token:
-        raise Unauthorized("缺少凭证：Authorization 头或 pb_token cookie")
+        raise Unauthorized("缺少凭证：Authorization 头")
 
     row = _lookup_device(st.db, token)
     if row is None:

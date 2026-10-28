@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -1467,7 +1468,10 @@ def _normalize_target_dir(target_dir: str) -> str:
     沙箱检查留在循环内 —— 它依赖具体的 `root`，而多根时同一个
     `target_dir` 字符串在不同根下解析出的绝对路径不同。
     """
-    rel = (target_dir or "").replace("\\", "/").strip().strip("/")
+    raw = target_dir or ""
+    if raw.startswith(("\\\\", "//")) or re.match(r"^[a-zA-Z]:", raw):
+        raise BadRequest("目标目录必须是库内相对路径")
+    rel = raw.replace("\\", "/").strip().strip("/")
     if rel in ("", "."):
         return ""
     for seg in rel.split("/"):

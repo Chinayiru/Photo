@@ -535,7 +535,8 @@ def _is_json_content_type(ctype: str) -> bool:
 
 
 def cookie_header_value(name: str, value: str, max_age: int, *,
-                        path: str = "/", http_only: bool = True) -> str:
+                        path: str = "/", http_only: bool = True,
+                        secure: bool = False) -> str:
     """把 cookie 的语义值拼成一行 `Set-Cookie` 的值（不含头名）。
 
     ★ 放在 core 层而不是各适配器里各写一遍：二期加云端隧道适配器时，
@@ -554,6 +555,8 @@ def cookie_header_value(name: str, value: str, max_age: int, *,
              "SameSite=Lax"]
     if http_only:
         parts.append("HttpOnly")
+    if secure:
+        parts.append("Secure")
     return "; ".join(parts)
 
 

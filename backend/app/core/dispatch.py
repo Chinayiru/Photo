@@ -331,7 +331,10 @@ class Router:
         # 先建 Ctx 后建 Reply，保证即使中间件崩了也能带上 request_id ——
         # 用户报障时唯一能用来在日志里定位的就是它。
         try:
-            reply = await self._run(ctx)
+            if self._is_cors_preflight(ctx):
+                reply = self._cors_preflight_reply(ctx)
+            else:
+                reply = await self._run(ctx)
         except Exception as exc:  # noqa: BLE001 —— 这里就是要兜住一切
             reply = self._error_reply(ctx, exc)
 
@@ -356,6 +359,24 @@ class Router:
 
         log.info("%s %s -> %s %.1fms", ctx.method, ctx.path, reply.status,
                  ctx.elapsed_ms)
+        return reply
+
+    def _is_cors_preflight(self, ctx: Ctx) -> bool:
+        return (self._cors is not None
+                and ctx.method.upper() == "OPTIONS"
+                and bool(ctx.headers.get("origin"))
+                and bool(ctx.headers.get("access-control-request-method")))
+
+    def _cors_preflight_reply(self, ctx: Ctx) -> Reply:
+        reply = Reply(status=204)
+        self._apply_cors(ctx, reply)
+        origin = ctx.headers.get("origin") or ""
+        if self._cors is not None and (
+                self._cors["wildcard"] or origin in self._cors["origins"]):
+            method = ctx.headers.get("access-control-request-method", "").upper()
+            methods = self.allowed_methods(ctx.path)
+            if method in methods:
+                reply.headers["Access-Control-Allow-Methods"] = ", ".join(methods)
         return reply
 
     async def _run(self, ctx: Ctx) -> Reply:

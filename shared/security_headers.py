@@ -77,22 +77,23 @@ PAGE_HEADERS: tuple[tuple[str, str], ...] = COMMON_HEADERS + (
 )
 
 
-def csp_for(*, extra_connect: list[str] | None = None) -> str:
+def csp_for(*, extra_connect: list[str] | None = None,
+            lan_port: int | None = None) -> str:
     """按需在 `connect-src` 里加来源（给"知道真实域名"的伺服层用）。
 
     目前没有调用点：中继域名是运行时的，把 quick tunnel 的随机域名塞进
     CSP 会让"域名一变页面就白屏"。留这个入口是为了换成 named tunnel +
     自建域名之后能收紧（`docs/11` ISSUE-034）。
     """
-    if not extra_connect:
-        return PAGE_CSP
-    add = " ".join(s for s in extra_connect if s)
-    if not add:
-        return PAGE_CSP
-    return PAGE_CSP + " " + add
+    csp = PAGE_CSP
+    if lan_port is not None and 1 <= int(lan_port) <= 65535:
+        csp = csp.replace("http://*:8787", f"http://*:{int(lan_port)}")
+    add = " ".join(s for s in (extra_connect or []) if s)
+    return csp + (" " + add if add else "")
 
 
-def headers_for(content_type: str) -> tuple[tuple[str, str], ...]:
+def headers_for(content_type: str, *,
+                lan_port: int | None = None) -> tuple[tuple[str, str], ...]:
     """按响应的 `Content-Type` 选一套头。
 
     判断依据是**实际发出去的类型**，而不是"我们打算发什么"：`pages.py`
@@ -101,5 +102,8 @@ def headers_for(content_type: str) -> tuple[tuple[str, str], ...]:
     `localStorage` 里的令牌，缺了 CSP 就少了一道 XSS 兜底。
     """
     if (content_type or "").lower().startswith("text/html"):
-        return PAGE_HEADERS
+        if lan_port is None:
+            return PAGE_HEADERS
+        return COMMON_HEADERS + (("content-security-policy",
+                                  csp_for(lan_port=lan_port)),)
     return COMMON_HEADERS

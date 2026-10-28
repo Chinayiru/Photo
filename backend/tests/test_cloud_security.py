@@ -751,7 +751,11 @@ def test_another_accounts_code_is_indistinguishable_from_a_missing_one(
     assert dead.status_code == 400, dead.text
     assert live.json()["error"]["code"] == "E1002"
     # 两边的 error 对象必须一模一样 —— 差一个字段就是 oracle
-    assert live.json()["error"] == dead.json()["error"]
+    live_error = dict(live.json()["error"])
+    dead_error = dict(dead.json()["error"])
+    live_error.pop("request_id", None)
+    dead_error.pop("request_id", None)
+    assert live_error == dead_error
 
 
 def test_my_other_computers_code_still_says_so(tmp_path: Path) -> None:

@@ -189,6 +189,7 @@ PUBLIC_POST_PATHS: frozenset[str] = frozenset({
     # 而这一步本身就是在换令牌。与 `/api/pair` 同构，所以同样只放行 POST。
     "/api/guest/redeem",
 })
+PAIR_RATE_PATHS: frozenset[str] = frozenset({"/api/pair"})
 
 #: 匿名探活的限流（每个来源 IP，每秒）。比鉴权路径的 120/s 宽，因为
 #: 它不读库、不落盘，且状态机的探活频率天然更高。
@@ -333,14 +334,13 @@ class Forwarder:
 
         token = _client_token(request)
         if not token:
-            return self._reject_auth(ip, rid, "缺少配对令牌")
+            return self._reject_auth(ip, rid)
         # ★ 审计 F03：形状检查必须在**回源之前**。云端不认识的令牌会触发
         #   `_adopt_token_via_agent()` —— 一次隧道往返，让家里的电脑替陌生人
         #   验签，验过还会往 `clients` 里插一行。`Bearer a` 这种垃圾值不该
         #   有资格把电脑变成验签器。
         if not looks_like_token(token):
-            return self._reject_auth(ip, rid, "配对已失效，请重新配对",
-                                     clear_cookie=True)
+            return self._reject_auth(ip, rid, clear_cookie=True)
         row = find_client_by_token(self.db, token)
         if row is None:
             # --- 局域网配对签发的令牌 ---
@@ -356,8 +356,7 @@ class Forwarder:
         if row is None:
             # 令牌死透了：顺手清掉浏览器里的死 cookie，否则 `<img>` 会
             # 用同一个死令牌一直 401（它发不出 Authorization 头）。
-            return self._reject_auth(ip, rid, "配对已失效，请重新配对",
-                                     clear_cookie=True)
+            return self._reject_auth(ip, rid, clear_cookie=True)
         if str(row["device_id"]) != device_id:
             # ★ 没有这一步，手机上任何一次配对都能读**别的**设备。
             # 令牌里的 device_id 是唯一可信的归属，路径里的只是它想访问的。
@@ -420,7 +419,7 @@ class Forwarder:
         self.inflight.release(device_id)
         self.inflight_total.release(_INFLIGHT_ALL)
 
-    def _reject_auth(self, ip: str, rid: str, message: str, *,
+    def _reject_auth(self, ip: str, rid: str, *,
                      clear_cookie: bool = False) -> Response:
         """一次认证失败：先记账，超限改判 429，否则按原样 401。"""
         allowed, retry = self.auth_fail.hit(ip)
@@ -428,7 +427,7 @@ class Forwarder:
             log.warning("来源 IP 认证失败过多 ip=%s", ip)
             return _error(429, "E4001", "认证失败次数过多，请稍后再试",
                           request_id=rid, retry_after=max(1, int(retry)))
-        return _error(401, "E2002", message, request_id=rid,
+        return _error(401, "E2002", "配对已失效，请重新配对", request_id=rid,
                       clear_cookie=clear_cookie)
 
     async def _adopt_token_via_agent(self, token: str,
@@ -854,7 +853,7 @@ def _is_public(request: Request) -> bool:
 
 def _is_pair(request: Request) -> bool:
     """是不是一次匿名配对（决定用哪个限流桶）。"""
-    return _inner_path(request) in PUBLIC_POST_PATHS
+    return _inner_path(request) in PAIR_RATE_PATHS
 
 
 def _client_ip(request: Request) -> str:

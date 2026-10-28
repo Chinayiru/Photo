@@ -235,6 +235,13 @@ def test_html_gets_csp_and_framing_headers(tmp_path) -> None:
     assert r.headers["referrer-policy"] == "no-referrer"
 
 
+def test_html_csp_uses_configured_lan_port(tmp_path) -> None:
+    response = _run(StaticFiles(_dist(tmp_path), lan_port=8877), _ctx("/"))
+    csp = response.headers["content-security-policy"]
+    assert "http://*:8877" in csp
+    assert "http://*:8787" not in csp
+
+
 def test_assets_get_nosniff_but_no_csp(tmp_path) -> None:
     """静态资源不需要 CSP（CSP 只管文档），但 `nosniff` 必须有。"""
     s = StaticFiles(_dist(tmp_path))

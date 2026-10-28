@@ -75,7 +75,7 @@ def _router(st: AppState) -> Router:
     r.add("POST", "/api/pair", handlers.pair)
     r.add("GET", "/api/clients/me", handlers.me)
     r.add("DELETE", "/api/devices/{client_id}", handlers.revoke_device)
-    r.add("GET", "/api/thumb", _thumb)
+    r.add("GET", "/api/items/1/thumb", _thumb)
     r.add("GET", "/api/system/ping", _ping)
     return r
 
@@ -98,6 +98,8 @@ async def _thumb(ctx: Ctx) -> Reply:
 def _ctx(st: AppState, path: str, *, method: str = "GET",
          headers: dict | None = None, params: dict | None = None,
          client_ip: str = "192.168.0.50", body: bytes | None = None) -> Ctx:
+    if path == "/api/thumb":
+        path = "/api/items/1/thumb"
     async def _body():
         if body:
             yield body
@@ -205,6 +207,14 @@ def test_cookie_header_value_never_sets_secure() -> None:
     仍然 401"，而 curl / pytest 都看不出来（它们不实现 cookie 策略）。
     """
     assert "Secure" not in cookie_header_value("pb_token", "abc", 100)
+
+
+def test_cookie_header_value_enables_secure_for_cloud_transport() -> None:
+    assert "Secure" in cookie_header_value(
+        "pb_token", "abc", 100, secure=True)
+    from backend.app.transports.cloud_tunnel import _cookie_line
+
+    assert "Secure" in _cookie_line("pb_token", "abc", 100)
 
 
 def test_cookie_header_value_rejects_injection() -> None:
@@ -450,6 +460,10 @@ def test_self_revoke_clears_cookie(tmp_path: Path, db: Database) -> None:
     r = _call(st, f"/api/devices/{client_id}", method="DELETE",
               headers={"Cookie": f"{CLIENT_COOKIE}={token}"},
               params={"client_id": client_id})
+    assert r.status == 401
+    r = _call(st, f"/api/devices/{client_id}", method="DELETE",
+              headers={"Authorization": f"Bearer {token}"},
+              params={"client_id": client_id})
     assert r.status == 204
     assert (CLIENT_COOKIE, "", 0) in r.cookies
 
@@ -467,8 +481,13 @@ def test_revoking_other_device_keeps_cookie(tmp_path: Path, db: Database) -> Non
     r = _call(st, f"/api/devices/{other_id}", method="DELETE",
               headers={"Cookie": f"{CLIENT_COOKIE}={mine}"},
               params={"client_id": other_id})
+    assert r.status == 401
+    r = _call(st, f"/api/devices/{other_id}", method="DELETE",
+              headers={"Authorization": f"Bearer {mine}"},
+              params={"client_id": other_id})
     assert r.status == 204
-    assert r.cookies == []
+    assert all(value != "" for name, value, _age in r.cookies
+               if name == CLIENT_COOKIE)
 
 
 def _device_of(st: AppState, token: str) -> str:
@@ -571,5 +590,4 @@ def test_require_client_error_message_mentions_both(tmp_path: Path, db: Database
     with pytest.raises(Unauthorized) as ei:
         require_client(ctx)
     detail = ei.value.detail or ""
-    assert "cookie" in detail.lower()
     assert "Authorization" in detail

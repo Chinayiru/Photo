@@ -101,6 +101,19 @@ def test_verify_client_rejects_a_forged_token(state) -> None:
                    {"token": forged})["valid"] is False
 
 
+def test_refresh_client_preserves_client_id_and_rotates_token(state) -> None:
+    old = _handle(state, "mint_client", {"name": "手机", "ttl_days": 1})
+    refreshed = _handle(state, "refresh_client", {
+        "token": old["token"], "client_id": old["client_id"]})
+    assert refreshed["client_id"] == old["client_id"]
+    assert refreshed["token"] != old["token"]
+    claims = token_mod.verify_token(
+        agent_control.client_signing_secret(state.db), refreshed["token"],
+        device_id=CLOUD_DEVICE_ID)
+    assert claims is not None
+    assert claims["sub"] == old["client_id"]
+
+
 # --------------------------------------------------- ③ 旧密钥默认关闭
 
 

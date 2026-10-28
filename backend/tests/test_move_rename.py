@@ -374,6 +374,14 @@ def test_move_rejects_absolute_path(tmp_path, library) -> None:
     assert r.status == 400
 
 
+def test_move_rejects_unc_path(tmp_path, library) -> None:
+    st = _state(tmp_path, library)
+    ids = _seed(st, library)
+    r = _call(st, "POST", "/api/items/move",
+              body=_body(ids=[ids["a.jpg"]], target_dir=r"\\server\share"))
+    assert r.status == 400
+
+
 def test_move_rejects_bad_params(tmp_path, library) -> None:
     st = _state(tmp_path, library)
     ids = _seed(st, library)
