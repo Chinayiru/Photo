@@ -295,6 +295,48 @@ function onHostBlur(): void {
 }
 
 /**
+ * 跨源配对：把「同一份配对意图」搬到目标页自己身上发。
+ *
+ * ## 为什么必须换源
+ *
+ * 页面可能开着 A、却点了 B 的入口：典型场景是用户在云端页
+ * （`https://域名/d/<id>/`）上看到「家里 Wi-Fi」那条入口，点了它。此时
+ * `POST /api/pair` 是从 A 的源打到 B 的源，浏览器会先发预检；而电脑端的
+ * 策略是「不给自己不认识的源开 CORS」（`server.cors_origins` 默认空集，
+ * 见 `docs/04` §8.4），于是预检被拒、真实请求根本不发出去，用户只看到
+ * 一句含糊的「连不上」。
+ *
+ * ## 为什么不给电脑端放宽 CORS
+ *
+ * 那等于允许「任意页面」向电脑端发配对请求 —— 配对成功就是拿到一台相册
+ * 的令牌，这个面不该由「页面里写死的一个地址」决定。
+ *
+ * ## 换源怎么做
+ *
+ * 跳转到目标页，把配对码与电脑 `did` 放进 **fragment**（`#code=&did=`，
+ * 与托盘二维码同一个通道，见 `tray.pair_qr_url`）。fragment 不参与任何
+ * 一次 HTTP 请求：不进 Referer、不进反代与访问日志。目标页冷启动时由
+ * `pairParamsFromLocation()` 读出来，同源发配对请求。
+ */
+function crossOriginPair(target: string): string {
+  if (!target) return "";
+  let u: URL;
+  try {
+    u = new URL(target, window.location.href);
+  } catch {
+    return "";
+  }
+  if (u.origin === window.location.origin) return "";
+  const q = new URLSearchParams({ code: code.value.replace(/[\s-]/g, "") });
+  if (expectedDid.value) q.set("did", expectedDid.value);
+  // 保留路径（云端页在 `/d/<id>/` 下），丢掉原来的 query/hash。
+  u.search = "";
+  u.hash = "";
+  const path = u.toString().endsWith("/") ? u.toString() : `${u.toString()}/`;
+  return `${path}#${q.toString()}`;
+}
+
+/**
  * 真正发配对请求（两条入口共用）。
  *
  * 收的是**完整基址字符串**而不是读数 ref：粘贴链接时那个基址的协议与端口
@@ -313,6 +355,13 @@ async function runPair(target: string): Promise<void> {
   }
   if (!/^\d{6}$/.test(code.value.replace(/[\s-]/g, ""))) {
     error.value = "配对码是 6 位数字";
+    return;
+  }
+  // ★ 跨源就换源（见 `crossOriginPair`）：不在别人家的源上发配对请求。
+  const hop = crossOriginPair(target);
+  if (hop) {
+    busy.value = true;
+    window.location.href = hop;
     return;
   }
   busy.value = true;

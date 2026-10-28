@@ -87,6 +87,7 @@ from ..relay import netutil
 from ..relay.forward import Forwarder
 from ..relay.headers import (
     AccessLogMiddleware,
+    CorsMiddleware,
     HostAllowlistMiddleware,
     RequestIdMiddleware,
     SecurityHeadersMiddleware,
@@ -293,10 +294,13 @@ def create_app(db: CloudDB | None = None, *,
     # "整个请求花了多久"，`SecurityHeadersMiddleware` 必需在最外层之内
     # 但早于业务：它要改写 `http.response.start`，而任何内层中间件都可能
     # 提前结束响应（例如 CORS 预检的 204）。
+    # `HostAllowlistMiddleware` 在 `CorsMiddleware` **之前**：伪造 Host 的
+    # 请求连预检都该拿到 404，而不是被 CORS 层提前答成 204。
     middleware = [
         Middleware(AccessLogMiddleware),
-        Middleware(SecurityHeadersMiddleware),
+        Middleware(SecurityHeadersMiddleware, page_connect=_page_connect()),
         Middleware(HostAllowlistMiddleware, allowed_hosts=configured_hosts),
+        Middleware(CorsMiddleware, allowed=_cors_origins()),
         Middleware(RequestIdMiddleware),
     ]
 
@@ -421,6 +425,19 @@ def _cors_origins() -> frozenset[str]:
     """
     raw = os.environ.get("PB_CLOUD_CORS_ORIGINS", "") or ""
     return frozenset(x.strip() for x in raw.split(",") if x.strip())
+
+
+def _page_connect() -> tuple[str, ...]:
+    """云端页面 CSP 里**额外**允许 `connect-src` 的来源（逗号分隔）。
+
+    默认空：中继伺服的是 `https://域名` 上的页面，它只需要跟自己
+    （`/d/<id>/api/**`）说话。局域网页面由电脑端自己伺服、用电脑端那份
+    策略（`backend/app/server.py:_page_connect_sources`），所以这里**不**
+    再放行 `http://*:8787` —— 那在 https 页面上是混合内容，浏览器在 CSP
+    之前就拦掉了（`docs/11` ISSUE-034）。
+    """
+    raw = os.environ.get("PB_CLOUD_PAGE_CONNECT", "") or ""
+    return tuple(x.strip() for x in raw.split(",") if x.strip())
 
 
 def _with_cors(request: Request, response: Response) -> Response:

@@ -26,9 +26,14 @@
 * `img-src … blob: data: http://*:8787`：原图走 `URL.createObjectURL`
   （`blob:`）、占位图走 `data:`、双通路下手机可能直接从局域网
   `http://192.168.x.x:8787` 取缩略图。
-* `connect-src 'self' https: http://*:8787`：页面可能由云端伺服、却要回
+* `connect-src 'self' https: http://*:8787`：页面可能由电脑端伺服、却要回
   局域网取图；中继域名又是运行时才知道的（quick tunnel 每次重启都变）。
-  收紧到具体域名需要把域名喂进伺服层，见 `docs/11` ISSUE-034。
+
+  ★ **中继伺服页面时传 `allow_lan_http=False`**（见 `csp_for`）：那条通配在
+  https 页面上用不上 —— `https://域名` 的页面去 `fetch http://192.168…`
+  会被浏览器按**混合内容**直接拦掉，CSP 放不放行都一样；留着反而让人以为
+  "云端页面能直连局域网"。中继页面的 `connect-src` 因此只留 `'self' https:`，
+  需要额外来源时由 `PB_CLOUD_PAGE_CONNECT` 点名（`docs/11` ISSUE-034）。
 * `frame-ancestors 'none'` + `X-Frame-Options: DENY`：点击劫持。这个面的
   代价实测过 —— 透明 iframe 把"删除照片"盖在"领取奖品"下面，一次点击
   就是不可逆的批量删除。
@@ -78,10 +83,11 @@ PAGE_HEADERS: tuple[tuple[str, str], ...] = COMMON_HEADERS + (
 
 
 def csp_for(*, extra_connect: list[str] | None = None,
-            lan_port: int | None = None) -> str:
+            lan_port: int | None = None,
+            allow_lan_http: bool = True) -> str:
     """按需改写/追加来源：`lan_port` 换掉通配端口，`extra_connect` 追进 `connect-src`。
 
-    ## 两个参数各解决什么
+    ## 三个参数各解决什么
 
     * `lan_port`：`PAGE_CSP` 里写死的是 `http://*:8787`（默认端口）。电脑端
       改了 `server.port` 之后，页面从 `http://<ip>:8877` 发请求就会被
@@ -92,8 +98,11 @@ def csp_for(*, extra_connect: list[str] | None = None,
     * `extra_connect`：页面**由电脑端伺服**、却要访问云端的 `/d/<id>/` 时，
       那是另一个 origin，通配端口盖不住它。电脑端配置里本来就有
       `cloud.base_url`，所以这里可以点名（`server._page_connect_sources`）。
-      只有知道确切来源的伺服层才传这个参数；中继域名是运行时的，它不传
-      （见 `docs/11` ISSUE-034）。
+    * `allow_lan_http`：**中继伺服页面时传 `False`**。云端页面跑在
+      `https://域名` 上，它去 `fetch http://192.168.x.x:8787` 属于混合内容，
+      浏览器在 CSP 之前就拦掉了；把 `http://*:8787` 留在云端页面的策略里
+      只会误导人。关掉之后 `img-src`/`media-src`/`connect-src` 里那句通配
+      整个消失，其余指令不变。
 
     ★ 追加必须进 `connect-src` 里。早先的实现是 `csp + " " + add`，于是
     整串多出一个**不属于任何指令**的尾部 token，浏览器直接忽略它 ——
@@ -101,7 +110,7 @@ def csp_for(*, extra_connect: list[str] | None = None,
     """
     port_ok = lan_port is not None and 1 <= int(lan_port) <= 65535
     add = [s.strip() for s in (extra_connect or []) if s and s.strip()]
-    if not port_ok and not add:
+    if not port_ok and not add and allow_lan_http:
         return PAGE_CSP
     port = f"http://*:{int(lan_port)}" if port_ok else "http://*:8787"
 
@@ -112,9 +121,13 @@ def csp_for(*, extra_connect: list[str] | None = None,
             continue
         name, _, rest = directive.partition(" ")
         tokens = [t for t in rest.split() if t]
-        # 取图/取流也走同一个端口，通配端口一换就得跟着换。
         if name in ("img-src", "media-src", "connect-src"):
-            tokens = [port if t == "http://*:8787" else t for t in tokens]
+            # 取图/取流也走同一个端口，通配端口一换就得跟着换；
+            # `allow_lan_http=False` 时整条通配直接摘掉（见上）。
+            if allow_lan_http:
+                tokens = [port if t == "http://*:8787" else t for t in tokens]
+            else:
+                tokens = [t for t in tokens if t != "http://*:8787"]
         if name == "connect-src":
             tokens += [a for a in add if a not in tokens]
         out.append(" ".join([name, *tokens]))
@@ -124,6 +137,7 @@ def csp_for(*, extra_connect: list[str] | None = None,
 def headers_for(content_type: str, *,
                 lan_port: int | None = None,
                 extra_connect: list[str] | None = None,
+                allow_lan_http: bool = True,
                 ) -> tuple[tuple[str, str], ...]:
     """按响应的 `Content-Type` 选一套头。
 
@@ -132,14 +146,15 @@ def headers_for(content_type: str, *,
     反过来只要类型是 `text/html`，就必须有 CSP —— 页面里可能藏着
     `localStorage` 里的令牌，缺了 CSP 就少了一道 XSS 兜底。
 
-    `extra_connect` 给"知道确切来源"的伺服层用：电脑端在配置里就有
-    自己的端口与云端基址，因此能把 `connect-src` 收到具体 origin，
-    而不必依赖 `http://*:8787` 那个通配（见 `csp_for` 的说明）。
+    `extra_connect` / `allow_lan_http` 给伺服层表达"这个页面到底能连谁"：
+    电脑端知道自己的端口与云端基址（`server._page_connect_sources`），
+    中继只知道自己是 https、且不该放行明文局域网（`allow_lan_http=False`）。
     """
     if (content_type or "").lower().startswith("text/html"):
-        if lan_port is None and not extra_connect:
+        if lan_port is None and not extra_connect and allow_lan_http:
             return PAGE_HEADERS
         return COMMON_HEADERS + (("content-security-policy",
                                   csp_for(extra_connect=extra_connect,
-                                          lan_port=lan_port)),)
+                                          lan_port=lan_port,
+                                          allow_lan_http=allow_lan_http)),)
     return COMMON_HEADERS

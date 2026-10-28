@@ -196,6 +196,31 @@ def test_bad_cursor_is_400_not_500(bad: str) -> None:
     assert ei.value.status == 400
 
 
+def test_cursor_roundtrip_is_exact_for_fs_timestamps() -> None:
+    """`mtime` 类时间戳必须**逐位**往返，不能四舍五入。
+
+    翻页条件是严格的 `taken_at < cur_ts OR (taken_at = cur_ts AND id < cur_id)`。
+    早先用 `:.6f` 编码，会把 `1793214286.6520717` 写成 `1793214286.652072`
+    （更大），于是边界行仍满足 `taken_at < cur_ts`，在下一页**重复出现**。
+    """
+    for ts in (1793214286.6520717, 1793214286.6520719, 1715509200.123456, 1.0):
+        got_ts, got_id = decode_cursor(encode_cursor(ts, 7))
+        assert got_ts == ts, f"{ts!r} 往返成了 {got_ts!r}"
+        assert got_id == 7
+
+
+def test_cursor_never_repeats_the_boundary_row() -> None:
+    """把「翻页条件」钉成断言：游标里的 ts 不得大于原行的 ts。
+
+    只要 `decoded <= row_ts` 且 id 参与比较，边界行就被排除；
+    这条测试锁住 `encode_cursor` 不能被改回有损格式化。
+    """
+    row_ts = 1793214286.6520717
+    cur_ts, cur_id = decode_cursor(encode_cursor(row_ts, 33))
+    assert not (row_ts < cur_ts), "边界行会被下一页当成新行"
+    assert cur_id == 33
+
+
 def test_cursor_is_not_a_security_boundary() -> None:
     """手工构造的合法游标会被接受 —— 这是**有意的**。
 

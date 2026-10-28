@@ -21,13 +21,13 @@ Cloudflare quick tunnel（`docs/11` ISSUE-028）之后，Caddy 就不在请求�
   但 Vue 的 `:style` / CSS `v-bind()` 会写 `el.style`，部分浏览器实现把它
   算作内联样式。这一项保留 `'unsafe-inline'` 是**有意的取舍**：样式注入
   的危害远小于脚本注入，而白屏的代价是产品不可用。
-* `img-src … blob: data: http://*:8787`：原图走 `URL.createObjectURL`
-  （`blob:`）、占位图走 `data:`、双通路下手机可能直接从局域网
-  `http://192.168.x.x:8787` 取缩略图。
-* `connect-src 'self' http://*:8787 https:`：页面可能由局域网伺服、却要
-  调云端中继（跨源 `fetch`），而中继域名是运行时才知道的（quick tunnel
-  每次重启都变）。收紧到具体域名需要把域名喂进伺服层，见 `docs/11`
-  ISSUE-034 的后续项。
+* `img-src … blob: data:`：原图走 `URL.createObjectURL`（`blob:`）、占位图
+  走 `data:`。云端页面**不再**放行 `http://*:8787`：`https://域名` 上的页面
+  去取 `http://192.168…` 是混合内容，浏览器在 CSP 之前就拦掉了，留着那条
+  通配只会让人以为"云端页面能直连局域网"（ISSUE-034）。局域网页面由电脑端
+  自己伺服、用自己那份策略（`backend/app/static.py` → `csp_for(lan_port=…)`）。
+* `connect-src 'self' https:`：云端页面只跟**自己**（`/d/<id>/api/**`）说话。
+  需要额外来源时由 `PB_CLOUD_PAGE_CONNECT` 点名（逗号分隔的 origin）。
 * `frame-ancestors 'none'` + `X-Frame-Options: DENY`：点击劫持。实测过
   这个面的代价 —— 攻击者用透明 iframe 把"删除照片"按钮盖在"领取奖品"
   下面，一次点击就是不可逆的批量删除。
@@ -52,6 +52,7 @@ __all__ = [
     "PAGE_HEADERS",
     "COMMON_HEADERS",
     "AccessLogMiddleware",
+    "CorsMiddleware",
     "SecurityHeadersMiddleware",
     "csp_for",
 ]
@@ -111,16 +112,24 @@ class SecurityHeadersMiddleware:
     纯 ASGI 而不是 `BaseHTTPMiddleware`：后者会把响应包进一个 anyio 任务，
     对**流式响应**（`/d/**` 的隧道下载、SSE）会多一层背压，实测过它的
     症状是"大文件下载到一半停住"。
+
+    `page_connect` 是这个部署**额外**允许页面连的来源（`PB_CLOUD_PAGE_CONNECT`）。
+    不配就只允许 `'self' https:` —— 中继页面永远不需要直连局域网，理由见
+    模块文档里 `img-src` 那条。
     """
 
-    def __init__(self, app: Any) -> None:
+    def __init__(self, app: Any, *,
+                 page_connect: tuple[str, ...] | list[str] = ()) -> None:
         self.app = app
+        self.page_connect = tuple(s for s in page_connect if s)
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         is_https = _is_https(scope)
+        page_csp = csp_for(extra_connect=list(self.page_connect),
+                           allow_lan_http=False)
 
         async def _send(message: dict) -> None:
             if message["type"] == "http.response.start":
@@ -133,7 +142,7 @@ class SecurityHeadersMiddleware:
                         break
                 wanted = list(COMMON_HEADERS)
                 if ctype.startswith("text/html"):
-                    wanted.extend(PAGE_HEADERS[len(COMMON_HEADERS):])
+                    wanted.append(("content-security-policy", page_csp))
                 if is_https:
                     wanted.append(("strict-transport-security",
                                    "max-age=15552000"))
@@ -143,6 +152,80 @@ class SecurityHeadersMiddleware:
                     headers.append((key.encode("latin-1"),
                                     value.encode("latin-1")))
                 message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, _send)
+
+
+class CorsMiddleware:
+    """给**中继根**上的接口补 CORS 头（`/d/**` 由 `main.py` 自己贴）。
+
+    ## 为什么根路径也要
+
+    `cors.py` 的白名单解决的是"页面从局域网来、却要调云端的 `/d/**`"。
+    同一条真实路径上还有两个**根路径**调用：
+
+    | 页面从哪来 | 调什么 | 跨源 |
+    |---|---|---|
+    | `http://192.0.2.10:8787/` | `POST https://域名/api/auth/login` | **是** |
+    | `http://192.0.2.10:8787/` | `POST https://域名/api/devices/{id}/pair` | **是** |
+
+    局域网入口上用户仍然要能账号登录（ISSUE-046 修订）、要能用自动配对，
+    而这两条在 `main.py` 里是**独立路由**、原先一个 CORS 头都没有 ——
+    浏览器把响应丢掉，前端只看到 `Failed to fetch`，被当成"密码错了"。
+
+    ## 白名单与凭据
+
+    与 `cors.py` 同一条判据：精确白名单（`PB_CLOUD_CORS_ORIGINS`）+ 私有/
+    回环字面量来源。**不发** `Access-Control-Allow-Credentials`，也不回显
+    任意 `Origin`。
+    """
+
+    def __init__(self, app: Any, *, allowed: Any = ()) -> None:
+        self.app = app
+        self.allowed = frozenset(allowed or ())
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        from .cors import cors_headers, preflight_headers
+
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in (scope.get("headers") or [])
+        }
+        origin = headers.get("origin", "")
+        if not origin:
+            await self.app(scope, receive, send)
+            return
+        path = str(scope.get("path") or "")
+        # `/d/**` 自己会贴（`main.py` 的 `_with_cors`），这里只管中继根。
+        if path.startswith("/d/"):
+            await self.app(scope, receive, send)
+            return
+
+        # 预检：就地回 204。三个条件缺一不可（与 `cors.is_preflight` 同判据）。
+        if (str(scope.get("method", "")).upper() == "OPTIONS"
+                and headers.get("access-control-request-method")):
+            from starlette.responses import Response
+
+            extra = preflight_headers(origin, allowed=self.allowed)
+            await Response(status_code=204, headers=extra)(
+                scope, receive, send)
+            return
+
+        extra = cors_headers(origin, allowed=self.allowed)
+
+        async def _send(message: dict) -> None:
+            if message["type"] == "http.response.start" and extra:
+                out = list(message.get("headers") or [])
+                have = {k.decode("latin-1").lower() for k, _ in out}
+                for key, value in extra.items():
+                    if key.lower() in have:
+                        continue
+                    out.append((key.encode("latin-1"), value.encode("latin-1")))
+                message = dict(message, headers=out)
             await send(message)
 
         await self.app(scope, receive, _send)

@@ -46,10 +46,19 @@ _SEP = "|"
 def encode_cursor(taken_at: float, media_id: int) -> str:
     """把 (taken_at, id) 编码成不透明游标。
 
-    用 `:.6f` 而不是 `repr()`：微秒精度足够区分任何真实照片，
-    且定长格式让游标长度可预测（日志里好看，也便于测试断言）。
+    用 `repr(float)`（即 `%.17g` 的往返表示）而不是 `f"{t:.6f}"`：
+
+    取整到微秒会**把边界值改大**，而翻页条件是严格的
+    `taken_at < cur_ts OR (taken_at = cur_ts AND id < cur_id)`。
+    `taken_src='mtime'` 的条目时间戳是文件系统给的浮点（带纳秒尾巴），
+    例如 `1793214286.6520717`，`:.6f` 会得到 `1793214286.652072`（更大），
+    于是这一行仍然满足 `taken_at < cur_ts` —— **边界条目在下一页重复出现**。
+    实测：`limit=5` 连翻 5 页，25 条里有 2~3 条重复（docs/04 §4.2.1 的
+    「游标锚定在 (taken_at, id) 上，已翻过的页不受影响」不成立）。
+
+    `repr()` 保证 `float(repr(t)) == t`，比较严格性得以保持。
     """
-    raw = f"{taken_at:.6f}{_SEP}{media_id}"
+    raw = f"{taken_at!r}{_SEP}{media_id}"
     return base64.urlsafe_b64encode(raw.encode("ascii")).decode("ascii").rstrip("=")
 
 
