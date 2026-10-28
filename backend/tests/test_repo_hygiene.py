@@ -229,6 +229,11 @@ class TestLineEndings:
             else:
                 problems.append(f"{name}（基线里有，但文件已不存在，请从基线删掉）")
         for name in sorted(set(head_crlf) - CRLF_BASELINE):
+            # 二进制（.docx/.xlsx/.pdf/图片…）本来就含 0x0d0a 字节，它不是
+            # "被工具改写了换行符的文本"，不该进 CRLF_BASELINE，也不该在这里
+            # 报红 —— 只对 TEXT_SUFFIXES 里的文本文件才谈得上换行符约定。
+            if Path(name).suffix.lower() not in TEXT_SUFFIXES:
+                continue
             problems.append(f"{name}（HEAD 里是 CRLF，不在基线里，请加进基线）")
 
         assert not problems, (
