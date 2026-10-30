@@ -292,7 +292,30 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str],
         try:
             root.title(title)
             root.resizable(False, False)
-            root.attributes("-topmost", True)
+
+            # ★ 不设 `-topmost`（P1-解释 C：普通窗口，靠用户自己切换）。
+            #   早先这里 `root.attributes("-topmost", True)` 是**创建时设一次、
+            #   全生命周期不取消**：窗口一旦弹出就压在所有程序之上，切到浏览器
+            #   或文件管理器也照样挡着，只能手动关。配对码是"看一眼就够"的
+            #   信息，不需要长期占用 z 序顶端；需要时再点托盘菜单即可。
+            #   真正要显示到最前的动作是下面的 `deiconify() + lift()`（一次性），
+            #   与"永久置顶"是两件事，别混在一起。
+
+            def _close() -> None:
+                """关窗的唯一出口：**先显式取消置顶**，再销毁。
+
+                即使当前没设过 topmost（P1-C），也显式清一次：窗口属性是
+                按 Tk 解释器存在的状态位，将来谁再把它设成 True，走这条路径
+                关窗也不会留下"看不见但仍在置顶"的残留窗口。
+                """
+                try:
+                    root.attributes("-topmost", False)
+                except Exception:       # noqa: BLE001
+                    pass                # 窗口已经没了
+                try:
+                    root.destroy()
+                except Exception:       # noqa: BLE001
+                    pass
 
             def _copy(text: str, what: str) -> None:
                 """复制到剪贴板，并让按钮闪一下"已复制"。
@@ -442,7 +465,10 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str],
             tk.Label(root, text="配对码 5 分钟内有效；想换一个就点上面的刷新",
                      font=("Segoe UI", 8), fg="#9ca3af").pack(pady=(2, 0))
 
-            tk.Button(root, text="关闭", width=12, command=root.destroy).pack(pady=12)
+            tk.Button(root, text="关闭", width=12, command=_close).pack(pady=12)
+
+            # 右上角 × 与 Alt+F4 也走同一个出口（"关闭"按钮之外的两条关闭路径）。
+            root.protocol("WM_DELETE_WINDOW", _close)
 
             if on_ready is not None:
                 on_ready({
@@ -453,6 +479,7 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str],
                     "status": status,
                     "state": state,
                     "_refresh": _refresh,
+                    "_close": _close,
                 })
 
             root.update_idletasks()
@@ -462,11 +489,12 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str],
             y = (root.winfo_screenheight() - h) // 3
             root.geometry(f"+{max(0, x)}+{max(0, y)}")
 
-            # ★ 显式"显示并提到最前"。
+            # ★ 显式"显示并提到最前" —— 这是**一次性**的抬升，不是置顶。
             # 实测过窗口被创建出来、尺寸内容都对，但 `IsWindowVisible()`
             # 返回 False 的情形 —— 用户看到的是"托盘就绪了，但没有窗口"。
-            # `-topmost` 只管 z 序，不管窗口是否处于 withdrawn 状态；
-            # 这三行把"显示 → 提到最前 → 抢焦点"补齐，代价为零。
+            # `deiconify()` 解决 withdrawn 状态；`lift()` + `focus_force()`
+            # 只在**打开的那一瞬**把窗口抬到前面并给一次焦点，之后用户切到
+            # 别的程序就不会再被抢回来（P1-解释 C：不做置顶，靠用户自己切换）。
             try:
                 root.deiconify()
                 root.lift()
@@ -478,10 +506,16 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str],
         except Exception:       # noqa: BLE001
             log.exception("二维码窗口异常")
         finally:
-            try:
-                root.destroy()
-            except Exception:       # noqa: BLE001
-                pass
+            # 统一走 `_close()`：先取消置顶再销毁。若异常发生在 `_close`
+            # 定义之前（例如 `root.title()` 抛），退回到裸 destroy。
+            closer = locals().get("_close")
+            if closer is not None:
+                closer()
+            else:
+                try:
+                    root.destroy()
+                except Exception:       # noqa: BLE001
+                    pass
             _QR_OPEN.clear()
 
     if _QR_OPEN.is_set():
