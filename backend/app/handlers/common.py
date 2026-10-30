@@ -94,6 +94,37 @@ def guest_uploader_id(ctx: Any) -> str:
     return str(client.get("id") or "")
 
 
+def uploader_of(st: Any, row: Any) -> str:
+    """取这条 media 的 `uploader_client_id`；行里没这一列就按 id 回查。
+
+    ★ 为什么要有这个兜底：`/thumb`、`/preview`、`/raw`、`/stream`、
+    `/stream-ticket` 为了少读几列，各自的 SELECT 只挑了路径/尺寸/kind 之类
+    的字段（不含 uploader_client_id），直接 `row["uploader_client_id"]`
+    会抛 `IndexError: No item with that key` → 游客点开自己的照片一律 500。
+    授权判据不能依赖「调用方碰巧选了哪几列」，所以在缺列时补一次主键查询；
+    列在行里时不产生任何额外 I/O。
+    """
+    try:
+        return str(row["uploader_client_id"] or "")
+    except (IndexError, KeyError):
+        pass
+    db = getattr(st, "db", None)
+    try:
+        mid = int(row["id"])
+    except (IndexError, KeyError, TypeError, ValueError):
+        return ""
+    if db is None:
+        return ""
+    got = db.query_one(
+        "SELECT uploader_client_id FROM media WHERE id = ?", (mid,))
+    if got is None:
+        return ""
+    try:
+        return str(got["uploader_client_id"] or "")
+    except (IndexError, KeyError):
+        return ""
+
+
 def check_media_visible(ctx: Any, st: Any, row: Any) -> None:
     """这条 media 能不能给本请求看：先看根，再（游客）看上传者。
 
@@ -104,7 +135,7 @@ def check_media_visible(ctx: Any, st: Any, row: Any) -> None:
     if not is_guest(ctx):
         return
     mine = guest_uploader_id(ctx)
-    if (row["uploader_client_id"] or "") != mine:
+    if uploader_of(st, row) != mine:
         from ..errors import NotFound
 
         raise NotFound(None)
@@ -130,6 +161,7 @@ __all__ = [
     "check_visible_root",
     "default_root_id",
     "guest_uploader_id",
+    "uploader_of",
     "check_media_visible",
     "parse_size",
     "etag_matches",

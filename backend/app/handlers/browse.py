@@ -293,7 +293,8 @@ async def _serve_thumb(st: AppState, ctx: Ctx, mid: int) -> Reply:
 
     row = db.query_one(
         "SELECT id, root_id, rel_path, mtime, size, orientation, kind,"
-        "       thumb_state, thumb_etag, missing FROM media WHERE id = ?",
+        "       thumb_state, thumb_etag, missing, uploader_client_id"
+        "  FROM media WHERE id = ?",
         (mid,),
     )
     if row is None:
@@ -503,8 +504,8 @@ async def get_preview(ctx: Ctx) -> Reply:
     size = parse_size(ctx.q("size"), allowed, name="size") if ctx.q("size") else default
 
     row = db.query_one(
-        "SELECT id, root_id, rel_path, mtime, size, orientation, kind, missing"
-        "  FROM media WHERE id = ?",
+        "SELECT id, root_id, rel_path, mtime, size, orientation, kind, missing,"
+        "       uploader_client_id  FROM media WHERE id = ?",
         (mid,),
     )
     if row is None:
@@ -610,7 +611,7 @@ async def get_raw(ctx: Ctx) -> Reply:
 
     row = db.query_one(
         "SELECT id, root_id, rel_path, file_name, ext, size, mtime, kind, missing,"
-        "       container"
+        "       container, uploader_client_id"
         "  FROM media WHERE id = ?",
         (mid,),
     )
@@ -730,7 +731,7 @@ async def stream_video(ctx: Ctx) -> Reply:
     #   用 400「该条目不是视频」与 404「不存在」的差别试探出哪些 id 存在 ——
     #   这正是 BUG-2 要求"越权响应与不存在不可区分"要堵的洞。
     row = st.db.query_one(
-        "SELECT id, root_id, kind, missing FROM media WHERE id = ?", (mid,))
+        "SELECT id, root_id, kind, missing, uploader_client_id FROM media WHERE id = ?", (mid,))
     if row is not None:
         st.cfg.root_by_id(row["root_id"], allow_disabled=False)
         common.check_media_visible(ctx, st, row)
@@ -750,7 +751,7 @@ async def stream_ticket(ctx: Ctx) -> Reply:
     # ★ 票是"无 Bearer 也能过闸"的凭证，所以"能不能换"必须在签发前判定：
     #   否则游客对主人家任意 id 换一张票，`?t=` 那条放行分支就把它放进来了。
     row = st.db.query_one(
-        "SELECT id, root_id, kind, missing FROM media WHERE id = ?", (mid,))
+        "SELECT id, root_id, kind, missing, uploader_client_id FROM media WHERE id = ?", (mid,))
     if row is None or row["missing"]:
         raise NotFound(None)   # ★ 不带 id：与“无权访问”的响应必须逐字一致
     st.cfg.root_by_id(row["root_id"], allow_disabled=False)
