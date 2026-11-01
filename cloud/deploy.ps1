@@ -512,6 +512,34 @@ try {
 if ($rotRc -eq 0) { Ok "已注册计划任务「PhotoBridge Rotate Logs」" }
 else { Warn "日志轮转任务没注册上（退出码 $rotRc），可手工加：powershell -File $rotateScript" }
 
+# ── 8c. 看门狗 ────────────────────────────────────────────────────────────
+Step "8c" "注册看门狗（每 5 分钟检查 relay 与隧道，坏了自动拉起）"
+# ★ 为什么必须做：上面两个任务只管「开机跑一次」和「日志别撑爆盘」，
+#   都不管「进程死了」。2026-10-30 12:54 就是这样断的 —— 两个计划任务
+#   状态都正常，进程却都没了，cloudflared 也没了，直到第二天人工发现
+#   （`docs/11` R-002「电脑必须常开」的失效面）。看门狗把这个发现时间
+#   从「一天」压到「5 分钟」。
+# ★ 它不解决快隧道换名：`*.trycloudflare.com` 每次重启都会换，那是
+#   quick tunnel 的固有行为，只能换命名隧道（见 `docs/08` §5）。
+$watchdogScript = Join-Path $PSScriptRoot "watchdog.ps1"
+if (Test-Path $watchdogScript) {
+    $prevEap3 = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        # 用独立进程跑：`exit` 的退出码只有跨进程才可靠地落到 $LASTEXITCODE。
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $watchdogScript `
+            -Install -BaseUrl "http://127.0.0.1:$Port" -IntervalMinutes 5 `
+            -InstallDir $InstallDir -CloudflaredLog (Join-Path $logDir "cloudflared.log") *>&1 | Out-Null
+        $wdRc = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap3
+    }
+    if ($wdRc -eq 0) { Ok "已注册计划任务「PhotoBridge Watchdog」（每 5 分钟）" }
+    else { Warn "看门狗没注册上（退出码 $wdRc），可手工加：powershell -File `"$watchdogScript`" -Install" }
+} else {
+    Warn "部署目录里没有 watchdog.ps1，跳过看门狗（进程挂掉后不会自愈）"
+}
+
 # ── 9. 交付信息 ───────────────────────────────────────────────────────────
 Write-Host "`n============================================================" -ForegroundColor Green
 Write-Host " 部署完成 —— 把下面四行抄给助手" -ForegroundColor Green
