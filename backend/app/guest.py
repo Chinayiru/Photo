@@ -35,6 +35,8 @@ from shared import client_token as token_mod
 
 from .errors import AppError, E1020, E1021, E1022, E1023, E1024, E1025
 
+from .identity import GUEST_COOKIE, _signing_secret
+
 log = logging.getLogger(__name__)
 
 __all__ = [
@@ -54,11 +56,6 @@ __all__ = [
     "kick_session",
     "invite_state",
 ]
-
-#: 游客令牌的 cookie 名。与主人的 `pb_token` 分开：**同一个浏览器可能既是
-#: 主人又刚点过朋友的链接**，共用一个 cookie 名就会互相覆盖，症状是
-#: "回到自己的页面变成游客"（或者反过来，最坏的情况是游客拿到主人身份）。
-GUEST_COOKIE: Final = "pb_guest"
 
 #: 会话 TTL 上限（G13）：`min(邀请剩余有效期, 2 小时)`。
 GUEST_MAX_TTL: Final = 7200.0
@@ -359,7 +356,6 @@ def issue_session_token(db: Any, *, client_id: str, invite_id: str,
                         now: float | None = None) -> str:
     """签一枚 `role=guest` 的令牌。密钥与主人令牌**同一把**
     （`client_signing_secret`，从不上传云端），所以云端库泄露也签不出令牌。"""
-    from .auth import _signing_secret
 
     secret = _signing_secret(db, None)
     return token_mod.issue_token(

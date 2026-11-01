@@ -56,6 +56,8 @@ from shared.protocol import (
     wants_credit_v2,
 )
 
+from .identity import cloud_device_id, sync_revoked_clients
+
 log = logging.getLogger(__name__)
 
 __all__ = [
@@ -114,33 +116,6 @@ def next_backoff(attempt: int, *, jitter: float | None = None) -> float:
     else:
         frac = jitter
     return base * (1.0 + frac)
-
-
-def cloud_device_id(cfg: Any = None, fallback: str = "") -> str:
-    """这台电脑在**云端**的设备 id（`cloud.device_id`）。
-
-    ## 为什么不能直接用 `state.device_id`
-
-    两个 id 是完全不同的东西，混用会让整条链路在握手阶段就断：
-
-    | | 生成者 | 形态 | 用途 |
-    |---|---|---|---|
-    | `state.device_id` | 电脑自己（首次启动 `uuid4().hex[:16]`） | 16 hex | 手机上"这是不是我配对过的那台电脑" |
-    | `cloud.device_id` | 云端（`scripts/cloud_init.py`，32 hex） | 32 hex | 云端 `devices.id`，`/d/{device_id}/**` 的路径段 |
-
-    云端 `tunnel.py:_handshake` 会校验 `HELLO.device_id` == `agent_token`
-    所属设备（`docs/04` §2.4 明确要求"必须校验"，否则 A 的令牌能冒充
-    B 上线），而 `agent_token` 是绑在云端那行 `devices.id` 上的。所以
-    HELLO 必须报**云端 id**。
-
-    `cloud.device_id` 没配时退回本地 id：这样"云端登记的 id 恰好等于
-    本地 id"的部署（例如手工插行）仍然能连，而不是直接连不上。
-    """
-    if cfg is not None:
-        raw = str(cfg.get("cloud.device_id", "") or "").strip()
-        if raw:
-            return raw
-    return fallback
 
 
 def public_base_for(base_url: str, device_id: str) -> str:
@@ -525,7 +500,6 @@ class TunnelClient:
         st = _state_get()
         if st is None:
             return
-        from .auth import sync_revoked_clients
 
         sync_revoked_clients(st, revoked)
 

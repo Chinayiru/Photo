@@ -57,9 +57,21 @@ from .errors import (
     AppError,
     Unauthorized,
 )
-# 游客的 cookie 名（ISSUE-063）。`guest` 只在 `issue_session_token()` 里
-# 反向 import 本模块，所以这条 import 不会成环。
-from .guest import GUEST_COOKIE
+
+from .identity import (
+    CLOUD_TOKEN_TABLE,
+    GUEST_COOKIE,
+    SigningSecretUnavailable,
+    _candidate_secrets,
+    _cloud_cfg,
+    cloud_device_id,
+    _ensure_cloud_table,
+    _signing_secret,
+    hash_token,
+    legacy_tunnel_secret,
+    legacy_window_open,
+    sync_revoked_clients,
+)
 
 log = logging.getLogger(__name__)
 
@@ -240,10 +252,6 @@ PANEL_PATHS: tuple[str, ...] = ("/panel",)
 # 哈希
 # --------------------------------------------------------------------------
 
-def hash_token(token: str) -> str:
-    """token 的存储形式。无盐 sha256 足够（token 是高熵随机数）。"""
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
 
 def hash_code(code: str) -> str:
     """配对码的存储形式。
@@ -305,10 +313,6 @@ def _issue_client_token(now: float, client_id: str,
     cfg = _cloud_cfg(cfg)
     secret = _signing_secret(db, cfg)
     if secret:
-        # 延迟导入：`tunnel.py` 在模块级 import 了本模块的常量，顶层
-        # 反向 import 会成环（`backend/app/tunnel.py:53` 那组 import）。
-        from .tunnel import cloud_device_id
-
         device_id = cloud_device_id(cfg, "")
         if device_id:
             days = token_ttl_days(cfg)
@@ -578,131 +582,6 @@ def _lookup_device(db: Any, token: str) -> Any:
 #: `devices` 的 `id` 是本地配对时生成的 16 位 hex，而云端令牌的
 #: `client_id` 是云端生成的 32 位 hex，两者语义不同却能同名，
 #: 混在一张表里会让"撤销一台设备"变成"两张表的行都可能被改"。
-_CLOUD_TOKEN_TABLE: Final = "cloud_clients"
-
-
-def _ensure_cloud_table(db: Any) -> None:
-    """首次用云端令牌时建缓存表（老库升级上来时没有这张表）。"""
-    db.execute(
-        f"CREATE TABLE IF NOT EXISTS {_CLOUD_TOKEN_TABLE} ("
-        "  client_id  TEXT PRIMARY KEY,"
-        "  device_id  TEXT NOT NULL,"
-        "  name       TEXT,"
-        "  expires_at REAL,"
-        "  created_at REAL NOT NULL,"
-        "  last_seen  REAL"
-        ")"
-    )
-
-
-def _cloud_cfg(cfg: Any = None) -> Any:
-    """取当前配置。`require_client` 只拿得到 `ctx`，配置只能从这里拿。"""
-    if cfg is not None:
-        return cfg
-    from .config import get as _get_cfg
-
-    try:
-        return _get_cfg()
-    except Exception:  # noqa: BLE001 —— 配置坏了不该让鉴权抛别的异常
-        return None
-
-
-class SigningSecretUnavailable(RuntimeError):
-    """电脑端私有签名密钥读不出来（审计 M01）。
-
-    ★ 这个异常存在的唯一目的是**不让调用方回退**。以前这里是
-    `except Exception: return legacy_tunnel_secret(cfg)`：一旦
-    `settings.client_signing_secret` 读失败（库损坏、迁移半途、磁盘只读），
-    验签就会"降级"到那枚**云端库里也有明文**的旧密钥 —— 正好是
-    ISSUE-049 修掉的那条攻击链，而且降级时没有任何日志。
-
-    现在拆成两条互不影响的路径：私有密钥坏了 = 拒绝认证 + 告警；旧密钥
-    只在 `devices.allow_legacy_until` 显式窗口内、作为**独立候选**参与
-    验签（`_candidate_secrets()` 里那一段），两者绝不互相顶替。
-    """
-
-
-def _signing_secret(db: Any = None, cfg: Any = None) -> str:
-    """签发令牌用的 HMAC 密钥：**电脑端私有**（`settings.client_signing_secret`）。
-
-    `db is None` 时退回旧密钥：有几个调用点（如 `_tunnel_secret()` 的老
-    用法）拿不到数据库句柄。这种回退是过渡期的妥协 —— 真正的修复是把
-    db 一路传下去，`control.mint_client` / `_verify_cloud_token` 都已经做到了。
-
-    ★ 审计 M01：`db is not None` 时**任何**读/生成失败都抛
-    `SigningSecretUnavailable`，不再静默换成旧密钥。拿不到私有密钥就是
-    "这台电脑现在没法判断令牌真假"，正确处置是拒绝并告警，不是换一把
-    攻击者也有的钥匙。
-    """
-    if db is not None:
-        try:
-            from .control import client_signing_secret
-
-            return client_signing_secret(db)
-        except Exception as exc:    # noqa: BLE001 - 任何失败都不能降级
-            log.warning("私有签名密钥不可用，拒绝云端令牌验签：%s", exc,
-                        exc_info=True)
-            raise SigningSecretUnavailable("私有签名密钥不可用") from exc
-    return legacy_tunnel_secret(cfg)
-
-
-def legacy_window_open(db: Any = None) -> bool:
-    """`devices.allow_legacy_until` 还没过期吗？（默认关闭）
-
-    旧密钥 = `sha256(agent_token)`，它在云端库里明文躺着。只要我们还拿它
-    验签，"云端库泄露 → 伪造成任意手机令牌"这条攻击链就还在。所以默认
-    不接受，只在运维显式开的窗口期内接受（`pbctl allow-legacy <天数>`）。
-    """
-    if db is None:
-        return False
-    try:
-        row = db.query_one(
-            "SELECT MAX(allow_legacy_until) AS until FROM devices")
-    except Exception:               # noqa: BLE001 - 老库没有这一列
-        return False
-    until = 0.0
-    try:
-        until = float(row["until"]) if row is not None and row["until"] else 0.0
-    except (TypeError, ValueError):
-        return False
-    return until > time.time()
-
-
-def _candidate_secrets(db: Any = None, cfg: Any = None) -> list[str]:
-    """验签时要试的密钥列表：新密钥在前，旧密钥只在窗口期内兜底。
-
-    ★ 审计 M01：私有密钥不可用时**抛异常**，不返回"只有旧密钥"的列表。
-    否则调用方的 for 循环会拿旧密钥验签成功，等于悄悄降级。
-    """
-    out: list[str] = []
-    fresh = _signing_secret(db, cfg)
-    if fresh:
-        out.append(fresh)
-    legacy = legacy_tunnel_secret(cfg)
-    if legacy and legacy not in out and legacy_window_open(db):
-        out.append(legacy)
-    return out
-
-
-def legacy_tunnel_secret(cfg: Any = None) -> str:
-    """**旧**令牌的 HMAC 密钥 = `sha256(agent_token)`。
-
-    ★ 2026-10-26 起新签发的令牌**不再**用它（见 `control.client_signing_secret()`）：
-    这个值在云端库里明文躺着，等于把签名私钥放进了云端数据库 ——
-    库一泄露就能离线签出任意手机令牌。这里保留只为让 90 天有效期的
-    老令牌自然过期，别再往这条路上加东西。
-
-    没配 `cloud.agent_token` 时返回空串，调用方据此跳过云端令牌校验
-    —— 一台根本没用过云端的电脑不该因为"表里有个不认识的令牌"而
-    多走一次 HMAC 计算（那是每个缩略图请求一次）。
-    """
-    cfg = _cloud_cfg(cfg)
-    if cfg is None:
-        return ""
-    raw = str(cfg.get("cloud.agent_token", "") or "").strip()
-    if not raw:
-        return ""
-    return token_mod.secret_for_agent_token(raw)
 
 
 def _admit_guest(ctx: Ctx, db: Any, claims: dict[str, Any]) -> dict[str, Any]:
@@ -815,7 +694,6 @@ def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
     # `devices.id`（32 位、云端分配）；本地 `state.device_id` 是电脑首次
     # 启动自己生成的 16 位串。混用会让每一枚云端令牌都验签失败，而症状
     # 是"配对成功、之后所有请求 401"——见 `tunnel.cloud_device_id` 的表。
-    from .tunnel import cloud_device_id
 
     cfg = ctx.app.cfg if ctx.app is not None else None
     device_id = cloud_device_id(cfg, st.device_id if st is not None else "")
@@ -856,19 +734,19 @@ def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
         # `last_seen` 也不能在撤销后被刷新 —— 它是"这枚令牌最后用过"的
         # 依据，刷新等于说"它还在正常使用"。
         db.execute(
-            f"INSERT INTO {_CLOUD_TOKEN_TABLE}"
+            f"INSERT INTO {CLOUD_TOKEN_TABLE}"
             "(client_id, device_id, name, expires_at, created_at, last_seen)"
             " VALUES (?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(client_id) DO UPDATE SET"
             "   name = excluded.name,"
             "   expires_at = CASE WHEN"
-            f"     {_CLOUD_TOKEN_TABLE}.expires_at IS NOT NULL"
-            f"     AND {_CLOUD_TOKEN_TABLE}.expires_at <= 0"
+            f"     {CLOUD_TOKEN_TABLE}.expires_at IS NOT NULL"
+            f"     AND {CLOUD_TOKEN_TABLE}.expires_at <= 0"
             "   THEN 0 ELSE excluded.expires_at END,"
             f"   last_seen = CASE WHEN"
-            f"     {_CLOUD_TOKEN_TABLE}.expires_at IS NOT NULL"
-            f"     AND {_CLOUD_TOKEN_TABLE}.expires_at <= 0"
-            f"   THEN {_CLOUD_TOKEN_TABLE}.last_seen"
+            f"     {CLOUD_TOKEN_TABLE}.expires_at IS NOT NULL"
+            f"     AND {CLOUD_TOKEN_TABLE}.expires_at <= 0"
+            f"   THEN {CLOUD_TOKEN_TABLE}.last_seen"
             "   ELSE excluded.last_seen END",
             (client_id, device_id, name, exp, now, now),
         )
@@ -881,7 +759,7 @@ def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
     row = None
     try:
         row = db.query_one(
-            f"SELECT expires_at FROM {_CLOUD_TOKEN_TABLE} WHERE client_id = ?",
+            f"SELECT expires_at FROM {CLOUD_TOKEN_TABLE} WHERE client_id = ?",
             (client_id,))
     except Exception:  # noqa: BLE001 —— 撤销状态不可用时拒绝访问
         log.warning("无法确认云端令牌撤销状态，拒绝访问 client_id=%s", client_id)
@@ -890,56 +768,6 @@ def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
         return None
 
     return {"id": client_id, "name": name, "cloud": True, "expires_at": exp}
-
-
-def sync_revoked_clients(st: Any, revoked_ids: list[str],
-                         *, access_token: str = "") -> int:
-    """把云端撤销列表落到本地缓存（`docs/04` §3.6）。
-
-    用 `expires_at = 0` 表示"已撤销"而不是删行：删了之后再验签会
-    **重新插入**一行干净记录，撤销就失效了（令牌本身没过期，签名也
-    还是对的）。这是本条链路唯一容易写错的地方。
-
-    ## 为什么还要动本地 `devices` 表
-
-    局域网配对现在也签发 HMAC 令牌（见 `_issue_client_token`），而那枚
-    令牌**同时**会在本地 `devices` 表留一行（`consume_pair_code` 写的）。
-    `require_client` 是先查本地库、查不到才验签的，所以这类令牌走的是
-    `_lookup_device` 那条路 —— 只写 `cloud_clients` 的话，用户在账号
-    后台点"移除这台手机"，云端通路立刻 403，但**局域网通路仍然放行**，
-    而用户以为自己已经把手机摘掉了。
-
-    两张表的 `id` 是同一个值（`consume_pair_code` 用同一个 `client_id`
-    同时写两处），所以按 id 直接落 `revoked = 1` 即可。
-
-    返回实际影响的缓存行数。
-    """
-    if not revoked_ids:
-        return 0
-    from .tunnel import cloud_device_id
-
-    device_id = cloud_device_id(st.cfg, st.device_id)
-    now = time.time()
-    _ensure_cloud_table(st.db)
-    n = 0
-    for cid in revoked_ids:
-        key = str(cid or "").strip()
-        if not key:
-            continue
-        n += int(st.db.execute_rowcount(
-            f"INSERT INTO {_CLOUD_TOKEN_TABLE}"
-            " (client_id, device_id, expires_at, created_at) VALUES (?, ?, 0, ?)"
-            " ON CONFLICT(client_id) DO UPDATE SET expires_at = 0"
-            f" WHERE {_CLOUD_TOKEN_TABLE}.expires_at IS NULL"
-            f" OR {_CLOUD_TOKEN_TABLE}.expires_at > 0",
-            (key, device_id, now)))
-        # 幂等：已经 revoked 的行不重复计数（rowcount 只数真正改到的行）。
-        n += int(st.db.execute_rowcount(
-            "UPDATE devices SET revoked = 1 WHERE id = ? AND revoked = 0",
-            (key,)))
-    if n:
-        log.info("从云端同步到 %d 台被撤销的手机", n)
-    return n
 
 
 def require_client(ctx: Ctx) -> dict[str, Any]:

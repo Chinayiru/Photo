@@ -53,6 +53,15 @@ import secrets
 import time
 from typing import Any
 
+from .identity import (
+    client_signing_secret,
+    cloud_device_id,
+    hash_token,
+    legacy_tunnel_secret,
+    legacy_window_open,
+    sync_revoked_clients,
+)
+
 #: 模块日志。控制通道的失败**必须**留痕：这条链路平时安静，出问题时
 #: 要么是"云端在命令电脑签令牌"（要能查），要么是"密钥坏了"（要能告警）。
 log = logging.getLogger(__name__)
@@ -64,9 +73,6 @@ CONTROL_PATH = "/.pb/control"
 
 #: 请求体上限。
 MAX_BODY = 4096
-
-#: 令牌签名密钥在本地 `settings` 表里的键名。
-SECRET_KEY = "client_signing_secret"
 
 #: 允许的动作。
 ACTIONS = ("ping", "mint_client", "refresh_client", "verify_client", "revoke_clients")
@@ -82,35 +88,6 @@ class ControlError(Exception):
         self.code = code
         self.message = message
         self.status = status
-
-
-def client_signing_secret(db: Any) -> str:
-    """取（首次调用时生成）电脑端独有的令牌签名密钥。
-
-    ★ 这是整条链路上**唯一**一份能签手机令牌的材料，它只存在于电脑的
-    `settings` 表里，从不上传、不进日志、不进任何隧道帧。云端拿到过的
-    只有 `sha256(token)`。
-
-    32 字节随机（`secrets.token_hex(32)`）+ 只在需要时生成：老库升级上来
-    时第一次配对会自动补上，不需要迁移脚本。
-    """
-    row = db.query_one(
-        "SELECT value FROM settings WHERE key = ?", (SECRET_KEY,))
-    current = str(row["value"]) if row is not None and row["value"] else ""
-    if _looks_like_secret(current):
-        return current
-    fresh = secrets.token_hex(32)
-    db.execute(
-        "INSERT INTO settings(key, value) VALUES (?, ?)"
-        " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (SECRET_KEY, fresh))
-    return fresh
-
-
-def _looks_like_secret(value: str) -> bool:
-    """64 位小写 hex 才算数 —— 手改坏了就重新生成，别拿坏值去签名。"""
-    return (len(value) == 64
-            and all(ch in "0123456789abcdef" for ch in value))
 
 
 def parse_request(raw: bytes) -> tuple[str, dict[str, Any]]:
@@ -162,7 +139,6 @@ def _version() -> str:
 
 
 def _local_device_id(state: Any, cfg: Any) -> str:
-    from .tunnel import cloud_device_id
 
     return cloud_device_id(cfg, str(getattr(state, "device_id", "") or ""))
 
@@ -172,7 +148,6 @@ def _mint_client(state: Any, cfg: Any, payload: dict[str, Any],
     """给云端配对签一枚手机令牌（云端只留 `sha256(token)`）。"""
     from shared import client_token as token_mod
 
-    from .auth import hash_token
 
     device_id = _local_device_id(state, cfg)
     if not device_id:
@@ -262,7 +237,6 @@ def _verify_client(state: Any, cfg: Any, payload: dict[str, Any]) -> dict[str, A
 
 def _revoke_clients(state: Any, payload: dict[str, Any]) -> dict[str, Any]:
     """立刻撤销（`docs/06` §13.2 的延迟问题）。"""
-    from .auth import sync_revoked_clients
 
     ids = payload.get("ids")
     if not isinstance(ids, list):
@@ -284,7 +258,6 @@ def _candidate_secrets(state: Any) -> list[str]:
     退化成"只试旧密钥"。那等于把 ISSUE-049 修掉的攻击链重新接上，而且
     退化时一眼看不出来（照样能验签成功）。
     """
-    from .auth import legacy_tunnel_secret, legacy_window_open
 
     try:
         fresh = client_signing_secret(state.db)
