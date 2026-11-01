@@ -561,15 +561,26 @@ export interface MeResponse {
   server_time: number;
 }
 
-/** `GET /api/devices`（`backend/app/handlers/auth.py: list_devices()`）。 */
+/**
+ * `GET /api/devices`（`backend/app/handlers/auth.py: list_devices()`）。
+ *
+ * ⚠️ 这个列表对 owner 与 viewer 是**两种形状**（ISSUE-034 ③）：
+ * 权限信息不该描述别的设备，所以 viewer 拿到的响应里没有
+ * `created_at`（配对时刻）与 `role`。两者都标成可选，
+ * 否则前端会以为它们永远在，`viewer` 那一侧静默拿到 `undefined`。
+ */
 export interface DeviceEntry {
   client_id: string;
   name: string;
-  created_at: number;
+  /** 只有 owner 的响应里有。 */
+  created_at?: number;
   last_seen: number;
   revoked: boolean;
+  /** 只有 owner 的响应里有：`"owner"` / `"viewer"`。 */
+  role?: "owner" | "viewer";
 }
 
 export interface DevicesResponse {
   items: DeviceEntry[];
 }
+

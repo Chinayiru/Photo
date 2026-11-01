@@ -522,3 +522,290 @@ def test_types_ts_covers_every_route(srv) -> None:
     for required in ("MediaItem", "MediaDetail", "TimelineResponse", "SystemInfo",
                      "UploadInitResponse", "PairResponse", "ApiErrorBody"):
         assert required in declared, f"types.ts 缺少 {required}"
+
+
+# ---------------------------------------------------------------------------
+# 覆盖门禁：types.ts 的每个 interface 都必须有人证（F3 收尾）
+# ---------------------------------------------------------------------------
+#
+# 为什么要有这张表
+# ----------------
+# 2026-11-01 的架构审查（F3）统计：types.ts 声明了 32 个 interface，
+# 而这个文件当时只对 19 个做过真实断言 —— 漏掉的 13 个恰好是
+# "改起来最容易忘"的一批（删除/移动/改名/重扫的响应、设备列表、
+# 上传分片的 PATCH/ABORT 响应、VideoInfo/WatchInfo）。
+#
+# 漏了不会红：后端把 `error` 改成 `code`，前端仍读 `f.error`，
+# 界面只是"删除失败时提示里少一句原因"，没有人会为此提 bug。
+# 所以覆盖率不能靠"上次好像加过"，必须由一张登记表 + 一条测试钉住：
+#
+# * 新增 interface 却没登记 → 失败（提醒你补断言，别只补类型）
+# * 登记了但 types.ts 已删除 → 失败（提醒你清理死登记）
+# * 登记的函数名不存在 → 失败（防止把没写的东西先登进来）
+COVERED: dict[str, str] = {
+    "ApiErrorBody": "test_error_envelope_matches_types",
+    "ApiErrorEnvelope": "test_error_envelope_matches_types",
+    # PageInfo 是 TimelineResponse 的 extends 父接口，字段已并进子接口断言
+    "PageInfo": "test_timeline_matches_types",
+    "PingResponse": "test_ping_matches_types",
+    "RootInfo": "test_system_info_matches_types",
+    "IndexInfo": "test_system_info_matches_types",
+    "WatchInfo": "test_watch_info_matches_types",
+    "LimitsInfo": "test_system_info_matches_types",
+    "SystemInfo": "test_system_info_matches_types",
+    "SystemStats": "test_system_stats_matches_types",
+    "MediaItem": "test_timeline_matches_types",
+    "TimelineResponse": "test_timeline_matches_types",
+    "ExifInfo": "test_media_detail_matches_types",
+    "VideoInfo": "test_video_info_matches_types",
+    "MediaDetail": "test_media_detail_matches_types",
+    "FolderEntry": "test_folders_matches_types",
+    "FoldersResponse": "test_folders_matches_types",
+    "DeleteResponse": "test_delete_matches_types",
+    "MoveResponse": "test_move_matches_types",
+    "RenameResponse": "test_rename_matches_types",
+    "RescanResponse": "test_rescan_matches_types",
+    "UploadInitRequest": "test_upload_init_request_fields_are_consumed",
+    "UploadInitResponse": "test_upload_init_matches_types",
+    "UploadPatchResponse": "test_upload_patch_and_abort_match_types",
+    "UploadStatusResponse": "test_upload_status_and_complete_match_types",
+    "UploadCompleteResponse": "test_upload_status_and_complete_match_types",
+    "UploadAbortResponse": "test_upload_patch_and_abort_match_types",
+    "PairRequest": "test_pair_request_matches_types",
+    "PairResponse": "test_pair_request_matches_types",
+    "MeResponse": "test_me_and_devices_match_types",
+    "DeviceEntry": "test_me_and_devices_match_types",
+    "DevicesResponse": "test_me_and_devices_match_types",
+}
+
+
+def test_every_declared_interface_has_a_contract_check() -> None:
+    """types.ts 里出现的每个 interface 都必须登记到 `COVERED`。
+
+    这条测试**不碰服务器** —— 它只是把"覆盖率"变成可判定的，
+    从而让上面那 13 个漏网的接口不会再悄悄多出第 14 个。
+    """
+    declared = set(_parse_types())
+    missing = sorted(declared - set(COVERED))
+    stale = sorted(set(COVERED) - declared)
+
+    assert not missing, (
+        "types.ts 里这些 interface 还没有契约断言：\n  "
+        + "\n  ".join(missing)
+        + "\n  → 补一条对真实响应/真实产出函数的断言，再登记进 COVERED"
+    )
+    assert not stale, (
+        "COVERED 里登记了 types.ts 已不存在的 interface：\n  "
+        + "\n  ".join(stale)
+        + "\n  → 删掉这些死登记（它们会让覆盖率看起来比实际高）"
+    )
+
+    dangling = sorted(
+        f"{iface} -> {fn}" for iface, fn in COVERED.items()
+        if not callable(globals().get(fn))
+    )
+    assert not dangling, (
+        "COVERED 指向了本文件里不存在的测试函数：\n  " + "\n  ".join(dangling)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 写操作与设备：删除 / 移动 / 改名 / 重扫 / 我 / 设备列表
+# ---------------------------------------------------------------------------
+
+def test_delete_matches_types(srv) -> None:
+    tok = _token(srv)
+    items = srv.request("GET", "/api/timeline", token=tok).json()["items"]
+    victim = items[0]["id"]
+
+    body = srv.request("POST", "/api/items/delete", token=tok,
+                       body={"ids": [victim, 10 ** 9]}).json()
+    _assert_fields(body, "DeleteResponse", where="POST /api/items/delete")
+    _assert_no_unknown_fields(body, "DeleteResponse",
+                              where="POST /api/items/delete")
+    assert body["deleted"] == 1, body
+    # `failed` 的元素是 `{id, error}`，不是错误码字符串 —— 前端
+    # `DeleteResponse` 里那句话（"⚠️ 不是数字"）写的正是这一点。
+    assert body["failed"] == [{"id": 10 ** 9, "error": "not_found"}], body
+
+
+def test_move_matches_types(srv) -> None:
+    tok = _token(srv)
+    items = srv.request("GET", "/api/timeline", token=tok).json()["items"]
+    mid = items[0]["id"]
+
+    body = srv.request("POST", "/api/items/move", token=tok,
+                       body={"ids": [mid], "target_dir": "2024"}).json()
+    _assert_fields(body, "MoveResponse", where="POST /api/items/move")
+    _assert_no_unknown_fields(body, "MoveResponse",
+                              where="POST /api/items/move")
+    assert [m["id"] for m in body["moved"]] == [mid], body
+    assert body["moved"][0]["to"].startswith("2024/"), body
+    assert body["skipped"] == [] and body["failed"] == [], body
+    assert body["target_dir"] == "2024", body
+
+    # 失败项是 `{id, code, message}` 三件套（与 DeleteResponse 的
+    # `{id, error}` 不同）—— 前端按 `code` 走错误映射表，按
+    # `message` 兜底，两个都必须真的存在。
+    bad = srv.request("POST", "/api/items/move", token=tok,
+                      body={"ids": [10 ** 9], "target_dir": "2024"}).json()
+    assert len(bad["failed"]) == 1, bad
+    assert set(bad["failed"][0]) == {"id", "code", "message"}, bad
+
+
+def test_rename_matches_types(srv) -> None:
+    tok = _token(srv)
+    items = srv.request("GET", "/api/timeline", token=tok).json()["items"]
+    mid = items[0]["id"]
+
+    body = srv.request("POST", "/api/items/rename", token=tok,
+                       body={"id": mid, "new_name": "renamed.jpg"}).json()
+    _assert_fields(body, "RenameResponse", where="POST /api/items/rename")
+    _assert_no_unknown_fields(body, "RenameResponse",
+                              where="POST /api/items/rename")
+    assert body["to"].endswith("/renamed.jpg"), body
+    # 改名可能改变 taken_at（文件名里原本带日期），所以这两个字段是
+    # 必需项而不是可选项 —— 前端要靠 response 回写时间线。
+    assert body["taken_at"] > 0 and body["taken_src"], body
+
+    # 同名改名是幂等成功：不写审计、路径原样返回
+    again = srv.request("POST", "/api/items/rename", token=tok,
+                        body={"id": mid, "new_name": "renamed.jpg"}).json()
+    assert again["from"] == again["to"] == body["to"], again
+
+
+def test_rescan_matches_types(srv) -> None:
+    tok = _token(srv)
+    r = srv.request("POST", "/api/index/rescan", token=tok,
+                    body={"root": "library"})
+    assert r.status == 202, r.body
+    body = r.json()
+    _assert_fields(body, "RescanResponse", where="POST /api/index/rescan")
+    _assert_no_unknown_fields(body, "RescanResponse",
+                              where="POST /api/index/rescan")
+    assert body["started"] is True and body["root"] == "library", body
+
+
+def test_me_and_devices_match_types(srv) -> None:
+    tok = _token(srv)
+    me = srv.request("GET", "/api/clients/me", token=tok).json()
+    _assert_fields(me, "MeResponse", where="GET /api/clients/me")
+    _assert_no_unknown_fields(me, "MeResponse", where="GET /api/clients/me")
+
+    devs = srv.request("GET", "/api/devices", token=tok).json()
+    _assert_fields(devs, "DevicesResponse", where="GET /api/devices")
+    _assert_no_unknown_fields(devs, "DevicesResponse", where="GET /api/devices")
+    assert devs["items"], "刚配对过的客户端必须出现在设备列表里"
+    _assert_fields(devs["items"][0], "DeviceEntry", where="GET /api/devices items[0]")
+    _assert_no_unknown_fields(devs["items"][0], "DeviceEntry",
+                              where="GET /api/devices items[0]")
+    assert me["client_id"] in {d["client_id"] for d in devs["items"]}, devs
+
+
+# ---------------------------------------------------------------------------
+# 上传：请求体（反向）+ PATCH / ABORT 响应
+# ---------------------------------------------------------------------------
+
+def test_upload_init_request_fields_are_consumed(srv) -> None:
+    """`UploadInitRequest` 是**请求体**，只能反向验：发全字段，看后端接不接。
+
+    正向断言（响应里有声明字段）对请求体没有意义 —— 漂移方向是
+    "前端多写了一个后端不认识的键"，后端会静默忽略，症状是
+    "设置了目标目录却传到了默认目录"。所以这里发一整套声明字段，
+    再从 `GET /api/uploads/{id}` 把被**消费**掉的字段读回来。
+    """
+    tok = _token(srv)
+    req = {
+        "name": "req-check.jpg",
+        "size": 64,
+        "mtime": 1_700_000_000.0,
+        "sha256": "0" * 64,
+        "root": "library",
+        "target_dir": "2024",
+        "declared_taken_at": 1_699_999_999.0,
+    }
+    init = srv.request("POST", "/api/uploads/init", token=tok, body=req)
+    assert init.status == 201, init.body
+    _assert_fields(init.json(), "UploadInitResponse",
+                   where="POST /api/uploads/init")
+
+    st = srv.request("GET", f"/api/uploads/{init.json()['upload_id']}",
+                     token=tok).json()
+    assert st["declared_name"] == "req-check.jpg", st
+    assert (st["target_rel"] or "").strip("/") == "2024", st
+
+
+def test_upload_patch_and_abort_match_types(srv) -> None:
+    tok = _token(srv)
+    total = 64
+    init = srv.request("POST", "/api/uploads/init", token=tok,
+                       body={"name": "chunk.jpg", "size": total}).json()
+    uid = init["upload_id"]
+
+    part = b"\xff\xd8\xff\xe0" + b"c" * 28      # 前 32 字节，留一半
+    assert len(part) == total // 2
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{srv.port}/api/uploads/{uid}",
+        data=part, method="PATCH",
+        headers={"Authorization": f"Bearer {tok}",
+                 "Content-Range": f"bytes 0-{len(part) - 1}/{total}"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        assert resp.status == 206
+        patched = json.loads(resp.read().decode("utf-8"))
+
+    _assert_fields(patched, "UploadPatchResponse", where="PATCH /api/uploads/{id}")
+    _assert_no_unknown_fields(patched, "UploadPatchResponse",
+                              where="PATCH /api/uploads/{id}")
+    # `offset` 是"以服务端为准"的那一个，客户端不许自己加
+    assert patched["offset"] == len(part), patched
+
+    aborted = srv.request("DELETE", f"/api/uploads/{uid}", token=tok).json()
+    _assert_fields(aborted, "UploadAbortResponse",
+                   where="DELETE /api/uploads/{id}")
+    _assert_no_unknown_fields(aborted, "UploadAbortResponse",
+                              where="DELETE /api/uploads/{id}")
+    assert aborted["upload_id"] == uid and aborted["aborted"] is True, aborted
+
+
+def test_pair_request_matches_types(srv) -> None:
+    """`PairRequest` 只有 `code` 一个字段：它的契约就是"别的什么都不用发"。"""
+    r = srv.request("POST", "/panel/pair-code")
+    assert r.status == 201, r.body
+    res = srv.request("POST", "/api/pair", body={"code": r.json()["code"]})
+    assert res.status == 201, res.body
+    body = res.json()
+    _assert_fields(body, "PairResponse", where="POST /api/pair")
+    _assert_no_unknown_fields(body, "PairResponse", where="POST /api/pair")
+
+
+# ---------------------------------------------------------------------------
+# 非响应体：VideoInfo / WatchInfo 由函数产出，直接对产出函数断言
+# ---------------------------------------------------------------------------
+
+def test_video_info_matches_types(srv) -> None:
+    """`VideoInfo` 只在视频详情里出现，而 fixture 里全是 jpg。
+
+    与其为了一个结构断言造一个真 MP4（还要 moov/faststart 探测），
+    不如直接对产出它的 `_video_block()` 断言 —— 漂移发生在那里，
+    修也在那里。
+    """
+    from backend.app.handlers import common as common_mod
+
+    block = common_mod._video_block({
+        "kind": "video", "container": "mp4", "vcodec": "h264",
+        "acodec": "aac", "duration": 12.5, "faststart": 1,
+    })
+    assert block is not None
+    _assert_fields(block, "VideoInfo", where="_video_block(mp4/h264/aac)")
+    _assert_no_unknown_fields(block, "VideoInfo",
+                              where="_video_block(mp4/h264/aac)")
+    assert block["hint"] == "ok" and block["reason"] == "", block
+    # 图片必须返回 None —— 前端靠这个 null 判断"要不要显示视频控件"
+    assert common_mod._video_block({"kind": "image"}) is None
+
+
+def test_watch_info_matches_types(srv) -> None:
+    info = srv.state.watch_info()
+    _assert_fields(info, "WatchInfo", where="state.watch_info()")
+    _assert_no_unknown_fields(info, "WatchInfo", where="state.watch_info()")
