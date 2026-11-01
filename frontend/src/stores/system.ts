@@ -9,6 +9,7 @@
 
 import { computed } from "vue";
 import { ApiError, api } from "../api/client";
+import { errorText } from "../api/errorText";
 import { onConnection, onEvent } from "../api/events";
 import type { RescanResponse, SystemInfo, SystemStats } from "../api/types";
 import { createStore } from "./index";
@@ -66,7 +67,7 @@ export async function refresh(): Promise<void> {
   );
   if (firstErr) {
     const e = firstErr.reason;
-    s.error = e instanceof ApiError ? e.friendly : "获取设备信息失败";
+    s.error = errorText(e, "获取设备信息失败");
   } else {
     s.lastLoadedAt = Date.now();
     // 服务端说正在扫描 → 同步本地标志

@@ -8,7 +8,7 @@
  *   ③ 直接粘贴一整条带参数的 URL（用户从聊天窗口复制过来的）
  */
 import { computed, onMounted, ref } from "vue";
-import { ApiError } from "../api/client";
+import { errorText } from "../api/errorText";
 import { buildBase, cloudBaseFromLocation, relayRootBase } from "../api/storage";
 import type { AccountDevice } from "../stores/auth";
 import {
@@ -369,9 +369,7 @@ async function runPair(target: string): Promise<void> {
     const r = await pair(target, code.value, expectedDid.value);
     toastOk(`已连接到 ${r.device_name}`);
   } catch (e) {
-    error.value = e instanceof ApiError
-      ? (e.userHint || e.friendly)
-      : "配对失败，请检查地址与配对码";
+    error.value = errorText(e, "配对失败，请检查地址与配对码");
   } finally {
     busy.value = false;
   }
@@ -389,7 +387,7 @@ async function submitPaste(): Promise<void> {
   } catch (e) {
     // ★ 识别出来了但主机不在白名单（ISSUE-033）：要把拒绝理由说清楚，
     //   否则用户会以为"没粘对"，把同一段攻击者链接再粘一次。
-    toastError(e instanceof ApiError ? (e.userHint || e.friendly) : "这段内容不能用来配对");
+    toastError(errorText(e, "这段内容不能用来配对"));
     return;
   }
   if (!parsed) {
@@ -451,9 +449,7 @@ async function submitAccount(): Promise<void> {
       toastOk(`已连接到 ${r.device_name}`);
     }
   } catch (e) {
-    accountError.value = e instanceof ApiError
-      ? (e.userHint || e.friendly)
-      : "登录失败，请检查邮箱与密码";
+    accountError.value = errorText(e, "登录失败，请检查邮箱与密码");
   } finally {
     accountBusy.value = false;
   }
@@ -469,9 +465,7 @@ async function chooseAccountDevice(id: string): Promise<void> {
     accountDevices.value = [];
     toastOk(`已连接到 ${r.device_name}`);
   } catch (e) {
-    accountError.value = e instanceof ApiError
-      ? (e.userHint || e.friendly)
-      : "连接失败，请再试一次";
+    accountError.value = errorText(e, "连接失败，请再试一次");
   } finally {
     accountBusy.value = false;
   }

@@ -29,6 +29,11 @@ function isGuest(): boolean {
   }
 }
 
+/** 是不是一句中文 —— 用来把"写给人看的提示"和英文技术串分开。 */
+function isChinese(text: string | null): boolean {
+  return !!text && /[\u4e00-\u9fa5]/.test(text);
+}
+
 /** 码 → 人话。只放"用户能据此决定下一步"的话，不复述技术原因。 */
 const BY_CODE: Record<string, string> = {
   // 越权/身份
@@ -64,10 +69,15 @@ export function errorText(e: unknown, fallback: string): string {
     if (e.code === "E2003" && isGuest()) {
       return "游客只能查看和上传，不能删除、改名或移动";
     }
+    // 本地构造的错误（`status === 0`：表单校验、网络层）自带整句中文，
+    // 比通用映射更具体 ——「请填写电脑地址」不该被 E1001 的
+    // 「请求有点问题」盖掉。只有服务端返回的错误才带真实状态码。
+    if (e.status === 0 && isChinese(e.userHint)) return e.userHint ?? fallback;
     const mapped = BY_CODE[e.code];
     if (mapped) return mapped;
-    // 后端给了中文提示就用它（它确实是写给人看的），否则用兜底。
-    if (e.userHint && /[\u4e00-\u9fa5]/.test(e.userHint)) return e.userHint;
+    // 后端的 `user_hint` 也是写给人看的中文，但**映射表优先**：同一个
+    // code 前端已有专门文案时以表为准，避免两端各说各话。
+    if (isChinese(e.userHint)) return e.userHint ?? fallback;
     if (e.status === 0) return "连不上电脑，请检查网络";
     return fallback;
   }

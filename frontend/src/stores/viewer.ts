@@ -12,6 +12,7 @@
 
 import { computed } from "vue";
 import { ApiError, api, previewUrl, rawUrl, thumbUrl } from "../api/client";
+import { errorText } from "../api/errorText";
 import { getToken } from "../api/storage";
 import type {
   DeleteResponse,
@@ -293,8 +294,7 @@ export async function fetchDetail(id: number): Promise<void> {
     if (d.size <= RAW_PREFETCH_MAX_BYTES) prefetchCurrent();
   } catch (e) {
     if (my !== s.seq) return;
-    const err = e instanceof ApiError ? e : null;
-    s.error = err?.friendly ?? "加载失败";
+    s.error = errorText(e, "加载失败");
   } finally {
     if (my === s.seq) s.loading = false;
   }

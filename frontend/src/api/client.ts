@@ -62,11 +62,6 @@ export class ApiError extends Error {
     this.userHint = init.userHint ?? null;
   }
 
-  /** 面向用户的一句话（优先 user_hint，其次 message）。 */
-  get friendly(): string {
-    return this.userHint || this.message || this.code || "请求失败";
-  }
-
   /** 网络不通 / 超时（status 0）。 */
   get isNetwork(): boolean {
     return this.status === 0;

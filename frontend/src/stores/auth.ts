@@ -34,6 +34,7 @@
 
 import { computed } from "vue";
 import { ApiError, api } from "../api/client";
+import { errorText } from "../api/errorText";
 import type { PairResponse, PingResponse } from "../api/types";
 import {
   activeBase,
@@ -160,7 +161,7 @@ export async function probe(): Promise<boolean> {
     return ok;
   } catch (e) {
     const err = e instanceof ApiError ? e : null;
-    s.lastError = err?.friendly ?? "无法连接";
+    s.lastError = errorText(e, "无法连接");
     s.conn = err?.isAuthLost ? "UNAUTHORIZED" : "OFFLINE";
     s.probing = false;
     return false;
