@@ -165,6 +165,83 @@ def source_signature(mtime: float, size: int) -> str:
 # 纯函数部分（可脱离 asyncio 测试）
 # --------------------------------------------------------------------------
 
+#: 缩略图缓存上限（MB）。超了按"最久未访问"淘汰到 80%（风险 R-023 ①）。
+#:
+#: 为什么要上限：320 档约 12 KB、1600 档约 180 KB，4915 张实测约 0.9 GB；
+#: 用户库涨到几万张时这一项会悄无声息吃掉几个 GB。而它**全是可再生数据**
+#: （删了下次打开重算），留着没有任何价值，删掉也没有任何风险。
+DEFAULT_CACHE_MB: Final[int] = 1024
+_CACHE_EVICT_TO: Final[float] = 0.8
+
+
+def cache_root(cfg: Config) -> Path:
+    """缩略图缓存根目录（`data/thumbs`）。"""
+    return cfg.data_path("thumbs")
+
+
+def cache_bytes(cfg: Config) -> int:
+    """当前缓存占用字节数（只统计 `.webp`）。"""
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(cache_root(cfg)):
+        for name in filenames:
+            if not name.endswith(".webp"):
+                continue
+            try:
+                total += os.path.getsize(os.path.join(dirpath, name))
+            except OSError:
+                continue
+    return total
+
+
+def sweep_cache(cfg: Config, budget_bytes: int | None = None) -> int:
+    """把缓存压到预算以内，返回释放的字节数。
+
+    ★ 按 **atime** 淘汰，不按 mtime：mtime 是"生成时间"，全库缩略图是同一次
+      扫描批量写出来的，用它排序等于随机删；atime 才是"用户最近看过"。
+    ★ 单张删不掉（正被查看器占用）只记 debug —— 少删一张不影响正确性，
+      下次启动会再试。
+    """
+    if budget_bytes is None:
+        budget_bytes = cfg.thumbs_cache_mb * 1024 * 1024
+    if budget_bytes <= 0:
+        return 0
+    root = cache_root(cfg)
+    if not root.is_dir():
+        return 0
+    entries: list[tuple[float, int, Path]] = []
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            if not name.endswith(".webp"):
+                continue
+            path = Path(dirpath) / name
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            total += st.st_size
+            entries.append((max(st.st_atime, st.st_mtime), st.st_size, path))
+    if total <= budget_bytes:
+        return 0
+    target = int(budget_bytes * _CACHE_EVICT_TO)
+    freed = 0
+    for _stamp, size, path in sorted(entries):
+        if total - freed <= target:
+            break
+        try:
+            path.unlink()
+        except OSError as exc:
+            log.debug("缩略图缓存删不掉（可能正被读取）：%s: %s", path.name, exc)
+            continue
+        freed += size
+    if freed:
+        log.info(
+            "缩略图缓存淘汰 %.1f MB（%.1f → %.1f MB）",
+            freed / 1048576, total / 1048576, (total - freed) / 1048576,
+        )
+    return freed
+
+
 def _apply_orientation(im: Image.Image, orientation: int | None) -> Image.Image:
     op = ORIENTATION_OPS.get(orientation or 1)
     if op is not None:
@@ -720,9 +797,12 @@ __all__ = [
     "THUMB_SIZES",
     "ThumbEngine",
     "ThumbJob",
+    "cache_bytes",
+    "cache_root",
     "generate_thumb",
     "placeholder_webp",
     "source_signature",
+    "sweep_cache",
     "thumb_key",
     "thumb_path",
 ]

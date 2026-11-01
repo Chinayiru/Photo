@@ -223,6 +223,9 @@ DEFAULT_CONFIG: Final[dict[str, Any]] = {
         "quality": 78,
         "workers": 4,
         "gen_version": 1,           # 生成算法版本变化时递增，触发全量重生成
+        # 缓存总量上限（MB，风险 R-023 ①）。超了按最久未访问淘汰到 80%。
+        # 缩略图是纯可再生数据，唯一的作用是省 CPU，所以可以放心删。
+        "cache_mb": 1024,
     },
     "video": {
         # ★ 视频功能总开关（ISSUE-055）。关掉时：不索引视频、不接受视频
@@ -488,6 +491,15 @@ class Config:
         except (TypeError, ValueError):
             return 1
         return max(1, min(4, n))
+
+    @property
+    def thumbs_cache_mb(self) -> int:
+        """缩略图缓存上限（MB），<=0 表示不清理（不推荐）。"""
+        try:
+            n = int(self._raw["thumbs"].get("cache_mb", 1024))
+        except (TypeError, ValueError):
+            return 1024
+        return n
 
     @property
     def transcode_cache_mb(self) -> int:

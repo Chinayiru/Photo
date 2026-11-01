@@ -33,6 +33,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -550,6 +551,36 @@ def _check_win_reserved(name: str) -> None:
         raise BadRequest("文件名是系统保留名，请重命名后再上传")
 
 
+#: 上传预检要留出的余量（风险登记册 R-023 ⑤）。
+#:
+#: 只按 `size` 判"够不够"是不够的：同一分区上还要长 SQLite/WAL、缩略图、
+#: 日志与视频转码产物 —— 真实情况往往是传到 100% 才原地写满，用户白等一场。
+DISK_RESERVE_BYTES: Final[int] = 64 * 1024 * 1024
+
+
+def _ensure_disk_space(root: RootConfig, size: int) -> None:
+    """上传前预检剩余空间，不够就当场 507，不要等传完再失败。
+
+    ★ 为什么判 `root.tmp_dir` 而不是 `root.path`：临时文件落在
+      `<库根>/.photobridge_tmp/`，归档靠 `os.replace` 同卷改名。
+      库根贴着挂载点边缘时两者可能不是同一卷，判错了照样传不完。
+    ★ 拿不到用量（权限、网络盘、配额盘）时**放行**：宁可让上传走完
+      再报错，也不要因为一次 `disk_usage` 失败就把能传的挡在门外。
+    """
+    try:
+        free = shutil.disk_usage(str(root.tmp_dir)).free
+    except OSError:
+        log.debug("读取剩余空间失败，跳过上传预检：%s", root.tmp_dir, exc_info=True)
+        return
+    need = int(size) + DISK_RESERVE_BYTES
+    if free < need:
+        raise AppError(
+            E3010,
+            f"磁盘剩余空间不足：需要约 {need / 1048576:.0f} MB，"
+            f"当前可用 {free / 1048576:.0f} MB",
+        )
+
+
 def create_session(
     db: Database,
     cfg: Config,
@@ -725,6 +756,8 @@ def create_session(
     reclaim_stale(db)
     if open_session_count(db) >= MAX_OPEN_SESSIONS:
         raise AppError(E4002, "同时上传的任务太多，请等前面的传完")
+
+    _ensure_disk_space(root, size)
 
     upload_id = uuid.uuid4().hex
     temp = sandbox.tmp_path(root, upload_id)

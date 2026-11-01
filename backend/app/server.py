@@ -32,6 +32,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from . import events as events_mod
+from . import archive
+from . import thumbs as thumbs_mod
 from . import uploads
 from .auth import auth_middleware
 from .config import Config, check_bind_safety, ensure_dirs, get as get_config, is_first_run
@@ -379,6 +381,45 @@ def _purge_stale_uploads(cfg: Config, st: AppState) -> int:
     return n
 
 
+#: 临时区的定期清理间隔（秒）。6 小时一次：`.part` 只在"进程被杀"时残留，
+#: 一次最多占掉一个上传会话的大小；半天清一次足够，也不会和上传抢 IO。
+TMP_SWEEP_INTERVAL_SEC: float = 6 * 3600.0
+
+
+def _cleanup_orphan_tmp(cfg: Config) -> int:
+    """清掉临时区里**没有会话认领**的孤儿文件（R-023 ③）。
+
+    `_purge_stale_uploads()` 只清"DB 里有行、且行已过期"的文件。进程在
+    `os.open()` 之后、`INSERT` 之前被杀，留下的 `.part` **没有任何行**，
+    `purge_expired()` 永远看不到它 —— 只有 `archive.cleanup_tmp()` 会收。
+    那个函数早就写好了（含"不动 60 秒内的新文件"这一条），但生产代码里
+    零调用、只有测试在调，等于没接线。这里把它接上。
+    """
+    total = 0
+    for root in cfg.enabled_roots:
+        try:
+            total += archive.cleanup_tmp(root)
+        except Exception:       # noqa: BLE001
+            log.warning("清理临时区失败（不影响服务）：%s", root.path, exc_info=True)
+    return total
+
+
+async def _tmp_sweeper(cfg: Config, stop: asyncio.Event) -> None:
+    """定期清理临时区（R-023 ③）。进程常驻时"只在启动清一次"不够。"""
+    while True:
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=TMP_SWEEP_INTERVAL_SEC)
+            return                  # 收到退出信号
+        except asyncio.TimeoutError:
+            pass
+        cutoff = time.time() - TMP_SWEEP_INTERVAL_SEC
+        for root in cfg.enabled_roots:
+            try:
+                archive.cleanup_tmp(root, older_than=cutoff)
+            except Exception:   # noqa: BLE001
+                log.warning("定期清理临时区失败：%s", root.path, exc_info=True)
+
+
 async def serve(cfg: Config | None = None, *,
                 on_ready: Any = None) -> None:
     """启动服务并阻塞，直到收到中断信号。
@@ -413,6 +454,14 @@ async def serve(cfg: Config | None = None, *,
     # （它在 exclude_dirs 里），也不会被任何人清掉，几个月后占掉几个 GB。
     # 放在这里执行一次，代价是启动时多一条 DELETE，收益是临时区不会无限增长。
     _purge_stale_uploads(cfg, st)
+
+    # ★ 再把"没有任何会话认领"的孤儿 .part 清掉，并把缩略图缓存压回上限
+    # （R-023 ③①）。两件事都只碰可再生数据，失败不影响启动。
+    _cleanup_orphan_tmp(cfg)
+    try:
+        thumbs_mod.sweep_cache(cfg)
+    except Exception:       # noqa: BLE001
+        log.warning("清理缩略图缓存失败（不影响服务）", exc_info=True)
 
     st.thumbs.start()
 
@@ -455,6 +504,7 @@ async def serve(cfg: Config | None = None, *,
         log.exception("启动文件系统监听失败（服务照常运行，可手动重扫）")
 
     stop = asyncio.Event()
+    tmp_sweeper = asyncio.create_task(_tmp_sweeper(cfg, stop), name="tmp-sweeper")
 
     def _on_signal(*_: Any) -> None:
         log.info("收到退出信号，正在停止…")
@@ -486,6 +536,7 @@ async def serve(cfg: Config | None = None, *,
     try:
         await stop.wait()
     finally:
+        tmp_sweeper.cancel()
         await _shutdown(st, transport)
 
 
