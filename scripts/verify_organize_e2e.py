@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
 import sys
 import tempfile
 import threading
@@ -33,6 +32,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+
+from _e2e_common import real_db_fingerprint  # noqa: E402
 
 from backend.app.config import Config  # noqa: E402
 from backend.app.server import serve  # noqa: E402
@@ -47,18 +48,8 @@ def check(ok: bool, label: str, extra: str = "") -> None:
 
 
 def real_fingerprint() -> str:
-    """真实库指纹。注意用默认配置的 data_dir（不是临时库）。"""
-    db = REPO / "data" / "photobridge.db"
-    if not db.exists():
-        return "absent"
-    con = sqlite3.connect(str(db))
-    try:
-        rows = con.execute("SELECT COUNT(*) FROM media").fetchone()[0]
-        miss = con.execute("SELECT COUNT(*) FROM media WHERE missing = 1").fetchone()[0]
-        mx = con.execute("SELECT MAX(id) FROM media").fetchone()[0]
-        return f"rows={rows} missing={miss} maxid={mx}"
-    finally:
-        con.close()
+    """真实库指纹（默认配置的 data_dir，不是临时库）。实现见 `_e2e_common`。"""
+    return real_db_fingerprint(REPO / "data" / "photobridge.db")
 
 
 def req(url: str, token: str | None = None, *, method: str = "GET",
