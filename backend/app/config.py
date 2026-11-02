@@ -206,7 +206,8 @@ DEFAULT_CONFIG: Final[dict[str, Any]] = {
     "upload": {
         "subdir": "手机上传",        # 归档子目录；空字符串表示直接放库根
         "chunk_mb_lan": 8,          # 局域网分片 8 MB
-        "chunk_mb_wan": 2,          # 云端分片 2 MB（二期）
+        "chunk_mb_wan": 0.25,       # 云端分片 256 KiB（1 Mbps 出口下约 2 秒一片；
+                             # 按 MiB 解释、允许小数，见 uploads._chunk_size）
         "max_file_mb": 2048,        # 单文件上限 2 GB（设计文档 §1.3）
         "session_ttl_hours": 24,
         "dedup": True,              # sha256 秒传与去重

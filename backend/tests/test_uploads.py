@@ -737,12 +737,41 @@ def test_chunk_size_switches_by_transport(tmp_path: Path) -> None:
         }, path=data / "config.json", data_dir=data)
 
     assert _chunk_size(_cfg("local_http")) == 8 * 1024 * 1024
-    # 二期通路（名字先定成 relay，见 config.py 的注释）
-    assert _chunk_size(_cfg("relay")) == 2 * 1024 * 1024, \
+    # 二期通路（名字先定成 relay，见 config.py 的注释）。
+    # 1 Mbps 出口 ≈ 122 KiB/s：2 MiB 一片要 17 秒，正好压在响应头预算上，
+    # 所以 WAN 默认档是 256 KiB（约 2 秒一片）。
+    assert _chunk_size(_cfg("relay")) == 256 * 1024, \
         "非局域网通路必须用 WAN 档分片"
 
 
-def test_chunk_size_floor_is_respected(tmp_path: Path) -> None:
+def test_chunk_size_accepts_fractional_mib(tmp_path: Path) -> None:
+    """`0.5` 必须真的是 512 KiB —— 旧的 `int(mb)` 会把它截成 0。
+
+    这不是美观问题：`docs/11` §8.54 的分片矩阵要测 128/256/512 KiB
+    三档，配置表达不出来就等于测不了，最后只能得出「调了没区别」的
+    错误结论。
+    """
+    from backend.app.uploads import _chunk_size
+
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    lib = tmp_path / "lib"
+    lib.mkdir(exist_ok=True)
+
+    def _cfg(mb: object) -> Config:
+        return Config({
+            "app": {"mode": "readwrite"},
+            "server": {"transport": "relay"},
+            "roots": [{"id": "library", "path": str(lib), "mode": "readwrite"}],
+            "upload": {"chunk_mb_wan": mb},
+        }, path=data / "config.json", data_dir=data)
+
+    assert _chunk_size(_cfg(0.5)) == 512 * 1024
+    assert _chunk_size(_cfg(0.125)) == 128 * 1024
+    assert _chunk_size(_cfg("0.25")) == 256 * 1024   # 手改 JSON 写成字符串也认
+    assert _chunk_size(_cfg(0.01)) == 128 * 1024     # 低于下限按 128 KiB 兜底
+    assert _chunk_size(_cfg("nonsense")) == 256 * 1024  # 坏值退回 WAN 默认档
+
     """用户把分片设成 0（或负数）时不能算出 0 —— 那会让上传死循环。
 
     分片大小 0 的实现会让 `offset += len(chunk)` 永不前进，
@@ -759,7 +788,7 @@ def test_chunk_size_floor_is_respected(tmp_path: Path) -> None:
         "roots": [{"id": "library", "path": str(lib), "mode": "readwrite"}],
         "upload": {"chunk_mb_lan": 0},
     }, path=data / "config.json", data_dir=data)
-    assert _chunk_size(cfg) == 256 * 1024
+    assert _chunk_size(cfg) == 128 * 1024
 
 
 # --------------------------------------------------------------------------

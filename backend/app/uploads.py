@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import os
 import shutil
 import threading
@@ -804,6 +805,12 @@ def create_session(
     }
 
 
+#: 分片下限：再小就只剩往返开销 —— 1 Mbps 出口下 128 KiB 约 1 秒，
+#: 再往下一片的固定成本（请求头、fsync、一次隧道往返）就开始占大头。
+#: 128 KiB 也是 `docs/11` §8.54 里矩阵的最低一档，配得出来才测得出来。
+MIN_CHUNK_BYTES: Final[int] = 128 * 1024
+
+
 def _chunk_size(cfg: Config) -> int:
     """服务端权威分片大小。
 
@@ -826,19 +833,29 @@ def _chunk_size(cfg: Config) -> int:
     档。这是**刻意的**：同一个上传会话可能在中途从 Wi-Fi 切到 4G
     （`docs/03` §5.1 的通路切换），分片大小由服务端在 init 时一次定死，
     选小的那个永远安全；反过来选 8 MB 会让切换后的每一片都重传失败。
+
+    ★ 数值按 MiB 解释，**允许小数**（`0.25` = 256 KiB）。原来的 `int(mb)`
+     会把 0.25 截成 0、再被 256 KiB 下限兜住 —— 看起来"配上了"，实际
+      永远测不到 512 KiB 这一档。云出口 1 Mbps ≈ 122 KiB/s，2 MiB 一片
+      要 17 秒，正好压在响应头预算上（见 `cloud/relay/forward.py` 的
+      `_head_timeout`）；256 KiB 一片约 2 秒，这才是弱网该用的粒度。
     """
     transport = str(cfg.get("server.transport", "local_http") or "local_http")
-    key = "chunk_mb_lan" if transport == "local_http" else "chunk_mb_wan"
-    mb = cfg.upload.get(key)
-    if mb is None:
+    is_lan = transport == "local_http"
+    key = "chunk_mb_lan" if is_lan else "chunk_mb_wan"
+    default_mb = 8.0 if is_lan else 0.25
+    value = cfg.upload.get(key)
+    if value is None:
         # 配置里只写了另一个档位（用户手改过配置文件）→ 用它，
         # 总比退回硬编码的 8 更贴近用户意图。
-        mb = cfg.upload.get("chunk_mb_lan", 8)
+        value = cfg.upload.get("chunk_mb_lan", 8)
     try:
-        mb = int(mb)
+        mb = float(value)
     except (TypeError, ValueError):
-        mb = 8
-    return max(256 * 1024, mb * 1024 * 1024)
+        mb = default_mb
+    if not math.isfinite(mb):
+        mb = default_mb
+    return max(MIN_CHUNK_BYTES, int(mb * 1024 * 1024))
 
 
 def _reconcile_offset(db: Database, sess: dict[str, Any]) -> int:
