@@ -13,7 +13,7 @@
 import { computed } from "vue";
 import { ApiError, api, previewUrl, rawUrl, thumbUrl } from "../api/client";
 import { errorText } from "../api/errorText";
-import { getToken } from "../api/storage";
+import { currentVia, getToken } from "../api/storage";
 import type {
   DeleteResponse,
   MediaDetail,
@@ -102,8 +102,14 @@ let rawSeq = 0;
  */
 let previewLoadedId = 0;
 
-/** 原图预取是否值得做：省流量模式下、或明确是慢网时直接放弃。 */
+/** 原图预取是否值得做：省流量模式下、慢网、或走云端中继时直接放弃。 */
 function prefetchWorthIt(): boolean {
+  // ★ 云端通路（1 Mbps 中继出口 ≈ 122 KiB/s）上**不预取**原图：
+  //   4 MiB 的原图要 34 秒，期间所有缩略图/预览都被它挤在后面。
+  //   AC-2.10 因此收窄为「局域网直连才后台预取；云端要用户点一次
+  //   『看原图』」。判据用 `currentVia()` 而不是 `effectiveType`：
+  //   中继出口的带宽与手机本身的 4G/5G 无关（见 docs/11 §8.55）。
+  if (currentVia() === "cloud") return false;
   const c = (navigator as unknown as {
     connection?: { saveData?: boolean; effectiveType?: string };
   }).connection;

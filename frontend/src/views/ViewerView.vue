@@ -37,6 +37,7 @@ import {
 } from "../stores/viewer";
 import { toastError, toastOk, toastWarn } from "../stores/toast";
 import { safeUrl } from "../lib/safeUrl";
+import { currentVia } from "../api/storage";
 import { errorText } from "../api/errorText";
 
 const s = viewerStore.state;
@@ -58,7 +59,28 @@ const isOpen = computed(() => s.open);
  * 手机屏幕的物理像素；再往下调只会让"用户还没看出模糊就先背上了原图的代价"。
  */
 const RAW_ZOOM = 1.5;
-const useRaw = computed(() => zoom.value > RAW_ZOOM);
+
+/**
+ * 云端通路上，原图要用户明确点一次才拉（AC-2.10 修订，docs/11 §8.55）。
+ *
+ * ★ 局域网直连保持原行为：放大到 1.5× 自动换原图，不需要问 ——
+ *   千兆内网下 4 MB 是几十毫秒的事，多问一句反而多余。
+ * ★ 云端通路下多问一句，是因为这一问的代价是 34 秒共享带宽。
+ */
+const askedRaw = ref(false);
+const useRaw = computed(
+  () => zoom.value > RAW_ZOOM && (askedRaw.value || currentVia() === "lan"),
+);
+
+/** 已经放大到需要原图、但云端通路还没得到许可 —— 给一个可点的入口。 */
+const needRawPermit = computed(
+  () =>
+    zoom.value > RAW_ZOOM &&
+    !askedRaw.value &&
+    !isVideo.value &&
+    !!s.detail &&
+    currentVia() === "cloud",
+);
 
 /**
  * 主图当前该用哪张。
@@ -90,6 +112,9 @@ const rawFailed = ref(false);
 
 watch(() => s.id, () => {
   rawFailed.value = false;
+  // 许可只对当前这张有效：切图后必须重新问，否则用户会以为「点了没反应」，
+  // 其实是上一张的许可被继承了下来。
+  askedRaw.value = false;
 });
 
 /** 手势状态。 */
@@ -1018,6 +1043,21 @@ async function doDelete(): Promise<void> {
             这张的原始格式浏览器无法显示，正在用预览图（最多 1600px）
           </div>
 
+          <!--
+            云端通路上的「看原图」入口：放大到 1.5× 以上时才出现。
+            ★ 不自动拉 —— 中继出口只有 1 Mbps，一张 4 MiB 原图要 34 秒。
+            ★ 只对当前这张有效：切图时 `askedRaw` 归零。
+          -->
+          <button
+            v-if="needRawPermit"
+            key="rawpermit"
+            class="v-rawnote v-rawbtn"
+            type="button"
+            @click="askedRaw = true"
+          >
+            云端通路：点这里查看原图（{{ sizeText }}）
+          </button>
+
           <div v-if="s.error" key="error" class="v-error">
             <p>{{ s.error }}</p>
             <button class="btn ghost" type="button" @click="close">返回</button>
@@ -1312,6 +1352,17 @@ async function doDelete(): Promise<void> {
   font-size: 12px;
   text-align: center;
   z-index: 3;
+}
+
+/* 云端通路的「看原图」做成按钮：沿用提示条外观，但必须看起来能点 */
+.v-rawnote.v-rawbtn {
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  line-height: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .v-img.drag {
