@@ -32,8 +32,6 @@ from __future__ import annotations
 import time
 from typing import Any, Hashable
 
-from shared.limits import MAX_RELAY_UPLOAD_INFLIGHT
-
 __all__ = [
     "RATE_LIMIT_PER_SEC",
     "MAX_INFLIGHT_PER_DEVICE",
@@ -52,9 +50,13 @@ RATE_LIMIT_PER_SEC: int = 120
 #: 单设备并发隧道请求上限。
 MAX_INFLIGHT_PER_DEVICE: int = 64
 #: 单设备并发上传上限（`docs/04`：429 E4002 + Retry-After: 3）。
-#: 与设备端 `MAX_OPEN_SESSIONS` 共用 `shared/limits.py` 里的同一个数字：
-#: 这里只数在途请求（前置粗筛），真正的准入由设备端的未完成会话数决定。
-MAX_UPLOAD_CONCURRENCY: int = MAX_RELAY_UPLOAD_INFLIGHT
+#:
+#: ⚠️ 设备侧也有一个 `MAX_OPEN_SESSIONS = 3`（`backend/app/uploads.py`），
+#: 但两者数的是**不同资源**：这里数「正在转发的上传请求」（拿到额度 → 释放，
+#: 见 `forward.py` 的 `UploadLimiter.take/release`），设备侧数「数据库里的
+#: open 会话」（init 创建 → complete/abort/超时消失）。数字相等是产品取舍，
+#: 不是同一个量；合并会同时改变两道保护边界（复核报告 V06）。
+MAX_UPLOAD_CONCURRENCY: int = 3
 
 #: 全云端**所有设备合计**的并发回源上限（审计 F03）。
 #:
