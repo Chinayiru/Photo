@@ -121,7 +121,10 @@ def wants_credit_v2(peer_caps: object) -> bool:
     return any(c == CREDIT_V2_CAP for c in peer_caps)
 
 # 超时（§2.5.5）
-HEAD_TIMEOUT = 30.0                 # 发 REQ_HEAD 到收 RES_HEAD/ERROR
+#: 首个 `RES_HEAD` 的默认预算（按路径分级见 docs/04 §3.7）。中继侧用的是
+#: **无进展**窗口：上行还有字节在流动就续期，见
+#: `cloud/relay/forward.py:_await_head_with_progress`。
+HEAD_TIMEOUT = 30.0
 IDLE_TIMEOUT = 60.0                 # 两次 RES_BODY 之间的最大间隔
 TOTAL_TIMEOUT = 1800.0              # 兜底：2 GB @1.5 MB/s ≈ 22 分钟
 SWEEP_INTERVAL = 5.0

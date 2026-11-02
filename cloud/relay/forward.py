@@ -10,7 +10,8 @@
 5. 从内存注册表里取隧道，没有就 503 `E3003`；
 6. 分配 `req_id`，发 `REQ_HEAD`；
 7. 边读 `request.stream()` 边发 `REQ_BODY`；
-8. 发 `REQ_END`，等 `RES_HEAD`（30 秒，超时 504 `E3009`）；
+8. 发 `REQ_END`，等 `RES_HEAD`（按路径分级、按"无进展"计时，
+   超时 504 `E3009`）；
 9. 把 `RES_HEAD` 变成 HTTP 响应头，`RES_BODY` 逐块写进响应流；
 10. `RES_END` 收尾；手机断开则发 `CANCEL`。
 
@@ -30,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any, AsyncIterator
 
@@ -584,7 +586,8 @@ class Forwarder:
             release = _Once(lambda: setattr(
                 conn, "inflight", max(0, conn.inflight - 1)))
             try:
-                res = await pending.wait_head(timeout=HEAD_TIMEOUT)
+                res = await _await_head_with_progress(
+                    pending, up, timeout=_head_timeout(request))
             except asyncio.TimeoutError:
                 await _abort(conn, pending, cancel, pump)
                 release()
@@ -956,6 +959,37 @@ def _total_timeout(request: Request) -> float | None:
     return TOTAL_TIMEOUT
 
 
+#: 首个 `RES_HEAD` 的**按路径分级**预算（`docs/04` §3.7 的表）。
+#:
+#: 这张表在文档里早就写好了，但实现一直用扁平 `HEAD_TIMEOUT=30` ——
+#: 文档比代码细，是典型的"规范先走一步、实现没跟上"。分级本身不是
+#: 性能优化，是**正确性**：上传的响应头要等整片收完才发（
+#: `handlers/uploads.py:149`），把它和 ping 放进同一个 30 秒预算里，
+#: 慢速上行必然被误判成 504。
+#:
+#: 每个数字是"无进展"窗口，不是总额：上传方向只要还有字节在流动，
+#: `_await_head_with_progress()` 就会续期（见那里的说明）。
+_HEAD_TIMEOUT_TABLE: tuple[tuple[re.Pattern[str], float], ...] = (
+    (re.compile(r"^/api/system/ping$"), 5.0),
+    (re.compile(r"^/api/system/info$"), 10.0),
+    (re.compile(r"^/api/items/\d+/thumb$"), 30.0),
+    (re.compile(r"^/api/items/\d+/preview$"), 60.0),
+    (re.compile(r"^/api/items/\d+/raw$"), 30.0),
+    (re.compile(r"^/api/(?:timeline|search|folders)$"), 30.0),
+    (re.compile(r"^/api/uploads/"), 120.0),
+    (re.compile(r"^/api/index/rescan$"), 10.0),
+)
+
+
+def _head_timeout(request: Request) -> float:
+    """这条请求允许"多久没有响应头进展"（`docs/04` §3.7）。"""
+    path = _inner_path(request)
+    for pattern, seconds in _HEAD_TIMEOUT_TABLE:
+        if pattern.search(path):
+            return seconds
+    return HEAD_TIMEOUT
+
+
 class _ByteCounter:
     """数**上行**字节（手机→电脑）。
 
@@ -967,6 +1001,61 @@ class _ByteCounter:
 
     def __init__(self) -> None:
         self.total = 0
+
+
+#: 轮询间隔：多久检查一次"上行还在不在动"。1 秒的粒度对 30 秒窗口足够，
+#: 也不会把 `wait_head` 变成忙等（每次只 await 一个 shielded Future）。
+_HEAD_PROGRESS_SLICE: float = 1.0
+
+
+async def _await_head_with_progress(
+    pending: Any,
+    up: _ByteCounter,
+    *,
+    timeout: float | None = None,
+    slice_: float | None = None,
+) -> dict[str, Any]:
+    """等 `RES_HEAD`，但**按无进展计时**，而不是按总时长。
+
+    为什么不能用 `pending.wait_head(timeout=HEAD_TIMEOUT)` 了结
+    ------------------------------------------------------------
+    上传的响应头要等整片收完才有：`backend/app/handlers/uploads.py:149`
+    用 `ctx.body_bytes()` 把整片读进内存、写盘、fsync，然后才返回 201/206。
+    于是"发 REQ_HEAD → 收 RES_HEAD"之间的时长 ≈ 这片字节的传输时长。
+
+    WAN 分片是 2 MiB（`backend/app/config.py:209`），云出口 1 Mbps
+    ≈ 122 KiB/s，光"云 → 电脑"这一段就要约 17 秒；手机上行更慢时
+    2 MiB 轻松超过 30 秒。旧实现把这个**正常在流动**的请求判成
+    "电脑响应超时"（504 E3009），而 `E3009` 是 `retryable=True`
+    （`backend/app/errors.py`），客户端会**把整片重传一遍** ——
+    弱网下这不是"慢 30 秒"，是"越传越慢"。
+
+    判据改成：**只要上行字节还在增加，就续期**；连续 `timeout` 秒
+    没有新字节才算真卡死。GET 类请求没有请求体（`up.total` 恒为 0），
+    行为与旧实现完全一致；上传则按实际进度放行。
+
+    `pending.wait_head` 内部是 `asyncio.wait_for(asyncio.shield(...))`，
+    超时不会取消底层 Future，所以这里可以反复分段等待同一份结果。
+    """
+    stall = HEAD_TIMEOUT if timeout is None else timeout
+    step = _HEAD_PROGRESS_SLICE if slice_ is None else slice_
+
+    deadline = time.monotonic() + stall
+    last_total = up.total
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        try:
+            return await pending.wait_head(timeout=min(step, remaining))
+        except asyncio.TimeoutError:
+            if up.total > last_total:
+                # 上行有进展：把"无进展"计时器重置，继续等响应头。
+                last_total = up.total
+                deadline = time.monotonic() + stall
+                continue
+            if time.monotonic() >= deadline:
+                raise
 
 
 def _swallow_abort_error(task: "asyncio.Task[None]") -> None:
