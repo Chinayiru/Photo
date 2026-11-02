@@ -105,33 +105,26 @@ export const authStore = createStore(initial);
 export const isPaired = (): boolean => Boolean(getToken() && (getBase() || getCloudBase()));
 export const currentBase = (): string => activeBase();
 
+/** 连接状态 → 状态条文案与 CSS 类。
+ *
+ * 以前是两个平行的 switch（一个取文案、一个取类名），加一个状态要记得改两处；
+ * 现在是同一张表查两次。 */
+const CONN_LOOK: Record<ConnState, { text: string; cls: string }> = {
+  IDLE: { text: "未连接", cls: "idle" },
+  PROBING: { text: "正在连接…", cls: "busy" },
+  CLOUD_PROBING: { text: "正在连接…", cls: "busy" },
+  RE_PROBE: { text: "正在连接…", cls: "busy" },
+  DIRECT: { text: "局域网直连", cls: "ok" },
+  CLOUD: { text: "云端中继", cls: "cloud" },
+  OFFLINE: { text: "电脑离线", cls: "bad" },
+  UNAUTHORIZED: { text: "配对已失效", cls: "bad" },
+};
+
 /** 供模板用的派生值。 */
-export const connText = computed<string>(() => {
-  switch (authStore.state.conn) {
-    case "DIRECT": return "局域网直连";
-    case "CLOUD": return "云端中继";
-    case "PROBING":
-    case "CLOUD_PROBING":
-    case "RE_PROBE": return "正在连接…";
-    case "OFFLINE": return "电脑离线";
-    case "UNAUTHORIZED": return "配对已失效";
-    default: return "未连接";
-  }
-});
+export const connText = computed<string>(() => CONN_LOOK[authStore.state.conn].text);
 
 /** 状态条的 CSS 类名。 */
-export const connClass = computed<string>(() => {
-  switch (authStore.state.conn) {
-    case "DIRECT": return "ok";
-    case "CLOUD": return "cloud";
-    case "PROBING":
-    case "CLOUD_PROBING":
-    case "RE_PROBE": return "busy";
-    case "OFFLINE": return "bad";
-    case "UNAUTHORIZED": return "bad";
-    default: return "idle";
-  }
-});
+export const connClass = computed<string>(() => CONN_LOOK[authStore.state.conn].cls);
 
 /**
  * 探活。冷启动、切回前台、用户点状态条、以及请求连续失败时调用。

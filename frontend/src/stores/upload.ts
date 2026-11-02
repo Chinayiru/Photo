@@ -607,18 +607,9 @@ export function fmtRate(bps: number): string {
   return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}/s`;
 }
 
-export function fmtBytes(n: number): string {
-  if (!Number.isFinite(n) || n < 0) return "—";
-  if (n < 1024) return `${n} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let v = n / 1024;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
-}
+/** 字节数 → 人类可读。实现只有一份（`../lib/format`）：上传队列、设置页、
+ * 查看器原来各写一遍，单位表档数还不一样。 */
+export { formatBytes as fmtBytes } from "../lib/format";
 
 /** 状态文案。 */
 export function statusText(t: UploadTask): string {

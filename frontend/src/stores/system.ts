@@ -291,18 +291,9 @@ export const diskTotal = computed<number | null>(() => {
   return vals.length ? Math.max(...vals) : null;
 });
 
-export function fmtBytes(n: number | null): string {
-  if (n === null || !Number.isFinite(n) || n < 0) return "—";
-  if (n < 1024) return `${n} B`;
-  const units = ["KB", "MB", "GB", "TB", "PB"];
-  let v = n / 1024;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
-}
+/** 字节数 → 人类可读。实现只有一份（`../lib/format`）：设置页、上传队列、
+ * 查看器原来各写了一遍，三份只在单位表档数上不同，谁也不会去比对它们。 */
+export { formatBytes as fmtBytes } from "../lib/format";
 
 /** 秒 → "3 天 2 小时"。 */
 export function fmtUptime(sec: number): string {

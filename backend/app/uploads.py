@@ -64,12 +64,14 @@ from .errors import (
     NotFound,
     SandboxError,
 )
+from shared.limits import MAX_UPLOAD_SESSIONS
 
 log = logging.getLogger(__name__)
 
-#: 单个上传会话最多允许的未完成会话数。手机端并发 3 条已经能跑满
-#: 家用上行；再多只会让每个都变慢，且电脑端要同时维持多个临时文件。
-MAX_OPEN_SESSIONS: Final[int] = 3
+#: 单台电脑最多允许的未完成上传会话数。数字与中继侧的前置粗筛共用一份
+#: （`shared/limits.py`）：两边各写一个 3 时，同一用户会看到"两个都没超、
+#: 但都是 429"这种对不上的口径（审计报告 R2「限流计数」）。
+MAX_OPEN_SESSIONS: Final[int] = MAX_UPLOAD_SESSIONS
 
 #: "只 init 过、一个字节都没收到"的会话，超过这么久就直接回收。
 #:

@@ -22,13 +22,11 @@ from typing import Any
 
 from .. import audit, sandbox, streamticket, video as videomod
 from ..config import ALLOWED_IMAGE_EXTS
-from ..core import Ctx, Reply, empty_reply, file_reply, json_reply, stream_reply
+from ..core import Ctx, Reply, empty_reply, json_reply, stream_reply
 from ..core.cursor import decode_cursor, encode_cursor
 from ..errors import (
     E1001,
     E1004,
-    E1008,
-    E1012,
     E1015,
     E1019,
     E3004,
@@ -45,25 +43,19 @@ from ..errors import (
 from ..state import AppState
 from ..thumbs import placeholder_webp, source_signature, thumb_path
 from ..core.httpmedia import (
-    RangeNotSatisfiable,
-    content_range_header,
     content_type_for,
-    parse_range,
-    range_length,
-    unsatisfied_range_header,
 )
 from . import common
 from .common import (
+    ORDER_BY_TAKEN_DESC,
     TIMELINE_COLUMNS,
     etag_matches,
     iter_file,
-    normalize_dir,
     parse_size,
     parse_ts,
     row_to_detail,
     row_to_item,
     stat_size,
-    thumb_etag,
     timeline_order,
     timeline_where,
 )
@@ -117,6 +109,59 @@ def _st(ctx: Ctx) -> AppState:
     return st
 
 
+#: 三个列表接口共用的排序见 `common.ORDER_BY_TAKEN_DESC`（决策 D12：时间线与
+#: 「按文件夹」必须逐字一致），这里不再各留一份字符串。
+
+
+def _page_by_cursor(
+    ctx: Ctx,
+    db: Any,
+    where: str,
+    params: list[Any],
+    limit: int,
+) -> tuple[list[Any], bool, str | None]:
+    """把「游标条件 + 多取一条 + has_more + next_cursor」收成一份实现。
+
+    时间线、目录正文、搜索三处的这一段原来各写一遍（13 行 × 3）。它们**必须**
+    逐字一致：游标锚在 `(taken_at, id)` 上，三处只要有一处少个括号、或者忘了
+    多取一条，就会出现"翻页重复/丢图"或"has_more 永远 false"。
+
+    `where`/`params` 按只读入参对待：内部复制后再拼游标条件，调用方之后还要
+    用**不带游标**的那一份（`folder_media` 的 `COUNT(*)` 就是）。
+
+    排序不开放成参数：一期只有 `desc`（`timeline_order()` 对 `asc` 直接报 400），
+    三处的 ORDER BY 必须与 `common.ORDER_BY_TAKEN_DESC` 逐字一致。
+
+    返回 `(rows, has_more, next_cursor)`；`rows` 已截到 `limit` 条。
+    """
+    cursor = ctx.q("cursor")
+    sql_where = where
+    sql_params = list(params)
+    if cursor:
+        cur_ts, cur_id = decode_cursor(cursor)
+        # 括号不能省：`taken_at < ? OR (taken_at = ? AND id < ?)` 与不带括号的
+        # 版本在 SQL 里含义完全不同（后者会无视 taken_at 越界）。
+        sql_where += " AND (taken_at < ? OR (taken_at = ? AND id < ?))"
+        sql_params.extend([cur_ts, cur_ts, cur_id])
+
+    # ★ 多取一条判断 has_more。用 COUNT(*) 另查一次会在 5000 行时多扫一遍
+    #   全表；多取一行的代价可以忽略。
+    rows = db.query(
+        f"SELECT {TIMELINE_COLUMNS} FROM media{sql_where}"
+        f" {ORDER_BY_TAKEN_DESC} LIMIT ?",
+        [*sql_params, limit + 1],
+    )
+    has_more = len(rows) > limit
+    if has_more:
+        rows = rows[:limit]
+
+    next_cursor = None
+    if has_more and rows:
+        last = rows[-1]
+        next_cursor = encode_cursor(float(last["taken_at"]), int(last["id"]))
+    return rows, has_more, next_cursor
+
+
 # --------------------------------------------------------------------------
 # 时间线
 # --------------------------------------------------------------------------
@@ -140,7 +185,9 @@ async def timeline(ctx: Ctx) -> Reply:
     db = st.db
 
     limit = ctx.q_int("limit", DEFAULT_LIMIT, minimum=1, maximum=MAX_LIMIT)
-    order_sql = timeline_order(ctx.q("order"))
+    # 只做参数校验：非 desc 直接 400（见 common.timeline_order）。排序串本身
+    # 由 `_page_by_cursor` 统一取 `common.ORDER_BY_TAKEN_DESC`，三处共用一份。
+    timeline_order(ctx.q("order"))
 
     root_id = common.root_id_param(ctx)
     if root_id is not None and root_id != "":
@@ -171,29 +218,9 @@ async def timeline(ctx: Ctx) -> Reply:
         uploader_client_id=common.guest_uploader_id(ctx) or None,
     )
 
-    cursor = ctx.q("cursor")
-    if cursor:
-        cur_ts, cur_id = decode_cursor(cursor)
-        # 括号不能省：`taken_at < ? OR (taken_at = ? AND id < ?)` 与
-        # 不带括号的版本在 SQL 里含义完全不同（后者会无视 taken_at 越界）。
-        where += " AND (taken_at < ? OR (taken_at = ? AND id < ?))"
-        params.extend([cur_ts, cur_ts, cur_id])
-
-    # ★ 多取一条判断 has_more。用 COUNT(*) 另查一次会在 5000 行时
-    # 多扫一遍全表；多取一行的代价可以忽略。
-    sql = (f"SELECT {TIMELINE_COLUMNS} FROM media{where}"
-           f" {order_sql} LIMIT ?")
-    rows = db.query(sql, [*params, limit + 1])
-
-    has_more = len(rows) > limit
-    if has_more:
-        rows = rows[:limit]
+    rows, has_more, next_cursor = _page_by_cursor(ctx, db, where, params, limit)
 
     items = [row_to_item(r) for r in rows]
-    next_cursor = None
-    if has_more and rows:
-        last = rows[-1]
-        next_cursor = encode_cursor(float(last["taken_at"]), int(last["id"]))
 
     return json_reply({
         "items": items,
@@ -655,53 +682,12 @@ async def get_raw(ctx: Ctx) -> Reply:
     # 一个 20 ms 的往返 + 304（几百字节）—— 这是"同一张图看第二遍"的差别。
     etag = f"r-{int(row['mtime'])}-{size}"
 
-    try:
-        rng = parse_range(ctx.header("range"), size)
-    except RangeNotSatisfiable:
-        # ★ 必须回 416 而不是静默给 200 全文件：那会让客户端以为
-        # "续传成功了"，实际把重复数据拼进已下载的部分，得到损坏文件。
-        #
-        # ⚠️ Content-Range 必须挂在**异常**上。早先写成"先构造一个 416
-        # Reply 再 raise"，那个 Reply 在抛出时就被丢弃了，dispatch 只认
-        # app_exc.headers —— 客户端收到一个没有 Content-Range 的 416，
-        # 按 RFC 7233 无法得知文件总长，只能整份重下。
-        raise AppError(E1008, headers={
-            "Content-Range": unsatisfied_range_header(size),
-            "Accept-Ranges": "bytes",
-        }) from None
-
-    # 复验只在「整份请求」上做：带 Range 的请求要的是某一段字节，
-    # 拿 304 回它会让客户端以为那段拿到了。
-    if rng is None and not download and etag_matches(
-            ctx.header("if-none-match"), etag):
-        r = empty_reply(304)
-        r.set_etag(etag)
-        r.set_cache(0, private=True)
-        r.headers["Accept-Ranges"] = "bytes"
-        r.set("Vary", "Authorization")
-        return r
-
-    if rng is None:
-        r = file_reply(iter_file(src), media_type, size, 200, filename=filename)
-        r.headers["Accept-Ranges"] = "bytes"
-        r.set_etag(etag)
-        # 原图不做长缓存：用户可能重命名/替换，而原图的 ETag 变化
-        # 不一定会触发前端刷新 URL。
-        # 但 `max-age=0` 不等于"不缓存"：带上 ETag 后浏览器会走
-        # `If-None-Match` 复验，命中就是 304 —— 不再重下 10 MB。
-        r.set_cache(0, private=True)
-        r.set("Vary", "Authorization")
-        _apply_disposition(r, filename, download=download)
-        return r
-
-    start, end = rng
-    r = file_reply(iter_file(src, start=start, length=end - start + 1),
-                   media_type, range_length(rng), 206, filename=filename,
-                   headers={"Content-Range": content_range_header(rng, size)})
-    r.headers["Accept-Ranges"] = "bytes"
-    r.set_etag(etag)
-    r.set_cache(0, private=True)
-    r.set("Vary", "Authorization")
+    # 200/206/304/416 的构造与头部规则只在 `common.range_file_reply()` 里写一份：
+    # 转码产物走同一段代码，两边不会再各自漂移（原来转码那份的 416 就少了
+    # `Accept-Ranges`）。
+    r = common.range_file_reply(
+        ctx, src, media_type=media_type, size=size, etag=etag,
+        filename=filename, max_age=0)
     _apply_disposition(r, filename, download=download)
     return r
 
@@ -1103,25 +1089,8 @@ async def folder_media(ctx: Ctx) -> Reply:
     total_row = db.query_one(f"SELECT COUNT(*) AS n FROM media{where}", params)
     total = int(total_row["n"]) if total_row else 0
 
-    cursor = ctx.q("cursor")
-    if cursor:
-        cur_ts, cur_id = decode_cursor(cursor)
-        where += " AND (taken_at < ? OR (taken_at = ? AND id < ?))"
-        params.extend([cur_ts, cur_ts, cur_id])
-
-    rows = db.query(
-        f"SELECT {TIMELINE_COLUMNS} FROM media{where}"
-        " ORDER BY taken_at DESC, id DESC LIMIT ?",
-        [*params, limit + 1],
-    )
-    has_more = len(rows) > limit
-    if has_more:
-        rows = rows[:limit]
-
-    next_cursor = None
-    if has_more and rows:
-        last = rows[-1]
-        next_cursor = encode_cursor(float(last["taken_at"]), int(last["id"]))
+    rows, has_more, next_cursor = _page_by_cursor(
+        ctx, db, where, params, limit)
 
     return json_reply({
         "root": root_id,
@@ -1225,25 +1194,8 @@ async def search(ctx: Ctx) -> Reply:
                   " OR camera LIKE ? ESCAPE '\\')")
         params.extend([pattern, pattern, pattern])
 
-    cursor = ctx.q("cursor")
-    if cursor:
-        cur_ts, cur_id = decode_cursor(cursor)
-        where += " AND (taken_at < ? OR (taken_at = ? AND id < ?))"
-        params.extend([cur_ts, cur_ts, cur_id])
-
-    rows = db.query(
-        f"SELECT {TIMELINE_COLUMNS} FROM media{where}"
-        f" ORDER BY taken_at DESC, id DESC LIMIT ?",
-        [*params, limit + 1],
-    )
-    has_more = len(rows) > limit
-    if has_more:
-        rows = rows[:limit]
-
-    next_cursor = None
-    if has_more and rows:
-        last = rows[-1]
-        next_cursor = encode_cursor(float(last["taken_at"]), int(last["id"]))
+    rows, has_more, next_cursor = _page_by_cursor(
+        ctx, db, where, params, limit)
 
     return json_reply({
         "items": [row_to_item(r) for r in rows],
@@ -1274,7 +1226,6 @@ async def delete_items(ctx: Ctx) -> Reply:
     避免用户为了"能上传"而顺带得到"能删照片"。
     """
     st = _st(ctx)
-    db = st.db
     cfg = st.cfg
 
     if not bool(cfg.get("auth.allow_delete", False)):

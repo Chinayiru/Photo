@@ -137,12 +137,33 @@ function qrSrc(kind: "lan" | "cloud"): string {
   return absUrl("/api/system/entrances/qr", { kind });
 }
 
-function copyEntry(it: EntryItem): void {
+function copyEntry(it: { url: string }): void {
   void copyText(it.url).then(
     (ok) => (ok ? toastOk("已复制") : toastWarn("复制失败，请手动选中地址")),
     () => toastWarn("复制失败，请手动选中地址"),
   );
 }
+
+/** 入口卡片。局域网与云端两张卡片除数据外完全一样，用 v-for 渲染一份：
+ * 原先模板里是两段近 40 行的手写 HTML，改样式时漏一处就长歪。 */
+const entryCards = computed(() => {
+  const out: { kind: "lan" | "cloud"; label: string; url: string }[] = [];
+  if (lanEntry.value) {
+    out.push({
+      kind: "lan",
+      label: lanEntry.value.label || "局域网",
+      url: lanEntry.value.url,
+    });
+  }
+  if (cloudEntry.value) {
+    out.push({
+      kind: "cloud",
+      label: cloudEntry.value.label || "云端",
+      url: cloudEntry.value.url,
+    });
+  }
+  return out;
+});
 
 async function onRescan(): Promise<void> {
   try {
@@ -294,39 +315,23 @@ const pairing = computed(() => {
     </div>
 
     <!-- 入口：给"另一台手机怎么连上这台电脑"用 -->
-    <div v-if="lanEntry || cloudEntry" class="card entries">
+    <div v-if="entryCards.length" class="card entries">
       <h3 class="sec">入口</h3>
 
-      <div v-if="lanEntry" class="entry">
+      <div v-for="e in entryCards" :key="e.kind" class="entry">
         <div class="entry-main">
-          <div class="entry-label ellipsis">{{ lanEntry.label || "局域网" }}</div>
-          <a class="entry-link mono ellipsis" :href="lanEntry.url">{{ lanEntry.url }}</a>
+          <div class="entry-label ellipsis">{{ e.label }}</div>
+          <a class="entry-link mono ellipsis" :href="e.url">{{ e.url }}</a>
         </div>
         <img
           class="qr"
-          :src="qrSrc('lan')"
-          :alt="`${lanEntry.label || '局域网'} 入口二维码`"
+          :src="qrSrc(e.kind)"
+          :alt="`${e.label} 入口二维码`"
           width="96"
           height="96"
           loading="lazy"
         />
-        <button class="mini" type="button" @click="copyEntry(lanEntry)">复制</button>
-      </div>
-
-      <div v-if="cloudEntry" class="entry">
-        <div class="entry-main">
-          <div class="entry-label ellipsis">{{ cloudEntry.label || "云端" }}</div>
-          <a class="entry-link mono ellipsis" :href="cloudEntry.url">{{ cloudEntry.url }}</a>
-        </div>
-        <img
-          class="qr"
-          :src="qrSrc('cloud')"
-          :alt="`${cloudEntry.label || '云端'} 入口二维码`"
-          width="96"
-          height="96"
-          loading="lazy"
-        />
-        <button class="mini" type="button" @click="copyEntry(cloudEntry)">复制</button>
+        <button class="mini" type="button" @click="copyEntry(e)">复制</button>
       </div>
 
       <p class="entry-tip dim">

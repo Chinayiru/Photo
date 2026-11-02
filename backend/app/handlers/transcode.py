@@ -27,10 +27,9 @@ from .. import audit, sandbox, streamticket
 from .. import transcode as tcmod
 from .. import video as videomod
 from ..config import Config
-from ..core import Ctx, Reply, file_reply, json_reply
+from ..core import Ctx, Reply, json_reply
 from ..errors import (
     E1001,
-    E1008,
     E3004,
     E4007,
     AppError,
@@ -39,15 +38,7 @@ from ..errors import (
     Unauthorized,
 )
 from ..state import AppState
-from ..core.httpmedia import (
-    RangeNotSatisfiable,
-    content_range_header,
-    parse_range,
-    range_length,
-    unsatisfied_range_header,
-)
 from . import common
-from .common import iter_file
 
 __all__ = ["start", "status", "stream"]
 
@@ -197,22 +188,12 @@ async def stream(ctx: Ctx) -> Reply:
 
     etag = f"t-{int(row['mtime'])}-{size}"
     media_type = "video/mp4"               # 转码产物恒为 mp4/h264
-    try:
-        rng = parse_range(ctx.header("range"), size)
-    except RangeNotSatisfiable:
-        raise AppError(E1008, headers={
-            "Content-Range": unsatisfied_range_header(size),
-        }) from None
-
-    if rng is None:
-        r = file_reply(iter_file(path), media_type, size, 200)
-    else:
-        start_at, end = rng
-        r = file_reply(iter_file(path, start=start_at, length=end - start_at + 1),
-                       media_type, range_length(rng), 206,
-                       headers={"Content-Range": content_range_header(rng, size)})
-    r.headers["Accept-Ranges"] = "bytes"
-    r.set_etag(etag)
-    # 产物随源文件指纹变化 → 名字变了 URL 也变了，可以长缓存。
-    r.set_cache(86400, private=True, immutable=True)
-    return r
+    # 与 `/raw` 共用同一段 Range/206/416 构造：转码产物的 416 早先少了
+    # `Accept-Ranges`（客户端据此不知道能续传），同一个 helper 之后不会再各自漂移。
+    # 产物随源文件指纹变化 → 名字变了 URL 也变了，可以长缓存；
+    # 也因为没有 304 复验（`allow_304=False`，保持既有行为），
+    # 票在 URL 里而不是 Authorization 头里，故不需要 `Vary: Authorization`。
+    return common.range_file_reply(
+        ctx, path, media_type=media_type, size=size, etag=etag,
+        max_age=86400, immutable=True, allow_304=False,
+        vary_authorization=False)

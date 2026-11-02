@@ -14,12 +14,19 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, AsyncIterator, Sequence
+from typing import Any, AsyncIterator, Final, Sequence
 
 from .. import video as videomod
 from ..thumbs import source_signature
 
 log = logging.getLogger(__name__)
+
+#: 三个列表接口（时间线 / 目录正文 / 搜索）共用的排序。
+#:
+#: 决策 D12：时间线与「按文件夹」的排序必须**逐字一致**，两处排序不同会让
+#: 用户切视图时彻底失去方向感（"刚才那张在这儿怎么不在这儿"）。写成一个
+#: 常量而不是各处粘贴字符串，改口径只改这一行。
+ORDER_BY_TAKEN_DESC: Final[str] = "ORDER BY taken_at DESC, id DESC"
 
 def is_guest(ctx: Any) -> bool:
     """这次请求是不是游客发起的（判据是令牌里的角色，不是有没有 cookie）。
@@ -394,7 +401,7 @@ def timeline_order(order: str | None) -> str:
     from ..errors import E1001, AppError
 
     if order is None or order == "" or order == "desc":
-        return "ORDER BY taken_at DESC, id DESC"
+        return ORDER_BY_TAKEN_DESC
     raise AppError(E1001, f"不支持的 order：{order}（一期仅支持 desc）")
 
 
@@ -704,3 +711,91 @@ def etag_matches(if_none_match: str | None, etag: str) -> bool:
         if p == etag:
             return True
     return False
+
+
+def range_file_reply(
+    ctx: Any,
+    path: Path,
+    *,
+    media_type: str,
+    size: int,
+    etag: str,
+    filename: str | None = None,
+    max_age: int = 0,
+    immutable: bool = False,
+    allow_304: bool = True,
+    vary_authorization: bool = True,
+) -> Any:
+    """构造一个支持 `Range` 的文件响应（`/raw`、`/stream`、转码产物共用）。
+
+    ## 为什么必须只有一份
+
+    这套规则里每条错了都**不报错**，只让用户拿到坏数据或白花流量：
+    - 416 少一个 `Content-Range`，客户端不知道文件总长，只能整份重下；
+    - 少 `Accept-Ranges`，客户端干脆不发 Range —— 2 GB 的原图在 5 Mbps 下
+      要 55 分钟，断了就得从头再来；
+    - 多了 304（对带 Range 的请求），客户端会以为那段字节已经拿到了。
+
+    原来 `/raw` 与转码产物各写一份，转码那份已经漂移（416 缺
+    `Accept-Ranges`）。这种漂移不会有人报 bug，只会有人觉得"这视频特别费流量"。
+
+    ## 参数
+
+    - `filename`：给了就按附件下载语义处理（此时**不做** 304 复验：带
+      `Content-Disposition` 的整份下载要么给全量、要么给 304，混着来会让
+      浏览器的下载管理器拿到空文件）。`Content-Disposition` 由调用方追加。
+    - `max_age`/`immutable`：缓存策略。原图用 `0`（可能被重命名/替换，靠
+      ETag 复验），转码产物可以长缓存（URL 里的指纹变了 URL 就变了）。
+    - `allow_304`：是否做条件请求复验。转码流当前不开（保持既有行为）。
+    - `vary_authorization`：响应是否随 `Authorization` 变化。原图按令牌授权，
+      必须 `Vary`；转码流靠 URL 里的票授权，不需要。
+    """
+    from ..core.ctx import file_reply
+    from ..core.httpmedia import (
+        RangeNotSatisfiable,
+        content_range_header,
+        parse_range,
+        range_length,
+        unsatisfied_range_header,
+    )
+    from ..errors import E1008, AppError
+
+    try:
+        rng = parse_range(ctx.header("range"), size)
+    except RangeNotSatisfiable:
+        # ★ 必须回 416 而不是静默给 200 全文件：那会让客户端以为"续传成功了"，
+        #   实际把重复数据拼进已下载的部分，得到损坏文件。
+        # ⚠️ `Content-Range` 必须挂在**异常**上：dispatch 只认 app_exc.headers，
+        #   先构造 Reply 再 raise 的话它会被丢弃。
+        raise AppError(E1008, headers={
+            "Content-Range": unsatisfied_range_header(size),
+            "Accept-Ranges": "bytes",
+        }) from None
+
+    # 复验只在「整份请求」上做：带 Range 的请求要的是某一段字节，
+    # 拿 304 回它会让客户端以为那段拿到了。
+    if (allow_304 and rng is None and filename is None
+            and etag_matches(ctx.header("if-none-match"), etag)):
+        from ..core.ctx import empty_reply
+
+        r = empty_reply(304)
+        r.set_etag(etag)
+        r.set_cache(0, private=True)
+        r.headers["Accept-Ranges"] = "bytes"
+        if vary_authorization:
+            r.set("Vary", "Authorization")
+        return r
+
+    if rng is None:
+        r = file_reply(iter_file(path), media_type, size, 200, filename=filename)
+    else:
+        start, end = rng
+        r = file_reply(iter_file(path, start=start, length=end - start + 1),
+                       media_type, range_length(rng), 206, filename=filename,
+                       headers={"Content-Range": content_range_header(rng, size)})
+    r.headers["Accept-Ranges"] = "bytes"
+    r.set_etag(etag)
+    r.set_cache(max_age, private=True, immutable=immutable)
+    if vary_authorization:
+        r.set("Vary", "Authorization")
+    return r
