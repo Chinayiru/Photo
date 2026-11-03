@@ -14,6 +14,7 @@ import { computed } from "vue";
 import { ApiError, api, previewUrl, rawUrl, thumbUrl } from "../api/client";
 import { errorText } from "../api/errorText";
 import { formatBytes } from "../lib/format";
+import { createTrustedBlobUrl, revokeTrustedBlobUrl } from "../lib/trustedBlob";
 import { currentVia, getToken } from "../api/storage";
 import type {
   DeleteResponse,
@@ -185,7 +186,10 @@ async function prefetchRaw(id: number): Promise<void> {
     const blob = await res.blob();
     if (my !== rawSeq) return;       // 期间用户又滑了，这次结果作废
     if (blob.size === 0) return;
-    rawBlobs.set(id, URL.createObjectURL(blob));
+    // ★ 走可信登记表创建：`safeUrl()` 只放行登记过的 blob（来源校验），
+    //   直接 `URL.createObjectURL` 出来的 URL 会被守卫判空 ⇒ 原图层
+    //   静默不显示（2026-11-03 的真实症状）。
+    rawBlobs.set(id, createTrustedBlobUrl(blob, `raw:${id}`));
     evictRaw();
   } catch {
     // ★ 静默失败：预取是"锦上添花"，任何错误（断网、取消、解码失败）
@@ -215,7 +219,8 @@ export function releaseRaw(id: number): void {
   if (!url) return;
   // ★ 必须 revoke：Blob URL 的字节会一直被 hold 住直到 revoke 或页面卸载，
   //   只从 Map 里删掉是**内存泄漏**（而且泄漏的是几 MB 的整张原图）。
-  URL.revokeObjectURL(url);
+  //   同时移出可信登记表 —— 已 revoke 的地址必须立刻被守卫拒绝。
+  revokeTrustedBlobUrl(url);
   rawBlobs.delete(id);
 }
 

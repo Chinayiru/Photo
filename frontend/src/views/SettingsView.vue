@@ -8,10 +8,18 @@
  * 退出配对要二次确认 —— 手机上重新输入 IP 和 6 位码并不轻松，
  * 误触的代价比多点一次大。
  */
-import { computed, onActivated, onMounted, ref } from "vue";
+import {
+  computed,
+  onActivated,
+  onBeforeUnmount,
+  onDeactivated,
+  onMounted,
+  ref,
+  watch,
+} from "vue";
 import GuestPanel from "../components/GuestPanel.vue";
 import { confirmDialog, setConfirmBusy } from "../stores/confirm";
-import { ApiError, absUrl, api } from "../api/client";
+import { ApiError, api } from "../api/client";
 import { copyText } from "../api/clipboard";
 import { getClientName, getDeviceId, getToken } from "../api/storage";
 import { authStore, currentBase, isPaired, unpair } from "../stores/auth";
@@ -32,6 +40,7 @@ import {
 import { clearTimeline } from "../stores/timeline";
 import { toastError, toastOk, toastWarn } from "../stores/toast";
 import { errorText } from "../api/errorText";
+import { createTrustedBlobUrl, revokeTrustedBlobUrl } from "../lib/trustedBlob";
 
 const s = systemStore.state;
 const info = computed(() => s.info);
@@ -101,6 +110,8 @@ onActivated(() => {
   // 每次切回设置页刷一次：用户来这里就是想看"现在怎么样了"
   void refresh();
   void loadEntries();
+  // 离开时二维码已 revoke；回来要重新取（entryCards 没变，watch 不会自己触发）
+  for (const c of entryCards.value) void loadQr(c.kind);
 });
 
 /**
@@ -133,8 +144,44 @@ async function loadEntries(): Promise<void> {
   }
 }
 
-function qrSrc(kind: "lan" | "cloud"): string {
-  return absUrl("/api/system/entrances/qr", { kind });
+/**
+ * 入口二维码：**必须带认证取字节**，不能靠 `<img :src>`。
+ *
+ * `<img>` 发不出 `Authorization` 头，而这个接口的权限是 `owner`
+ * （`backend/app/handlers/system.py::entrances_qr`）。所以先走 `api.getBytes`
+ * （与其它请求同一条认证/自愈流水线）拿到 PNG，再交给可信 Blob 登记表
+ * 生成可渲染的地址 —— 与查看器原图层共用同一套「创建→登记→校验→revoke」。
+ *
+ * ★ 刷新或组件卸载时**必须** revoke 旧的：否则每进一次设置页就多留一张
+ *   码的字节，且旧地址仍被守卫放行（任务书 T2 要能逐条核对这件事）。
+ */
+const qrUrls = ref<Record<string, string>>({});
+const qrBusy = ref<Record<string, boolean>>({});
+
+async function loadQr(kind: "lan" | "cloud"): Promise<void> {
+  if (qrBusy.value[kind]) return;
+  qrBusy.value[kind] = true;
+  try {
+    const blob = await api.getBytes("/api/system/entrances/qr", {
+      query: { kind },
+      retry: 1,
+      timeoutMs: 8000,
+    });
+    const url = createTrustedBlobUrl(blob, `qr:${kind}`);
+    const prev = qrUrls.value[kind];
+    qrUrls.value = { ...qrUrls.value, [kind]: url };
+    if (prev) revokeTrustedBlobUrl(prev);
+  } catch {
+    // 取不到码不影响本卡片：地址与「复制」按钮仍然可用。
+  } finally {
+    qrBusy.value[kind] = false;
+  }
+}
+
+/** 收掉两张码的 blob 并清空表 —— 离开页面或卸载时用，幂等。 */
+function revokeAllQr(): void {
+  for (const url of Object.values(qrUrls.value)) revokeTrustedBlobUrl(url);
+  qrUrls.value = {};
 }
 
 function copyEntry(it: { url: string }): void {
@@ -164,6 +211,22 @@ const entryCards = computed(() => {
   }
   return out;
 });
+
+/** 卡片出现（或换了一条入口）就取一次码。 */
+watch(
+  entryCards,
+  (cards) => {
+    for (const c of cards) void loadQr(c.kind);
+  },
+  { immediate: true },
+);
+
+onBeforeUnmount(revokeAllQr);
+
+/** 本页被 `<KeepAlive>` 缓存：离开时不走 unmount，只走 deactivate。
+ * 二维码是页面级资源，离开就该收掉 —— 否则每进一次设置页留一张，
+ * 台账只增不减，`[6z]` 那条「离开设置页后台账归零」也就永远不会绿。 */
+onDeactivated(revokeAllQr);
 
 async function onRescan(): Promise<void> {
   try {
@@ -324,13 +387,19 @@ const pairing = computed(() => {
           <a class="entry-link mono ellipsis" :href="e.url">{{ e.url }}</a>
         </div>
         <img
+          v-if="qrUrls[e.kind]"
           class="qr"
-          :src="qrSrc(e.kind)"
+          :src="qrUrls[e.kind]"
           :alt="`${e.label} 入口二维码`"
           width="96"
           height="96"
-          loading="lazy"
         />
+        <span
+          v-else
+          class="qr qr-pending"
+          aria-hidden="true"
+          style="display: inline-block; width: 96px; height: 96px; background: #f1f1f5; border-radius: 6px"
+        ></span>
         <button class="mini" type="button" @click="copyEntry(e)">复制</button>
       </div>
 

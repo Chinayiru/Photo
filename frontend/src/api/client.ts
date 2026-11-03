@@ -293,6 +293,14 @@ export interface RequestOptions {
   retry?: number;
   /** 超时毫秒；默认 20s。 */
   timeoutMs?: number;
+  /**
+   * 把响应体当**二进制**读成 `Blob` 而不是 JSON。
+   *
+   * 给二维码这类"服务端出图、但需要 `Authorization` 头"的接口用：
+   * `<img src>` 发不出自定义头，只能先带认证取回字节，再走可信 Blob
+   * 渲染（见 `lib/trustedBlob.ts`）。
+   */
+  raw?: boolean;
   /** 不触发"配对失效"跳转（配对接口自身用）。 */
   skipAuthLost?: boolean;
   /**
@@ -453,6 +461,8 @@ async function once<T>(path: string, opt: RequestOptions): Promise<T> {
 
   // 204 / 空体
   if (res.status === 204) return undefined as T;
+  // 二进制响应：直接给 Blob，别走 JSON 解析（二维码 PNG 会当场炸在 JSON.parse）
+  if (opt.raw) return (await res.blob()) as unknown as T;
   const text = await res.text();
   if (!text) return undefined as T;
   return JSON.parse(text) as T;
@@ -485,6 +495,13 @@ export async function request<T>(path: string, opt: RequestOptions = {}): Promis
 export const api = {
   get: <T>(path: string, opt?: Omit<RequestOptions, "method" | "body">) =>
     request<T>(path, { ...opt, method: "GET" }),
+
+  /**
+   * 取二进制（二维码 PNG 等）。与 `get` 完全同一条认证/自愈流水线，
+   * 只把响应体读成 `Blob`。
+   */
+  getBytes: (path: string, opt?: Omit<RequestOptions, "method" | "body" | "raw">) =>
+    request<Blob>(path, { ...opt, method: "GET", raw: true }),
 
   post: <T>(path: string, body?: unknown, opt?: Omit<RequestOptions, "method" | "body">) =>
     request<T>(path, { ...opt, method: "POST", body }),
