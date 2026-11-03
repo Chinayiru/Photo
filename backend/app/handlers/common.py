@@ -549,6 +549,38 @@ async def iter_file(path: Path, *, start: int = 0, length: int | None = None,
             log.debug("close failed for %s", path)
 
 
+async def iter_fileobj(f: Any, *, start: int = 0, length: int | None = None,
+                       chunk_size: int = CHUNK_SIZE) -> AsyncIterator[bytes]:
+    """从**已打开的**文件对象分块读（`sandbox.open_read()` 的配套）。
+
+    与 `iter_file()` 的区别：句柄是调用方校验过身份再打开的，本函数不负责
+    解析路径，因此不存在"校验完再按路径打开"的 TOCTOU 窗口。
+
+    句柄由本函数负责关闭（同 `iter_file()`：客户端断开时协程被取消，
+    `GeneratorExit` 在 yield 处抛出，finally 仍会执行）。
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        if start:
+            await loop.run_in_executor(None, f.seek, start)
+        remaining = length
+        while True:
+            if remaining is not None and remaining <= 0:
+                return
+            n = chunk_size if remaining is None else min(chunk_size, remaining)
+            chunk = await loop.run_in_executor(None, f.read, n)
+            if not chunk:
+                return
+            if remaining is not None:
+                remaining -= len(chunk)
+            yield chunk
+    finally:
+        try:
+            f.close()
+        except OSError:  # pragma: no cover
+            log.debug("close failed for open handle")
+
+
 def download_filename(name: str | None, fallback: str) -> str:
     """清洗下载文件名。
 
@@ -724,6 +756,14 @@ def etag_matches(if_none_match: str | None, etag: str) -> bool:
     return False
 
 
+def _body_stream(fh: Any | None, path: Path, *, start: int = 0,
+                 length: int | None = None) -> AsyncIterator[bytes]:
+    """正文来源：给了校验过的句柄就从句柄读，否则退回按路径打开。"""
+    if fh is not None:
+        return iter_fileobj(fh, start=start, length=length)
+    return iter_file(path, start=start, length=length)
+
+
 def range_file_reply(
     ctx: Any,
     path: Path,
@@ -736,6 +776,7 @@ def range_file_reply(
     immutable: bool = False,
     allow_304: bool = True,
     vary_authorization: bool = True,
+    fh: Any | None = None,
 ) -> Any:
     """构造一个支持 `Range` 的文件响应（`/raw`、`/stream`、转码产物共用）。
 
@@ -760,6 +801,9 @@ def range_file_reply(
     - `allow_304`：是否做条件请求复验。转码流当前不开（保持既有行为）。
     - `vary_authorization`：响应是否随 `Authorization` 变化。原图按令牌授权，
       必须 `Vary`；转码流靠 URL 里的票授权，不需要。
+    - `fh`：调用方用 `sandbox.open_read()` 校验并打开的句柄。给了就从该句柄
+      读（不再按路径打开），从而关掉"校验完再按路径打开"的 TOCTOU 窗口；
+      句柄由本函数在流结束时关闭。
     """
     from ..core.ctx import file_reply
     from ..core.httpmedia import (
@@ -771,9 +815,22 @@ def range_file_reply(
     )
     from ..errors import E1008, AppError
 
+    def _drop_handle() -> None:
+        """异常/304 分支不消费正文时，句柄必须由这里关掉。
+
+        漏了它，客户端每发一次 `Range: bytes=99999999-` 就泄漏一个句柄；
+        Windows 上被"占用"的照片随后连删除都失败。
+        """
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:  # pragma: no cover
+                pass
+
     try:
         rng = parse_range(ctx.header("range"), size)
     except RangeNotSatisfiable:
+        _drop_handle()
         # ★ 必须回 416 而不是静默给 200 全文件：那会让客户端以为"续传成功了"，
         #   实际把重复数据拼进已下载的部分，得到损坏文件。
         # ⚠️ `Content-Range` 必须挂在**异常**上：dispatch 只认 app_exc.headers，
@@ -789,6 +846,7 @@ def range_file_reply(
             and etag_matches(ctx.header("if-none-match"), etag)):
         from ..core.ctx import empty_reply
 
+        _drop_handle()
         r = empty_reply(304)
         r.set_etag(etag)
         r.set_cache(0, private=True)
@@ -798,10 +856,10 @@ def range_file_reply(
         return r
 
     if rng is None:
-        r = file_reply(iter_file(path), media_type, size, 200, filename=filename)
+        r = file_reply(_body_stream(fh, path), media_type, size, 200, filename=filename)
     else:
         start, end = rng
-        r = file_reply(iter_file(path, start=start, length=end - start + 1),
+        r = file_reply(_body_stream(fh, path, start=start, length=end - start + 1),
                        media_type, range_length(rng), 206, filename=filename,
                        headers={"Content-Range": content_range_header(rng, size)})
     r.headers["Accept-Ranges"] = "bytes"

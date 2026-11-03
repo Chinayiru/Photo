@@ -1537,9 +1537,9 @@ def test_oversized_thumb_is_marked_failed_without_decoding(
     calls: list[Path] = []
     real_call = browse._call_generate
 
-    def _spy(src, dst, size, orientation):
+    def _spy(src, dst, size, orientation, fh=None):
         calls.append(Path(dst))
-        return real_call(src, dst, size, orientation)
+        return real_call(src, dst, size, orientation, fh)
 
     monkeypatch.setattr(browse, "_call_generate", _spy)
 
@@ -1578,12 +1578,12 @@ def test_fallback_thumb_generation_is_serialized(
     peak = [0]
     real_call = browse._call_generate
 
-    def _slow(src, dst, size, orientation):
+    def _slow(src, dst, size, orientation, fh=None):
         active.append(1)
         peak[0] = max(peak[0], len(active))
         try:
             time.sleep(0.05)      # 放大窗口：不睡的话第一个可能已经跑完了
-            return real_call(src, dst, size, orientation)
+            return real_call(src, dst, size, orientation, fh)
         finally:
             active.pop()
 

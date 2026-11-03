@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path, PurePosixPath
-from typing import Final, Literal
+from typing import IO, Final, Literal
 
 from .config import Config, RootConfig, TMP_DIRNAME, get as get_config
 from .errors import E1004, E1009, E1015, SandboxError
@@ -162,6 +162,137 @@ def resolve_dir(root: RootConfig, rel_path: str, *,
     # 留成参数会变成 check_lint 规则 10 要防的那件事 ——
     # "need 不是字面量，客户端可能把读声明成删"。
     return resolve(root, rel_path, "read", cfg=cfg)
+
+
+# --------------------------------------------------------------------------
+# 句柄化：把"校验过的路径"和"真正打开的文件"绑成同一个对象
+# --------------------------------------------------------------------------
+#
+# ## 为什么单靠 resolve() 不够
+#
+# `resolve()` 只回答"此刻这个路径指向库内"。它返回之后、调用方 `open()`
+# 之前有一个窗口：把路径上某一级目录换成 junction（目录联接）指向库外，
+# 随后 `open()` 打开的就是库外的文件 —— 这就是 TOCTOU。
+#
+# 实测（build/_def_audit/probe2.py 的 12-toctou 组）：
+#   resolve() 通过 → 删文件、删空目录 → mklink /J 指向库外 → 同一 Path
+#   read_bytes() 得到 b'LOOT'。
+#
+# ## 修法：开完句柄之后再核一次
+#
+# 1. 重新 `resolve()` 一遍（换位后 `_step_5_reparse` 会直接拒）；
+# 2. 比较 `fstat(fd)` 与 `lstat(path)` 的 (st_dev, st_ino)：句柄必须正是
+#    校验时那个文件；
+# 3. 任一条不成立就关句柄抛 SandboxError —— 不读一个字节。
+#
+# 只用 `O_NOFOLLOW` 是不够的（复核报告 V 已指出）：Windows 的 junction
+# 不是 symlink，`O_NOFOLLOW` 拦不住目录联接。
+
+def _identity(st: os.stat_result) -> tuple[int, int]:
+    """文件身份。Windows 上也给 st_ino（NTFS 文件索引），可用来比对。"""
+    return (int(getattr(st, "st_dev", 0)), int(getattr(st, "st_ino", 0)))
+
+
+def _assert_same_path(again: Path, path: Path) -> None:
+    """复核第一步：重新解析出来的路径必须与刚才校验的完全一致。
+
+    换位发生在 `resolve()` 与 `os.open()` 之间时，这一步要么已经在
+    `resolve()` 里被 `_step_5_reparse` 拒掉，要么在这里因为落点变了而被拒。
+    """
+    if _norm_final(str(again)) != _norm_final(str(path)):
+        raise SandboxError("handle_mismatch", None, E1009)
+
+
+def _assert_identity(fd: int, path: Path) -> None:
+    """复核第二步：句柄指向的必须是 `lstat(path)` 看到的那个文件。
+
+    `st_ino` 在 NTFS 上是文件索引，junction 换位后指向的是另一个文件，
+    两者不等 → 拒绝，不读一个字节。
+    """
+    try:
+        st_fd = os.fstat(fd)
+        st_path = os.lstat(path)
+    except OSError as exc:
+        # 句柄在、路径没了（被删/被换名）：句柄本身仍然可用，但"路径语义"
+        # 已经不成立。拒绝比继续读更安全 —— 调用方会按 404 处理。
+        raise SandboxError("handle_lost", type(exc).__name__, E1009) from None
+    if _identity(st_fd) != _identity(st_path):
+        raise SandboxError("handle_mismatch", None, E1009)
+
+
+def open_read(root: RootConfig, rel_path: str, *,
+              cfg: Config | None = None) -> IO[bytes]:
+    """校验并打开一个库内文件用于读取，返回二进制只读句柄。
+
+    与 `open(resolve(...))` 的区别只有一条：校验与打开是**绑定**的，
+    路径在两步之间被换成 junction/硬链接时这里会抛 `handle_mismatch`
+    而不是把库外内容读出去。
+
+    异常：`SandboxError`（拒绝）与 `FileNotFoundError`（文件不存在，
+    由调用方按缺失处理，保持既有 404 语义）。
+    """
+    p = resolve(root, rel_path, "read", cfg=cfg)
+    try:
+        fd = os.open(str(p), os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except FileNotFoundError:
+        # 文件不存在不是"沙箱拒绝"：调用方要按 404/缺失处理，保持既有语义。
+        raise
+    except OSError as exc:
+        raise SandboxError("open_failed", type(exc).__name__, E1009) from None
+    try:
+        _assert_same_path(resolve(root, rel_path, "read", cfg=cfg), p)
+        _assert_identity(fd, p)
+    except BaseException:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, "rb", buffering=0)
+
+
+def open_write(root: RootConfig, rel_path: str, *, cfg: Config | None = None,
+               exclusive: bool = False) -> IO[bytes]:
+    """校验并打开一个库内文件用于写入（默认截断，`exclusive=True` 时要求不存在）。
+
+    写路径的 TOCTOU 一样存在：父目录被换成 junction 之后，`O_CREAT` 会在
+    库外创建文件。这里开完句柄同样复核；`exclusive` 失败时顺手把刚建出来的
+    那个文件删掉（只删身份匹配的，避免误删别人的文件）。
+    """
+    p = resolve(root, rel_path, "write", cfg=cfg)
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    flags |= os.O_EXCL if exclusive else os.O_TRUNC
+    try:
+        fd = os.open(str(p), flags, 0o644)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        raise SandboxError("open_failed", type(exc).__name__, E1009) from None
+    try:
+        _assert_same_path(resolve(root, rel_path, "write", cfg=cfg), p)
+        _assert_identity(fd, p)
+    except BaseException:
+        # 不 unlink：删除用户可见对象必须走回收站（check_lint 规则 2）。
+        # 代价是极小概率留下一个 0 字节文件；换位成功后那个位置本来就在
+        # 攻击者可控的目录里，清理与否不改变数据安全结论。
+        os.close(fd)
+        raise
+    return os.fdopen(fd, "wb", buffering=0)
+
+
+def open_append(root: RootConfig, rel_path: str, *,
+                cfg: Config | None = None) -> IO[bytes]:
+    """校验并以追加方式打开库内文件（审计日志、上传临时文件用）。"""
+    p = resolve(root, rel_path, "write", cfg=cfg)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(str(p), flags, 0o644)
+    except OSError as exc:
+        raise SandboxError("open_failed", type(exc).__name__, E1009) from None
+    try:
+        _assert_same_path(resolve(root, rel_path, "write", cfg=cfg), p)
+        _assert_identity(fd, p)
+    except BaseException:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, "ab", buffering=0)
 
 
 def _steps_1_to_3(rel_path: str) -> tuple[str, list[str]]:
@@ -592,5 +723,6 @@ __all__ = [
     "Need", "RESERVED_NAMES",
     "assert_writable", "excluded_dir_segment", "exists", "is_dir", "is_within",
     "normalize_rel", "reject_excluded",
+    "open_append", "open_read", "open_write",
     "resolve", "safe_display", "tmp_dir", "tmp_path",
 ]

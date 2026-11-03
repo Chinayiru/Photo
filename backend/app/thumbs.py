@@ -24,7 +24,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Iterable, Literal
+from typing import TYPE_CHECKING, Any, Final, Iterable, Literal
 
 from PIL import Image
 
@@ -249,7 +249,8 @@ def _apply_orientation(im: Image.Image, orientation: int | None) -> Image.Image:
     return im
 
 
-def _open_downscaled(path: str | Path, target: int) -> Image.Image:
+def _open_downscaled(path: str | Path, target: int,
+                     *, fh: Any | None = None) -> Image.Image:
     """打开图片并尽量在解码阶段就缩小，控制峰值内存。
 
     四层防护：
@@ -266,7 +267,7 @@ def _open_downscaled(path: str | Path, target: int) -> Image.Image:
     正好绕开了这道防护。
     """
     try:
-        im = Image.open(path)
+        im = Image.open(fh if fh is not None else path)
     except FileNotFoundError:
         # 文件消失是"这一轮读不到"，不是坏图：让调用方按缺失去处理。
         raise
@@ -296,13 +297,18 @@ def generate_thumb(
     *,
     quality: int = THUMB_QUALITY,
     orientation: int | None = None,
+    src_fh: Any | None = None,
 ) -> tuple[int, int]:
     """同步生成一张缩略图并原子落盘。返回 (宽, 高)。
 
     抛出的异常由调用方（ThumbEngine）决定是否重试。
+
+    `src_fh`：调用方用 `sandbox.open_read()` 校验并打开好的句柄。给了就从
+    句柄解码，不再按路径二次打开 —— 否则"校验过的路径"与"Pillow 打开的
+    路径"之间仍留有 junction 换位窗口（TOCTOU）。句柄由**调用方**关闭。
     """
     _prepare_pillow()
-    with _open_downscaled(src, size) as im:
+    with _open_downscaled(src, size, fh=src_fh) as im:
         im = _apply_orientation(im, orientation)
         if im.mode not in ("RGB", "RGBA"):
             im = im.convert("RGB")
@@ -341,13 +347,17 @@ def generate_thumb(
 
 def _generate_thumb_kw(
     src: str, dst: Path, size: int, quality: int, orientation: int | None,
+    src_fh: Any | None = None,
 ) -> tuple[int, int]:
     """run_in_executor 不接受关键字参数，用它把位置参数转成关键字参数。
 
     直接 `functools.partial` 也行，但 partial 会在异常回溯里丢掉函数名，
     排查缩略图失败时更难读。多一个两行的包装函数换取可读的回溯是值得的。
+
+    `src_fh`：调用方用 `sandbox.open_read()` 校验并打开的句柄（TOCTOU 防护）。
     """
-    return generate_thumb(src, dst, size, quality=quality, orientation=orientation)
+    return generate_thumb(src, dst, size, quality=quality, orientation=orientation,
+                          src_fh=src_fh)
 
 
 def generate_video_thumb(
@@ -632,10 +642,19 @@ class ThumbEngine:
                             float(self.cfg.video.get("frame_timeout", 30.0)),
                         )
                     else:
-                        await loop.run_in_executor(
-                            self._pool, _generate_thumb_kw,
-                            str(src), dst, size, THUMB_QUALITY, row["orientation"],
-                        )
+                        # ★ 句柄化（审计 D4-1）：`resolve()` 只保证"此刻在库内"，
+                        #   校验与 Pillow 打开之间还有 junction 换位窗口。这里
+                        #   每张尺寸各开一个已绑定身份的句柄，读的必然是校验过的
+                        #   那个文件。视频分支仍传路径（ffmpeg 需要文件名）。
+                        fh = sandbox.open_read(root, row["rel_path"], cfg=self.cfg)
+                        try:
+                            await loop.run_in_executor(
+                                self._pool, _generate_thumb_kw,
+                                str(src), dst, size, THUMB_QUALITY, row["orientation"],
+                                fh,
+                            )
+                        finally:
+                            fh.close()
                 except videomod.FFmpegMissing as exc:
                     # ffmpeg 不在是**部署问题**：所有视频都会以同样方式失败。
                     # 判永久失败而不是重排三次 —— 让用户在设置页看到一句

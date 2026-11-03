@@ -185,3 +185,36 @@ def test_relay_page_csp_names_extra_connect_from_env(
     connect = [p for p in csp.split(";") if p.strip().startswith("connect-src")]
     assert len(connect) == 1, csp
     assert "https://photos.example.com" in connect[0]
+
+# --------------------------------------------------- 局域网源判据（纯函数）
+
+@pytest.mark.parametrize("origin", [
+    "http://192.0.2.10:8787",
+    "http://10.0.0.5",
+    "http://172.16.3.4:5173",
+    "http://127.0.0.1:8787",
+    "http://localhost:5173",
+    "http://[::1]:8787",
+])
+def test_lan_origins_are_accepted(origin: str) -> None:
+    from cloud.relay.cors import is_lan_origin
+
+    assert is_lan_origin(origin) is True
+
+
+@pytest.mark.parametrize("origin", [
+    # ★ 链路本地段：没有「用户自己浏览器里的页面」这种合法来源，
+    #   最出名的主机是云厂商的元数据服务 169.254.169.254。给它 ACAO、
+    #   等于替别人的 SSRF 探针开门。
+    "http://169.254.169.254",
+    "http://169.254.1.1:80",
+    "http://[fe80::1]:8787",
+    # 看着像局域网、其实是域名
+    "http://192.168.0.1.evil.com",
+    "https://evil.example",
+    "null",
+])
+def test_non_lan_origins_are_rejected(origin: str) -> None:
+    from cloud.relay.cors import is_lan_origin
+
+    assert is_lan_origin(origin) is False

@@ -167,6 +167,15 @@ def build_app(cfg: Config | None = None, *, state: AppState | None = None) -> An
         router.enable_cors(allow_origins=origins)
         log.info("已启用 CORS，白名单：%s", ", ".join(origins))
 
+    # `/panel/**` 是**本机调试接口**：它没有令牌校验，唯一的边界是"必须从
+    # 回环发起"。默认关闭（`server.panel_http` 缺省 false）；一旦打开就等于
+    # 承认"同一台 Windows 上的任何进程都可以替主人 mint 配对码"，这不是
+    # 能以代码消除的威胁模型 —— 但至少要说出来，别让人以为它是净收益。
+    if bool(cfg.get("server.panel_http", False)):
+        log.warning(
+            "/panel/** 已启用：本机任意进程都能生成配对码与读取设备/审计列表"
+            "（无令牌校验，仅以回环为边界）。不需要时请把 server.panel_http 关掉")
+
     # 静态前端兜底：手机访问 http://<电脑IP>:8787/ 直接看到界面。
     # 用 set_fallback 而不是再注册一条 `/{path:path}` 路由 —— 后者会
     # 与所有 API 路由竞争匹配，一旦正则顺序变化就可能把 API 请求

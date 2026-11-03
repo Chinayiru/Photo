@@ -58,16 +58,92 @@ def test_expired_ticket_is_rejected(database) -> None:
 
 def test_tampered_signature_is_rejected(database) -> None:
     ticket = streamticket.mint(database, 7)
-    head, exp, sig = ticket.split(".")
+    head, exp, cid, sig = ticket.split(".")
     flipped = ("A" if sig[0] != "A" else "B") + sig[1:]
-    assert streamticket.verify(database, f"{head}.{exp}.{flipped}", 7) is False
+    assert streamticket.verify(database, f"{head}.{exp}.{cid}.{flipped}", 7) is False
 
 
 def test_extending_the_expiry_by_hand_breaks_the_signature(database) -> None:
     """票里唯一可变的部分是过期时间 —— 手改它必须导致签名对不上。"""
     ticket = streamticket.mint(database, 7)
-    head, exp, sig = ticket.split(".")
-    assert streamticket.verify(database, f"{head}.{int(exp) + 86400}.{sig}", 7) is False
+    head, exp, cid, sig = ticket.split(".")
+    assert streamticket.verify(
+        database, f"{head}.{int(exp) + 86400}.{cid}.{sig}", 7) is False
+
+
+def test_swapping_the_client_segment_breaks_the_signature(database) -> None:
+    """把 client 段换成别人：签名里签了它，所以换一下就废。"""
+    ticket = streamticket.mint(database, 7, client_id="a" * 32)
+    head, exp, cid, sig = ticket.split(".")
+    other = streamticket._encode_client("b" * 32)
+    assert other != cid
+    assert streamticket.verify(database, f"{head}.{exp}.{other}.{sig}", 7) is False
+
+
+def _guest_session(database, client_id: str, *, revoked_at=None,
+                   expires_in: float = 600.0) -> None:
+    """造一条真实的游客会话行（含它依赖的邀请行）。"""
+    now = time.time()
+    invite = "i" * 32
+    database.execute(
+        "INSERT INTO guest_invites (id, device_id, token_hash, label, created_at,"
+        " expires_at, first_used_at, created_via) "
+        "VALUES (?, 'dev', ?, 't', ?, ?, ?, 'lan')",
+        (invite, "h" * 8, now, now + 3600, now))
+    database.execute(
+        "INSERT INTO guest_sessions (client_id, token_hash, invite_id, device_id,"
+        " label, created_at, expires_at, revoked_at)"
+        " VALUES (?, ?, ?, 'dev', 't', ?, ?, ?)",
+        (client_id, "s" * 8, invite, now, now + expires_in, revoked_at))
+
+
+def test_guest_ticket_dies_when_the_session_is_kicked(database) -> None:
+    """★ 踢出游客之后，他手里那张还没过期的票必须立刻不能用了。
+
+    票的 300 秒寿命是给 `<video>` 连发的几次 Range 请求用的，不是给
+    被踢出去的人续命用的。少了这一条，主人的「踢出」要等满 5 分钟才生效。
+    """
+    cid = "c" * 32
+    _guest_session(database, cid)
+    ticket = streamticket.mint(database, 7, client_id=cid)
+    assert streamticket.verify(database, ticket, 7) is True
+
+    database.execute(
+        "UPDATE guest_sessions SET revoked_at = ? WHERE client_id = ?",
+        (time.time(), cid))
+    assert streamticket.verify(database, ticket, 7) is False
+
+
+def test_guest_ticket_dies_when_the_invite_is_revoked(database) -> None:
+    """撤销邀请连带终止会话，票也跟着作废。"""
+    cid = "d" * 32
+    _guest_session(database, cid)
+    ticket = streamticket.mint(database, 7, client_id=cid)
+    database.execute(
+        "UPDATE guest_invites SET revoked_at = ? WHERE id = ?",
+        (time.time(), "i" * 32))
+    assert streamticket.verify(database, ticket, 7) is False
+
+
+def test_guest_ticket_dies_when_the_session_expires(database) -> None:
+    cid = "e" * 32
+    _guest_session(database, cid, expires_in=1.0)
+    ticket = streamticket.mint(database, 7, client_id=cid, ttl=600)
+    assert streamticket.verify(database, ticket, 7, now=time.time() + 5) is False
+
+
+def test_owner_ticket_is_unaffected_by_guest_session_rules(database) -> None:
+    """主人没有 `guest_sessions` 行 —— 游客那套规则不该卡到主人自己。"""
+    ticket = streamticket.mint(database, 7, client_id="f" * 32)
+    assert streamticket.verify(database, ticket, 7) is True
+
+
+def test_legacy_three_part_ticket_still_verifies(database) -> None:
+    """升级瞬间还在飞的老票（3 段）继续可用，直到它自己过期。"""
+    exp = int(time.time()) + 60
+    sig = streamticket._sig(streamticket._secret(database), 7, exp, "")
+    assert streamticket.verify(database, f"st1.{exp}.{sig}", 7) is True
+
 
 
 @pytest.mark.parametrize("junk", ["", "st1", "st1.abc.def", "v2.1.2", "st1.1", "..."])

@@ -146,9 +146,15 @@ def is_lan_origin(origin: str) -> bool:
         return False
     if ip.is_loopback:
         return True
-    # `is_private` 覆盖 10/8、172.16/12、192.168/16、fc00::/7、
-    # 169.254/16（链路本地）与 ::1。刻意**不**包含公网地址。
-    return ip.is_private or ip.is_link_local
+    # 链路本地（169.254/16、fe80::/10）**不算**局域网来源：这一段里没有
+    # "用户自己浏览器里的页面"这种合法来源，最出名的主机是云厂商元数据
+    # 服务 169.254.169.254 —— 对它回 ACAO 等于替别人的 SSRF 探针开门。
+    # 注意 Python 的 `is_private` 把这些也归为私有，所以必须先单独拦。
+    if ip.is_link_local:
+        return False
+    # `is_private` 覆盖 10/8、172.16/12、192.168/16、fc00::/7。刻意**不**
+    # 包含公网地址，也不包含上面的链路本地段。
+    return ip.is_private
 
 
 def cors_headers(origin: str, *,

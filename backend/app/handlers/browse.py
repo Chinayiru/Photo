@@ -433,9 +433,18 @@ async def _generate_sync(st: AppState, row: Any, dst: Path, size: int) -> None:
     if not src.exists():
         return
     loop = asyncio.get_running_loop()
+    # ★ 句柄化（审计 D4-1）：图片兜底路径同样要在"校验"与"Pillow 打开"之间
+    #   不留 junction 换位窗口。视频要路径，拿不到句柄就只能沿用 resolve。
+    fh = None
+    if videomod.row_kind(row) != "video":
+        try:
+            fh = sandbox.open_read(st.cfg.root_by_id(row["root_id"], allow_disabled=False),
+                                   row["rel_path"], cfg=st.cfg)
+        except FileNotFoundError:
+            return
     try:
         await loop.run_in_executor(_THUMB_FALLBACK_POOL, _call_generate,
-                                   str(src), dst, size, _gen_opts(st.cfg, row))
+                                   str(src), dst, size, _gen_opts(st.cfg, row), fh)
     except OversizedImageError as exc:
         # 声明尺寸超单边上限 → 走与 ThumbEngine 完全相同的"永久失败"落库，
         # 让时间线拿到占位图而不是反复重试。不落库的话每次刷新都会再试一次，
@@ -444,6 +453,10 @@ async def _generate_sync(st: AppState, row: Any, dst: Path, size: int) -> None:
                     row["id"], exc)
         st.db.execute("UPDATE media SET thumb_state='failed' WHERE id=?", (row["id"],))
         return
+    finally:
+        # 句柄由这里统一关（生成函数只读，不拥有句柄）。
+        if fh is not None:
+            fh.close()
     # ★ 写回**磁盘上**的签名，与 `_source_sig()` 保持同一口径。
     # 若这里写 DB 的旧 mtime，下一次请求算出的 disk 签名与它不等，
     # 就会判定"陈旧"并重新生成 —— 用户每刷新一次页面就重生成一遍缩略图。
@@ -470,7 +483,8 @@ def _gen_opts(cfg: Any, row: Any) -> tuple[str, Any, float]:
 
 
 def _call_generate(src: str, dst: Path, size: int,
-                   opts: tuple[str, Any, float]) -> None:
+                   opts: tuple[str, Any, float],
+                   fh: Any | None = None) -> None:
     kind, arg, at = opts
     if kind == "video":
         from ..thumbs import generate_video_thumb
@@ -479,7 +493,8 @@ def _call_generate(src: str, dst: Path, size: int,
         return
     from ..thumbs import generate_thumb
 
-    generate_thumb(Path(src), dst, size, orientation=arg)
+    # 图片分支优先走已校验的句柄（TOCTOU 防护）；视频分支 ffmpeg 只能吃路径。
+    generate_thumb(Path(src), dst, size, orientation=arg, src_fh=fh)
 
 
 async def _file_thumb_reply(st: AppState, dst: Path, sig: str, ctx: Ctx) -> Reply:
@@ -652,13 +667,24 @@ async def get_raw(ctx: Ctx) -> Reply:
         raise NotFound(f"源文件已丢失 media_id={mid}")
     # ★ 即使路径来自我们自己的数据库，也要过沙箱：配置可能已经改过，
     # 旧行的 rel_path 现在可能指向库外（或变成 junction）。
+    # ★ 句柄化：校验与打开必须绑在一起。只 `resolve()` 再 `open()` 的话，
+    #   两步之间把某一级目录换成 junction（目录联接）就能把库外文件读出去
+    #   （实测见 build/_def_audit/probe2.py 的 12-toctou 组：读到 b'LOOT'）。
+    #   `sandbox.open_read()` 开完句柄会复核 reparse 链与 (dev, ino) 身份，
+    #   换位后抛 handle_mismatch，一个字节都不读。
+    try:
+        fh = sandbox.open_read(root, row["rel_path"], cfg=st.cfg)
+    except FileNotFoundError:
+        raise NotFound(f"源文件不存在 media_id={mid}") from None
+    # `fh.name` 是文件描述符号（`os.fdopen()` 的 FileIO.name 不是路径），
+    # 所以这里再解析一次，只用于日志与 ETag；大小与正文一律取自句柄。
     src = sandbox.resolve(root, row["rel_path"], "read", cfg=st.cfg)
-    if not src.is_file():
-        raise NotFound(f"源文件不存在 media_id={mid}")
 
     try:
-        size = stat_size(src)
+        # 大小取自**句柄**而不是路径：路径在 stat 与 open 之间同样可能被换。
+        size = os.fstat(fh.fileno()).st_size
     except OSError:
+        fh.close()
         raise NotFound("源文件无法读取") from None
 
     # ★ 视频的 Content-Type 必须**按容器**给，不能按扩展名：库里 `.MOV` 绝大多数
@@ -682,9 +708,13 @@ async def get_raw(ctx: Ctx) -> Reply:
     # 200/206/304/416 的构造与头部规则只在 `common.range_file_reply()` 里写一份：
     # 转码产物走同一段代码，两边不会再各自漂移（原来转码那份的 416 就少了
     # `Accept-Ranges`）。
-    r = common.range_file_reply(
-        ctx, src, media_type=media_type, size=size, etag=etag,
-        filename=filename, max_age=0)
+    try:
+        r = common.range_file_reply(
+            ctx, src, media_type=media_type, size=size, etag=etag,
+            filename=filename, max_age=0, fh=fh)
+    except BaseException:
+        fh.close()          # 416/304 分支里 range_file_reply 已关过，重复关闭无害
+        raise
     _apply_disposition(r, filename, download=download)
     return r
 
@@ -739,7 +769,8 @@ async def stream_ticket(ctx: Ctx) -> Reply:
         raise NotFound(None)   # ★ 不带 id：与“无权访问”的响应必须逐字一致
     st.cfg.root_by_id(row["root_id"], allow_disabled=False)
     common.check_media_visible(ctx, st, row)
-    ticket = streamticket.mint(st.db, mid)
+    me = ctx.state.get("client") or {}
+    ticket = streamticket.mint(st.db, mid, client_id=str(me.get("id") or ""))
     r = json_reply({"ticket": ticket,
                     "expires_in": int(streamticket.STREAM_TICKET_TTL)})
     # 票是一次性的短命凭证：任何中间层都不许缓存它。

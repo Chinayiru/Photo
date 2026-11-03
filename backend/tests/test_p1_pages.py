@@ -79,14 +79,19 @@ def test_lan_origin_accepts_private_and_loopback_only() -> None:
     ★ 这一步是防绕过的关键：`192.168.0.1.evil.com` 是一个**公网域名**，
     只是长得像私有 IP。写成 `host.startswith("192.168.")` 就会把它放进来
     —— 而攻击者完全可以注册这种域名。
+
+    ★ 链路本地（169.254/16、fe80::/10）**不算**局域网源：这一段里没有
+    "用户自己浏览器里的页面"这种合法来源，最出名的主机是云厂商元数据服务
+    169.254.169.254 —— 对它回 ACAO 等于替别人的 SSRF 探针开门。旧版把
+    `https://[fe80::1]` 当成合法来源，是这次刻意改掉的策略（复核建议 2）。
     """
     for ok in ("http://192.0.2.10:8787", "http://10.0.0.5",
                "https://172.16.3.9:8443", "http://127.0.0.1:8787",
-               "http://localhost:5173", "http://[::1]:8787",
-               "https://[fe80::1]"):
+               "http://localhost:5173", "http://[::1]:8787"):
         assert cors_mod.is_lan_origin(ok) is True, ok
     for bad in ("https://evil.example.com", "http://192.168.0.1.evil.com",
                 "https://pb.example.com", "http://8.8.8.8",
+                "http://169.254.169.254", "https://[fe80::1]",
                 "null", "", "   ", "file:///etc/passwd",
                 "http://192.168.0.1:8787/path"):
         assert cors_mod.is_lan_origin(bad) is False, bad
