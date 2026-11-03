@@ -1,0 +1,507 @@
+{
+  "test_api_contract": {
+    "passed": 24,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_archive": {
+    "passed": 26,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_audit": {
+    "passed": 31,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_audit_07f03d": {
+    "passed": 14,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_audit_20261020": {
+    "passed": 21,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_audit_f01_f04_f07": {
+    "passed": 15,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_audit_f01_root_disabled": {
+    "passed": 17,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_audit_f03_f05_f06": {
+    "passed": 18,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_audit_f03_forward": {
+    "passed": 23,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_audit_f04_pair_tx": {
+    "passed": 9,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_audit_f05_deploy_lock": {
+    "passed": 7,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_audit_m01_signing_secret": {
+    "passed": 9,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_auth": {
+    "passed": 75,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_autostart": {
+    "passed": 10,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_browser_e2e_harness": {
+    "passed": 5,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_build_repro": {
+    "passed": 11,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_check_frontend_api": {
+    "passed": 11,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_check_lint": {
+    "passed": 52,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_cloud_auto_pair": {
+    "passed": 12,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_cloud_cli": {
+    "passed": 10,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_cloud_deploy": {
+    "passed": 34,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_cloud_security": {
+    "passed": 29,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_cloud_watchdog": {
+    "passed": 13,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_config_guest_root": {
+    "passed": 12,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_control_channel": {
+    "passed": 8,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_cookie_auth": {
+    "passed": 35,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_core": {
+    "passed": 57,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_docs_api_examples": {
+    "passed": 6,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_download_name": {
+    "passed": 13,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_entrances": {
+    "passed": 15,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_error_division": {
+    "passed": 70,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_events": {
+    "passed": 19,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_exif": {
+    "passed": 77,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_f1_hardening": {
+    "passed": 38,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_ffmpeg_pin": {
+    "passed": 5,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_folder_browse": {
+    "passed": 25,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_frontend_error_text": {
+    "passed": 4,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_frontend_guest_copy": {
+    "passed": 11,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_frontend_guest_enter": {
+    "passed": 10,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_frontend_hardening": {
+    "passed": 15,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_frontend_issue060": {
+    "passed": 8,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_frontend_raw_prefetch": {
+    "passed": 2,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_guest_db": {
+    "passed": 11,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_guest_escalation": {
+    "passed": 25,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_guest_folder_isolation": {
+    "passed": 16,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_guest_isolation": {
+    "passed": 24,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_guest_limits": {
+    "passed": 12,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_guest_media_access": {
+    "passed": 10,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_guest_three_bugs": {
+    "passed": 26,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_guest_token": {
+    "passed": 18,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_guest_upload": {
+    "passed": 11,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_handlers": {
+    "passed": 106,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_indexer": {
+    "passed": 53,
+    "skipped": 1,
+    "failed": 0
+  },
+  "test_isolation": {
+    "passed": 29,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_layering": {
+    "passed": 3,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_migration_ledger": {
+    "passed": 8,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_migrations": {
+    "passed": 12,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_move_rename": {
+    "passed": 61,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_netguard": {
+    "passed": 26,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_ops_disk_guard": {
+    "passed": 12,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_origin_marker": {
+    "passed": 3,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_p1_acceptance": {
+    "passed": 14,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_p1_gaps": {
+    "passed": 15,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_p1_mux": {
+    "passed": 39,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_p1_pages": {
+    "passed": 19,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_p1_perf": {
+    "passed": 4,
+    "skipped": 4,
+    "failed": 0
+  },
+  "test_p1_tunnel": {
+    "passed": 22,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_packaging": {
+    "passed": 14,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_packaging_s06_pillow": {
+    "passed": 7,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_pbctl": {
+    "passed": 3,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_pillow13_boundaries": {
+    "passed": 17,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_protocol": {
+    "passed": 70,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_public_tls_config": {
+    "passed": 5,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_relay_cors": {
+    "passed": 20,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_relay_head_progress": {
+    "passed": 14,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_repo_hygiene": {
+    "passed": 2,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_review_939660d": {
+    "passed": 7,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_sandbox": {
+    "passed": 100,
+    "skipped": 1,
+    "failed": 0
+  },
+  "test_secrets_hygiene": {
+    "passed": 6,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_security_20261026": {
+    "passed": 19,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_server": {
+    "passed": 35,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_single_instance": {
+    "passed": 8,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_soak": {
+    "passed": 17,
+    "skipped": 2,
+    "failed": 0
+  },
+  "test_soak_growth": {
+    "passed": 26,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_soak_tunnel": {
+    "passed": 14,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_static": {
+    "passed": 20,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_streamticket": {
+    "passed": 22,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_tc_switch_func_006": {
+    "passed": 4,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_thumb_race": {
+    "passed": 3,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_thumbs": {
+    "passed": 52,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_transcode": {
+    "passed": 26,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_transports": {
+    "passed": 67,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_tray": {
+    "passed": 13,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_tray_cloud_entry": {
+    "passed": 10,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_tray_lifecycle": {
+    "passed": 5,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_tray_qr_refresh": {
+    "passed": 2,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_tray_qr_rows": {
+    "passed": 6,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_tray_qr_topmost": {
+    "passed": 4,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_uploads": {
+    "passed": 87,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_video": {
+    "passed": 80,
+    "skipped": 0,
+    "failed": 0
+  },
+  "test_watcher": {
+    "passed": 71,
+    "skipped": 0,
+    "failed": 0
+  }
+}

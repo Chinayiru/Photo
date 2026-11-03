@@ -1,0 +1,13 @@
+{
+  "name": "frontend-lint",
+  "command": [
+    "E:\\Development tool\\nodejs\\npm.cmd",
+    "run",
+    "lint"
+  ],
+  "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片\\frontend",
+  "started_utc": "2026-11-03T14:21:10.830386+00:00",
+  "seconds": 24.547,
+  "exit_code": 0,
+  "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\frontend-lint.log"
+}

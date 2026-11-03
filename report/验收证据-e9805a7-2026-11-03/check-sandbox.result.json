@@ -1,0 +1,12 @@
+{
+  "name": "check-sandbox",
+  "command": [
+    "D:\\Photos\\.venv\\Scripts\\python.exe",
+    "scripts/check_sandbox.py"
+  ],
+  "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+  "started_utc": "2026-11-03T14:19:23.558627+00:00",
+  "seconds": 0.219,
+  "exit_code": 0,
+  "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\check-sandbox.log"
+}

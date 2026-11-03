@@ -1,0 +1,12 @@
+{
+  "name": "e2e-organize",
+  "command": [
+    "D:\\Photos\\.venv\\Scripts\\python.exe",
+    "scripts/verify_organize_e2e.py"
+  ],
+  "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+  "started_utc": "2026-11-03T14:20:26.595233+00:00",
+  "seconds": 1.672,
+  "exit_code": 0,
+  "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-organize.log"
+}

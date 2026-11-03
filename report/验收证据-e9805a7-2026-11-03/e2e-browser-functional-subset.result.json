@@ -1,0 +1,13 @@
+{
+  "name": "e2e-browser-functional-subset",
+  "command": [
+    "D:\\Photos\\.venv\\Scripts\\python.exe",
+    "D:\\Photos\\build\\final-validation-e9805a7-20261103\\browser_functional_subset.py",
+    "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+  ],
+  "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+  "started_utc": "2026-11-03T14:37:29.493376+00:00",
+  "seconds": 174.891,
+  "exit_code": 1,
+  "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-browser-functional-subset.log"
+}

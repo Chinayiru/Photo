@@ -1,0 +1,16 @@
+{
+  "timeline_cells": 8,
+  "status": "云端中继\nYiRu",
+  "raw_requests_before_zoom": [],
+  "permit_before_click": true,
+  "raw_requests_before_permission": [],
+  "raw_decoded_after_click": true,
+  "overlay_transform_equal": true,
+  "raw_requests_after_click": [
+    "http://127.0.0.1:56669/d/299c065e20a4ab9696936e2a07082475/api/items/8/raw"
+  ],
+  "permit_reset_after_next": true,
+  "next_is_different": true,
+  "raw_not_mounted_before_next_permission": true,
+  "passed": true
+}

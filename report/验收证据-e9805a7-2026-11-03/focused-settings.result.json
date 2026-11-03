@@ -1,0 +1,13 @@
+{
+  "name": "focused-settings",
+  "command": [
+    "D:\\Photos\\.venv\\Scripts\\python.exe",
+    "D:\\Photos\\build\\final-validation-e9805a7-20261103\\focused_checks.py",
+    "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+  ],
+  "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+  "started_utc": "2026-11-03T14:31:31.777637+00:00",
+  "seconds": 18.188,
+  "exit_code": 0,
+  "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\focused-settings.log"
+}

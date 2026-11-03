@@ -1,0 +1,17 @@
+{
+  "name": "pytest-full",
+  "command": [
+    "D:\\Photos\\.venv\\Scripts\\python.exe",
+    "-m",
+    "pytest",
+    "backend/tests",
+    "-ra",
+    "--durations=20",
+    "--junitxml=build/final-pytest.xml"
+  ],
+  "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+  "started_utc": "2026-11-03T14:19:23.535114+00:00",
+  "seconds": 146.64,
+  "exit_code": 1,
+  "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\pytest-full.log"
+}

@@ -1,0 +1,12 @@
+{
+  "name": "check-docs",
+  "command": [
+    "D:\\Photos\\.venv\\Scripts\\python.exe",
+    "scripts/check_docs.py"
+  ],
+  "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+  "started_utc": "2026-11-03T14:19:23.546568+00:00",
+  "seconds": 0.484,
+  "exit_code": 0,
+  "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\check-docs.log"
+}

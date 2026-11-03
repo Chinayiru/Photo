@@ -1,0 +1,23 @@
+{
+  "rounds": 36,
+  "hours": 0.05,
+  "reqs_total": 576,
+  "bad_total": 0,
+  "online_all": true,
+  "active_reqs_max": 0,
+  "active_reqs_peak_max": 4,
+  "active_reqs_final": 0,
+  "session_count": 1,
+  "cloud_rss_start_mb": 4.3,
+  "cloud_rss_end_mb": 4.27,
+  "cloud_rss_peak_mb": 4.3,
+  "cloud_rss_head_avg_mb": 4.28,
+  "cloud_rss_tail_avg_mb": 4.27,
+  "attempts_seen": [
+    0
+  ],
+  "errors": [],
+  "failures": [],
+  "problems": [],
+  "pass": true
+}

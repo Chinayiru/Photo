@@ -1,0 +1,13 @@
+{
+  "name": "e2e-lan-viewer",
+  "command": [
+    "D:\\Photos\\.venv\\Scripts\\python.exe",
+    "D:\\Photos\\build\\final-validation-e9805a7-20261103\\lan_viewer.py",
+    "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+  ],
+  "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+  "started_utc": "2026-11-03T14:43:13.549554+00:00",
+  "seconds": 20.609,
+  "exit_code": 1,
+  "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-lan-viewer.log"
+}

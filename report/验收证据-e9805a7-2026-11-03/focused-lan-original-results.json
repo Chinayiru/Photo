@@ -1,0 +1,573 @@
+{
+  "valid_concurrent_thumbnails": [
+    {
+      "requests": 60,
+      "all_200_webp": true,
+      "failed": []
+    },
+    {
+      "requests": 60,
+      "all_200_webp": true,
+      "failed": []
+    },
+    {
+      "requests": 60,
+      "all_200_webp": true,
+      "failed": []
+    }
+  ],
+  "corrupt_thumbnail": {
+    "status": 500,
+    "body": {
+      "error": {
+        "code": "E3004",
+        "message": "thumb_failed",
+        "detail": "thumb failed media_id=1",
+        "retryable": false,
+        "request_id": "c32383caf2dd4ccb",
+        "user_hint": "这张图片无法生成缩略图"
+      }
+    }
+  },
+  "relative_verified_open": {
+    "opened": false,
+    "error": "HandleMismatch",
+    "reason": "mismatch",
+    "absolute_same_file_ok": true
+  },
+  "fresh_wrong_device_qr": {
+    "error": "扫码连到的是另一台电脑（IP 被重新分配了）。请在电脑托盘里重新显示二维码再扫，或手动填写地址与配对码",
+    "paired": false,
+    "inputs": 3
+  },
+  "fresh_correct_device_qr": {
+    "paired_timeline": true,
+    "cells": 61
+  },
+  "same_document_after_storage_clear": {
+    "error": "",
+    "paired": false,
+    "cells": 61,
+    "inputs": 0
+  },
+  "viewer": {
+    "open": true,
+    "buttons": [
+      {
+        "text": "✕",
+        "title": ""
+      },
+      {
+        "text": " ⓘ ",
+        "title": ""
+      },
+      {
+        "text": "›",
+        "title": ""
+      },
+      {
+        "text": "⬇下载原图",
+        "title": ""
+      },
+      {
+        "text": "✏️改名",
+        "title": ""
+      },
+      {
+        "text": "📁移动",
+        "title": ""
+      },
+      {
+        "text": "🗑回收站",
+        "title": ""
+      }
+    ],
+    "images": [
+      {
+        "class": "v-img main",
+        "decoded": true,
+        "src": "http://127.0.0.1:51320/api/items/61/preview"
+      }
+    ]
+  },
+  "network_responses": [
+    {
+      "path": "http://127.0.0.1:51320/",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/assets/style-Dc0Q2t3U.css",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/assets/index-Bkk-64im.js",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/system/entrances",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/system/ping",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/favicon.ico",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/assets/style-Dc0Q2t3U.css",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/assets/index-Bkk-64im.js",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/system/entrances",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/system/ping",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/pair",
+      "status": 201
+    },
+    {
+      "path": "http://127.0.0.1:51320/favicon.ico",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/timeline",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/events",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/favicon.ico",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/61/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/60/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/59/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/58/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/57/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/56/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/55/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/54/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/53/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/52/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/49/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/50/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/51/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/47/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/48/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/46/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/45/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/44/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/43/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/42/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/41/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/40/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/39/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/38/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/37/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/36/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/35/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/34/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/33/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/32/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/31/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/30/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/29/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/28/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/27/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/26/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/25/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/24/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/23/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/22/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/21/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/20/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/19/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/18/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/favicon.ico",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/assets/style-Dc0Q2t3U.css",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/assets/index-Bkk-64im.js",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/system/entrances",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/system/ping",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/pair",
+      "status": 201
+    },
+    {
+      "path": "http://127.0.0.1:51320/favicon.ico",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/timeline",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/events",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/favicon.ico",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/61/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/60/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/59/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/58/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/57/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/56/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/55/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/54/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/53/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/52/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/51/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/50/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/49/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/48/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/47/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/46/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/45/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/44/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/43/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/42/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/41/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/40/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/39/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/38/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/37/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/36/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/35/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/34/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/33/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/32/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/31/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/30/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/29/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/28/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/27/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/26/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/25/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/24/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/23/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/22/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/21/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/20/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/19/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/18/thumb",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/61",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/61/preview",
+      "status": 200
+    },
+    {
+      "path": "http://127.0.0.1:51320/api/items/61/raw",
+      "status": 200
+    }
+  ],
+  "lan_original": {
+    "decoded_after_double_tap": false,
+    "src": null,
+    "same_transform": false
+  },
+  "service_stopped": true
+}

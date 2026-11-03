@@ -1,0 +1,7 @@
+{
+  "app": "PhotoBridge",
+  "built_at": "2026-11-03T14:27:16+00:00",
+  "python": "3.12.10",
+  "pillow": "13.0.0",
+  "requirements_lock_sha256": "cb77363952e6f07262666a1776717a7bf07c308c71a2ebaa032709cf94d303a8"
+}

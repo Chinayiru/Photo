@@ -1,0 +1,697 @@
+{
+  "hours": 0.058,
+  "library": "C:\\Users\\alice\\AppData\\Local\\Temp\\pb_soak_shhht27a\\lib",
+  "rounds": 34,
+  "rounds_ok": 34,
+  "rounds_bad": 0,
+  "warmup_fraction": 0.25,
+  "rss_growth": 0.005798154373125915,
+  "rss_base_bytes": 62759857.23076923,
+  "rss_peak_bytes": 63987712,
+  "thread_growth": 1.4835164835164827,
+  "thread_net_first_last": 4.0,
+  "thread_plateau": true,
+  "task_growth": 0.0,
+  "task_net_first_last": 0.0,
+  "task_plateau": true,
+  "handle_growth": -0.7307692307692264,
+  "handle_net_first_last": 4.0,
+  "handle_plateau": true,
+  "shutdown_sec": 30.2,
+  "thread_alive": false,
+  "media_total": 200,
+  "media_missing": 0,
+  "failures": [],
+  "inconclusive": [],
+  "latency": {
+    "ping": {
+      "n": 35,
+      "p95_first_ms": 28.7,
+      "p95_second_ms": 28.2,
+      "p95_last_ms": 28.7
+    },
+    "timeline": {
+      "n": 35,
+      "p95_first_ms": 24.0,
+      "p95_second_ms": 19.0,
+      "p95_last_ms": 23.7
+    },
+    "thumb": {
+      "n": 35,
+      "p95_first_ms": 48.6,
+      "p95_second_ms": 21.7,
+      "p95_last_ms": 48.5
+    },
+    "search": {
+      "n": 35,
+      "p95_first_ms": 24.8,
+      "p95_second_ms": 15.6,
+      "p95_last_ms": 24.8
+    },
+    "info": {
+      "n": 35,
+      "p95_first_ms": 22.8,
+      "p95_second_ms": 29.0,
+      "p95_last_ms": 28.2
+    },
+    "folders": {
+      "n": 35,
+      "p95_first_ms": 26.0,
+      "p95_second_ms": 18.9,
+      "p95_last_ms": 26.0
+    }
+  },
+  "samples": [
+    {
+      "t": 11.7,
+      "tag": "baseline",
+      "rss": 61521920,
+      "threads": 5,
+      "tasks": 3,
+      "handles": 311,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 11.8,
+      "tag": "tick",
+      "rss": 61865984,
+      "threads": 5,
+      "tasks": 3,
+      "handles": 311,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 15.1,
+      "tag": "tick",
+      "rss": 62615552,
+      "threads": 6,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 20.1,
+      "tag": "tick",
+      "rss": 62648320,
+      "threads": 6,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 25.1,
+      "tag": "tick",
+      "rss": 62726144,
+      "threads": 6,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 30.1,
+      "tag": "tick",
+      "rss": 61632512,
+      "threads": 6,
+      "tasks": 3,
+      "handles": 314,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 35.1,
+      "tag": "tick",
+      "rss": 62173184,
+      "threads": 7,
+      "tasks": 3,
+      "handles": 318,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 40.1,
+      "tag": "tick",
+      "rss": 61739008,
+      "threads": 7,
+      "tasks": 3,
+      "handles": 318,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 45.1,
+      "tag": "tick",
+      "rss": 62332928,
+      "threads": 7,
+      "tasks": 3,
+      "handles": 318,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 50.1,
+      "tag": "tick",
+      "rss": 61825024,
+      "threads": 7,
+      "tasks": 3,
+      "handles": 318,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 55.1,
+      "tag": "tick",
+      "rss": 62418944,
+      "threads": 7,
+      "tasks": 3,
+      "handles": 318,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 60.1,
+      "tag": "tick",
+      "rss": 61825024,
+      "threads": 7,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 65.1,
+      "tag": "tick",
+      "rss": 62316544,
+      "threads": 7,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 70.1,
+      "tag": "tick",
+      "rss": 62713856,
+      "threads": 7,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 75.0,
+      "tag": "tick",
+      "rss": 62787584,
+      "threads": 7,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 80.1,
+      "tag": "tick",
+      "rss": 63115264,
+      "threads": 7,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 85.0,
+      "tag": "tick",
+      "rss": 63115264,
+      "threads": 7,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 90.1,
+      "tag": "tick",
+      "rss": 63119360,
+      "threads": 7,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 95.0,
+      "tag": "tick",
+      "rss": 63119360,
+      "threads": 7,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 100.1,
+      "tag": "tick",
+      "rss": 63143936,
+      "threads": 8,
+      "tasks": 3,
+      "handles": 317,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 105.1,
+      "tag": "tick",
+      "rss": 63180800,
+      "threads": 8,
+      "tasks": 3,
+      "handles": 319,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 110.1,
+      "tag": "tick",
+      "rss": 63197184,
+      "threads": 8,
+      "tasks": 3,
+      "handles": 319,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 115.1,
+      "tag": "tick",
+      "rss": 63356928,
+      "threads": 8,
+      "tasks": 3,
+      "handles": 319,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 120.0,
+      "tag": "tick",
+      "rss": 63365120,
+      "threads": 8,
+      "tasks": 3,
+      "handles": 319,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 125.0,
+      "tag": "tick",
+      "rss": 63377408,
+      "threads": 8,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 130.0,
+      "tag": "tick",
+      "rss": 63389696,
+      "threads": 8,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 135.1,
+      "tag": "tick",
+      "rss": 63504384,
+      "threads": 9,
+      "tasks": 3,
+      "handles": 313,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "asyncio_4",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 140.1,
+      "tag": "tick",
+      "rss": 63504384,
+      "threads": 9,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "asyncio_4",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 145.1,
+      "tag": "tick",
+      "rss": 63721472,
+      "threads": 9,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "asyncio_4",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 150.1,
+      "tag": "tick",
+      "rss": 63987712,
+      "threads": 9,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "asyncio_4",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 155.1,
+      "tag": "tick",
+      "rss": 62377984,
+      "threads": 9,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "asyncio_4",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 160.1,
+      "tag": "tick",
+      "rss": 62529536,
+      "threads": 9,
+      "tasks": 3,
+      "handles": 316,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "asyncio_4",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 165.1,
+      "tag": "tick",
+      "rss": 62537728,
+      "threads": 9,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "asyncio_4",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 170.1,
+      "tag": "tick",
+      "rss": 62603264,
+      "threads": 9,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "asyncio_4",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 175.1,
+      "tag": "tick",
+      "rss": 62738432,
+      "threads": 9,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "asyncio_4",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    },
+    {
+      "t": 180.0,
+      "tag": "final",
+      "rss": 62738432,
+      "threads": 9,
+      "tasks": 3,
+      "handles": 315,
+      "thread_names": [
+        "MainThread",
+        "asyncio_0",
+        "asyncio_1",
+        "asyncio_2",
+        "asyncio_3",
+        "asyncio_4",
+        "exif_0",
+        "soak-server",
+        "thumb_0"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "timeline_cells": 8,
+  "status": "局域网直连\nYiRu",
+  "raw_requests_before_zoom": [
+    "http://127.0.0.1:56256/api/items/8/raw"
+  ],
+  "raw_decoded_after_click": false
+}

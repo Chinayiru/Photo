@@ -1,0 +1,12 @@
+{
+  "name": "check-frontend-api",
+  "command": [
+    "D:\\Photos\\.venv\\Scripts\\python.exe",
+    "scripts/check_frontend_api.py"
+  ],
+  "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+  "started_utc": "2026-11-03T14:19:23.559629+00:00",
+  "seconds": 1.079,
+  "exit_code": 0,
+  "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\check-frontend-api.log"
+}

@@ -1,0 +1,15 @@
+{
+  "name": "package-build",
+  "command": [
+    "D:\\Photos\\.venv\\Scripts\\python.exe",
+    "-m",
+    "PyInstaller",
+    "packaging/photobridge.spec",
+    "--noconfirm"
+  ],
+  "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+  "started_utc": "2026-11-03T14:26:37.294414+00:00",
+  "seconds": 39.5,
+  "exit_code": 0,
+  "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\package-build.log"
+}

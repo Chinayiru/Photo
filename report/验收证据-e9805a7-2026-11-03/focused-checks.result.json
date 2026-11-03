@@ -1,0 +1,13 @@
+{
+  "name": "focused-checks",
+  "command": [
+    "D:\\Photos\\.venv\\Scripts\\python.exe",
+    "D:\\Photos\\build\\final-validation-e9805a7-20261103\\focused_checks.py",
+    "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+  ],
+  "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+  "started_utc": "2026-11-03T14:29:10.293897+00:00",
+  "seconds": 7.406,
+  "exit_code": 1,
+  "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\focused-checks.log"
+}

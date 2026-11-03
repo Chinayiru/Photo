@@ -1,0 +1,20 @@
+{
+  "name": "soak-lan",
+  "command": [
+    "D:\\Photos\\.venv\\Scripts\\python.exe",
+    "scripts/soak_test.py",
+    "--hours",
+    "0.05",
+    "--interval",
+    "5",
+    "--synthetic",
+    "200",
+    "--report",
+    "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片\\build\\final-lan-soak-report.json"
+  ],
+  "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+  "started_utc": "2026-11-03T14:26:37.293406+00:00",
+  "seconds": 210.797,
+  "exit_code": 0,
+  "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\soak-lan.log"
+}

@@ -1,0 +1,24 @@
+{
+  "name": "soak-tunnel",
+  "command": [
+    "D:\\Photos\\.venv\\Scripts\\python.exe",
+    "scripts/soak_tunnel.py",
+    "--hours",
+    "0.05",
+    "--interval",
+    "5",
+    "--rounds-requests",
+    "4",
+    "--photos",
+    "40",
+    "--workdir",
+    "build/final-tunnel",
+    "--report",
+    "build/final-tunnel-report.json"
+  ],
+  "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+  "started_utc": "2026-11-03T14:21:59.309042+00:00",
+  "seconds": 182.11,
+  "exit_code": 1,
+  "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\soak-tunnel.log"
+}

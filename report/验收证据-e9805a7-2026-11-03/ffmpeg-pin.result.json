@@ -1,0 +1,14 @@
+{
+  "name": "ffmpeg-pin",
+  "command": [
+    "D:\\Photos\\.venv\\Scripts\\python.exe",
+    "scripts/check_ffmpeg_pin.py",
+    "--dir",
+    "build/tools/ffmpeg"
+  ],
+  "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+  "started_utc": "2026-11-03T14:21:10.849778+00:00",
+  "seconds": 1.75,
+  "exit_code": 0,
+  "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\ffmpeg-pin.log"
+}

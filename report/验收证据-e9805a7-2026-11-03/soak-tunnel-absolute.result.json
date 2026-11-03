@@ -1,0 +1,24 @@
+{
+  "name": "soak-tunnel-absolute",
+  "command": [
+    "D:\\Photos\\.venv\\Scripts\\python.exe",
+    "scripts/soak_tunnel.py",
+    "--hours",
+    "0.05",
+    "--interval",
+    "5",
+    "--rounds-requests",
+    "4",
+    "--photos",
+    "40",
+    "--workdir",
+    "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片\\build\\final-tunnel-absolute",
+    "--report",
+    "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片\\build\\final-tunnel-absolute-report.json"
+  ],
+  "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+  "started_utc": "2026-11-03T14:23:52.223175+00:00",
+  "seconds": 181.875,
+  "exit_code": 0,
+  "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\soak-tunnel-absolute.log"
+}

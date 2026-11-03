@@ -1,0 +1,460 @@
+[
+  {
+    "name": "check-docs",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "scripts/check_docs.py"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:19:23.546568+00:00",
+    "seconds": 0.484,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\check-docs.log"
+  },
+  {
+    "name": "check-frontend-api",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "scripts/check_frontend_api.py"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:19:23.559629+00:00",
+    "seconds": 1.079,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\check-frontend-api.log"
+  },
+  {
+    "name": "check-lint",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "scripts/check_lint.py"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:19:23.532607+00:00",
+    "seconds": 1.625,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\check-lint.log"
+  },
+  {
+    "name": "check-sandbox",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "scripts/check_sandbox.py"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:19:23.558627+00:00",
+    "seconds": 0.219,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\check-sandbox.log"
+  },
+  {
+    "name": "cross-volume-supplement",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "D:\\Photos\\build\\final-validation-e9805a7-20261103\\cross_volume.py",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:51:47.295262+00:00",
+    "seconds": 0.828,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\cross-volume-supplement.log"
+  },
+  {
+    "name": "e2e-acceptance",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "scripts/verify_acceptance_e2e.py"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:23:52.208393+00:00",
+    "seconds": 18.422,
+    "exit_code": 1,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-acceptance.log"
+  },
+  {
+    "name": "e2e-browser-fresh",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "D:\\Photos\\build\\final-validation-e9805a7-20261103\\browser_fresh_navigation.py",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:31:31.756121+00:00",
+    "seconds": 158.031,
+    "exit_code": 1,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-browser-fresh.log"
+  },
+  {
+    "name": "e2e-browser-functional-subset",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "D:\\Photos\\build\\final-validation-e9805a7-20261103\\browser_functional_subset.py",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:37:29.493376+00:00",
+    "seconds": 174.891,
+    "exit_code": 1,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-browser-functional-subset.log"
+  },
+  {
+    "name": "e2e-browser",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "scripts/verify_browser_e2e.py"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:21:59.309042+00:00",
+    "seconds": 154.563,
+    "exit_code": 1,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-browser.log"
+  },
+  {
+    "name": "e2e-cloud-viewer",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "D:\\Photos\\build\\final-validation-e9805a7-20261103\\cloud_viewer.py",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:41:05.507995+00:00",
+    "seconds": 6.75,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-cloud-viewer.log"
+  },
+  {
+    "name": "e2e-exe",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "D:\\Photos\\build\\final-validation-e9805a7-20261103\\exe_isolated.py",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:31:31.741883+00:00",
+    "seconds": 11.0,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-exe.log"
+  },
+  {
+    "name": "e2e-firefox",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "scripts/verify_firefox_e2e.py"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:21:59.309042+00:00",
+    "seconds": 9.016,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-firefox.log"
+  },
+  {
+    "name": "e2e-lan-isolated",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "D:\\Photos\\build\\final-validation-e9805a7-20261103\\lan_isolated.py",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:31:31.765625+00:00",
+    "seconds": 1.218,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-lan-isolated.log"
+  },
+  {
+    "name": "e2e-lan-viewer-evidence",
+    "command": [
+      "D:\\Photos\\.venv\\\\Scripts\\python.exe",
+      "D:\\Photos\\build\\final-validation-e9805a7-20261103\\lan_viewer_evidence.py",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:44:33.498810+00:00",
+    "seconds": 20.735,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-lan-viewer-evidence.log"
+  },
+  {
+    "name": "e2e-lan-viewer",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "D:\\Photos\\build\\final-validation-e9805a7-20261103\\lan_viewer.py",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:43:13.549554+00:00",
+    "seconds": 20.609,
+    "exit_code": 1,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-lan-viewer.log"
+  },
+  {
+    "name": "e2e-lan",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "scripts/verify_lan_e2e.py"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:21:10.872128+00:00",
+    "seconds": 34.797,
+    "exit_code": 1,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-lan.log"
+  },
+  {
+    "name": "e2e-organize",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "scripts/verify_organize_e2e.py"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:20:26.595233+00:00",
+    "seconds": 1.672,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-organize.log"
+  },
+  {
+    "name": "e2e-resume",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "scripts/verify_resume_e2e.py"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:20:26.595233+00:00",
+    "seconds": 8.922,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-resume.log"
+  },
+  {
+    "name": "e2e-watch",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "scripts/verify_watch_e2e.py"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:20:26.616153+00:00",
+    "seconds": 20.0,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\e2e-watch.log"
+  },
+  {
+    "name": "ffmpeg-pin",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "scripts/check_ffmpeg_pin.py",
+      "--dir",
+      "build/tools/ffmpeg"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:21:10.849778+00:00",
+    "seconds": 1.75,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\ffmpeg-pin.log"
+  },
+  {
+    "name": "focused-checks-retry",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "D:\\Photos\\build\\final-validation-e9805a7-20261103\\focused_checks.py",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:29:50.786228+00:00",
+    "seconds": 6.953,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\focused-checks-retry.log"
+  },
+  {
+    "name": "focused-checks",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "D:\\Photos\\build\\final-validation-e9805a7-20261103\\focused_checks.py",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:29:10.293897+00:00",
+    "seconds": 7.406,
+    "exit_code": 1,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\focused-checks.log"
+  },
+  {
+    "name": "focused-lan-original",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "D:\\Photos\\build\\final-validation-e9805a7-20261103\\focused_lan_original.py",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:41:39.717425+00:00",
+    "seconds": 17.281,
+    "exit_code": 1,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\focused-lan-original.log"
+  },
+  {
+    "name": "focused-qr",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "D:\\Photos\\build\\final-validation-e9805a7-20261103\\focused_qr.py",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:36:50.855425+00:00",
+    "seconds": 8.328,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\focused-qr.log"
+  },
+  {
+    "name": "focused-settings",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "D:\\Photos\\build\\final-validation-e9805a7-20261103\\focused_checks.py",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:31:31.777637+00:00",
+    "seconds": 18.188,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\focused-settings.log"
+  },
+  {
+    "name": "frontend-build",
+    "command": [
+      "E:\\Development tool\\nodejs\\npm.cmd",
+      "run",
+      "build"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片\\frontend",
+    "started_utc": "2026-11-03T14:21:10.838598+00:00",
+    "seconds": 12.843,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\frontend-build.log"
+  },
+  {
+    "name": "frontend-lint",
+    "command": [
+      "E:\\Development tool\\nodejs\\npm.cmd",
+      "run",
+      "lint"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片\\frontend",
+    "started_utc": "2026-11-03T14:21:10.830386+00:00",
+    "seconds": 24.547,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\frontend-lint.log"
+  },
+  {
+    "name": "package-build",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "-m",
+      "PyInstaller",
+      "packaging/photobridge.spec",
+      "--noconfirm"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:26:37.294414+00:00",
+    "seconds": 39.5,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\package-build.log"
+  },
+  {
+    "name": "pytest-final",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "-m",
+      "pytest",
+      "backend/tests",
+      "-ra",
+      "--durations=20",
+      "--junitxml=build/final-pytest-ready.xml"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:23:52.210397+00:00",
+    "seconds": 148.265,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\pytest-final.log"
+  },
+  {
+    "name": "pytest-full",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "-m",
+      "pytest",
+      "backend/tests",
+      "-ra",
+      "--durations=20",
+      "--junitxml=build/final-pytest.xml"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:19:23.535114+00:00",
+    "seconds": 146.64,
+    "exit_code": 1,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\pytest-full.log"
+  },
+  {
+    "name": "soak-lan",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "scripts/soak_test.py",
+      "--hours",
+      "0.05",
+      "--interval",
+      "5",
+      "--synthetic",
+      "200",
+      "--report",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片\\build\\final-lan-soak-report.json"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:26:37.293406+00:00",
+    "seconds": 210.797,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\soak-lan.log"
+  },
+  {
+    "name": "soak-tunnel-absolute",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "scripts/soak_tunnel.py",
+      "--hours",
+      "0.05",
+      "--interval",
+      "5",
+      "--rounds-requests",
+      "4",
+      "--photos",
+      "40",
+      "--workdir",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片\\build\\final-tunnel-absolute",
+      "--report",
+      "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片\\build\\final-tunnel-absolute-report.json"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:23:52.223175+00:00",
+    "seconds": 181.875,
+    "exit_code": 0,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\soak-tunnel-absolute.log"
+  },
+  {
+    "name": "soak-tunnel",
+    "command": [
+      "D:\\Photos\\.venv\\Scripts\\python.exe",
+      "scripts/soak_tunnel.py",
+      "--hours",
+      "0.05",
+      "--interval",
+      "5",
+      "--rounds-requests",
+      "4",
+      "--photos",
+      "40",
+      "--workdir",
+      "build/final-tunnel",
+      "--report",
+      "build/final-tunnel-report.json"
+    ],
+    "cwd": "C:\\Users\\alice\\.codex\\worktrees\\final-validation-e9805a7\\远程照片",
+    "started_utc": "2026-11-03T14:21:59.309042+00:00",
+    "seconds": 182.11,
+    "exit_code": 1,
+    "log": "D:\\Photos\\build\\final-validation-e9805a7-20261103\\soak-tunnel.log"
+  }
+]
