@@ -95,8 +95,8 @@ def test_real_repo_is_clean() -> None:
 
 
 def test_every_rule_is_registered() -> None:
-    """20 条都要有实现，且编号连续 —— 少一条就少守一个洞。"""
-    assert sorted(CL.RULES) == list(range(1, 21))
+    """每条都要有实现，且编号连续 —— 少一条就少守一个洞。"""
+    assert sorted(CL.RULES) == list(range(1, len(CL.RULES) + 1))
 
 
 def test_all_rules_have_nonempty_titles() -> None:
@@ -632,14 +632,75 @@ def test_rule_20_parses_r_add_style_routes(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 规则 21：库内内容必须经沙箱句柄读取
+# ---------------------------------------------------------------------------
+
+
+def test_rule_21_flags_a_new_path_open(tmp_path: Path) -> None:
+    """业务模块里新写一处 `open(path)` 就要报 —— 这才是护栏的意义。"""
+    t = Tree(tmp_path)
+    t.write("handlers/page.py", (
+        "def sniff(path):\n"
+        "    with open(path, 'rb') as fh:\n"
+        "        return fh.read(8)\n"
+    ))
+    found = t.run(21)
+    assert [(f.line, "open()" in f.message) for f in found] == [(2, True)]
+
+
+def test_rule_21_flags_path_read_bytes(tmp_path: Path) -> None:
+    """`p.read_bytes()` 同样是"按路径打开"，不能漏。"""
+    t = Tree(tmp_path)
+    t.write("video.py", (
+        "def probe(p):\n"
+        "    return p.read_bytes()[:8]\n"
+        "def probe2(p):\n"
+        "    return p.read_bytes()[:8]\n"
+    ))
+    found = t.run(21)
+    # `video.py` 的存量基线是 1，所以第二处才报
+    assert [f.line for f in found] == [4]
+
+
+def test_rule_21_lets_the_baseline_through(tmp_path: Path) -> None:
+    """存量按 `_HANDLE_BASELINE` 记账：恰好等于基线时一句都不报。"""
+    t = Tree(tmp_path)
+    t.write("indexer.py", (
+        "def head(path):\n"
+        "    with open(path, 'rb') as fh:\n"
+        "        return fh.read(32)\n"
+    ))
+    assert t.run(21) == []
+
+
+def test_rule_21_skips_infrastructure(tmp_path: Path) -> None:
+    """配置/日志/库这些模块读的是自己的文件，不在"库内媒体"范围内。"""
+    t = Tree(tmp_path)
+    t.write("config.py", "def load(p):\n    return open(p, 'rb').read()\n")
+    t.write("sandbox.py", "def rd(p):\n    return p.read_bytes()\n")
+    assert t.run(21) == []
+
+
+def test_rule_21_ignores_os_open(tmp_path: Path) -> None:
+    """`os.open()` 返回 fd，本身不是"按路径读内容"，禁掉它等于禁掉句柄化的实现。"""
+    t = Tree(tmp_path)
+    t.write("handlers/reserve.py", (
+        "import os\n"
+        "def make(dst):\n"
+        "    os.close(os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))\n"
+    ))
+    assert t.run(21) == []
+
+# ---------------------------------------------------------------------------
 # CLI 行为
 # ---------------------------------------------------------------------------
 
 
-def test_cli_list_prints_all_twenty(capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_list_prints_every_rule(capsys: pytest.CaptureFixture[str]) -> None:
+    """规则清单必须与 `RULES` 一致 —— 加规则时忘了登记会被这条逮住。"""
     assert CL.main(["--list"]) == 0
     out = capsys.readouterr().out
-    for n in range(1, 21):
+    for n in sorted(CL.RULES):
         assert f"{n:2d}" in out or f"{n} " in out
 
 

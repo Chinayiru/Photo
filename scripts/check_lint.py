@@ -1612,6 +1612,83 @@ def _host_guard_wired(ctx: Ctx) -> bool:
 # 注册表
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 规则 21：库内媒体内容必须经沙箱句柄读取
+# ---------------------------------------------------------------------------
+
+#: 这些模块本身就是基础设施：配置读自己、日志写自己、数据库开自己、
+#: 前端静态文件由 `static.py` 按 `dist` 读。它们不在"库内媒体"范围内。
+_HANDLE_INFRA: frozenset[str] = frozenset({
+    "config.py", "audit.py", "db.py", "logging_setup.py", "static.py",
+    "server.py", "autostart.py", "tray.py", "sandbox.py", "errors.py",
+    "single_instance.py", "uploads_io.py", "thumbs.py",
+})
+
+#: 视为"按路径读内容"的调用：内置 `open()` 与 Path/Image 上的这些方法。
+#: `os.open()` **不算** —— 它返回 fd，调用方自己决定怎么用（`sandbox` 内部
+#: 就是靠 `os.open` 实现句柄化的，禁掉它等于禁掉修法本身）。
+_CONTENT_IO_ATTRS: frozenset[str] = frozenset({
+    "open", "read_bytes", "read_text", "write_bytes", "write_text",
+})
+
+#: 存量基线：`文件 -> 允许的按路径 IO 次数`。**只减不增**。
+#: 每一条都在 `docs/11` ISSUE-093 里列着"为什么还没改"，改掉一条就往下调一格。
+_HANDLE_BASELINE: dict[str, int] = {
+    "exif.py": 1,             # Image.open(path)：扫描/上传后读 EXIF，无句柄入口
+    "handlers/common.py": 1,  # _body_stream 的 fh=None 兜底（转码产物/缩略图缓存）
+    "indexer.py": 1,          # 扫描时读头 32 字节做魔术字节判定
+    "uploads.py": 3,          # 临时文件：写分片、算哈希、读头校验
+    "video.py": 1,            # 探测视频容器（读头部若干字节）
+}
+
+
+def _content_io_sites(tree: ast.Module) -> list[tuple[int, str]]:
+    out: list[tuple[int, str]] = []
+    for call in _calls(tree):
+        name = _call_name(call)
+        if name == "open":
+            out.append((call.lineno, "open()"))
+            continue
+        if not isinstance(call.func, ast.Attribute):
+            continue
+        if call.func.attr not in _CONTENT_IO_ATTRS:
+            continue
+        recv = ast.unparse(call.func.value)
+        if recv == "os" or recv.endswith(".os"):
+            continue
+        out.append((call.lineno, f"{recv}.{call.func.attr}()"))
+    return out
+
+
+def _rule_21(ctx: Ctx) -> list[Finding]:
+    """规则 21：库内媒体内容必须经 `sandbox.open_read()` 之类的句柄读。
+
+    为什么需要这条：`sandbox.resolve()` 只校验**校验那一刻**的路径。
+    先 `resolve()` 拿到 Path，再 `path.read_bytes()`，中间被换成 junction
+    就绕过了（`probe2` 实测读到库外 `b'LOOT'`；`sandbox.open_read()` 在
+    同一窗口下报 `E1009 handle_mismatch`）。
+
+    所以：拿到沙箱路径之后，读内容必须走 `sandbox.open_read/open_write/
+    open_append`（它们把授权判据绑在同一个句柄上）。本规则不要求现在就
+    把存量全改完——**那是 `docs/11` ISSUE-093 的排期**——只要求"不许新增"，
+    存量按 `_HANDLE_BASELINE` 记账，改一条往下调一格。
+    """
+    out: list[Finding] = []
+    for path, tree in ctx.app_trees():
+        if path.name in _HANDLE_INFRA:
+            continue
+        rel = ctx.rel_to_app(path)
+        sites = _content_io_sites(tree)
+        allowed = _HANDLE_BASELINE.get(rel, 0)
+        for lineno, what in sites[allowed:]:
+            out.append(Finding(
+                21, ctx.rel(path), lineno,
+                f"按路径读内容（{what}）—— 授权判据与打开动作分离，"
+                "换 junction 即越过沙箱；改用 sandbox.open_read()/open_write()",
+            ))
+    return out
+
+
 RULES: dict[int, tuple[str, Callable[[Ctx], list[Finding]]]] = {
     1: ("所有文件访问必须经过沙箱", _rule_1),
     2: ("删除用户数据必须进回收站（send2trash）", _rule_2),
@@ -1633,6 +1710,7 @@ RULES: dict[int, tuple[str, Callable[[Ctx], list[Finding]]]] = {
     18: ("默认只绑回环，通配地址必须过三道门", _rule_18),
     19: ("凭据必须用 secrets，不得用 random", _rule_19),
     20: ("除白名单外所有端点必须挂鉴权", _rule_20),
+    21: ("库内内容必须经沙箱句柄读取（不许新增按路径 open）", _rule_21),
 }
 
 
