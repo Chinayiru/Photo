@@ -1,0 +1,117 @@
+{
+  "_说明": "示例配置，只描述结构与默认值。真实配置放在 data/config.json（已被 .gitignore 排除），不要提交。占位符 <...> 全部要换成你自己的值。",
+  "app": {
+    "name": "PhotoBridge",
+    "version": "0.1.0",
+    "mode": "readwrite",
+    "tray": true,
+    "autostart": true
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8787,
+    "transport": "local_http",
+    "allow_lan": true,
+    "trusted_hosts": [],
+    "panel_http": false,
+    "cors_origins": []
+  },
+  "roots": [
+    {
+      "id": "library",
+      "path": "<照片库绝对路径，例如 D:/Photos>",
+      "label": "我的照片库",
+      "mode": "readwrite",
+      "enabled": true,
+      "recursive": true
+    }
+  ],
+  "upload": {
+    "subdir": "手机上传",
+    "chunk_mb_lan": 8,
+    "chunk_mb_wan": 0.25,
+    "max_file_mb": 2048,
+    "session_ttl_hours": 24,
+    "dedup": true,
+    "allowed_exts": [
+      "avif",
+      "bmp",
+      "gif",
+      "heic",
+      "heif",
+      "jpeg",
+      "jpg",
+      "png",
+      "tif",
+      "tiff",
+      "webp"
+    ]
+  },
+  "thumbs": {
+    "sizes": [320, 1600],
+    "format": "webp",
+    "quality": 78,
+    "workers": 4,
+    "gen_version": 1,
+    "cache_mb": 1024
+  },
+  "video": {
+    "enabled": true,
+    "ffmpeg_dir": "",
+    "max_concurrency": 2,
+    "frame_at": 1.0,
+    "probe_timeout": 10.0,
+    "frame_timeout": 30.0,
+    "transcode_concurrency": 1,
+    "transcode_cache_mb": 2048
+  },
+  "auth": {
+    "require_pairing": true,
+    "allow_delete": true,
+    "delete_to_recycle_bin": true,
+    "allow_move": true,
+    "token_ttl_days": 90
+  },
+  "guest": {
+    "max_online": 3,
+    "max_visible": 3
+  },
+  "index": {
+    "scan_on_start": true,
+    "watch": true,
+    "hash_on_index": false,
+    "batch_size": 500,
+    "debounce_sec": 2.0,
+    "exclude_dirs": [
+      "@eaDir",
+      "System Volume Information",
+      "$RECYCLE.BIN",
+      ".git",
+      "node_modules",
+      ".thumbnails",
+      "#recycle",
+      ".Trash",
+      ".Trashes",
+      ".photobridge_tmp",
+      "data",
+      "lost+found",
+      ".Spotlight-V100",
+      ".fseventsd"
+    ],
+    "exclude_files": [
+      "Thumbs.db",
+      "desktop.ini",
+      ".DS_Store",
+      "ehthumbs.db"
+    ]
+  },
+  "locale": {
+    "tz_offset_minutes": 480
+  },
+  "cloud": {
+    "base_url": "<云端中继地址，例如 https://photos.example.com>",
+    "enabled": false,
+    "device_id": "",
+    "agent_token": ""
+  }
+}
