@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Final, Sequence
 
 from .. import video as videomod
+from ..sandbox import strip_bidi
 from ..thumbs import source_signature
 
 log = logging.getLogger(__name__)
@@ -553,9 +554,19 @@ def download_filename(name: str | None, fallback: str) -> str:
 
     ⚠️ 必须同时去掉路径分隔符与 CR/LF：CRLF 注入可以伪造响应头，
     而 `..\\` 在 `Content-Disposition` 里可能被某些客户端当作路径。
+
+    ⚠️ 还要去掉 **bidi 控制字符**：`?name=` 是用户可控入参，带 U+202E
+    时客户端会把 `photo<U+202E>gnp.exe` 显示成 `photoexe.png`（附件名
+    欺骗）。这里复用 `sandbox.strip_bidi()` 的同一集合，不另建白名单
+    ——两处各写一套必然漂移（审计 F1：`download_filename` 曾漏掉它）。
+
+    边界：只剥 `BIDI_CONTROLS`（U+202A–202E、U+2066–2069、U+200E/200F）。
+    U+200B–200D 与 U+FEFF **不剥** —— 它们在中文/阿拉伯文排版里是正常
+    组合字符，无差别删除会毁掉真实文件名（与 `sandbox` 的取舍一致）。
     """
-    raw = (name or fallback or "download").strip()
+    raw = (name or "").strip() or (fallback or "").strip() or "download"
     cleaned = "".join(c for c in raw if c not in '\\/:*?"<>|\r\n\t')
+    cleaned = strip_bidi(cleaned)
     cleaned = cleaned.strip().strip(".")
     if not cleaned:
         return "download"

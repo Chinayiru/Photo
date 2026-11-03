@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -70,6 +71,14 @@ def _lines(cfg: Config) -> list[str]:
 
 def _rows(db: Database) -> list[dict]:
     return db.query("SELECT * FROM audit_log ORDER BY id")
+
+
+@pytest.fixture(autouse=True)
+def _reset_index_warn_state() -> None:
+    """索引告警节流是模块级状态，用例之间必须隔离。"""
+    audit._index_fail_streak = 0
+    audit._index_fail_since = 0.0
+    audit._index_last_warn = 0.0
 
 
 # --------------------------------------------------------------------------
@@ -356,7 +365,7 @@ def test_missing_db_only_writes_file(cfg: Config) -> None:
 
 
 def test_table_failure_is_tolerated(cfg: Config) -> None:
-    """写表失败只记 DEBUG，不抛 —— 为了写审计而让用户的删除失败是荒谬的。"""
+    """写表失败只记**限频 WARNING**，不抛 —— 为了写审计而让用户的删除失败是荒谬的。"""
     class _BrokenDb:
         path = Path("broken.db")
 
@@ -366,6 +375,71 @@ def test_table_failure_is_tolerated(cfg: Config) -> None:
     audit.record(_BrokenDb(), cfg, audit.ACTION_DELETE,   # type: ignore[arg-type]
                  rel_path="a.jpg", device="PC")
     assert len(_lines(cfg)) == 1, "表写失败不该影响文件（主记录）"
+
+
+class _BrokenDb:
+    """永远写表失败的最小替身（用于告警/节流用例）。"""
+
+    path = Path("broken.db")
+
+    def execute(self, *a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+
+def test_table_failure_warns_at_warning_level(cfg: Config,
+                                              caplog: pytest.LogCaptureFixture) -> None:
+    """索引失败必须能被**生产日志级别**看见（原来只记 DEBUG ≈ 静默）。"""
+    with caplog.at_level(logging.WARNING, logger="backend.app.audit"):
+        audit.record(_BrokenDb(), cfg, audit.ACTION_DELETE,   # type: ignore[arg-type]
+                     rel_path="a.jpg", device="PC")
+    hits = [r for r in caplog.records if "写审计索引表失败" in r.getMessage()]
+    assert len(hits) == 1
+    msg = hits[0].getMessage()
+    assert "连续 1 次" in msg
+    assert "audit.log" in msg, "要告诉运维文件主记录仍在、索引可重建"
+    assert "OperationalError" in msg, "失败类别要有，用来区分锁冲突与磁盘故障"
+    # 不许把内部细节（SQL、路径、令牌）写进日志
+    assert "INSERT INTO" not in msg
+    assert "pbc1." not in msg
+
+
+def test_table_failure_warning_is_throttled(cfg: Config,
+                                            caplog: pytest.LogCaptureFixture) -> None:
+    """连续失败只告警一次，否则每条业务操作都会刷一行 WARNING。"""
+    with caplog.at_level(logging.WARNING, logger="backend.app.audit"):
+        for i in range(5):
+            audit.record(_BrokenDb(), cfg, audit.ACTION_DELETE,   # type: ignore[arg-type]
+                         rel_path=f"{i}.jpg", device="PC")
+    hits = [r for r in caplog.records if "写审计索引表失败" in r.getMessage()]
+    assert len(hits) == 1
+    assert audit._index_fail_streak == 5
+
+
+def test_table_failure_rewarns_after_window(cfg: Config,
+                                            caplog: pytest.LogCaptureFixture,
+                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """节流窗口过后再告警一次（长时间故障不能被首条日志掩埋）。"""
+    monkeypatch.setattr(audit, "_INDEX_WARN_EVERY", 0.0)
+    with caplog.at_level(logging.WARNING, logger="backend.app.audit"):
+        for i in range(3):
+            audit.record(_BrokenDb(), cfg, audit.ACTION_DELETE,   # type: ignore[arg-type]
+                         rel_path=f"{i}.jpg", device="PC")
+    hits = [r for r in caplog.records if "写审计索引表失败" in r.getMessage()]
+    assert len(hits) == 3
+
+
+def test_index_recovery_is_reported_once(db: Database, cfg: Config,
+                                         caplog: pytest.LogCaptureFixture) -> None:
+    """恢复后补一条提示并清零；没有失败时不刷恢复提示。"""
+    audit.record(_BrokenDb(), cfg, audit.ACTION_DELETE,   # type: ignore[arg-type]
+                 rel_path="a.jpg", device="PC")
+    with caplog.at_level(logging.WARNING, logger="backend.app.audit"):
+        audit.record(db, cfg, audit.ACTION_DELETE, rel_path="b.jpg", device="PC")
+        audit.record(db, cfg, audit.ACTION_DELETE, rel_path="c.jpg", device="PC")
+    recovered = [r for r in caplog.records if "已恢复" in r.getMessage()]
+    assert len(recovered) == 1, "只在恢复那一刻提示一次"
+    assert audit._index_fail_streak == 0
+    assert db.scalar("SELECT COUNT(*) FROM audit_log") == 2
 
 
 def test_file_failure_is_tolerated(db: Database, cfg: Config,

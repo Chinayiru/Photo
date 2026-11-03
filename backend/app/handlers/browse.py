@@ -283,9 +283,6 @@ async def get_item(ctx: Ctx) -> Reply:
 # 缩略图 / 预览 / 原图
 # --------------------------------------------------------------------------
 
-def _size_allowed(st: AppState, size: int) -> bool:
-    return size in st.thumb_sizes()
-
 
 def _source_sig(st: AppState, row: Any) -> str:
     """缩略图缓存签名 —— 取**磁盘上**的真实 mtime/size。

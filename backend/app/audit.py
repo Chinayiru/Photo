@@ -205,6 +205,48 @@ def parse_line(line: str) -> dict[str, str]:
 # 写入
 # --------------------------------------------------------------------------
 
+#: 索引表连续失败时的告警节流窗口（秒）。
+#:
+#: 表是索引、文件是主记录，所以写表失败**不能**让业务失败；但"一只失败"
+#: 必须能被看见 —— 原来这里只记 DEBUG，而生产日志级别下 DEBUG 等于静默，
+#: 结果是"审计索引悄悄停更、没人发现"（审计 F1-c）。节流是为了避免
+#: 每条业务操作刷一行 WARNING 把日志打满。
+_INDEX_WARN_EVERY: Final[float] = 60.0
+
+_index_fail_streak: int = 0
+_index_fail_since: float = 0.0
+_index_last_warn: float = 0.0
+
+
+def _note_index_failure(action: str, exc: BaseException) -> None:
+    """记一次索引写入失败：首失败与每 60 秒各告警一次，其余只计数。"""
+    global _index_fail_streak, _index_fail_since, _index_last_warn
+    now = time.time()
+    if _index_fail_streak == 0:
+        _index_fail_since = now
+    _index_fail_streak += 1
+    if _index_fail_streak == 1 or (now - _index_last_warn) >= _INDEX_WARN_EVERY:
+        _index_last_warn = now
+        log.warning(
+            "写审计索引表失败（连续 %d 次，已持续 %.0f 秒）action=%s："
+            "文件记录已落盘，索引可由 audit.log 重建；原因 %s",
+            _index_fail_streak, now - _index_fail_since, action,
+            type(exc).__name__,
+        )
+        # 首失败带上堆栈，后续节流告警不再重复整段 traceback。
+        if _index_fail_streak == 1:
+            log.debug("审计索引首次失败的堆栈", exc_info=exc)
+
+
+def _note_index_ok() -> None:
+    """索引写入恢复：若此前有失败，补一条恢复提示并清零。"""
+    global _index_fail_streak
+    if _index_fail_streak:
+        log.warning("写审计索引表已恢复（此前连续失败 %d 次），索引不再缺行",
+                    _index_fail_streak)
+        _index_fail_streak = 0
+
+
 def record(
     db: "Database",
     cfg: "Config",
@@ -221,7 +263,7 @@ def record(
     此时只写文件。文件是主记录，它必须尽量写成。
 
     本函数**不抛异常**。审计失败不该让用户的删除/上传失败；
-    但也**绝不静默**：文件写失败记 WARNING，表写失败记 DEBUG
+    但也**绝不静默**：文件写失败记 WARNING，表写失败记**限频 WARNING**
     （表是索引，丢了能靠文件重建；文件丢了才是真的没了）。
     """
     payload = dict(detail or {})
@@ -250,8 +292,10 @@ def record(
              action, safe_field(rel_path),
              json.dumps(payload, ensure_ascii=False)),
         )
-    except Exception:  # noqa: BLE001 —— 索引写失败不能影响业务
-        log.debug("写审计索引表失败 action=%s", action, exc_info=True)
+    except Exception as exc:  # noqa: BLE001 —— 索引写失败不能影响业务
+        _note_index_failure(action, exc)
+    else:
+        _note_index_ok()
 
 
 def _append_file(cfg: "Config", line: str, *, action: str) -> None:
