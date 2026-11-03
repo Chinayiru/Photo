@@ -77,6 +77,7 @@ from backend.app.sandbox import (
     is_dir,
     is_within,
     normalize_rel,
+    open_verified,
     resolve,
     safe_display,
     strip_bidi,
@@ -453,6 +454,60 @@ def test_traversal_before_junction_is_still_traversal(junction_library: tuple[Pa
     """
     lib, _esc, _outside = junction_library
     assert _rule(_root(lib), "esc/../secret.txt") == "parent_traversal"
+
+
+# ---------------------------------------------------------------------------
+# G2 组：句柄级打开（open_verified / fsopen）
+# ---------------------------------------------------------------------------
+
+
+def test_open_verified_reads_a_plain_file(tmp_path: Path) -> None:
+    """正常文件照读 —— 复核只是"多核对一次"，不是"多要一份权限"。"""
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"hello")
+    with open_verified(f, "rb") as fh:
+        assert fh.read() == b"hello"
+
+
+def test_open_verified_missing_file_is_file_not_found(tmp_path: Path) -> None:
+    """不存在要抛 `FileNotFoundError`（调用方按 404 处理），不能变成沙箱拒绝。"""
+    with pytest.raises(FileNotFoundError):
+        open_verified(tmp_path / "nope.bin", "rb")
+
+
+def test_open_verified_rejects_a_swapped_parent(tmp_path: Path) -> None:
+    """检查之后把父目录换成 junction：复核必须拒绝（这就是 TOCTOU）。"""
+    lib = tmp_path / "lib"
+    (lib / "race").mkdir(parents=True)
+    target = lib / "race" / "ok.jpg"
+    target.write_bytes(b"inside")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "ok.jpg").write_bytes(b"LOOT")
+
+    with open_verified(target, "rb") as fh:
+        assert fh.read() == b"inside"
+
+    # 换位：必须先删文件再删目录，否则 rmdir 失败、junction 建不起来
+    target.unlink()
+    (lib / "race").rmdir()
+    if not _make_junction(lib / "race", outside):
+        pytest.skip("本机无法创建 junction（mklink /J 失败）")
+
+    with pytest.raises(SandboxError) as ei:
+        open_verified(lib / "race" / "ok.jpg", "rb")
+    assert ei.value.rule == "handle_mismatch"
+
+
+def test_fsopen_primitives_are_importable_without_sandbox(tmp_path: Path) -> None:
+    """`fsopen` 必须不依赖 sandbox —— `video.py` 靠这一点避开 import 环。"""
+    from backend.app import fsopen
+
+    f = tmp_path / "b.bin"
+    f.write_bytes(b"xy")
+    with fsopen.open_verified(f, "rb") as fh:
+        assert fh.read() == b"xy"
+    assert fsopen.norm_final("C:\\Temp\\A") == fsopen.norm_final("c:\\temp\\a")
 
 
 # ---------------------------------------------------------------------------

@@ -974,7 +974,7 @@ def _append_chunk_locked(
         raise AppError(E1012, f"临时路径不可用：{exc.rule}") from None
 
     try:
-        with open(temp, "r+b") as fh:
+        with sandbox.open_verified(temp, "r+b") as fh:
             fh.seek(received)
             fh.write(data)
             fh.flush()
@@ -1028,7 +1028,7 @@ def _append_chunk_locked(
 
 def hash_file(path: Path, *, chunk: int = HASH_CHUNK) -> str:
     h = hashlib.sha256()
-    with open(path, "rb") as fh:
+    with sandbox.open_verified(path, "rb") as fh:
         while True:
             block = fh.read(chunk)
             if not block:
@@ -1093,7 +1093,7 @@ def complete_session(
     # 与 sha256 不符的处理**相反** —— 后者保留临时文件让客户端重传坏分片
     # （内容是对的，只是传输坏了），而伪装文件的字节再传一万遍也还是 exe。
     try:
-        with open(temp, "rb") as fh:
+        with sandbox.open_verified(temp, "rb") as fh:
             head = fh.read(MAGIC_HEAD_BYTES)
         check_magic(cfg, sess["declared_name"], head)
     except AppError:

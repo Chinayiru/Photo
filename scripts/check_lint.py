@@ -1633,13 +1633,29 @@ _CONTENT_IO_ATTRS: frozenset[str] = frozenset({
 
 #: 存量基线：`文件 -> 允许的按路径 IO 次数`。**只减不增**。
 #: 每一条都在 `docs/11` ISSUE-093 里列着"为什么还没改"，改掉一条就往下调一格。
-_HANDLE_BASELINE: dict[str, int] = {
-    "exif.py": 1,             # Image.open(path)：扫描/上传后读 EXIF，无句柄入口
-    "handlers/common.py": 1,  # _body_stream 的 fh=None 兜底（转码产物/缩略图缓存）
-    "indexer.py": 1,          # 扫描时读头 32 字节做魔术字节判定
-    "uploads.py": 3,          # 临时文件：写分片、算哈希、读头校验
-    "video.py": 1,            # 探测视频容器（读头部若干字节）
-}
+_HANDLE_BASELINE: dict[str, int] = {}
+"""存量记账表。现在是空的 —— 7 处存量都改成了 `sandbox.open_verified()`。
+
+保留这个机制是因为以后可能出现"确实没法走句柄"的位置（比如第三方库只吃
+路径）；那时往这里加一行并写清理由，比关掉规则安全。空表意味着**任何**
+新增的按路径打开都会报错。"""
+
+
+def _opens_a_handle(call: ast.Call) -> bool:
+    """`X.open(fh)` 是不是在打开一个**句柄**（而不是路径）。
+
+    只认"第一个位置参数是个名字，且名字以 fh/fp/handle 结尾"这一种形态 ——
+    例如 `Image.open(fh)`：文件已经由 `sandbox.open_verified()` 打开并复核过，
+    这里再按路径算会把正确写法判成违规。
+
+    故意不做得更聪明（比如判断赋值来源）：宽口径的豁免等于把这条规则废掉。
+    """
+    if not call.args:
+        return False
+    first = call.args[0]
+    if not isinstance(first, ast.Name):
+        return False
+    return first.id.endswith(("fh", "fp", "handle"))
 
 
 def _content_io_sites(tree: ast.Module) -> list[tuple[int, str]]:
@@ -1655,6 +1671,9 @@ def _content_io_sites(tree: ast.Module) -> list[tuple[int, str]]:
             continue
         recv = ast.unparse(call.func.value)
         if recv == "os" or recv.endswith(".os"):
+            continue
+        if call.func.attr == "open" and _opens_a_handle(call):
+            # `Image.open(fh)`：参数已经是句柄，不再有"按路径打开"的窗口。
             continue
         out.append((call.lineno, f"{recv}.{call.func.attr}()"))
     return out

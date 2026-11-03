@@ -216,9 +216,10 @@ def check_content(path: str, *, size: int = -1) -> bool:
     try:
         if 0 <= size < 12:
             return False
-        with open(path, "rb") as fh:
+        with sandbox.open_verified(path, "rb") as fh:
             head = fh.read(_HEAD_BYTES)
-    except OSError:
+    except (OSError, sandbox.SandboxError):
+        # 换位拒绝与"读不到"同类处理：判成 False 会让正常照片永远进不了库。
         return True
     if len(head) < 12:
         return False

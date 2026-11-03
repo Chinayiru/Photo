@@ -658,19 +658,50 @@ def test_rule_21_flags_path_read_bytes(tmp_path: Path) -> None:
         "    return p.read_bytes()[:8]\n"
     ))
     found = t.run(21)
-    # `video.py` 的存量基线是 1，所以第二处才报
-    assert [f.line for f in found] == [4]
+    # 基线已清零：两处都要报，一处都不能漏
+    assert [f.line for f in found] == [2, 4]
 
 
-def test_rule_21_lets_the_baseline_through(tmp_path: Path) -> None:
-    """存量按 `_HANDLE_BASELINE` 记账：恰好等于基线时一句都不报。"""
+def test_rule_21_accepts_the_sandbox_handle(tmp_path: Path) -> None:
+    """走 `sandbox.open_verified()` 的不报 —— 那才是规则要求的写法。"""
     t = Tree(tmp_path)
     t.write("indexer.py", (
+        "from . import sandbox\n"
         "def head(path):\n"
-        "    with open(path, 'rb') as fh:\n"
+        "    with sandbox.open_verified(path, 'rb') as fh:\n"
         "        return fh.read(32)\n"
     ))
     assert t.run(21) == []
+
+
+def test_rule_21_accepts_an_already_open_handle(tmp_path: Path) -> None:
+    """`Image.open(fh)` 是"用句柄"，不是"按路径打开" —— 不能误报。"""
+    t = Tree(tmp_path)
+    t.write("exif.py", (
+        "from . import sandbox\n"
+        "from PIL import Image\n"
+        "def read(path):\n"
+        "    with sandbox.open_verified(path) as fh:\n"
+        "        return Image.open(fh).size\n"
+    ))
+    assert t.run(21) == []
+
+
+def test_rule_21_baseline_is_accounted(tmp_path: Path) -> None:
+    """存量记账机制还在：往基线里填 1，同一个文件就只报第 2 处。"""
+    t = Tree(tmp_path)
+    t.write("exif.py", (
+        "def a(p):\n"
+        "    return open(p, 'rb').read(8)\n"
+        "def b(p):\n"
+        "    return open(p, 'rb').read(8)\n"
+    ))
+    assert CL._HANDLE_BASELINE == {}
+    CL._HANDLE_BASELINE["exif.py"] = 1
+    try:
+        assert [f.line for f in t.run(21)] == [4]
+    finally:
+        CL._HANDLE_BASELINE.clear()
 
 
 def test_rule_21_skips_infrastructure(tmp_path: Path) -> None:

@@ -27,6 +27,13 @@ from typing import IO, Final, Literal
 
 from .config import Config, RootConfig, TMP_DIRNAME, get as get_config
 from .errors import E1004, E1009, E1015, SandboxError
+from .fsopen import HandleMismatch
+from .fsopen import assert_identity as _fs_assert_identity
+from .fsopen import assert_same_path as _fs_assert_same_path
+from .fsopen import identity as _identity
+from .fsopen import norm_final as _norm_final
+from .fsopen import open_verified as _fs_open_verified
+from .fsopen import strip_win_prefix as _strip_win_prefix
 
 Need = Literal["read", "write", "modify", "delete"]
 
@@ -188,9 +195,9 @@ def resolve_dir(root: RootConfig, rel_path: str, *,
 # 只用 `O_NOFOLLOW` 是不够的（复核报告 V 已指出）：Windows 的 junction
 # 不是 symlink，`O_NOFOLLOW` 拦不住目录联接。
 
-def _identity(st: os.stat_result) -> tuple[int, int]:
-    """文件身份。Windows 上也给 st_ino（NTFS 文件索引），可用来比对。"""
-    return (int(getattr(st, "st_dev", 0)), int(getattr(st, "st_ino", 0)))
+def _handle_rule(exc: HandleMismatch) -> str:
+    """把 `fsopen` 的拒绝理由翻译成本模块的错误码。"""
+    return "handle_lost" if exc.reason == "lost" else "handle_mismatch"
 
 
 def _assert_same_path(again: Path, path: Path) -> None:
@@ -199,8 +206,10 @@ def _assert_same_path(again: Path, path: Path) -> None:
     换位发生在 `resolve()` 与 `os.open()` 之间时，这一步要么已经在
     `resolve()` 里被 `_step_5_reparse` 拒掉，要么在这里因为落点变了而被拒。
     """
-    if _norm_final(str(again)) != _norm_final(str(path)):
-        raise SandboxError("handle_mismatch", None, E1009)
+    try:
+        _fs_assert_same_path(again, path)
+    except HandleMismatch as exc:
+        raise SandboxError(_handle_rule(exc), None, E1009) from None
 
 
 def _assert_identity(fd: int, path: Path) -> None:
@@ -210,14 +219,9 @@ def _assert_identity(fd: int, path: Path) -> None:
     两者不等 → 拒绝，不读一个字节。
     """
     try:
-        st_fd = os.fstat(fd)
-        st_path = os.lstat(path)
-    except OSError as exc:
-        # 句柄在、路径没了（被删/被换名）：句柄本身仍然可用，但"路径语义"
-        # 已经不成立。拒绝比继续读更安全 —— 调用方会按 404 处理。
-        raise SandboxError("handle_lost", type(exc).__name__, E1009) from None
-    if _identity(st_fd) != _identity(st_path):
-        raise SandboxError("handle_mismatch", None, E1009)
+        _fs_assert_identity(fd, path)
+    except HandleMismatch as exc:
+        raise SandboxError(_handle_rule(exc), None, E1009) from None
 
 
 def open_read(root: RootConfig, rel_path: str, *,
@@ -293,6 +297,33 @@ def open_append(root: RootConfig, rel_path: str, *,
         os.close(fd)
         raise
     return os.fdopen(fd, "ab", buffering=0)
+
+
+def open_verified(path: str | Path, mode: str = "rb", *,
+                  buffering: int = 0) -> IO[bytes]:
+    """打开一个**不在库根下**的文件，并复核它不是被换位来的。
+
+    与 `open_read()` 的区别：不做 root 归属校验（调用方给的是缓存文件、
+    上传临时文件，或已经过 `resolve()` 的库内路径），但仍然做
+    "打开之后再核对身份"这一步 —— 也就是 `open_read()` 里消除 TOCTOU
+    的那两条：重解析后路径一致、句柄 identity 与 `lstat(path)` 一致。
+
+    为什么需要它：`exif`/`indexer` 拿到的只是一个路径，没有 root；
+    上传临时文件在库内但不在任何 root 的白名单里。这些地方此前一律
+    `open(path)`，与库内读取共享同一个 TOCTOU 窗口。
+
+    实现在 `backend/app/fsopen.py`（那里不依赖 config，`video.py` 也能用），
+    这里只把 `HandleMismatch` 翻译成 `SandboxError`。
+    """
+    try:
+        return _fs_open_verified(path, mode, buffering=buffering)
+    except HandleMismatch as exc:
+        raise SandboxError(_handle_rule(exc), None, E1009) from None
+    except FileNotFoundError:
+        # 文件不存在不是"沙箱拒绝"：调用方按缺失处理（既有 404 语义）。
+        raise
+    except OSError as exc:
+        raise SandboxError("open_failed", type(exc).__name__, E1009) from None
 
 
 def _steps_1_to_3(rel_path: str) -> tuple[str, list[str]]:
@@ -394,49 +425,6 @@ def strip_bidi(text: str) -> str:
     if BIDI_CONTROLS.isdisjoint(text):
         return text
     return "".join(c for c in text if c not in BIDI_CONTROLS)
-
-
-def _strip_win_prefix(path: str) -> str:
-    """剥掉 realpath 可能带上的 Windows 扩展长度前缀。
-
-    ★ 这里修的是一个**只在并发下出现、且会拒绝合法请求**的 Windows 坑。
-
-    `os.path.realpath()` 在 Windows 上调用 `nt._getfinalpathname()`，
-    它返回两种形态的路径：
-
-      * `C:\\Users\\...\\lib\\a.jpg`        （普通）
-      * `\\\\?\\C:\\Users\\...\\lib\\a.jpg`  （扩展长度前缀）
-
-    哪种形态取决于系统当时的内部状态 —— 实测同一进程内并发调用时
-    **同一个路径会随机返回两者之一**，且删除挂起的文件还会返回
-    `\\\\?\\C:\\$Extend\\$Deleted\\...`。而 `os.path.commonpath` 见到
-    `\\\\?\\c:\\...` 会把它当成 UNC（服务器名是 `?`），于是判为
-    "different drive" 并抛 ValueError。
-
-    后果：两台手机同时上传照片时，**有一半请求被沙箱拒绝**，
-    而照片本身完全合法。更糟的是错误文案（"不在同一磁盘分区"）
-    会把人引向磁盘分区去排查，与真实原因毫无关系。
-
-    前缀剥离是无损的：`\\\\?\\C:\\x` 与 `C:\\x` 指同一个文件。
-    """
-    p = path
-    if p.startswith("\\\\?\\"):
-        p = p[4:]
-        # `\\?\UNC\server\share` 剥掉前缀后要补回前导 `\\`
-        if p[:4].upper() == "UNC\\":
-            p = "\\\\" + p[4:]
-    elif p.startswith("\\\\.\\"):
-        p = p[4:]
-    return p
-
-
-def _norm_final(path: str) -> str:
-    """可比较形式：剥前缀 + normcase。
-
-    normcase 单独用在**比较**上（Windows 大小写不敏感），
-    不能用在返回值上 —— 会把真实磁盘上的大小写抹掉。
-    """
-    return os.path.normcase(_strip_win_prefix(path))
 
 
 def _real_root(root: RootConfig) -> Path:
@@ -723,6 +711,6 @@ __all__ = [
     "Need", "RESERVED_NAMES",
     "assert_writable", "excluded_dir_segment", "exists", "is_dir", "is_within",
     "normalize_rel", "reject_excluded",
-    "open_append", "open_read", "open_write",
+    "open_append", "open_read", "open_verified", "open_write",
     "resolve", "safe_display", "tmp_dir", "tmp_path",
 ]

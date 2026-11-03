@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Final, Sequence
 
 from .. import video as videomod
-from ..sandbox import strip_bidi
+from ..sandbox import open_verified, strip_bidi
 from ..thumbs import source_signature
 
 log = logging.getLogger(__name__)
@@ -499,7 +499,12 @@ def _like_escape(s: str) -> str:
 # --------------------------------------------------------------------------
 
 def _open_rb(path: str) -> Any:
-    return open(path, "rb", buffering=0)
+    """兜底打开（转码产物 / 缩略图缓存）。
+
+    走 `sandbox.open_verified`：这些文件不在任何 root 下，但同样可能被
+    junction 换位，所以"打开后复核身份"这一步不能省。
+    """
+    return open_verified(path, "rb")
 
 
 def stat_size(path: Path) -> int:

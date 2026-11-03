@@ -47,6 +47,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
+from .fsopen import HandleMismatch, open_verified
+
 log = logging.getLogger(__name__)
 
 __all__ = [
@@ -440,7 +442,7 @@ def moov_before_mdat(path: str | Path) -> int | None:
     `size == 1`（64 位长度）按 ISO/IEC 14496-12 处理。
     """
     try:
-        with open(path, "rb") as fh:
+        with open_verified(path, "rb") as fh:
             total = fh.seek(0, 2)
             pos = 0
             for _ in range(64):          # 顶层 box 通常 < 10 个；防个别文件失控
@@ -466,7 +468,9 @@ def moov_before_mdat(path: str | Path) -> int | None:
                 if size < 8:
                     return None
                 pos += size
-    except OSError:
+    except (OSError, HandleMismatch):
+        # `HandleMismatch` 是 OSError 的子类，两个都写上是为了读代码时
+        # 一眼看出"换位拒绝"与"读不到"都在同一侧处理。
         return None
     return None
 

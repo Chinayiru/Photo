@@ -30,6 +30,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, Literal
 
+from . import sandbox
+
 # --------------------------------------------------------------------------
 # Pillow 配置（必须在任何 Image.open 之前）
 # --------------------------------------------------------------------------
@@ -196,7 +198,7 @@ def extract_sync(path: str | Path) -> ExifInfo:
 
     info = ExifInfo()
     try:
-        with Image.open(path) as im:
+        with sandbox.open_verified(path) as fh, Image.open(fh) as im:
             info.width, info.height = im.size
             exif = im.getexif()
             if exif:
