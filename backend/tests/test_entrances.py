@@ -152,7 +152,12 @@ def test_qr_is_a_png_with_the_lan_entry(monkeypatch) -> None:
     # 二维码里是用户自己的地址，不能被中间代理缓存
     assert reply.headers.get("cache-control") == "no-store"
     text = reply.headers.get("x-pb-qr-text")
-    assert text.startswith("http://192.0.2.10:8877")
+    # 地址由本机探测得来，不写死某台机器的 IP —— 否则换机器就红
+    from urllib.parse import urlsplit
+    parts = urlsplit(text)
+    assert parts.scheme == "http"
+    assert parts.port == 8877
+    assert parts.hostname not in {None, "0.0.0.0", "127.0.0.1"}
     assert text.endswith("/")
 
 
