@@ -314,6 +314,10 @@ def open_verified(path: str | Path, mode: str = "rb", *,
 
     实现在 `backend/app/fsopen.py`（那里不依赖 config，`video.py` 也能用），
     这里只把 `HandleMismatch` 翻译成 `SandboxError`。
+
+    **输入契约**：`path` 必须是绝对路径（`fsopen.PathContractError` 兜底）。
+    前缀的相对→绝对转换只允许发生在 `resolve()` 里 —— 传相对路径进来
+    说明调用链漏了转换，不能靠 `os.open` 按 CWD 猜。
     """
     try:
         return _fs_open_verified(path, mode, buffering=buffering)

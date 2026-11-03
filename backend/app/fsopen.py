@@ -102,6 +102,38 @@ def assert_identity(fd: int, path: Path) -> None:
         raise HandleMismatch("mismatch")
 
 
+class PathContractError(ValueError):
+    """违反了「文件访问层只接受绝对路径」的契约。
+
+    为什么用异常而不是就地转换：`os.open("a.jpg")` 会静默按**进程 CWD**
+    解析。CWD 在托盘、计划任务、PyInstaller 三种启动方式下完全不同，
+    于是"同一个相对路径"会指向三个不同的文件，而失败时症状是"照片找不到"
+    或"打开了另一张照片"—— 后者尤其糟：校验过的是 A，读的是 B。
+
+    相对→绝对的转换**只允许**发生在 `sandbox.resolve()` 这一处（它同时做
+    库根归属校验）。这里收到相对路径说明调用链漏了一步，必须当场炸。
+    """
+
+    def __init__(self, path: object) -> None:
+        super().__init__(
+            f"文件访问层只接受绝对路径，收到相对路径：{path!r}。"
+            "相对路径请先经 sandbox.resolve(root, rel, op) 转换。"
+        )
+
+
+def require_absolute(path: str | Path) -> Path:
+    """校验并返回绝对路径；违反契约直接抛 `PathContractError`。
+
+    只做"是不是绝对"这一件事，不做 `resolve()`（不碰符号链接、不查库根）——
+    那是 `sandbox.resolve()` 的职责。这里再"顺手转换"一次，就等于把
+    唯一转换点又拆成两处。
+    """
+    p = Path(path)
+    if not p.is_absolute():
+        raise PathContractError(path)
+    return p
+
+
 #: `open_verified()` 支持的模式。故意只开放这三个 —— 需要 `O_TRUNC`
 #: 或 `O_EXCL` 的写入必须走 `sandbox.open_write()`（那里有完整的 root 校验）。
 VERIFIED_FLAGS: dict[str, int] = {
@@ -120,13 +152,18 @@ def open_verified(path: str | Path, mode: str = "rb", *,
     "打开之后再核对身份"这一步 —— 也就是消除 TOCTOU 的那两条：重解析后
     路径一致、句柄 identity 与 `lstat(path)` 一致。
 
-    异常：`FileNotFoundError`（不存在，调用方按缺失处理）、`OSError`、
-    `HandleMismatch`（复核失败）。
+    ## 输入契约（F-03）
+
+    只接受**绝对路径**。相对路径一律抛 `PathContractError`，不做任何
+    "看起来像相对路径就拼 CWD"的猜测 —— 那样等于把转换点复制到这里。
+
+    异常：`PathContractError`（违反了上面的契约）、`FileNotFoundError`
+    （不存在，调用方按缺失处理）、`OSError`、`HandleMismatch`（复核失败）。
     """
     flags = VERIFIED_FLAGS.get(mode)
     if flags is None:
         raise ValueError(f"open_verified 不支持的模式：{mode!r}")
-    p = Path(path)
+    p = require_absolute(path)
     try:
         fd = os.open(str(p), flags | getattr(os, "O_BINARY", 0), 0o644)
     except FileNotFoundError:
@@ -143,7 +180,7 @@ def open_verified(path: str | Path, mode: str = "rb", *,
 
 
 __all__ = [
-    "HandleMismatch", "VERIFIED_FLAGS",
+    "HandleMismatch", "PathContractError", "VERIFIED_FLAGS",
     "assert_identity", "assert_same_path", "identity",
-    "norm_final", "open_verified", "strip_win_prefix",
+    "norm_final", "open_verified", "require_absolute", "strip_win_prefix",
 ]
