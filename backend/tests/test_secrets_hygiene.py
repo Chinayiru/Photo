@@ -161,3 +161,55 @@ def test_both_serving_paths_share_one_header_definition() -> None:
             if not h.startswith("shared/security_headers.py")
             and "/tests/" not in h]
     assert hits == [], f"CSP 字面量出现在共享定义之外：{hits}"
+
+
+# ------------------------------------------------- 示例配置（2026-11-04 打包推送）
+
+
+def test_example_config_holds_no_real_values() -> None:
+    """`config.example.json` 会被推上公网：只许占位符与默认值。
+
+    2026-11-04 打包推送时的实测：真配置在 `data/config.json`（已被忽略），
+    但仓库里没有可提交的模板，`docs/08` §5.2.4 还让人去复制一个
+    并不存在的 `backend/config.example.toml`。补的是模板，不是真值。
+    """
+    import json
+
+    data = json.loads((REPO / "config.example.json").read_text(encoding="utf-8"))
+    text = json.dumps(data, ensure_ascii=False)
+
+    # 令牌/设备号必须是空：它们由云端注册时回填
+    assert data["cloud"]["agent_token"] == ""
+    assert data["cloud"]["device_id"] == ""
+    # 真实 IP（含内网段与公网）一个都不许有；监听地址这类通配值除外
+    ips = re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text)
+    assert [ip for ip in ips if ip not in ("0.0.0.0", "127.0.0.1")] == [], \
+        "示例配置里出现了 IP —— 模板只该用占位符"
+    # 个人目录（带用户名的 home）不许有
+    assert not re.search(r"[A-Za-z]:[\\/]{1,2}Users[\\/]", text)
+
+
+def test_no_plaintext_password_in_backticks() -> None:
+    """`echo <口令>` 这种形态在文档里也只能是占位符。
+
+    2026-11-04 的实测：服务器口令原样躺在 `docs/11` 与两份审计报告里，
+    而旧判据只查"看起来像 askpass/ssh 脚本"的行，文档行漏了。
+    """
+    hits = []
+    for rel in _tracked_files():
+        text = _text_of(rel)
+        if text is None:
+            continue
+        for no, line in enumerate(text.splitlines(), 1):
+            for m in re.finditer(r"echo\s+([^\s`\"']{8,})", line):
+                token = m.group(1).rstrip(".")
+                # 变量展开与显式占位符是允许的写法
+                if token.startswith(("$", "%", "<")) or "${" in token:
+                    continue
+                # 只怀疑"像口令"的：字母数字混排、够长。
+                # `echo PhotoBridge 备份` 这种标题行不该被误伤。
+                if (re.fullmatch(r"[A-Za-z0-9!@#$%^&*._-]{10,}", token)
+                        and re.search(r"\d", token) and re.search(r"[A-Za-z]", token)):
+                    hits.append(f"{rel}:{no}")
+    assert hits == [], f"疑似 echo 明文口令：{hits}"
+

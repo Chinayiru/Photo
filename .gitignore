@@ -62,3 +62,25 @@ _askpass*
 .env
 .env.*
 !.env.example
+
+# 探针与变异脚本（2026-11-04 打包推送前补）
+# 一次性验证脚本的命名惯例就是 `_probe_*` / `_mut_*`，它们常带真实令牌、
+# 真实 IP、真实库路径；约定俗成放 build/，但被拷到根目录就漏了。
+_probe_*
+_mut_*
+
+# 覆盖率与测试缓存
+coverage/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# SQLite 附属文件与导入残留
+*.sqlite
+*.sqlite3
+*.db-journal
+*.orig
+*.rej
+*.bak
+

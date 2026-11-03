@@ -197,5 +197,5 @@ def test_deploy_script_installs_the_watchdog() -> None:
 def test_watchdog_contains_no_credentials() -> None:
     """脚本会以 SYSTEM 跑在服务器上 —— 里面不许有任何口令。"""
     text = _text()
-    for bad in ("PB_PW", "password=", "Passw0rd", "REDACTED_PASSWORD"):
+    for bad in ("PB_PW", "password=", "Passw0rd", "Sup3rS3cretPw1"):
         assert bad not in text, f"watchdog.ps1 里出现了疑似凭据字面量：{bad}"
