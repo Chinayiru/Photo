@@ -1812,6 +1812,88 @@ def main() -> int:
           f"前几个 ts={stamps[:3]}")
 
     # =====================================================================
+    print("\n[K-02] 文件访问层只接受绝对路径（F-03 契约）")
+    from backend.app.fsopen import PathContractError, open_verified
+    from backend.app.sandbox import SandboxError, resolve
+
+    root0 = list(cfg.enabled_roots)[0]
+    rel = "青甘环线/敦煌.jpg"
+    direct = lib / rel
+
+    converted = resolve(root0, rel, "read", cfg=cfg)
+    check(converted.is_absolute(),
+          "sandbox.resolve 返回绝对路径", f"got {converted}")
+    check(converted.resolve() == direct.resolve(),
+          "转换结果与直接构造的绝对路径指向同一文件",
+          f"{converted} vs {direct}")
+
+    a = b""
+    with open_verified(converted, "rb") as fh:
+        a = fh.read()
+    b = b""
+    with open_verified(direct, "rb") as fh:
+        b = fh.read()
+    check(a == b and a[:4] == b"\xff\xd8\xff\xe0",
+          "两条路径读到同一份 JPEG 字节", f"{len(a)} vs {len(b)}")
+
+    msg = ""
+    try:
+        open_verified(rel, "rb")
+    except PathContractError as exc:
+        msg = str(exc)
+    check(bool(msg) and "绝对路径" in msg and "sandbox.resolve" in msg,
+          "相对路径直传被拒，且错误指出正确做法", msg[:80])
+
+    escaped = False
+    try:
+        resolve(root0, "../outside.jpg", "read", cfg=cfg)
+    except SandboxError:
+        escaped = True
+    check(escaped, "收敛没有削弱沙箱：`..` 越界仍被拦")
+
+    # 调用点扫描：传字面量就是契约没落地的信号
+    import ast as _ast
+    app_dir = REPO / "backend" / "app"
+    literal_sites: list[str] = []
+    for src in sorted(app_dir.rglob("*.py")):
+        tree = _ast.parse(src.read_text(encoding="utf-8"), filename=str(src))
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Call) or not node.args:
+                continue
+            fn = node.func
+            name = fn.attr if isinstance(fn, _ast.Attribute) else getattr(fn, "id", "")
+            if name != "open_verified":
+                continue
+            first = node.args[0]
+            if isinstance(first, _ast.Constant) and isinstance(first.value, str):
+                literal_sites.append(f"{src.name}:{node.lineno} -> {first.value!r}")
+    check(not literal_sites, "open_verified 调用点没有路径字面量",
+          "; ".join(literal_sites[:5]))
+
+    # =====================================================================
+    print("\n[K-03] 可信 Blob 边界（F-01/F-02/T1/T2）")
+    import shutil as _shutil
+    import subprocess as _sp
+
+    node = _shutil.which("node")
+    probe = REPO / "frontend" / "tests" / "safeurl_probe.ts"
+    if node is None:
+        check(False, "本机有 node（可信 Blob 守卫无法验证）", "node 不在 PATH")
+    else:
+        proc = _sp.run([node, "--experimental-strip-types", str(probe)],
+                       capture_output=True, timeout=120)
+        out = proc.stdout.decode("utf-8", "replace")
+        err = proc.stderr.decode("utf-8", "replace")
+        check(proc.returncode == 0, "★ 守卫探针全绿（可信放行/未登记拒绝/"
+              "伪造拒绝/revoke 拒绝/上限）", (err or out)[-300:])
+        check("OK " in out, "探针输出了用例计数", out.strip().splitlines()[-1]
+              if out.strip() else "(空)")
+        # T2：台账是**全文**输出，能逐条核对来源
+        check('"origin"' in out and '"createdAt"' in out,
+              "★ 台账全文输出（含来源与创建时间，未截断）")
+        check('"raw:' in out, "台账条目带来源前缀（raw:/qr:）")
+
+    # =====================================================================
     real_after = real_fingerprint()
     print(f"\n真实库（结束）：{real_after}")
     check(real_after == real_before, "★ 真实照片库一个字节都没变")

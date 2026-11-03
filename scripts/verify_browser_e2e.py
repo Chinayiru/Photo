@@ -350,6 +350,51 @@ class Browser:
         self._target_id = str(info.get("id") or "")
         self._replay_durable()
 
+    def goto_fresh(self, url: str) -> None:
+        """在**一个全新文档**里打开 `url`，然后把旧标签页关掉。
+
+        为什么不用 `goto()`：`Page.navigate` 是在**当前文档**上换文档，
+        中间那段时间旧文档还活着，`Runtime.evaluate` 会落在它上面。对
+        "照片能不能显示"这类断言无所谓 —— 但对**页面级状态**就不是了：
+
+          * 可信 Blob 台账（`window.__pbTrustedBlobs`）挂在 window 上，
+            旧文档残留的条目会让"新用例从干净状态开始"变成一句假设；
+          * `Page.addScriptToEvaluateOnNewDocument` 只对**以后**的文档
+            生效，新标签页得补一次注入（`recover()` 里踩过同一个坑）。
+
+        这里走的是"新标签页 + 直达目标地址"：浏览器自己创建一个新文档，
+        没有上一页的堆内存、没有残留的台账，也就没有"上一页污染下一页"。
+        真机扫码本来也是开新页，与用户路径一致。
+        """
+        old = self._target_id
+        self.new_page(url)
+        if not self.wait_ready(budget=30.0):
+            raise RuntimeError(f"新文档没有加载完（{url}）")
+        for _key, method, params in self._durable:
+            if method != "Page.addScriptToEvaluateOnNewDocument":
+                continue
+            try:
+                self.evaluate(str(params.get("source") or "void 0"))
+            except Exception:                          # noqa: BLE001
+                pass
+        if old and old != self._target_id:
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    f"http://127.0.0.1:{self.port}/json/close/{old}",
+                    method="GET"), timeout=10).read()
+            except Exception:                          # noqa: BLE001
+                pass
+
+    def trusted_blobs(self) -> list[dict] | None:
+        """读页面里的可信 Blob 台账，**全文**返回（不截断，便于逐条核对）。
+
+        返回 `None` 表示页面里根本没有这个入口 —— 那说明登记表没被挂上，
+        是失败而不是"没有条目"（后者返回空列表）。两者必须能区分开，
+        否则"台账为空"会因为"台账不存在"而假绿。
+        """
+        return self.evaluate(
+            "(window.__pbTrustedBlobs ? window.__pbTrustedBlobs() : null)")
+
     def remember(self, method: str, *, _key: str = "", **params) -> None:
         """记下一条"每个新标签页都要重放"的 CDP 设置并立即执行。
 
@@ -1222,6 +1267,75 @@ def main() -> int:
 
         # 把新图删掉，后面的步骤（Tab 切换、未配对）不受影响
         (lib / new_name).unlink()
+
+        # ---------------------------------------------------------------
+        print("\n[6z] 可信 Blob 边界：二维码经认证取图、卸载即回收（F-02/T3）")
+        # ---------------------------------------------------------------
+        # ★ 用 goto_fresh 而不是 goto：台账是页面级状态，必须从干净文档开始。
+        br.goto_fresh(base + "/")
+        br.wait_for("!!document.querySelector('button')", budget=20, label="[6z] 首屏")
+        tb0 = br.trusted_blobs()
+        check(tb0 == [], "新文档里可信 Blob 台账为空（用例起点干净）", f"{tb0}")
+
+        # 反证这个端点**需要鉴权**：裸 <img> 带不了 Authorization，
+        # 所以它能显示出来本身就说明走了 fetch。
+        code_noauth = 0
+        try:
+            urllib.request.urlopen(
+                f"{base}/api/system/entrances/qr?kind=lan", timeout=10).read()
+        except urllib.error.HTTPError as e:
+            code_noauth = e.code
+        except Exception as e:                          # noqa: BLE001
+            print(f"      无令牌取二维码：{e}")
+        check(code_noauth == 401, "不带令牌取二维码被拒（401）", f"got {code_noauth}")
+
+        br.evaluate("""
+          (() => {
+            const b = [...document.querySelectorAll('.tabbar button')]
+              .find(x => /我的/.test(x.textContent || ''));
+            if (b) b.click();
+            return !!b;
+          })()
+        """)
+        ok_qr = br.wait_for("""
+          (() => {
+            const im = [...document.querySelectorAll('img.qr')];
+            return im.length > 0 &&
+                   im.every(i => (i.getAttribute('src') || '').startsWith('blob:'));
+          })()
+        """, budget=20, label="[6z] 二维码 blob")
+        check(ok_qr, "★ 二维码以 blob: 渲染（不是裸 <img> 直连 API）")
+
+        srcs = br.evaluate(
+            "JSON.stringify([...document.querySelectorAll('img.qr')]"
+            ".map(i => i.getAttribute('src')))")
+        print(f"      二维码 src：{srcs}")
+        tb1 = br.trusted_blobs() or []
+        qr_entries = [e for e in tb1 if str(e.get("origin", "")).startswith("qr:")]
+        check(len(qr_entries) >= 1, "★ 二维码的 blob URL 在可信台账里",
+              f"{len(qr_entries)} 条")
+        check(all(str(e.get("url", "")).startswith("blob:") for e in qr_entries),
+              "台账里的二维码条目都是 blob: 地址")
+
+        # 离开设置页 → 组件卸载 → 旧 URL 必须被 revoke 并移出台账
+        # 只在 tabbar 里找：设置页正文里也可能有含「照片」的按钮，
+        # 误点它等于没离开，后面的回收断言就会假红。
+        left = br.evaluate("""
+          (() => {
+            const b = [...document.querySelectorAll('.tabbar button')]
+              .find(x => /照片/.test(x.textContent || ''));
+            if (b) b.click();
+            return !!b;
+          })()
+        """)
+        check(bool(left), "点得到「照片」标签页（离开设置页的前提）")
+        gone = br.wait_for(
+            "(() => { const t = window.__pbTrustedBlobs ? window.__pbTrustedBlobs() : [];"
+            " return t.filter(e => String(e.origin || '').startsWith('qr:')).length === 0; })()",
+            budget=15, label="[6z] 二维码回收")
+        check(gone, "★ 离开设置页后二维码 blob 被 revoke 并移出台账")
+        tb2 = br.trusted_blobs() or []
+        check(len(tb2) == 0, "用例结束时台账重新为空（没有泄漏）", f"{len(tb2)} 条")
 
         # ---------------------------------------------------------------
         print("\n[4f] AC-5.2 二维码带 device_id（静态码 + 动态 IP 的错配防护）")
