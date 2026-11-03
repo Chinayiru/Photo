@@ -15,6 +15,8 @@ ffmpeg 时自动跳过。
 """
 from __future__ import annotations
 
+import pathlib
+
 import asyncio
 import json
 import os
@@ -350,15 +352,17 @@ def _st_with_video(tmp_path, *, kind: str = "video"):
 
 
 def _ctx(st, method: str, path: str, *, query: dict | None = None,
-         mid: int | None = None):
+         mid: int | None = None, headers: dict | None = None):
     from app.core import Ctx
 
     q: dict[str, list[str]] = {}
     for k, v in (query or {}).items():
         q[k] = v if isinstance(v, list) else [str(v)]
     params = {"media_id": str(mid)} if mid is not None else {}
+    hdrs = {"host": "127.0.0.1:8799"}
+    hdrs.update({k.lower(): v for k, v in (headers or {}).items()})
     return Ctx(method=method, path=path, query=q, params=params,
-               headers={"host": "127.0.0.1:8799"}, body=None, app=st)
+               headers=hdrs, body=None, app=st)
 
 
 def test_status_of_an_untranscoded_video_is_none(tmp_path) -> None:
@@ -419,6 +423,45 @@ def test_stream_serves_the_artifact_with_range_support(tmp_path, monkeypatch) ->
     assert reply.status == 200
     assert reply.headers["Accept-Ranges"] == "bytes"
     assert "video/mp4" in reply.headers.get("Content-Type", "")
+
+
+def test_transcode_unsatisfiable_range_is_416_with_accept_ranges(
+        tmp_path, monkeypatch) -> None:
+    """越界 Range 必须 416，且 416 也要带 `Accept-Ranges`（契约对齐，2026-11-03）。
+
+    这条是审计里 R2「Range 响应构造两份」的回归点：转码产物早先自己拼 416，
+    少了 `Accept-Ranges`，客户端据此不知道"这个资源其实支持续传"，只能整段重下。
+    共用一个 helper 之后两处不会再各自漂移，但**漂移是可以重新长出来的**，
+    所以要有一条断言钉住它。
+    """
+    from app import streamticket
+    from app.handlers import transcode as ht
+    from app import transcode as tcmod
+
+    import asyncio
+
+    st, mid, _ = _st_with_video(tmp_path)
+    monkeypatch.setattr(tcmod.subprocess, "Popen",
+                        lambda argv, **kw: _FakeProc(argv, progress=("progress=end",)))
+    job = st.transcodes.start(media_id=mid, src=tmp_path / "lib" / "clip.mp4",
+                              duration=12.0, ffmpeg="ffmpeg")
+    _wait(job)
+    ticket = streamticket.mint(st.db, mid)
+
+    import pytest
+
+    from app.errors import AppError
+
+    with pytest.raises(AppError) as ei:
+        asyncio.run(ht.stream(_ctx(st, "GET",
+                                   f"/api/items/{mid}/transcode/stream",
+                                   mid=mid, query={"t": ticket},
+                                   headers={"range": "bytes=999999999-"})))
+    # 416 由 dispatch 从 AppError 落地；头必须挂在异常上，否则会被丢掉。
+    assert ei.value.status == 416
+    size = pathlib.Path(job.path).stat().st_size
+    assert ei.value.headers["Accept-Ranges"] == "bytes"
+    assert ei.value.headers["Content-Range"] == f"bytes */{size}"
 
 
 def test_transcode_paths_end_with_stream_so_the_ticket_gate_allows_them() -> None:

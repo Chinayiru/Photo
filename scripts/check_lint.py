@@ -37,14 +37,12 @@ from __future__ import annotations
 
 import argparse
 import ast
-import io
 import json
 import re
 import sys
-import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -160,10 +158,6 @@ def _call_name(node: ast.Call) -> str:
         return cur.id
     return ""
 
-
-def _full_name(node: ast.Call) -> str:
-    """与 `_call_name` 同义，但保证返回带接收者的形态（含空接收者）。"""
-    return _call_name(node)
 
 
 def _attr_chain(node: ast.AST) -> list[str]:

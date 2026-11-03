@@ -58,7 +58,6 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -275,21 +274,6 @@ class BidiBrowser:
                 "actions": [
                     {"type": "pointerMove", "x": x, "y": y},
                     {"type": "pointerDown", "button": 0},
-                    {"type": "pointerUp", "button": 0},
-                ],
-            }],
-        })
-
-    def long_press(self, x: float, y: float, ms: int = 800) -> None:
-        self.send("input.performActions", {
-            "context": self.ctx,
-            "actions": [{
-                "type": "pointer", "id": "finger1",
-                "parameters": {"pointerType": "touch"},
-                "actions": [
-                    {"type": "pointerMove", "x": x, "y": y},
-                    {"type": "pointerDown", "button": 0},
-                    {"type": "pause", "duration": ms},
                     {"type": "pointerUp", "button": 0},
                 ],
             }],

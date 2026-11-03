@@ -44,7 +44,7 @@ import time
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from shared.mux import Mux, MuxClosed
+from shared.mux import Mux
 from shared.protocol import (
     CREDIT_V2_CAP,
     HEARTBEAT_SEC,
@@ -480,7 +480,6 @@ class TunnelClient:
 
     async def _sync_revoked(self) -> None:
         """`GET {base}/api/clients/revoked`，把结果灌进本地缓存。"""
-        import json
         import urllib.request
 
         base = self.public_base()

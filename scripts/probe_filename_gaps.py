@@ -12,8 +12,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.exif import extract_sync, parse_datetime_from_name, resolve_taken_at  # noqa: E402
-from scripts.probe_exif_coverage import LIBRARY, collect  # noqa: E402
+from app.exif import extract_sync, resolve_taken_at  # noqa: E402
+from scripts.probe_exif_coverage import collect  # noqa: E402
 
 
 def main() -> int:

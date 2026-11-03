@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -86,10 +85,10 @@ def main() -> int:
     fails = 0
     for rel, need, want in CASES:
         try:
-            got = resolve(ROOT, rel, need)  # type: ignore[arg-type]
+            resolve(ROOT, rel, need)  # type: ignore[arg-type]
             rule = None
         except SandboxError as e:
-            got, rule = None, e.rule
+            rule = e.rule
         ok = rule == want
         fails += not ok
         print(f"{'ok ' if ok else 'FAIL'} {need:6} {rel[:44]!r:48} want={want!r:24} got={rule!r}")

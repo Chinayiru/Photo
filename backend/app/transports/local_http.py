@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, AsyncIterator, Final, Iterable
+from typing import Any, AsyncIterator, Final
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -34,8 +34,8 @@ from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route as StarletteRoute
 
 from ..config import Config, check_bind_safety, local_ipv4_addresses
-from ..core import Ctx, Reply, cookie_header_value, iter_body, json_reply
-from ..errors import AppError, E1006, E3001, to_app_error
+from ..core import Ctx, Reply, cookie_header_value
+from ..errors import AppError, E3001
 from .base import ServerTransport
 
 log = logging.getLogger(__name__)
@@ -96,17 +96,6 @@ async def _request_body(request: Request) -> AsyncIterator[bytes]:
         if chunk:
             yield chunk
 
-
-def _asgi_body(reply: Reply) -> AsyncIterator[bytes] | bytes | None:
-    """把 Reply.body 转成 Starlette 能消费的形态。
-
-    bytes 直接给（Starlette 会算 Content-Length 并一次性发送）；
-    异步流保持流式（大文件不占内存）。
-    """
-    body = reply.body
-    if body is None or isinstance(body, bytes):
-        return body
-    return _stream(body)
 
 
 async def _stream(src: AsyncIterator[bytes]) -> AsyncIterator[bytes]:

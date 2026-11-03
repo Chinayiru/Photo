@@ -23,10 +23,8 @@
 """
 from __future__ import annotations
 
-import mimetypes
-from typing import ClassVar, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
-from ..core import Ctx, Reply
 
 __all__ = [
     "ServerTransport",
@@ -48,9 +46,12 @@ from ..core.httpmedia import (
     DANGEROUS_EXTS,
     content_type_for,
     parse_range,
-    range_length,
-    content_range_header,
-    unsatisfied_range_header,
+    # 兼容旧导入路径：	ransports/__init__.py 从这里取这三个名字。
+    # ruff 的 F401 会想把它们删掉（本文件内部没用），删了就 ImportError
+    # —— docs/11 记着这次事故（自动 --fix 打挂 import）。
+    range_length,  # noqa: F401
+    content_range_header,  # noqa: F401
+    unsatisfied_range_header,  # noqa: F401
 )
 
 @runtime_checkable

@@ -33,7 +33,6 @@ sha256 无盐即可 —— token 本身就是 32 字节高熵随机数，
 from __future__ import annotations
 
 import hashlib
-import hmac
 import logging
 import re
 import secrets
@@ -68,8 +67,11 @@ from .identity import (
     _ensure_cloud_table,
     _signing_secret,
     hash_token,
-    legacy_tunnel_secret,
-    legacy_window_open,
+    # 兼容旧的导入路径：`control.py`、`identity.py` 与若干测试都从
+    # `backend.app.auth` 取这两个名字。ruff 的 F401 会把它们当“没用”删掉，
+    # 删了就是 AttributeError —— 与 `transports/base.py` 那次同一个坑。
+    legacy_tunnel_secret,  # noqa: F401
+    legacy_window_open,  # noqa: F401
     sync_revoked_clients,
 )
 

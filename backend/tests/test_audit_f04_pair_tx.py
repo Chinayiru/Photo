@@ -108,9 +108,10 @@ def _pair_code(client: TestClient, device_id: str, code: str = CODE) -> str:
     database = client.app.state.db
     now = time.time()
     database.execute(
-        "INSERT INTO pair_codes(code, device_id, expires_at, tries, "
+        "INSERT INTO pair_codes(code_hash, device_id, expires_at, tries, "
         "created_at) VALUES (?, ?, ?, 0, ?)",
-        (code, device_id, now + 300, now))
+        (cloud_db.hash_pair_code(database.path, code), device_id,
+         now + 300, now))
     return code
 
 
@@ -122,8 +123,10 @@ def _post_pair(client: TestClient, device_id: str, token: str, *,
 
 
 def _used_at(client: TestClient, code: str):
-    row = client.app.state.db.query_one(
-        "SELECT used_at FROM pair_codes WHERE code = ?", (code,))
+    db = client.app.state.db
+    row = db.query_one(
+        "SELECT used_at FROM pair_codes WHERE code_hash = ?",
+        (cloud_db.hash_pair_code(db.path, code),))
     return None if row is None else row["used_at"]
 
 
@@ -314,15 +317,17 @@ def test_release_only_undoes_its_own_claim(tmp_path) -> None:
     database = client.app.state.db
 
     first = time.time()
-    assert cloud_pairing._claim_code(database, code, first) is True
-    assert cloud_pairing._claim_code(database, code, first + 1) is False
+    # 抢/释放都按 HMAC 走（库里不再有明文码，ISSUE-091）。
+    code_hash = cloud_db.hash_pair_code(database.path, code)
+    assert cloud_pairing._claim_code(database, code_hash, first) is True
+    assert cloud_pairing._claim_code(database, code_hash, first + 1) is False
 
     # 用一个不匹配的时间戳释放 → 不命中（也不改行）
-    assert cloud_pairing._release_code(database, code, first + 99) is False
+    assert cloud_pairing._release_code(database, code_hash, first + 99) is False
     assert _used_at(client, code) == pytest.approx(first)
 
     # 用真正抢码的那一次释放 → 命中
-    assert cloud_pairing._release_code(database, code, first) is True
+    assert cloud_pairing._release_code(database, code_hash, first) is True
     assert _used_at(client, code) is None
 
 

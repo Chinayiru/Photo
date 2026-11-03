@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import logging
 import socket
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:      # pragma: no cover
     from .config import Config

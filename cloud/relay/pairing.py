@@ -68,11 +68,10 @@ from starlette.responses import Response
 from ..relay import control as cloud_control
 from ..relay import netutil, security
 from ..relay.auth import require_account
-from ..relay.db import CloudDB
+from ..relay.db import CloudDB, hash_pair_code
 from ..relay.body import RequestBodyTooLarge, read_json_object
 from ..relay.devices import find_device_by_agent_token
 from ..relay.reply import json_error, json_reply
-from shared import client_token as shared_token
 
 log = logging.getLogger("pb.cloud.pairing")
 
@@ -127,10 +126,12 @@ async def issue_pair_code(request: Request, db: CloudDB) -> Response:
         "DELETE FROM pair_codes WHERE device_id = ? AND used_at IS NULL",
         (device_id,))
     code = _new_unique_code(db)
+    # 库里只留 HMAC：db 文件泄露时还原不出这枚码（ISSUE-091）。
     db.execute(
-        "INSERT INTO pair_codes(code, device_id, expires_at, tries, "
+        "INSERT INTO pair_codes(code_hash, device_id, expires_at, tries, "
         "created_at) VALUES (?, ?, ?, 0, ?)",
-        (code, device_id, now + security.PAIR_CODE_TTL, now))
+        (hash_pair_code(db.path, code), device_id,
+         now + security.PAIR_CODE_TTL, now))
     return json_reply({
         "code": code,
         "device_id": device_id,
@@ -143,14 +144,15 @@ async def issue_pair_code(request: Request, db: CloudDB) -> Response:
 def _new_unique_code(db: CloudDB) -> str:
     """生成一个当前不冲突的 6 位码。
 
-    冲突概率是 100 万分之一，但 `code` 是主键——撞上会直接抛
+    冲突概率是 100 万分之一，但 `code_hash` 是主键——撞上会直接抛
     `IntegrityError` 让整个请求 500。重试 8 次够了：连续 8 次撞上
     说明"未使用的码已经有几十万枚"，那才是真问题。
     """
     for _ in range(8):
         code = security.new_pair_code()
-        row = db.query_one("SELECT 1 AS x FROM pair_codes WHERE code = ?",
-                           (code,))
+        row = db.query_one(
+            "SELECT 1 AS x FROM pair_codes WHERE code_hash = ?",
+            (hash_pair_code(db.path, code),))
         if row is None:
             return code
     raise RuntimeError("配对码空间即将耗尽，请清理过期的 pair_codes")
@@ -223,15 +225,17 @@ async def redeem_pair_code(request: Request, db: CloudDB,
                           retry_after=max(1, int(locked)))
 
     now = time.time()
+    # 用户输入的明文只在这一行存在：查库用的是 HMAC（ISSUE-091）。
+    code_hash = hash_pair_code(db.path, code.strip())
     row = db.query_one(
-        "SELECT code, device_id, expires_at, tries, locked_until, used_at "
-        "FROM pair_codes WHERE code = ?", (code.strip(),))
+        "SELECT code_hash, device_id, expires_at, tries, locked_until,"
+        " used_at FROM pair_codes WHERE code_hash = ?", (code_hash,))
     if row is None:
         _bump_failure(db, did, ip)
         return json_error("E1002", message="配对码不存在",
                           request_id=_rid(request))
     if str(row["device_id"]) != did:
-        _note_code_failure(db, code.strip())
+        _note_code_failure(db, code_hash)
         _bump_failure(db, did, ip)
         # 码是真的、但不是这台电脑的，分两种情形：
         #
@@ -252,7 +256,7 @@ async def redeem_pair_code(request: Request, db: CloudDB,
         return json_error("E1002", message="配对码不存在",
                           request_id=_rid(request))
     if row["used_at"] is not None:
-        _note_code_failure(db, code.strip())
+        _note_code_failure(db, code_hash)
         _bump_failure(db, did, ip)
         return json_error("E1005", message="配对码已被使用",
                           request_id=_rid(request))
@@ -261,7 +265,7 @@ async def redeem_pair_code(request: Request, db: CloudDB,
         return json_error("E4004", request_id=_rid(request),
                           retry_after=int(float(lock_until) - now) + 1)
     if float(row["expires_at"]) <= now:
-        _note_code_failure(db, code.strip())
+        _note_code_failure(db, code_hash)
         _bump_failure(db, did, ip)
         return json_error("E1003", message="配对码已过期",
                           request_id=_rid(request))
@@ -282,7 +286,7 @@ async def redeem_pair_code(request: Request, db: CloudDB,
     # 是死路，他自己没有任何办法恢复），所以 `_release_code()` 是失败路径
     # 的必经一站，两条失败分支都调它。
     claimed_at = now
-    if not _claim_code(db, code.strip(), claimed_at):
+    if not _claim_code(db, code_hash, claimed_at):
         # 并发下另一台手机先抢到了这个码；与"已被使用"同一口径。
         return json_error("E1005", message="配对码已被使用",
                           request_id=_rid(request))
@@ -290,14 +294,14 @@ async def redeem_pair_code(request: Request, db: CloudDB,
     try:
         minted = await _mint_via_agent(request, did, client_name)
     except _MintUnavailable:
-        _release_code(db, code.strip(), claimed_at)
+        _release_code(db, code_hash, claimed_at)
         return json_error("E2007",
                           message="电脑当前不在线，无法签发配对令牌",
                           request_id=_rid(request))
 
     if not _write_client(db, did=did, client_name=client_name,
                          minted=minted, now=now):
-        _release_code(db, code.strip(), claimed_at)
+        _release_code(db, code_hash, claimed_at)
         return json_error("E2007", message="配对结果未能保存，请重试",
                           request_id=_rid(request))
 
@@ -326,7 +330,7 @@ class _MintUnavailable(Exception):
 # 失败路径：签发失败 / 写库失败都必须 `_release_code()`，把码还回去。
 
 
-def _claim_code(db: CloudDB, code: str, claimed_at: float) -> bool:
+def _claim_code(db: CloudDB, code_hash: str, claimed_at: float) -> bool:
     """F04a：短事务抢码。抢到返回 True；被别人抢走返回 False。
 
     用 `used_at = claimed_at` 而不是布尔列，是为了让释放能精确对上这一次
@@ -336,12 +340,12 @@ def _claim_code(db: CloudDB, code: str, claimed_at: float) -> bool:
     """
     with db.transaction() as conn:
         cur = conn.execute(
-            "UPDATE pair_codes SET used_at = ? WHERE code = ? "
-            "AND used_at IS NULL", (claimed_at, code))
+            "UPDATE pair_codes SET used_at = ? WHERE code_hash = ? "
+            "AND used_at IS NULL", (claimed_at, code_hash))
     return cur.rowcount == 1
 
 
-def _release_code(db: CloudDB, code: str, claimed_at: float) -> bool:
+def _release_code(db: CloudDB, code_hash: str, claimed_at: float) -> bool:
     """失败路径：把抢到但没签成的码还回去。
 
     只释放"自己抢的那一次"（`used_at = claimed_at`）。释放不命中不报错：
@@ -350,10 +354,12 @@ def _release_code(db: CloudDB, code: str, claimed_at: float) -> bool:
     with db.transaction() as conn:
         cur = conn.execute(
             "UPDATE pair_codes SET used_at = NULL "
-            "WHERE code = ? AND used_at = ?", (code, claimed_at))
+            "WHERE code_hash = ? AND used_at = ?", (code_hash, claimed_at))
     released = cur.rowcount == 1
     if not released:
-        log.warning("配对码释放未命中 code=%s（可能已被清理/已被再次抢走）", code)
+        # 日志里只记 hash 前 8 位：明文码不该出现在任何日志里（ISSUE-091）。
+        log.warning("配对码释放未命中 hash=%s…（可能已被清理/已被再次抢走）",
+                    code_hash[:8])
     return released
 
 
@@ -573,7 +579,7 @@ def _note_device_failure(db: CloudDB, device_id: str, now: float) -> None:
          now + PAIR_LOCK_SECONDS, device_id))
 
 
-def _note_code_failure(db: CloudDB, code: str) -> None:
+def _note_code_failure(db: CloudDB, code_hash: str) -> None:
     """给**某一枚码**记一次失败；满 5 次就把这枚码锁 10 分钟。
 
     只对"码真实存在、但这次用不成"（属于别的电脑 / 已被用 / 已过期）
@@ -583,8 +589,8 @@ def _note_code_failure(db: CloudDB, code: str) -> None:
         "UPDATE pair_codes SET tries = tries + 1, "
         "  locked_until = CASE WHEN tries + 1 >= ? THEN ? "
         "                     ELSE locked_until END "
-        "WHERE code = ? AND used_at IS NULL",
-        (_DEVICE_MAX_TRIES, time.time() + PAIR_LOCK_SECONDS, code))
+        "WHERE code_hash = ? AND used_at IS NULL",
+        (_DEVICE_MAX_TRIES, time.time() + PAIR_LOCK_SECONDS, code_hash))
 
 
 def _bump(key: tuple[str, str], limit: int, now: float) -> None:

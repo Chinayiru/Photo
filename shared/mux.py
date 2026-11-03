@@ -47,7 +47,6 @@ import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Sequence
 
 from .protocol import (
-    CONN_CREDIT_WINDOW,
     CREDIT_DEADLOCK_TIMEOUT,
     CREDIT_THRESHOLD,
     CREDIT_WINDOW,
@@ -215,10 +214,6 @@ class _CreditGate:
     @property
     def credit(self) -> int:
         return self._credit
-
-    @property
-    def sent_total(self) -> int:
-        return self._sent_total
 
     @property
     def recv_total(self) -> int:

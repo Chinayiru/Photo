@@ -630,7 +630,7 @@ def main() -> int:
             time.sleep(min(sleep_for, max(0.0, total_sec - (time.time() - t_start))))
 
     # 收尾前再采一次，然后干净关闭
-    final = sample("final")
+    sample("final")
     print("\n正在关闭服务……")
     t0 = time.time()
     svc.stop()

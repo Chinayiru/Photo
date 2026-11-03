@@ -164,9 +164,6 @@ class DeviceRegistry:
     def get(self, device_id: str) -> TunnelConnection | None:
         return self._map.get(device_id)
 
-    def online_ids(self) -> list[str]:
-        return list(self._map)
-
     def count(self) -> int:
         return len(self._map)
 

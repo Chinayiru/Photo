@@ -365,10 +365,6 @@ def _slots(limit: int = DEFAULT_CONCURRENCY) -> threading.BoundedSemaphore:
         return _SLOTS
 
 
-def set_concurrency(limit: int) -> None:
-    """设置并发上限（配置变化时调用）。已在跑的任务不受影响。"""
-    _slots(limit)
-
 
 # --------------------------------------------------------------------------
 # 子进程调用

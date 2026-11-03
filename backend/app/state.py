@@ -250,12 +250,6 @@ class AppState:
             log.warning("获取本机 IP 失败：%s", e)
             return []
 
-    def server_port(self) -> int:
-        try:
-            return int(self.cfg.get("server.port", 8787))
-        except (TypeError, ValueError):
-            return 8787
-
 
 def _default_device_name() -> str:
     try:

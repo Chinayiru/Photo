@@ -216,17 +216,6 @@ class Ctx:
             return default
         return raw.lower() in ("1", "true", "yes", "on")
 
-    def q_float(self, name: str) -> float | None:
-        from ..errors import BadRequest
-
-        raw = self.q(name)
-        if raw is None or raw == "":
-            return None
-        try:
-            return float(raw)
-        except (TypeError, ValueError):
-            raise BadRequest(f"参数 {name} 必须是数字") from None
-
     # ---- 头部便捷读取 ----
 
     def header(self, name: str, default: str | None = None) -> str | None:
@@ -434,10 +423,6 @@ class Reply:
         self.headers["Cache-Control"] = ", ".join(parts)
         return self
 
-    def set_length(self, n: int) -> "Reply":
-        self.headers["Content-Length"] = str(n)
-        return self
-
     def set_cookie(self, name: str, value: str, *, max_age: int) -> "Reply":
         """记录一个待下发的 cookie。
 
@@ -470,10 +455,6 @@ class Reply:
     @property
     def is_stream(self) -> bool:
         return self.body is not None and not isinstance(self.body, bytes)
-
-    @property
-    def is_empty(self) -> bool:
-        return self.body is None or self.body == b""
 
     def __repr__(self) -> str:
         kind = "stream" if self.is_stream else (

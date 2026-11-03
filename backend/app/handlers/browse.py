@@ -1375,29 +1375,6 @@ def _split_dir_name(rel_path: str) -> tuple[str, str]:
     return "", p
 
 
-def _unique_name_in(
-    taken_names: set[str], name: str, *, limit: int = 999
-) -> tuple[str, bool]:
-    """在已占用的名字集合里给 `name` 找一个不冲突的名字。
-
-    冲突时在**扩展名前**追加 `_1`/`_2`…（与归档的序号规则一致，
-    序号从 1 开始，第一张不带序号）。
-
-    返回 `(最终名字, 是否改过名)`。这是纯字符串层面的工具，供
-    `_pick_free_name` 之外的调用方使用（例如未来的"批量重命名"）。
-    """
-    if name not in taken_names:
-        return name, False
-    stem, dot, ext = name.rpartition(".")
-    if not dot or not stem:
-        stem, dot, ext = name, "", ""
-    for seq in range(1, limit + 1):
-        cand = f"{stem}_{seq}{dot}{ext}"
-        if cand not in taken_names:
-            return cand, True
-    raise Conflict(f"目标目录里同名文件过多（{name}）", spec=E3012)
-
-
 def _pick_free_name(
     root, rel_dir: str, name: str, taken: set[str], *, cfg, limit: int = 999
 ) -> tuple[str, str, Path] | None:

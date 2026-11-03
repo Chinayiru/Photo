@@ -772,14 +772,6 @@ class ThumbEngine:
             "workers": self.workers,
         }
 
-    def reset_failed(self) -> int:
-        """把 failed 重置为 pending，供托盘"重试失败的缩略图"。"""
-        n = self.db.execute_rowcount(
-            "UPDATE media SET thumb_state = 'pending' WHERE thumb_state = 'failed'"
-        )
-        self.failed = 0
-        return n
-
 
 # --------------------------------------------------------------------------
 # 占位图（thumb_state='failed' 时返回，避免时间线出现破图）

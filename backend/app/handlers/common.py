@@ -493,9 +493,6 @@ def _like_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _like_contains(s: str) -> str:
-    return "%" + _like_escape(s) + "%"
-
 
 # --------------------------------------------------------------------------
 # 文件流

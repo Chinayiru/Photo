@@ -150,8 +150,3 @@ def no_content(extra: Iterable[tuple[str, str]] = ()) -> Response:
         resp.raw_headers.append((k.encode("latin-1"), v.encode("latin-1")))
     return resp
 
-
-def add_headers(resp: Response, headers: dict[str, str]) -> Response:
-    for k, v in headers.items():
-        resp.headers[k] = v
-    return resp

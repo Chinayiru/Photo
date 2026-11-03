@@ -644,9 +644,10 @@ def test_a_successful_pair_clears_the_device_counters(tmp_path: Path) -> None:
     database = cloud_db.CloudDB(str(tmp_path / "cloud.db"))
     code = "424242"
     database.execute(
-        "INSERT INTO pair_codes(code, device_id, expires_at, created_at) "
-        "VALUES (?, ?, ?, ?)",
-        (code, device_id, time.time() + 300, time.time()))
+        "INSERT INTO pair_codes(code_hash, device_id, expires_at, created_at)"
+        " VALUES (?, ?, ?, ?)",
+        (cloud_db.hash_pair_code(database.path, code), device_id,
+         time.time() + 300, time.time()))
     database.execute(
         "UPDATE devices SET pair_fails = 3, pair_window = ? WHERE id = ?",
         (time.time(), device_id))
@@ -679,16 +680,18 @@ def test_the_pair_code_row_is_the_first_gate(tmp_path: Path) -> None:
 
     database = cloud_db.CloudDB(str(tmp_path / "cloud.db"))
     code = "515151"
+    code_hash = cloud_db.hash_pair_code(database.path, code)
     database.execute(
-        "INSERT INTO pair_codes(code, device_id, expires_at, created_at) "
-        "VALUES (?, ?, ?, ?)",
-        (code, device_id, time.time() + 300, time.time()))
+        "INSERT INTO pair_codes(code_hash, device_id, expires_at, created_at)"
+        " VALUES (?, ?, ?, ?)",
+        (code_hash, device_id, time.time() + 300, time.time()))
 
     for _ in range(pairing._DEVICE_MAX_TRIES):
-        pairing._note_code_failure(database, code)
+        pairing._note_code_failure(database, code_hash)
 
     row = database.query_one(
-        "SELECT tries, locked_until FROM pair_codes WHERE code = ?", (code,))
+        "SELECT tries, locked_until FROM pair_codes WHERE code_hash = ?",
+        (code_hash,))
     assert int(row["tries"]) == pairing._DEVICE_MAX_TRIES
     assert float(row["locked_until"] or 0) > time.time()
 
@@ -719,9 +722,10 @@ def _insert_device_for(path: Path, email: str, *, name: str) -> str:
 def _insert_code(path: Path, device_id: str, code: str) -> None:
     database = cloud_db.CloudDB(str(path / "cloud.db"))
     database.execute(
-        "INSERT INTO pair_codes(code, device_id, expires_at, created_at) "
-        "VALUES (?, ?, ?, ?)", (code, device_id, time.time() + 300,
-                                time.time()))
+        "INSERT INTO pair_codes(code_hash, device_id, expires_at, created_at)"
+        " VALUES (?, ?, ?, ?)",
+        (cloud_db.hash_pair_code(database.path, code), device_id,
+         time.time() + 300, time.time()))
 
 
 def test_another_accounts_code_is_indistinguishable_from_a_missing_one(
@@ -840,16 +844,18 @@ def test_pair_fails_cleanly_when_the_computer_does_not_answer(
     database = cloud_db.CloudDB(str(tmp_path / "cloud.db"))
     code = "555555"
     database.execute(
-        "INSERT INTO pair_codes(code, device_id, expires_at, created_at) "
-        "VALUES (?, ?, ?, ?)",
-        (code, device_id, time.time() + 300, time.time()))
+        "INSERT INTO pair_codes(code_hash, device_id, expires_at, created_at)"
+        " VALUES (?, ?, ?, ?)",
+        (cloud_db.hash_pair_code(database.path, code), device_id,
+         time.time() + 300, time.time()))
 
     FAKE.online = False
     failed = _pair(client, device_id, token, code=code)
     assert failed.status_code == 503, failed.text
     assert failed.json()["error"]["code"] == "E2007"
     row = database.query_one(
-        "SELECT used_at FROM pair_codes WHERE code = ?", (code,))
+        "SELECT used_at FROM pair_codes WHERE code_hash = ?",
+        (cloud_db.hash_pair_code(database.path, code),))
     assert row["used_at"] is None, "电脑没回话却把配对码消费掉了"
 
     # 电脑回来后同一个码还能用 —— 这才是"重试一次就好"。
@@ -883,3 +889,47 @@ def test_removing_a_phone_pushes_the_revocation_immediately(
     row = database.query_one(
         "SELECT revoked FROM clients WHERE id = ?", (client_id,))
     assert int(row["revoked"]) == 1
+
+# ------------------------- ⑨ 配对码不落明文（ISSUE-091）
+
+
+def test_pair_code_is_never_stored_in_plaintext(tmp_path: Path) -> None:
+    """签发出来的 6 位码不能以明文出现在库里。
+
+    判据不看 schema（那只是一个字符串），而是**直接读 db 文件的字节**：
+    `pair_codes` 只存 HMAC，所以整份文件里搜不到那 6 位数字。背景：6 位码
+    只有 100 万种，明文落库等于把"此刻有效的那几枚码"交给任何一个能读到
+    db 文件的人（备份 / 误拷 / 误提交）。
+    """
+    _make_account(tmp_path)
+    db_path = tmp_path / "cloud.db"
+    database = cloud_db.CloudDB(str(db_path))
+    account = database.query_one("SELECT id FROM accounts LIMIT 1")
+    device_id = security.new_device_id()
+    agent_token = security.new_token()
+    database.execute(
+        "INSERT INTO devices(id, account_id, name, agent_token, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (device_id, account["id"], "家里的电脑",
+         security.hash_token(agent_token), time.time()))
+    FAKE.secret = shared_token.secret_for_agent_token(agent_token)
+
+    agent = TestClient(_app(tmp_path, dist=_dist(tmp_path)),
+                       client=("203.0.113.62", 5000))
+    issued = agent.post(f"/api/devices/{device_id}/paircode",
+                        headers={"Authorization": f"Bearer {agent_token}"})
+    assert issued.status_code == 201, issued.text
+    code = str(issued.json()["code"])
+    assert code.isdigit() and len(code) == 6
+
+    # 明码仍然能配对（用户看到的 UX 不变）……
+    client = TestClient(_app(tmp_path, dist=_dist(tmp_path)),
+                        client=("203.0.113.61", 5000))
+    token = _account_token(client, "owner@example.com")
+    assert _pair(client, device_id, token, code=code).status_code == 200
+
+    # ……但库里只有摘要：整份文件里搜不到那 6 位数字。
+    blob = db_path.read_bytes()
+    assert code.encode("ascii") not in blob, "配对码以明文写进了云端库"
+    row = database.query_one("SELECT code_hash FROM pair_codes")
+    assert len(str(row["code_hash"])) == 64

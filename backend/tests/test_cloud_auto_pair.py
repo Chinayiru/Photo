@@ -354,10 +354,12 @@ def test_code_pairing_semantics_are_unchanged(tmp_path: Path) -> None:
     assert no_code.json()["error"]["code"] == "E1001"
 
     code = security.new_pair_code()
-    client.app.state.db.execute(
-        "INSERT INTO pair_codes(code, device_id, expires_at, tries, "
+    db = client.app.state.db
+    db.execute(
+        "INSERT INTO pair_codes(code_hash, device_id, expires_at, tries, "
         "created_at) VALUES (?, ?, ?, 0, ?)",
-        (code, device_id, time.time() + 300, time.time()))
+        (cloud_db.hash_pair_code(db.path, code), device_id,
+         time.time() + 300, time.time()))
     ok = client.post(f"/api/devices/{device_id}/pair",
                      json={"code": code, "client_name": "手机"},
                      headers={"Authorization": f"Bearer {token}"})

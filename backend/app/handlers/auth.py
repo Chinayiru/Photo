@@ -37,20 +37,18 @@ from .. import audit
 from ..auth import (
     CLIENT_COOKIE,
     PAIR_CODE_TTL,
-    TOKEN_TTL_DAYS,
     cookie_max_age_for,
     token_expiry,
     consume_pair_code,
     generate_pair_code,
     is_loopback,
-    pair_code_info,
     purge_expired_codes,
     require_client,
     revoke_all_codes,
     store_pair_code,
 )
 from ..core import Ctx, Reply, empty_reply, json_reply
-from ..errors import E1001, E1015, E2003, E4001, AppError, NotFound, Unauthorized
+from ..errors import E1001, E2003, E4001, AppError, NotFound
 
 log = logging.getLogger(__name__)
 

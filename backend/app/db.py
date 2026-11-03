@@ -965,20 +965,6 @@ class Database:
         v = row[0]
         return default if v is None else v
 
-    def iterate(
-        self, sql: str, params: Sequence[Any] | dict[str, Any] = (), *, arraysize: int = 256
-    ) -> Iterator[sqlite3.Row]:
-        """流式读取，用于全表扫描（索引器）。不会把结果全读进内存。"""
-        cur = self.connect().execute(sql, params)
-        try:
-            while True:
-                rows = cur.fetchmany(arraysize)
-                if not rows:
-                    return
-                yield from rows
-        finally:
-            cur.close()
-
     # --- 写入 -------------------------------------------------------------
 
     def execute(self, sql: str, params: Sequence[Any] | dict[str, Any] = ()) -> sqlite3.Cursor:
@@ -1032,9 +1018,6 @@ class Database:
     def get_setting(self, key: str, default: Any = None) -> Any:
         row = self.query_one("SELECT value FROM settings WHERE key = ?", (key,))
         return default if row is None else _decode_setting(row["value"])
-
-    def all_settings(self) -> dict[str, Any]:
-        return {r["key"]: _decode_setting(r["value"]) for r in self.query("SELECT key, value FROM settings")}
 
     # --- 统计 -------------------------------------------------------------
 

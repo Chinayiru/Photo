@@ -87,29 +87,6 @@ def req(url: str, token: str | None = None, *, method: str = "GET",
         return resp.status, (payload if raw else json.loads(payload.decode("utf-8")))
 
 
-def req_err(url: str, token: str | None = None, *, method: str = "GET",
-            body: dict | None = None, headers: dict | None = None):
-    """发一个预期会失败的请求，返回 (status, parsed_body, response_headers)。"""
-    data = None
-    hdrs = dict(headers or {})
-    if token:
-        hdrs["Authorization"] = f"Bearer {token}"
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        hdrs["Content-Type"] = "application/json"
-    r = urllib.request.Request(url, data=data, headers=hdrs, method=method)
-    try:
-        with urllib.request.urlopen(r, timeout=30) as resp:
-            payload = resp.read()
-            return resp.status, json.loads(payload.decode("utf-8")), dict(resp.headers)
-    except urllib.error.HTTPError as e:
-        payload = e.read()
-        try:
-            parsed = json.loads(payload.decode("utf-8"))
-        except Exception:  # noqa: BLE001
-            parsed = {"_raw": payload[:200].decode("utf-8", "replace")}
-        return e.code, parsed, dict(e.headers or {})
-
 
 def split_host(base: str) -> tuple[str, int]:
     rest = base.split("://", 1)[1]

@@ -94,7 +94,7 @@ from ..relay.headers import (
 )
 from ..relay.pages import StaticPages
 from ..relay.pairing import issue_pair_code, purge_expired_codes, redeem_pair_code
-from ..relay.reply import json_error, json_reply, no_content
+from ..relay.reply import json_error, json_reply
 from ..relay.tunnel import TunnelServer
 
 __all__ = ["create_app", "CLOUD_VERSION"]

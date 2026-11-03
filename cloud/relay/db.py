@@ -17,7 +17,7 @@
 | `accounts` | 一个账号（邮箱 + scrypt 口令哈希） |
 | `devices` | 用户家里的一台电脑（`agent_token` 的 sha256） |
 | `clients` | 一部手机对一个设备的配对（`token_hash`） |
-| `pair_codes` | 一个 6 位配对码（5 次尝试 / 10 分钟锁） |
+| `pair_codes` | 一条配对码记录（只存 HMAC；5 次尝试 / 10 分钟锁） |
 | `traffic` | 每设备每天的双向字节数（AC-3.15） |
 
 等等，这是六张。`schema_version` 是迁移账本，不算业务表——AC-7.3 数的是
@@ -38,8 +38,11 @@ P1 的中继是**单进程**（设备注册表是内存 map，多 worker 会各�
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -117,7 +120,10 @@ CREATE TABLE IF NOT EXISTS clients (
 );
 
 CREATE TABLE IF NOT EXISTS pair_codes (
-    code        TEXT PRIMARY KEY CHECK (length(code) = 6),
+    -- 只存码的 HMAC（key 来自库旁边的 `.pepper` 文件或 PB_CLOUD_PAIR_PEPPER
+    -- 环境变量），不存明文：6 位数字只有 100 万种，明文落库等于把「此刻有效
+    -- 的那几枚码」直接交给任何能读 db 文件的人（`docs/11` ISSUE-091）。
+    code_hash   TEXT PRIMARY KEY CHECK (length(code_hash) = 64),
     device_id   TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     expires_at  REAL NOT NULL,
     tries       INTEGER NOT NULL DEFAULT 0,
@@ -186,6 +192,71 @@ _ADDED_INDEXES: tuple[tuple[str, str], ...] = (
      "CREATE UNIQUE INDEX IF NOT EXISTS idx_clients_token_hash "
      "ON clients(token_hash)"),
 )
+
+
+#: 进程内缓存：同一个库文件只读一次 `.pepper`。
+_PEPPERS: dict[str, str] = {}
+
+
+def _pepper_from_env() -> str:
+    return (os.environ.get("PB_CLOUD_PAIR_PEPPER") or "").strip()
+
+
+def pair_pepper(path: str | Path) -> str:
+    """配对码 HMAC 的密钥。
+
+    优先级：`PB_CLOUD_PAIR_PEPPER` 环境变量 → 库文件旁边的 `<db>.pepper`
+    文件（首次自动生成 32 字节 hex）。
+
+    为什么要有 key：6 位数字只有 100 万种，无盐 `sha256(code)` 用一张
+    彩虹表就能瞬间还原。有了 key，**只拿到 db 文件**（最常见的泄露形态：
+    备份、误提交、误拷走）还原不出任何一枚活码。
+
+    两个来源都不可用时（只读目录且没设环境变量）不阻断启动：退化为
+    "按库路径派生"的固定值并打 WARNING —— 这种做法挡不住有心人，但比
+    明文强，且不会让中继因为一个写不进去的目录起不来。
+    """
+    env = _pepper_from_env()
+    if env:
+        return env
+    key = os.path.abspath(str(path))
+    cached = _PEPPERS.get(key)
+    if cached:
+        return cached
+    side = key + ".pepper"
+    try:
+        with open(side, "r", encoding="ascii") as f:
+            value = f.read().strip()
+    except FileNotFoundError:
+        value = ""
+    except OSError:          # pragma: no cover —— 读不了当作没有
+        value = ""
+    if not value:
+        fresh = secrets.token_hex(32)
+        try:
+            with open(side, "x", encoding="ascii") as f:
+                f.write(fresh)
+            value = fresh
+            log.info("已生成配对码 pepper：%s", side)
+        except FileExistsError:      # 另一个进程抢先建了
+            try:
+                with open(side, "r", encoding="ascii") as f:
+                    value = f.read().strip()
+            except OSError:          # pragma: no cover
+                value = ""
+        except OSError as exc:       # pragma: no cover —— 只读目录
+            log.warning("配对码 pepper 写不进 %s（%s），退化为按库路径派生",
+                        side, type(exc).__name__)
+            value = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    _PEPPERS[key] = value
+    return value
+
+
+def hash_pair_code(path: str | Path, code: str) -> str:
+    """把 6 位明文码换成入库用的 HMAC（64 位 hex）。"""
+    key = pair_pepper(path).encode("utf-8")
+    return hmac.new(key, code.strip().encode("utf-8"),
+                    hashlib.sha256).hexdigest()
 
 
 class CloudDB:
@@ -286,6 +357,50 @@ class CloudDB:
                 conn.execute(ddl)
             except sqlite3.IntegrityError:
                 log.error("索引 %s 建不起来：表里已有重复数据，需人工清理", name)
+
+        self._migrate_pair_codes(conn)
+
+    def _migrate_pair_codes(self, conn: sqlite3.Connection) -> None:
+        """老库的 `pair_codes.code`（明文）→ 新库的 `code_hash`。
+
+        `ALTER TABLE` 改不了主键与约束，只能重建：建新表 → 逐行按明文算
+        HMAC 插进去 → 丢旧表 → 改名 → 补回索引。已有的码在剩余 TTL 内
+        继续可用（`PAIR_CODE_TTL` 是 5 分钟，不需要停机迁数据）。
+        """
+        cols = {str(r["name"]) for r in
+                conn.execute("PRAGMA table_info(pair_codes)").fetchall()}
+        if not cols or "code_hash" in cols:
+            return
+        if "code" not in cols:      # pragma: no cover —— 结构不认识，别乱动
+            log.warning("pair_codes 既没有 code 也没有 code_hash，跳过迁移")
+            return
+        log.info("云端库迁移：pair_codes 明文码 → HMAC")
+        conn.execute("DROP TABLE IF EXISTS pair_codes_migrating")
+        conn.execute(
+            "CREATE TABLE pair_codes_migrating ("
+            " code_hash TEXT PRIMARY KEY CHECK (length(code_hash) = 64),"
+            " device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,"
+            " expires_at REAL NOT NULL, tries INTEGER NOT NULL DEFAULT 0,"
+            " locked_until REAL, created_at REAL NOT NULL, used_at REAL)")
+        rows = conn.execute(
+            "SELECT code, device_id, expires_at, tries, locked_until,"
+            " created_at, used_at FROM pair_codes").fetchall()
+        for row in rows:
+            conn.execute(
+                "INSERT OR IGNORE INTO pair_codes_migrating(code_hash,"
+                " device_id, expires_at, tries, locked_until, created_at,"
+                " used_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (hash_pair_code(self.path, str(row["code"])),
+                 str(row["device_id"]), row["expires_at"], row["tries"],
+                 row["locked_until"], row["created_at"], row["used_at"]))
+        conn.execute("DROP TABLE pair_codes")
+        conn.execute("ALTER TABLE pair_codes_migrating RENAME TO pair_codes")
+        for ddl in ("CREATE INDEX IF NOT EXISTS idx_pair_codes_device"
+                    " ON pair_codes(device_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_pair_codes_expires"
+                    " ON pair_codes(expires_at)"):
+            conn.execute(ddl)
+        log.info("云端库迁移：pair_codes 迁移完成（%d 行）", len(rows))
 
     def tables(self) -> set[str]:
         """当前库里所有用户表的名字（测试用来断言"恰好五张业务表"）。"""

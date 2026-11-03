@@ -452,15 +452,6 @@ class Config:
         return bool(self._raw["video"].get("enabled", False))
 
     @property
-    def video_concurrency(self) -> int:
-        """解码并发，钳在 1..8。0 或负数会让闸门死锁，过大只会互相拖慢。"""
-        try:
-            n = int(self._raw["video"].get("max_concurrency", 2))
-        except (TypeError, ValueError):
-            return 2
-        return max(1, min(8, n))
-
-    @property
     def video_frame_at(self) -> float:
         """封面取第几秒，负数按 0 处理（ffmpeg 对负 `-ss` 行为未定义）。"""
         try:
@@ -734,10 +725,6 @@ class Config:
     def secret(self, key: str, default: str | None = None) -> str | None:
         v = self.secrets.get(key, default)
         return v if isinstance(v, str) else default
-
-    def set_secret(self, key: str, value: str) -> None:
-        self.secrets[key] = value
-        _write_json(self._data_dir / "secrets.json", self.secrets, private=True)
 
     # --- 持久化 -----------------------------------------------------------
 

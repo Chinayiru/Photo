@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import pathlib
 import secrets
 import sys
 import time

@@ -51,7 +51,6 @@ def main() -> int:
 
     state: dict = {}
     ready = threading.Event()
-    stop_flag = threading.Event()
 
     async def runner() -> None:
         # on_ready 是**同步**回调（server.py 直接调用，不 await）。

@@ -36,7 +36,7 @@ from . import archive
 from . import thumbs as thumbs_mod
 from . import uploads
 from .auth import auth_middleware
-from .config import Config, check_bind_safety, ensure_dirs, get as get_config, is_first_run
+from .config import Config, ensure_dirs, get as get_config, is_first_run
 from .db import Database, get_db, make_db
 from .errors import AppError
 from .indexer import Indexer

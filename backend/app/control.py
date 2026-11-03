@@ -56,7 +56,6 @@ from typing import Any
 from .identity import (
     client_signing_secret,
     cloud_device_id,
-    hash_token,
     legacy_tunnel_secret,
     legacy_window_open,
     sync_revoked_clients,

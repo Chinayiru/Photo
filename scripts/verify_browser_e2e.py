@@ -1360,7 +1360,6 @@ def main() -> int:
           })()
         """)
         check(isinstance(box, dict) and box.get("x"), f"能定位第一个格子  got {box}")
-        long_id = int(box["id"])
         # ★ `Browser.touch()` 收的是 (x, y) 元组列表，不是 CDP 的 {"x":..,"y":..}
         p = [(box["x"], box["y"])]
         br.touch("touchStart", p)
@@ -3228,7 +3227,6 @@ def main() -> int:
                   f"{r0.get('ct')!r}")
 
         # 配对码只能用一次：同一枚码再换一次 token 必须被拒（防重放）
-        st_b02 = {"code": code_b02}
         s_reuse, body_reuse, _ = (None, {}, None)
         try:
             rq = urllib.request.Request(
@@ -3261,7 +3259,6 @@ def main() -> int:
         qr_pc = _panel_code(base)
         url_scan = pair_qr_url(base, qr_pc["code"], dev_id)
         parsed_scan = _up.urlparse(url_scan)
-        qs_scan = _up.parse_qs(parsed_scan.query)
         # ★ 配对码在 **fragment** 里（`#code=..&did=..`）：fragment 不随请求
         #   发给服务器、不进云端日志、不进 Referer。早期版本用的 query，
         #   所以这里必须解析 fragment（query 留作向后兼容）。

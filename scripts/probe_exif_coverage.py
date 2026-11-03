@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
 from app.config import ALLOWED_IMAGE_EXTS, DEFAULT_EXCLUDE_DIRS  # noqa: E402
-from app.exif import extract_sync, parse_datetime_from_name, resolve_taken_at  # noqa: E402
+from app.exif import extract_sync, resolve_taken_at  # noqa: E402
 
 LIBRARY = Path(r"D:\Photos")
 

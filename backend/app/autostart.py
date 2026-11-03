@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import logging
-import subprocess
 import sys
 from pathlib import Path
 
@@ -204,31 +203,3 @@ def ensure_enabled(want: bool | None = None) -> dict[str, object]:
             disable_autostart()
     return status()
 
-
-def start_menu_shortcut() -> bool:
-    """在开始菜单里放一个快捷方式（可选，失败不影响任何功能）。
-
-    用 PowerShell 创建 `.lnk`，避免引入 pywin32 这种重依赖。
-    """
-    if not getattr(sys, "frozen", False):
-        return False
-    try:
-        exe = Path(sys.executable).resolve()
-        start = Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs"
-        start.mkdir(parents=True, exist_ok=True)
-        lnk = start / "PhotoBridge.lnk"
-        ps = (
-            "$s=(New-Object -ComObject WScript.Shell).CreateShortcut("
-            f"'{lnk}');"
-            f"$s.TargetPath='{exe}';"
-            f"$s.WorkingDirectory='{exe.parent}';"
-            "$s.Save()"
-        )
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                       check=True, capture_output=True, timeout=20,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        log.info("已创建开始菜单快捷方式：%s", lnk)
-        return True
-    except Exception:       # noqa: BLE001
-        log.debug("创建开始菜单快捷方式失败", exc_info=True)
-        return False

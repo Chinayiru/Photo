@@ -71,16 +71,6 @@ _login_limiter = RateLimiter(_LOGIN_LIMIT, _LOGIN_WINDOW)
 _email_limiter = RateLimiter(_LOGIN_LIMIT, _LOGIN_WINDOW)
 
 
-def account_tokens_table() -> str:
-    """（已并入 `db.SCHEMA`。）
-
-    `account_tokens` 的 DDL 现在写在 `db.py` 的 `SCHEMA` 里，因为
-    `CloudDB.init()` 只跑 `executescript(SCHEMA)`，分散在别处会让
-    "建库"和"建这张表"变成两件必须记住一起做的事。
-    """
-    from ..relay.db import SCHEMA
-    return SCHEMA
-
 
 # ---------------------------------------------------------------------------
 # 账号

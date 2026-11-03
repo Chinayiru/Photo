@@ -17,7 +17,7 @@ from typing import Any, Final
 
 from ..config import WILDCARD_HOSTS
 from ..core import Ctx, Reply, bytes_reply, json_reply
-from ..errors import E1001, BadRequest
+from ..errors import BadRequest
 from ..state import AppState
 from . import common
 
@@ -309,18 +309,6 @@ async def stats(ctx: Ctx) -> Reply:
 # 内部统计
 # --------------------------------------------------------------------------
 
-def _thumb_cache_bytes(st: AppState) -> int:
-    """缩略图缓存占用。用户会关心它涨到多大（可以安全删除，会自动重建）。
-
-    ⚠️ 已不再直接遍历目录，改由 `_thumb_cache_stats()` 一次算出两列。
-    保留这个函数只为兼容（它现在走同一份 memo，不会再多跑一遍遍历）。
-    """
-    return _thumb_cache_stats_sync(st)[1]
-
-
-def _thumb_cache_files(st: AppState) -> int:
-    """缓存文件数。同上：与 `_thumb_cache_bytes` 共用同一次遍历。"""
-    return _thumb_cache_stats_sync(st)[0]
 
 
 #: 缓存统计的 memo 有效期（秒）。
