@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
+from . import procguard
 from .fsopen import HandleMismatch, open_verified
 
 log = logging.getLogger(__name__)
@@ -373,23 +374,21 @@ def _slots(limit: int = DEFAULT_CONCURRENCY) -> threading.BoundedSemaphore:
 # --------------------------------------------------------------------------
 
 def _run(argv: list[str], *, timeout: float) -> subprocess.CompletedProcess[bytes]:
-    """跑一个子进程，带超时与"不弹控制台窗口"。
+    """跑一个子进程，带超时、内存上限与专用工作目录。
 
-    `stdin=DEVNULL` 是必须的：ffmpeg 会读 stdin 的按键（交互式覆盖询问），
-    在 Windows 服务/托盘进程里 stdin 是无效句柄，读它会直接卡住。
+    实现在 `procguard`：这里只做一件事 —— 把它的 `ProcTimeout` 翻译成
+    `subprocess.TimeoutExpired`，让下面 `probe()` / `extract_frame()` 的
+    既有 `except` 分支不用改。
+
+    为什么还要内存上限：一张 8K HEVC 的关键帧解码就能吃掉 2 GB，
+    没有上限时表现是"整机开始换页"，不是"这张封面没生成"。
     """
-    kwargs: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "timeout": timeout,
-        "check": False,
-    }
-    if os.name == "nt":
-        # 0x08000000 = CREATE_NO_WINDOW：否则每次抽帧都在托盘程序旁边
-        # 闪一下黑框。
-        kwargs["creationflags"] = 0x08000000
-    return subprocess.run(argv, **kwargs)  # noqa: S603 —— 参数数组，无 shell
+    try:
+        result = procguard.run(argv, timeout=timeout)
+    except procguard.ProcTimeout as exc:
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout) from exc
+    return subprocess.CompletedProcess(          # type: ignore[arg-type]
+        argv, result.returncode, result.stdout, result.stderr)
 
 
 def probe(

@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import procguard
+
 log = logging.getLogger(__name__)
 
 __all__ = [
@@ -306,12 +308,15 @@ class Transcoder:
             argv = plan_args(ffmpeg, src, tmp)
             log.info("转码开始 media_id=%s → %s", job.media_id, out.name)
             try:
-                proc = subprocess.Popen(
+                # `open_guarded`：内存上限（Job Object / RLIMIT_AS）、
+                # 专用工作目录、超时后连整棵进程树一起收。ffmpeg 吃的是
+                # 用户文件，跑飞了必须是"这次转码失败"，不是"托盘程序卡死"。
+                guard = procguard.open_guarded(
                     argv,
-                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                 )
+                proc = guard.proc
             except OSError as exc:
                 job.state = STATE_FAILED
                 job.error = f"启动 ffmpeg 失败：{exc}"
@@ -327,14 +332,15 @@ class Transcoder:
                         job.progress = pct
                 rc = proc.wait(timeout=3600)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                guard.kill()
                 rc = -1
                 job.error = "转码超时（超过 60 分钟）"
             except Exception as exc:              # noqa: BLE001
-                proc.kill()
+                guard.kill()
                 rc = -1
                 job.error = f"转码失败：{exc}"
             finally:
+                guard.close()
                 with self._lock:
                     self._procs.pop(job.media_id, None)
                 job.finished_at = time.time()
