@@ -573,10 +573,58 @@ COVERED: dict[str, str] = {
     "UploadAbortResponse": "test_upload_patch_and_abort_match_types",
     "PairRequest": "test_pair_request_matches_types",
     "PairResponse": "test_pair_request_matches_types",
+    "PairPendingResponse": "test_pair_pending_and_poll_match_types",
+    "PairPollPending": "test_pair_pending_and_poll_match_types",
     "MeResponse": "test_me_and_devices_match_types",
     "DeviceEntry": "test_me_and_devices_match_types",
     "DevicesResponse": "test_me_and_devices_match_types",
 }
+
+
+def test_pair_pending_and_poll_match_types(tmp_path: Path, monkeypatch) -> None:
+    """`202` 登记与轮询 `pending` 的形状，必须与 `types.ts` 声明一致。
+
+    这一条走的是**云端**：本地服务端没有"待批准"这个概念（配对码在电脑本机
+    就是权威）。所以起一个真云端 app + 替身电脑端，跟
+    `test_cloud_auto_pair.py` 用同一套夹具 —— 复用，不另造一份。
+
+    为什么值得单独钉：手机端拿到 202 之后的所有行为（显示核对码、比对指纹、
+    倒计时、按 `poll_after` 排下一拍）都只依赖这几个字段名。后端把
+    `verify_code` 改名成 `code`，界面会安静地显示一张空白卡片。
+    """
+    from starlette.testclient import TestClient
+
+    from _pair_wire import pair_body, poll, start
+    from cloud.relay import control as cloud_control
+    from cloud.relay import pairing as cloud_pairing
+    from test_cloud_auto_pair import FAKE, _account, _app, _device, _online
+
+    FAKE.reset()
+    cloud_pairing._AUTO_ATTEMPTS.clear()
+    # 控制通道换成本地替身：配对现在要问电脑端"某台手机请求加入"，
+    # 契约测试不该为此起一条真隧道（`_fake_control` 是同一份替身）
+    monkeypatch.setattr(cloud_control, "call_agent", FAKE)
+    client = TestClient(_app(tmp_path))
+    token = _account(client)
+    device_id, _agent_token = _device(client)
+    _online(client.app, device_id)
+
+    started = start(client, device_id, token, pair_body(auto=True))
+    assert started.status_code == 202, started.text
+    pending = started.json()
+    for key in ("state", "request_id", "verify_code", "fingerprint",
+                "expires_at", "device_id", "device_name", "poll_after"):
+        assert key in pending, f"202 少了 {key}"
+    assert pending["state"] == "pending"
+
+    # 还没批准：轮询回 pending，只有它自己那一小撮字段
+    waiting = poll(client, device_id, token, pending["request_id"])
+    assert waiting.status_code == 200, waiting.text
+    body = waiting.json()
+    assert body["state"] == "pending"
+    for key in ("verify_code", "expires_at", "poll_after"):
+        assert key in body, f"轮询 pending 少了 {key}"
+    assert body["verify_code"] == pending["verify_code"]
 
 
 def test_every_declared_interface_has_a_contract_check() -> None:

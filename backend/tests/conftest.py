@@ -41,11 +41,15 @@ def _reset_global_state() -> None:
     每处都用 try/except 包住：某个模块被删掉或改名时，
     这个夹具不该让整套测试崩掉 —— 它只是隔离手段，不是被测对象。
     """
-    # 配对限速窗口
+    # 配对限速窗口。两个桶都要清：按来源的那个 + 全局熔断（120 次/10 分钟）。
+    # 全局桶是 2026-11-26 为整改单 B7.2 新加的：不清它，整套测试跑过一百多次
+    # 配对之后，后半段的用例全部拿到 `429 E4001 pair attempts globally limited`
+    # —— 报错说"太快了"，其实是前面几十个用例攒下的额度。
     try:
         from backend.app.handlers import auth as auth_handlers
 
         auth_handlers._pair_attempts.clear()
+        auth_handlers._pair_global.clear()
     except Exception:       # noqa: BLE001
         pass
 

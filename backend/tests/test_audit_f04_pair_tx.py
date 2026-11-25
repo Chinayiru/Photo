@@ -8,18 +8,21 @@
 心跳、上传登记、设备列表全排在后面。电脑卡一下或隧道抖一下，整个云端被
 拖到超时；而配对本身还会因为外层事务被异常回滚而**静默丢掉**用户刚输的码。
 
-## 拆法（三个函数，边界写在名字上）
+## 拆法（两段，边界写在名字上）
 
 * `_claim_code()` —— F04a 短事务：条件 `UPDATE ... WHERE used_at IS NULL`，
   影响行数就是那把锁，立即提交。
-* `_mint_via_agent()` —— F04b 事务外：`await` 电脑签发，**不得持有事务或行锁**。
-* `_write_client()` —— F04c 短事务：`INSERT clients`。
+* `_request_via_agent()` —— F04b 事务外：`await` 电脑**登记申请**（唯一允许
+  长耗时的位置），**不得持有事务或行锁**。
+* `_write_client()` —— F04c 短事务：`INSERT clients`。★ 2026-11-24 之后它不再
+  紧跟 `_request_via_agent()`：签发要等用户在电脑上点「批准」，手机轮询
+  `/pair/{request_id}` 时才写库（`pair_status`）。
 
 ## 失败路径（这批用例的重点）
 
-签不出来（电脑离线 / 隧道断 / 回来的内容不成立）或写库失败，都必须
-`_release_code()` 把码**还回去**：用户拿着一个"已使用"的码是死路，他自己
-没有任何办法恢复。释放只认自己那一次抢码（`WHERE used_at = ?`），不误伤。
+申请登记失败（电脑离线 / 隧道断 / 回来的内容不成立）必须 `_release_code()`
+把码**还回去**：用户拿着一个"已使用"的码是死路，他自己没有任何办法恢复。
+释放只认自己那一次抢码（`WHERE used_at = ?`），不误伤。
 
 所以这里断言的不是"能配对"，而是：**事务里没有 await、失败后码还能用、
 并发抢码只有一个赢家**。
@@ -41,6 +44,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from _fake_control import FAKE                      # noqa: E402
+from _pair_wire import DEVICE_KEY, approve_and_poll, poll  # noqa: E402
 from cloud.relay import auth as cloud_auth           # noqa: E402
 from cloud.relay import control as cloud_control     # noqa: E402
 from cloud.relay import db as cloud_db               # noqa: E402
@@ -117,9 +121,17 @@ def _pair_code(client: TestClient, device_id: str, code: str = CODE) -> str:
 
 def _post_pair(client: TestClient, device_id: str, token: str, *,
                code: str = CODE):
+    """第一步：发起配对（期望 202 + 待批准）。"""
     return client.post(f"/api/devices/{device_id}/pair",
                        headers={"Authorization": f"Bearer {token}"},
-                       json={"code": code, "client_name": "我的手机"})
+                       json={"code": code, "client_name": "我的手机",
+                             "device_key": DEVICE_KEY})
+
+
+def _finish_pair(client: TestClient, device_id: str, token: str,
+                 pending, *, fake=FAKE):
+    """第二步：批准 + 轮询（期望 200 + 令牌）。"""
+    return approve_and_poll(client, device_id, token, pending, fake=fake)
 
 
 def _used_at(client: TestClient, code: str):
@@ -192,8 +204,8 @@ def _spy_agent(probe: _TxnProbe, seen: list[tuple[str, int]]):
 # ---------------------------------------------------------------------------
 
 
-def test_signing_happens_with_no_transaction_open(monkeypatch, tmp_path) -> None:
-    """三段式最关键的性质：`mint_client` 那次 await 的时刻，事务深度必须是 0。"""
+def test_request_happens_with_no_transaction_open(monkeypatch, tmp_path) -> None:
+    """最关键的性质：`request_pair` 那次 await 的时刻，事务深度必须是 0。"""
     app = _app(tmp_path)
     client = TestClient(app)
     token = _account(client)
@@ -204,33 +216,36 @@ def test_signing_happens_with_no_transaction_open(monkeypatch, tmp_path) -> None
     seen: list[tuple[str, int]] = []
     monkeypatch.setattr(cloud_control, "call_agent", _spy_agent(probe, seen))
 
-    response = _post_pair(client, did, token)
-    assert response.status_code == 200, response.text
+    pending = _post_pair(client, did, token)
+    assert pending.status_code == 202, pending.text
+    assert _client_rows(client) == 0, "批准之前不该写 clients"
 
-    mint_depths = [d for action, d in seen if action == "mint_client"]
-    assert mint_depths == [0], seen        # 签发那一刻没有任何事务
-    assert "mint_client" in [a for a, _ in seen]
-    # 抢码一段 + 写 clients 一段；不嵌套、不长
-    assert probe.count >= 2, probe.count
+    request_depths = [d for action, d in seen if action == "request_pair"]
+    assert request_depths == [0], seen        # 申请那一刻没有任何事务
+    # 抢码一段；不嵌套、不长
+    assert probe.count >= 1, probe.count
     assert probe.max_depth == 1, probe.max_depth
+
+    done = _finish_pair(client, did, token, pending)
+    assert done.status_code == 200, done.text
     assert _client_rows(client) == 1
 
 
 def test_claim_and_write_are_synchronous_short_steps() -> None:
-    """两段短事务必须是同步函数：同步函数里写不出 `await`，也就偷不回事务里。"""
+    """短事务必须是同步函数：同步函数里写不出 `await`，也就偷不回事务里。"""
     import inspect
 
     for fn in (cloud_pairing._claim_code, cloud_pairing._release_code,
                cloud_pairing._write_client):
         assert not inspect.iscoroutinefunction(fn), fn.__name__
-    assert inspect.iscoroutinefunction(cloud_pairing._mint_via_agent)
+    assert inspect.iscoroutinefunction(cloud_pairing._request_via_agent)
 
 
-def test_mint_step_touches_no_database_transaction() -> None:
-    """`_mint_via_agent()` 的源码里不许出现 `db.transaction(`。"""
+def test_request_step_touches_no_database_transaction() -> None:
+    """`_request_via_agent()` 的源码里不许出现 `db.transaction(`。"""
     import inspect
 
-    src = inspect.getsource(cloud_pairing._mint_via_agent)
+    src = inspect.getsource(cloud_pairing._request_via_agent)
     assert "db.transaction(" not in src
     assert "call_agent" in src
 
@@ -256,14 +271,16 @@ def test_agent_offline_releases_the_code_so_the_user_can_retry(tmp_path) -> None
 
     # 电脑恢复在线后，同一个码还能用 —— 用户不必回电脑前重新生成
     FAKE.online = True
-    response = _post_pair(client, did, token)
-    assert response.status_code == 200, response.text
+    recovery = _post_pair(client, did, token)
+    assert recovery.status_code == 202, recovery.text
+    done = _finish_pair(client, did, token, recovery)
+    assert done.status_code == 200, done.text
     assert _client_rows(client) == 1
     assert _used_at(client, code) is not None
 
 
-def test_malformed_mint_answer_is_treated_as_failure(tmp_path) -> None:
-    """电脑端回了个不成立的载荷（老版本 / 自己算错）→ 释放码，不写半条 clients。"""
+def test_malformed_request_answer_is_treated_as_failure(tmp_path) -> None:
+    """电脑端回了个不成立的申请载荷（老版本 / 自己算错）→ 释放码。"""
     app = _app(tmp_path)
     client = TestClient(app)
     token = _account(client)
@@ -271,8 +288,9 @@ def test_malformed_mint_answer_is_treated_as_failure(tmp_path) -> None:
     code = _pair_code(client, did)
 
     async def broken(conn, action, params, *, timeout=None):
-        if action == "mint_client":
-            return {"ok": True, "client_id": "", "token": "", "expires_at": 0}
+        if action == "request_pair":
+            return {"ok": True, "request_id": "zz", "verify_code": "",
+                    "expires_at": 0}
         return await FAKE(conn, action, params, timeout=timeout)
 
     cloud_control.call_agent = broken  # type: ignore[assignment]
@@ -286,25 +304,38 @@ def test_malformed_mint_answer_is_treated_as_failure(tmp_path) -> None:
     assert _client_rows(client) == 0
 
 
-def test_write_failure_releases_the_code(monkeypatch, tmp_path) -> None:
+def test_write_failure_at_poll_time_leaves_no_half_client(monkeypatch, tmp_path) -> None:
+    """轮询时写库失败 → 503，库里不留半条 `clients` 行。
+
+    ★ 这条的取舍写清楚：令牌是**电脑端**在批准后算好的，写库失败发生在
+    云端把令牌落盘这一步，此时电脑端那条申请已经被标记为"已兑换"。
+    用户需要重新发起配对 —— 比"留下一枚手机不知道、库里又查得到的令牌"
+    要好得多（后者撤销都撤不掉：库里没有那条行）。所以这里断言的是
+    "没有半成品"，而不是"重试一定能成功"。
+    """
     app = _app(tmp_path)
     client = TestClient(app)
     token = _account(client)
     did, _ = _device(client)
     code = _pair_code(client, did)
 
+    pending = _post_pair(client, did, token)
+    assert pending.status_code == 202, pending.text
+
     real_write = cloud_pairing._write_client
     monkeypatch.setattr(cloud_pairing, "_write_client",
                         lambda _db, **_kw: False)
-    response = _post_pair(client, did, token)
-    assert response.status_code == 503, response.text
-    assert response.json()["error"]["code"] == "E2007"
-    assert _used_at(client, code) is None
+    failed = _finish_pair(client, did, token, pending)
+    assert failed.status_code == 503, failed.text
+    assert failed.json()["error"]["code"] == "E2007"
+    assert _client_rows(client) == 0
 
-    # 换回真实现（`monkeypatch.undo()` 会把上层的 FAKE 替身也一起撤掉，别用）
+    # 申请在电脑端已经用掉：再轮询只能拿到"已兑换"，不会重复发令牌
     monkeypatch.setattr(cloud_pairing, "_write_client", real_write)
-    response = _post_pair(client, did, token)
-    assert response.status_code == 200, response.text
+    again = poll(client, did, token, str(pending.json()["request_id"]))
+    assert again.status_code == 403, again.text
+    assert again.json()["error"]["code"] == "E2008"
+    assert _client_rows(client) == 0
 
 
 def test_release_only_undoes_its_own_claim(tmp_path) -> None:
@@ -339,10 +370,13 @@ def test_second_request_loses_the_race_with_the_same_error_as_used(tmp_path) -> 
     did, _ = _device(client)
     code = _pair_code(client, did)
 
-    assert _post_pair(client, did, token).status_code == 200
+    first = _post_pair(client, did, token)
+    assert first.status_code == 202, first.text
     second = _post_pair(client, did, token)
     assert second.status_code == 409, second.text
     assert second.json()["error"]["code"] == "E1005"
+    done = _finish_pair(client, did, token, first)
+    assert done.status_code == 200, done.text
     assert _client_rows(client) == 1
 
 

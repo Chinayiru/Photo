@@ -48,11 +48,18 @@ __all__ = [
     "new_request_id",
     "LAN",
     "CLOUD",
+    "UNKNOWN_SOURCE",
 ]
 
 #: 通路标识。只用于日志与诊断，**业务代码不应据此分支**。
 LAN = "lan"
 CLOUD = "cloud"
+
+#: "拿不到来源地址"时的占位。云端在隧道帧里没带 `client_ip` 就会落到这里
+#: （见 `transports/cloud_tunnel.py`）。它**不是一个真实的来源**，因此限流
+#: 代码必须把它当成"共享桶"而不是"某个客户端"：否则一个配置漏项就会让
+#: 所有人都挤进同一个配额（2026-11-24 渗透报告 B7.2）。
+UNKNOWN_SOURCE = "unknown"
 
 Body = bytes | AsyncIterator[bytes] | None
 

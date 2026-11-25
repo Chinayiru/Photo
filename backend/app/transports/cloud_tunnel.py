@@ -38,6 +38,7 @@ from shared.protocol import ProtocolError
 
 from ..core.ctx import (
     CLOUD,
+    UNKNOWN_SOURCE,
     Ctx,
     Headers,
     Reply,
@@ -174,7 +175,11 @@ async def _handle_control(mux: Any, rid: int, req: Any, state: Any,
 
     try:
         action, payload = control_mod.parse_request(b"".join(chunks))
-        result = control_mod.handle(state, cfg, action, payload)
+        # `remote` 只进事件留痕：配对请求的"来源"要写进电脑端的 `pair_events`
+        # 才查得出"这条申请是从哪个客户端来的"。它**不参与**鉴权（对端已经
+        # 过了 agent_token 握手），也不参与限流归属（见下方 `client_ip`）。
+        result = control_mod.handle(state, cfg, action, payload,
+                                    remote=str(req.head.get("client_ip") or ""))
     except control_mod.ControlError as exc:
         await _send_control(mux, rid, exc.status,
                             {"ok": False, "code": exc.code, "message": exc.message})
@@ -299,7 +304,14 @@ class TunnelDispatcher:
             headers=headers,
             body=self._body_iter(req),
             via=CLOUD,
-            client_ip=str(head.get("client_ip") or "cloud"),
+            # ★ B7.2 的根因：这里原来是 `str(head.get("client_ip") or "cloud")`，
+            # 于是"中继没带 client_ip"时**所有客户端**共用一个 `cloud` 桶，
+            # 一个人刷满 20 次失败就把所有新手机锁 10 分钟（渗透报告 B7.2 实测）。
+            # 现在缺来源时落到 `unknown`：它仍然是一个共享桶，但
+            # `handlers/auth._rate_limit()` 对 `unknown` 只算全局熔断、不算
+            # 单来源配额 —— 缺 IP 的部署不应该把正常用户挡在门外。
+            # 这个值来自**已鉴权的隧道帧**，不是客户端自报的 `X-Forwarded-For`。
+            client_ip=str(head.get("client_ip") or UNKNOWN_SOURCE),
         )
 
         reply = await self.router.dispatch(ctx)

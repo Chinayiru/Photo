@@ -526,6 +526,200 @@ def _show_qr_window(title: str, url: str, code: str, ips: list[str],
 
 
 # --------------------------------------------------------------------------
+# 配对批准窗口
+# --------------------------------------------------------------------------
+
+#: 同一时刻只允许一个批准窗口（理由同 `_QR_OPEN`：两个 Tk 解释器会互相打架）。
+_APPROVE_OPEN = threading.Event()
+
+
+def _fmt_left(expires_at: float, now: float | None = None) -> str:
+    """把"还剩几秒"写成人话：`mm:ss`，已过期写「已过期」。"""
+    left = float(expires_at or 0) - (time.time() if now is None else now)
+    if left <= 0:
+        return "已过期"
+    return f"{int(left) // 60}:{int(left) % 60:02d}"
+
+
+def _show_approval_window(items: list[dict[str, Any]], decide: Any,
+                          on_refresh: Any = None) -> None:
+    """弹「待批准的配对」窗口（跑在独立线程里，阻塞到用户关闭）。
+
+    ## 这个窗口为什么必须存在
+
+    2026-11-24 的渗透测试（`report/pentest/PENTEST-REPORT.md` A1.3）证明：
+    中继只要拿到 `agent_token`，就能在**没有人查看电脑**的情况下让电脑
+    签发一枚可用 30 天的手机令牌，随后读走时间线与原图。根因不是"中继
+    能发请求"，而是"电脑端发请求就盖章"。
+
+    现在签发权回到这里：手机上点「配对」只会让电脑挂起一条**待批准**
+    记录，托盘弹通知 + 这个窗口，用户核对手机屏幕上的 6 位数字与指纹后
+    点「批准」，令牌才会产生。中继单独发起的请求会一直停在 pending，
+    直到过期（`pairing.REQUEST_TTL` = 5 分钟）。
+
+    ## 参数
+
+    * `items` — `pairing.list_pending()` 的返回值。
+    * `decide` — `(request_id, approve) -> str | None`：在工作线程里执行，
+      返回 `None` 表示成功，返回字符串表示要显示给用户的错误（例如
+      "该请求已被处理"）。**数据库写入绝不能在 Tk 线程里做**：主库是
+      WAL 模式、写入偶尔要等锁，卡住的是整个窗口。
+    * `on_refresh` — 点「刷新」时重新取 pending 列表，返回新列表。
+    """
+    def _run() -> None:
+        try:
+            import tkinter as tk
+        except Exception:       # noqa: BLE001
+            log.warning("没有可用的图形界面，无法显示配对批准窗口", exc_info=True)
+            return
+
+        try:
+            root = tk.Tk()
+        except Exception:       # noqa: BLE001
+            log.warning("创建批准窗口失败（可能无桌面会话）", exc_info=True)
+            return
+
+        rows: list[dict[str, Any]] = list(items)
+        holder = {"busy": False}
+
+        def _close() -> None:
+            """关窗的唯一出口（与二维码窗口同因：不留下"隐形置顶"残留）。"""
+            try:
+                root.attributes("-topmost", False)
+            except Exception:       # noqa: BLE001
+                pass
+            try:
+                root.destroy()
+            except Exception:       # noqa: BLE001
+                pass
+            _APPROVE_OPEN.clear()
+
+        root.title("PhotoBridge 配对请求")
+        root.resizable(False, False)
+        root.protocol("WM_DELETE_WINDOW", _close)
+
+        tip = tk.Label(
+            root,
+            text="核对手机屏幕上的 6 位数字与指纹（前 6 位）。\n"
+                 "只批准你此刻正在操作的那台手机。",
+            font=("Segoe UI", 10), justify="left", wraplength=430,
+        )
+        tip.pack(padx=16, pady=(14, 2))
+
+        status = tk.Label(root, text="", font=("Segoe UI", 8), fg="#059669")
+        status.pack(padx=16, anchor="w")
+
+        list_holder = tk.Frame(root)
+        list_holder.pack(fill="x", padx=8, pady=(6, 0))
+
+        empty = tk.Label(list_holder, text="当前没有待处理的配对请求。",
+                         font=("Segoe UI", 9), fg="#6b7280")
+        empty.pack(padx=8, pady=18)
+
+        def _say(text: str, *, bad: bool = False) -> None:
+            status.configure(text=text, fg="#dc2626" if bad else "#059669")
+
+        def _act(request_id: str, approve: bool) -> None:
+            """在工作线程里执行批准/拒绝，结果回到 Tk 线程刷新列表。"""
+            if holder["busy"]:
+                return
+            holder["busy"] = True
+            _say("处理中…")
+
+            def _work() -> None:
+                err: str | None
+                try:
+                    err = decide(request_id, approve)
+                except Exception:       # noqa: BLE001 —— 绝不让窗口线程死掉
+                    log.exception("处理配对请求失败 request_id=%s", request_id)
+                    err = "处理失败，详见日志"
+                root.after(0, lambda: _done(request_id, approve, err))
+
+            threading.Thread(target=_work, name="photobridge-approve",
+                             daemon=True).start()
+
+        def _done(request_id: str, approve: bool, err: str | None) -> None:
+            holder["busy"] = False
+            try:
+                if err is None:
+                    rows[:] = [r for r in rows if r.get("request_id") != request_id]
+                    _say("已批准，手机稍后自动完成配对" if approve else "已拒绝")
+                else:
+                    _say(err, bad=True)
+                _paint()
+            except Exception:       # noqa: BLE001 —— 窗口可能已被关掉
+                log.debug("刷新批准结果失败", exc_info=True)
+
+        def _paint() -> None:
+            for child in list_holder.winfo_children():
+                child.destroy()
+            if not rows:
+                tk.Label(list_holder, text="当前没有待处理的配对请求。",
+                         font=("Segoe UI", 9), fg="#6b7280").pack(padx=8, pady=18)
+                return
+            for r in rows:
+                box = tk.Frame(list_holder, bd=1, relief="solid")
+                box.pack(fill="x", padx=8, pady=4)
+                head = tk.Frame(box)
+                head.pack(fill="x", padx=10, pady=(8, 2))
+                tk.Label(head, text=str(r.get("verify_code") or "------"),
+                         font=("Segoe UI", 22, "bold"), fg="#111827").pack(side="left")
+                meta = (
+                    f"指纹 {r.get('fingerprint') or '------'}"
+                    f"   设备 {r.get('client_name') or '手机'}"
+                    f"   来源 {r.get('source') or 'cloud'}"
+                    f"   剩余 {_fmt_left(r.get('expires_at') or 0)}"
+                )
+                tk.Label(box, text=meta, font=("Segoe UI", 8), fg="#6b7280",
+                         anchor="w", justify="left", wraplength=420).pack(
+                             fill="x", padx=10, anchor="w")
+                btns = tk.Frame(box)
+                btns.pack(fill="x", padx=10, pady=(4, 8))
+                rid = str(r.get("request_id") or "")
+                tk.Button(btns, text="批准", width=8, font=("Segoe UI", 9),
+                          command=lambda x=rid: _act(x, True)).pack(side="left")
+                tk.Button(btns, text="拒绝", width=8, font=("Segoe UI", 9),
+                          command=lambda x=rid: _act(x, False)).pack(
+                              side="left", padx=(6, 0))
+
+        def _refresh() -> None:
+            if on_refresh is None:
+                _paint()
+                return
+            try:
+                fresh = on_refresh()
+            except Exception:       # noqa: BLE001
+                log.exception("刷新配对请求失败")
+                _say("刷新失败，详见日志", bad=True)
+                return
+            rows[:] = list(fresh or [])
+            _say("已刷新")
+            _paint()
+
+        bottom = tk.Frame(root)
+        bottom.pack(fill="x", padx=16, pady=(6, 12))
+        tk.Button(bottom, text="刷新", width=8, font=("Segoe UI", 9),
+                  command=_refresh).pack(side="left")
+        tk.Button(bottom, text="关闭", width=8, font=("Segoe UI", 9),
+                  command=_close).pack(side="right")
+
+        _paint()
+        try:
+            root.mainloop()
+        except Exception:       # noqa: BLE001
+            log.warning("配对批准窗口异常退出", exc_info=True)
+        finally:
+            _APPROVE_OPEN.clear()
+
+    if _APPROVE_OPEN.is_set():
+        log.info("配对批准窗口已经开着，忽略这次点击")
+        return
+    _APPROVE_OPEN.set()
+    threading.Thread(target=_run, name="photobridge-approve-win",
+                     daemon=True).start()
+
+
+# --------------------------------------------------------------------------
 # 托盘控制器
 # --------------------------------------------------------------------------
 
@@ -572,6 +766,7 @@ class TrayController:
             menu = pystray.Menu(
                 pystray.MenuItem("显示配对二维码", self._on_show_qr,
                                  default=True),
+                pystray.MenuItem("待批准的配对", self._on_approvals),
                 pystray.MenuItem("复制手机访问地址", self._on_copy_url,
                                  enabled=bool(lan)),
                 pystray.Menu.SEPARATOR,
@@ -606,6 +801,13 @@ class TrayController:
 
         global _active
         _active = self
+
+        # ★ 配对申请的通知钩子：`pairing.create_request()` 每挂起一条请求
+        #   就回调一次，托盘弹通知并打开批准窗口。控制面（`:control`）与
+        #   云端中继都走这条路径，所以这里是"有人想配对"的唯一入口。
+        from . import pairing
+
+        pairing.set_notifier(self._on_pair_request)
 
         log.info("系统托盘已就绪（%s）", tip)
 
@@ -746,6 +948,58 @@ class TrayController:
 
         _show_qr_window("PhotoBridge 配对", url, code, ips,
                         self._alt_urls_for(url) or None, refetch=_refetch)
+
+    # ------------------------------------------------------------------
+    # 配对批准（P0：签发权在电脑端）
+    # ------------------------------------------------------------------
+
+    def _pending_list(self) -> list[dict[str, Any]]:
+        """当前待批准的配对请求（窗口的初始数据与「刷新」都走这里）。"""
+        st = self._state
+        if st is None:
+            return []
+        from . import pairing
+
+        try:
+            return pairing.list_pending(st.db)
+        except Exception:       # noqa: BLE001 —— 托盘任何功能都不该因此崩
+            log.exception("读取待批准配对失败")
+            return []
+
+    def _decide_pair(self, request_id: str, approve: bool) -> str | None:
+        """批准/拒绝一条请求。在工作线程里调用，返回要显示的错误文案。"""
+        st = self._state
+        if st is None:
+            return "服务尚未就绪"
+        from . import pairing
+
+        try:
+            res = pairing.decide(st.db, request_id, approve=approve, source="tray")
+        except pairing.PairError as e:
+            return f"{e.message}（{e.code}）"
+        except Exception:       # noqa: BLE001 —— 窗口里只显示一句人话
+            log.exception("处理配对请求失败 request_id=%s", request_id)
+            return "处理失败，详见 data/logs/agent.log"
+        log.info("托盘%s配对请求 request_id=%s 状态=%s",
+                 "批准" if approve else "拒绝", request_id, res.get("state"))
+        return None
+
+    def _on_approvals(self, *_: Any) -> None:
+        _show_approval_window(self._pending_list(), self._decide_pair,
+                              on_refresh=self._pending_list)
+
+    def _on_pair_request(self, info: dict[str, Any]) -> None:
+        """`pairing.set_notifier` 注册的回调：有新的配对申请就告诉用户。
+
+        ★ 自动开窗而不是只发通知：请求只活 5 分钟（`pairing.REQUEST_TTL`），
+        而 Windows 的通知横幅常常被用户滑掉、也常被"专注助手"静音。窗口
+        才是真的"把这件事摆到眼前"。
+        """
+        name = str(info.get("client_name") or "手机")
+        code = str(info.get("verify_code") or "")
+        self._notify("新的配对请求", f"{name} 请求配对，核对码 {code}")
+        _show_approval_window(self._pending_list(), self._decide_pair,
+                              on_refresh=self._pending_list)
 
     def _has_paired_device(self) -> bool:
         """是否已经有手机配对过（未撤销的）。"""

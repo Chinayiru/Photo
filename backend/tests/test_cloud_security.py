@@ -39,6 +39,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from _fake_control import FAKE                     # noqa: E402
+from _pair_wire import pair_body, pair_now, start   # noqa: E402
 from cloud.relay import auth as cloud_auth          # noqa: E402
 from cloud.relay import control as cloud_control    # noqa: E402
 from cloud.relay import db as cloud_db             # noqa: E402
@@ -497,9 +498,13 @@ def _insert_device(tmp_path: Path, *, name: str = "家里的电脑") -> str:
 
 def _pair(client: TestClient, device_id: str, token: str,
           code: str = "000000"):
-    return client.post(f"/api/devices/{device_id}/pair",
-                       json={"code": code, "client_name": "手机"},
-                       headers={"Authorization": f"Bearer {token}"})
+    """只走第一步 `POST /pair`，用于"这一次必须失败/挂起"的断言。
+
+    2026-11-24（渗透报告 A1.3）之后，`POST /pair` 不再当场签发令牌：
+    码有效时回 202 + `request_id`，令牌要等电脑端批准后再轮询取走。
+    需要"配对成功"的用例改用 `pair_now()`（发起→批准→轮询）。
+    """
+    return start(client, device_id, token, pair_body(code=code))
 
 
 def test_migration_adds_the_pair_counter_columns_to_an_old_database(
@@ -652,7 +657,9 @@ def test_a_successful_pair_clears_the_device_counters(tmp_path: Path) -> None:
         "UPDATE devices SET pair_fails = 3, pair_window = ? WHERE id = ?",
         (time.time(), device_id))
 
-    paired = _pair(client, device_id, token, code=code)
+    # 三步走完才算配上：发起（202）→ 电脑端批准 → 轮询取令牌。
+    paired = pair_now(client, device_id, token, pair_body(code=code),
+                      fake=FAKE)
     assert paired.status_code == 200, paired.text
     assert paired.json()["client_token"].startswith("pbc1.")
 
@@ -859,8 +866,11 @@ def test_pair_fails_cleanly_when_the_computer_does_not_answer(
     assert row["used_at"] is None, "电脑没回话却把配对码消费掉了"
 
     # 电脑回来后同一个码还能用 —— 这才是"重试一次就好"。
+    # 注意：这一步同样要走完三步（发起 202 → 批准 → 轮询 200）。
     FAKE.online = True
-    assert _pair(client, device_id, token, code=code).status_code == 200
+    paired = pair_now(client, device_id, token, pair_body(code=code),
+                      fake=FAKE)
+    assert paired.status_code == 200, paired.text
 
 
 def test_removing_a_phone_pushes_the_revocation_immediately(
@@ -926,7 +936,9 @@ def test_pair_code_is_never_stored_in_plaintext(tmp_path: Path) -> None:
     client = TestClient(_app(tmp_path, dist=_dist(tmp_path)),
                         client=("203.0.113.61", 5000))
     token = _account_token(client, "owner@example.com")
-    assert _pair(client, device_id, token, code=code).status_code == 200
+    paired = pair_now(client, device_id, token, pair_body(code=code),
+                      fake=FAKE)
+    assert paired.status_code == 200, paired.text
 
     # ……但库里只有摘要：整份文件里搜不到那 6 位数字。
     blob = db_path.read_bytes()

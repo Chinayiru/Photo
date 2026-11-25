@@ -31,6 +31,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from _fake_control import FAKE                     # noqa: E402
+from _pair_wire import DEVICE_KEY, approve_and_poll, pair_body, poll, start  # noqa: E402
 from cloud.relay import auth as cloud_auth          # noqa: E402
 from cloud.relay import control as cloud_control    # noqa: E402
 from cloud.relay import db as cloud_db             # noqa: E402
@@ -117,11 +118,28 @@ def _online(app, device_id: str) -> None:
         SimpleNamespace(device_id=device_id, session_id="test-session")))
 
 
+def _auto_start(client: TestClient, device_id: str, token: str,
+                *, name: str = "手机") -> tuple[Any, Any]:
+    """只走第一步：返回 `(response, request_id)`（期望 202 + 待批准）。
+
+    渗透报告 A1.3 之后这条路径**不再当场签发令牌**，所以想断言"必须本机
+    批准"的用例要停在这一步。
+    """
+    response = start(client, device_id, token,
+                     pair_body(auto=True, name=name))
+    request_id = ""
+    if response.status_code == 202:
+        request_id = str(response.json()["request_id"])
+    return response, request_id
+
+
 def _auto(client: TestClient, device_id: str, token: str,
           *, name: str = "手机"):
-    return client.post(f"/api/devices/{device_id}/pair",
-                       json={"auto": True, "client_name": name},
-                       headers={"Authorization": f"Bearer {token}"})
+    """走完三步（申请 → 批准 → 轮询），返回最后一次响应。"""
+    response, _rid = _auto_start(client, device_id, token, name=name)
+    if response.status_code != 202:
+        return response
+    return approve_and_poll(client, device_id, token, response, fake=FAKE)
 
 
 # ------------------------------------------------------------------ 主路径
@@ -347,9 +365,7 @@ def test_code_pairing_semantics_are_unchanged(tmp_path: Path) -> None:
     device_id, _ = _device(client)
     _online(client.app, device_id)
 
-    no_code = client.post(f"/api/devices/{device_id}/pair",
-                          json={"client_name": "手机"},
-                          headers={"Authorization": f"Bearer {token}"})
+    no_code = start(client, device_id, token, pair_body())
     assert no_code.status_code == 400
     assert no_code.json()["error"]["code"] == "E1001"
 
@@ -360,12 +376,108 @@ def test_code_pairing_semantics_are_unchanged(tmp_path: Path) -> None:
         "created_at) VALUES (?, ?, ?, 0, ?)",
         (cloud_db.hash_pair_code(db.path, code), device_id,
          time.time() + 300, time.time()))
-    ok = client.post(f"/api/devices/{device_id}/pair",
-                     json={"code": code, "client_name": "手机"},
-                     headers={"Authorization": f"Bearer {token}"})
+    pending = start(client, device_id, token, pair_body(code))
+    assert pending.status_code == 202, pending.text
+    assert pending.json()["state"] == "pending"
+    # 批准 + 轮询才拿到令牌
+    ok = approve_and_poll(client, device_id, token, pending, fake=FAKE)
     assert ok.status_code == 200, ok.text
     # 码是一次性的：再用一次必须失败
-    again = client.post(f"/api/devices/{device_id}/pair",
-                        json={"code": code, "client_name": "手机"},
-                        headers={"Authorization": f"Bearer {token}"})
+    again = start(client, device_id, token, pair_body(code))
     assert again.status_code == 409
+
+
+# ------------------------------------------------------------ 必须本机批准
+
+
+def test_auto_pair_does_not_issue_a_token_before_local_approval(
+        tmp_path: Path) -> None:
+    """渗透报告 A1.3 的回归：中继抖动/被拿下都换不到令牌。
+
+    这条是这次改造的核心判据。三步流程里"没有批准"的那一步必须
+    **什么令牌都不产生**：库里没有 clients 行，申请还停在 pending。
+    """
+    client = TestClient(_app(tmp_path))
+    token = _account(client)
+    device_id, _ = _device(client)
+    _online(client.app, device_id)
+
+    response, request_id = _auto_start(client, device_id, token)
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["state"] == "pending"
+    assert len(body["verify_code"]) == 6
+    assert request_id
+
+    # 没批准时轮询 → 还是 pending，且库里一枚令牌都没有
+    waiting = poll(client, device_id, token, request_id)
+    assert waiting.status_code == 200, waiting.text
+    assert waiting.json()["state"] == "pending"
+    rows = client.app.state.db.query(
+        "SELECT id FROM clients WHERE device_id = ?", (device_id,))
+    assert rows == [], "批准之前不该有任何 clients 行"
+
+    # 批准之后同一条申请才换出令牌
+    FAKE.approve_all()
+    done = poll(client, device_id, token, request_id)
+    assert done.status_code == 200, done.text
+    assert done.json()["client_token"].startswith("pbc1.")
+
+
+def test_rejected_pair_request_returns_403_and_no_token(tmp_path: Path) -> None:
+    """用户在电脑上点了「拒绝」→ 403 E2008，且不会补发令牌。"""
+    client = TestClient(_app(tmp_path))
+    token = _account(client)
+    device_id, _ = _device(client)
+    _online(client.app, device_id)
+
+    pending, request_id = _auto_start(client, device_id, token)
+    assert pending.status_code == 202
+    FAKE.reject_all()
+    refused = poll(client, device_id, token, request_id)
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["error"]["code"] == "E2008"
+    rows = client.app.state.db.query(
+        "SELECT id FROM clients WHERE device_id = ?", (device_id,))
+    assert rows == []
+
+
+def test_pair_poll_needs_the_same_device_key(tmp_path: Path) -> None:
+    """另一台手机拿到 request_id 也换不走令牌（密钥绑住这次申请）。"""
+    from _pair_wire import OTHER_DEVICE_KEY
+
+    client = TestClient(_app(tmp_path))
+    token = _account(client)
+    device_id, _ = _device(client)
+    _online(client.app, device_id)
+
+    pending, request_id = _auto_start(client, device_id, token)
+    assert pending.status_code == 202
+    FAKE.approve_all()
+    stolen = poll(client, device_id, token, request_id,
+                  device_key=OTHER_DEVICE_KEY)
+    # 密钥不符是终态：403 E2008（不能报成"电脑不在线"，否则用户排查方向全错）
+    assert stolen.status_code == 403, stolen.text
+    assert stolen.json()["error"]["code"] == "E2008"
+    rows = client.app.state.db.query(
+        "SELECT id FROM clients WHERE device_id = ?", (device_id,))
+    assert rows == []
+    # 冒名轮询不该作废申请：正确密钥仍然能兑换
+    right = poll(client, device_id, token, request_id)
+    assert right.status_code == 200, right.text
+    assert right.json()["client_token"].startswith("pbc1.")
+
+
+def test_pair_status_hides_requests_of_another_account(tmp_path: Path) -> None:
+    """轮询也要过设备归属那一道：别人的设备一律 404。"""
+    client = TestClient(_app(tmp_path))
+    mine = _account(client)
+    _account(client, "other@example.com")
+    other_device, _ = _device(client, email="other@example.com")
+    _online(client.app, other_device)
+
+    pending, request_id = _auto_start(client, other_device, mine)
+    # 设备不属于我，第一步就 404，拿不到 request_id
+    assert pending.status_code == 404
+    assert pending.json()["error"]["code"] == "E1004"
+    assert request_id == ""

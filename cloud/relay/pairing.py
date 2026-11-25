@@ -58,6 +58,7 @@ Twister 在观察到 624 个输出后可以完全预测；而攻击者能观察�
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import time
 from typing import Any
@@ -78,9 +79,15 @@ log = logging.getLogger("pb.cloud.pairing")
 __all__ = [
     "PAIR_LOCK_SECONDS",
     "issue_pair_code",
+    "pair_status",
     "redeem_pair_code",
     "purge_expired_codes",
 ]
+
+#: 配对申请 id：电脑端生成的 32 位 hex（`pairing.create_request`）。
+_ID_RE = re.compile(r"[0-9a-f]{32}")
+#: 手机设备密钥：32 字节随机数的 hex（64 位），见 `redeem_pair_code` 的注释。
+_KEY_RE = re.compile(r"[0-9a-f]{64}")
 
 #: 码有效期（`docs/04` §3.5：5 分钟）。
 PAIR_LOCK_SECONDS: float = security.PAIR_LOCK_SECONDS
@@ -208,11 +215,21 @@ async def redeem_pair_code(request: Request, db: CloudDB,
         return json_error("E1001", message="手机名称需为 1-64 字符",
                           request_id=_rid(request))
     client_name = client_name.strip()
+    # ★ 2026-11-24 渗透报告 A1.3 的整改：手机必须自报一枚设备密钥，
+    #   电脑端批准时把"这次申请"绑在这枚密钥上。没有它，"批准"就只能
+    #   绑在"谁先来兑换"上 —— 而先来的可能是中继。密钥由手机生成
+    #   （`crypto.getRandomValues(32)`），中继看得到它（E2E 之前不假装
+    #   匿名），但它同时出现在手机屏幕与电脑窗口里，用户核对的就是它。
+    device_key = body.get("device_key")
+    if not isinstance(device_key, str) or not _KEY_RE.fullmatch(device_key.strip().lower()):
+        return json_error("E1001", message="缺少设备密钥",
+                          request_id=_rid(request))
+    device_key = device_key.strip().lower()
 
     # 自动配对：不看码，看「你是谁 + 这台电脑是不是你的 + 它现在在不在线」。
     if auto:
         return await _auto_pair(request, db, registry, account, device, did,
-                          client_name)
+                          client_name, device_key)
 
     if not isinstance(code, str) or not security.is_valid_pair_code(code):
         return json_error("E1001", message="配对码必须是 6 位数字",
@@ -270,21 +287,20 @@ async def redeem_pair_code(request: Request, db: CloudDB,
         return json_error("E1003", message="配对码已过期",
                           request_id=_rid(request))
 
-    # 走到这里就成功。
+    # 走到这里码有效。**码在这一步就被消费**（`_claim_code`），
+    # 后面的"等电脑回话"不再持有它 —— 用户拿到的 `request_id` 就是
+    # 这次申请的唯一凭据，码不能再用第二次（渗透报告 B7.2 的同一类
+    # 问题：一个可重放的凭据等于没有凭据）。
     #
-    # ★ 审计 F04：**签发要等电脑回话，绝不能等在一个事务里**。原来的写法是
-    # "一个 `BEGIN IMMEDIATE` 里先抢码、再 `await` 电脑签发"，后果是云端库的
-    # 写锁在整个网络往返期间（隧道 + 控制通道，最长 5 秒超时）被占着 ——
+    # ★ 审计 F04：**不许在事务里等电脑回话**。原来的写法是一个
+    # `BEGIN IMMEDIATE` 里先抢码、再 `await` 电脑，后果是云端库的写锁
+    # 在整个网络往返期间（隧道 + 控制通道，最长 10 秒）被占着 ——
     # 而云端的写操作不只是配对：登录、心跳、上传登记、设备列表全在排队。
-    # 电脑卡一下或隧道抖一下，整个云端就被拖到超时。
+    # 现在拆成两段，任何 `await` 都不持有事务、也不持有行锁。
     #
-    # 现在拆成三段，任何 `await` 都不持有事务、也不持有行锁：
-    #
-    #   F04a 短事务抢码 → F04b 事务外等签发 → F04c 短事务写 clients
-    #
-    # 失败口径不变：签不出来就把码**还回去**（用户拿着一个"已使用"的码
-    # 是死路，他自己没有任何办法恢复），所以 `_release_code()` 是失败路径
-    # 的必经一站，两条失败分支都调它。
+    # 失败口径：电脑没回话就把码**还回去**（用户拿着一个"已使用"的码
+    # 是死路，他自己没有任何办法恢复），所以 `_release_code()` 是失败
+    # 路径的必经一站。
     claimed_at = now
     if not _claim_code(db, code_hash, claimed_at):
         # 并发下另一台手机先抢到了这个码；与"已被使用"同一口径。
@@ -292,42 +308,37 @@ async def redeem_pair_code(request: Request, db: CloudDB,
                           request_id=_rid(request))
 
     try:
-        minted = await _mint_via_agent(request, did, client_name)
+        pending = await _request_via_agent(request, did, client_name, device_key)
     except _MintUnavailable:
         _release_code(db, code_hash, claimed_at)
         return json_error("E2007",
-                          message="电脑当前不在线，无法签发配对令牌",
+                          message="电脑当前不在线，无法发起配对申请",
                           request_id=_rid(request))
 
-    if not _write_client(db, did=did, client_name=client_name,
-                         minted=minted, now=now):
-        _release_code(db, code_hash, claimed_at)
-        return json_error("E2007", message="配对结果未能保存，请重试",
-                          request_id=_rid(request))
-
-    return _pair_reply(request, db, device, did, ip, minted, via="配对码")
+    return _pending_reply(request, pending, did=did, device_name=str(device["name"]))
 
 
 class _MintUnavailable(Exception):
-    """电脑端没回应控制通道（离线 / 隧道刚断）。
+    """电脑端没回应控制通道（离线 / 隧道刚断），或者回的申请不成立。
 
     单独一个异常而不是返回 None：调用方要据此走**释放配对码**的分支，
-    并把异常翻成 503 `E2007`。它现在只在事务**外**被抛出（F04b），
+    并把异常翻成 503 `E2007`。它只在事务**外**被抛出（F04b），
     所以不会再出现"事务被异常回滚"这种间接后果。
     """
 
 
 # ---------------------------------------------------------------------------
-# 审计 F04：配对的三段式
+# 审计 F04：配对的两段式
 # ---------------------------------------------------------------------------
 #
-# 三个函数各管一段，边界写在名字上，改的人不会把新逻辑塞回错的那一段：
+# 两个函数各管一段，边界写在名字上，改的人不会把新逻辑塞回错的那一段：
 #
-#   _claim_code()     短事务：条件 UPDATE 抢码，影响行数就是那把锁
-#   _mint_via_agent() 事务外：await 电脑签发（唯一允许长耗时的位置）
-#   _write_client()   短事务：INSERT clients
+#   _claim_code()          短事务：条件 UPDATE 抢码，影响行数就是那把锁
+#   _request_via_agent()   事务外：await 电脑**登记申请**（唯一允许长耗时的位置）
 #
-# 失败路径：签发失败 / 写库失败都必须 `_release_code()`，把码还回去。
+# ★ 签发不再发生在这条链上：电脑端现在只回一条 pending 记录，令牌要等
+#   用户在托盘里批准后，由手机轮询 `/pair/{request_id}` 时**一次性**取走
+#   （`pair_status` → `_write_client`）。失败路径仍必须 `_release_code()`。
 
 
 def _claim_code(db: CloudDB, code_hash: str, claimed_at: float) -> bool:
@@ -363,26 +374,154 @@ def _release_code(db: CloudDB, code_hash: str, claimed_at: float) -> bool:
     return released
 
 
-async def _mint_via_agent(request: Request, did: str,
-                          client_name: str) -> dict[str, Any]:
-    """F04b：事务外等电脑签发。**调用时不得持有任何事务或行锁。**
+async def _request_via_agent(request: Request, did: str, client_name: str,
+                             device_key: str) -> dict[str, Any]:
+    """F04b：事务外**申请**一次配对（不签发令牌）。**调用时不得持有事务。**
 
-    返回 `{client_id, token, expires_at}`；电脑没回话、或回来的内容不成立
-    （版本不匹配 / 自己算错了）一律抛 `_MintUnavailable`。
+    返回 `{request_id, verify_code, fingerprint, expires_at}`。电脑没回话、
+    或回来的内容不成立一律抛 `_MintUnavailable`（调用方释放配对码并回 503）。
+
+    ★ 2026-11-24 渗透报告 A1.3：这里原来调的是 `mint_client` —— 云端
+    一条控制帧就换一枚真令牌。现在同样的调用只会在电脑上挂起一条待批准
+    记录，签发要等用户在托盘里核对 6 位数字后点「批准」。
     """
     registry = getattr(getattr(request.app, "state", None), "registry", None)
-    minted = await cloud_control.call_agent(
-        cloud_control.conn_for(registry, did), "mint_client",
-        {"name": client_name, "device_id": did,
+    pending = await cloud_control.call_agent(
+        cloud_control.conn_for(registry, did), "request_pair",
+        {"device_id": did, "client_name": client_name,
+         "device_key": device_key,
          "ttl_days": int(security.CLIENT_TOKEN_TTL_DAYS)})
-    if minted is None:
+    if pending is None:
         raise _MintUnavailable()
-    client_id = str(minted.get("client_id") or "")
-    token = str(minted.get("token") or "")
-    expires_at = float(minted.get("expires_at") or 0.0)
-    if not client_id or not token or expires_at <= time.time():
+    request_id = str(pending.get("request_id") or "").strip().lower()
+    verify_code = str(pending.get("verify_code") or "")
+    expires_at = float(pending.get("expires_at") or 0.0)
+    if (not _ID_RE.fullmatch(request_id) or len(verify_code) != 6
+            or expires_at <= time.time()):
         raise _MintUnavailable()
-    return {"client_id": client_id, "token": token, "expires_at": expires_at}
+    return {"request_id": request_id, "verify_code": verify_code,
+            "fingerprint": str(pending.get("fingerprint") or ""),
+            "expires_at": expires_at}
+
+
+async def _status_via_agent(request: Request, did: str, request_id: str,
+                            device_key: str) -> dict[str, Any] | None:
+    """问电脑：这条申请现在什么状态？返回电脑给的原样字典（含 `state`）。
+
+    电脑离线/不回话返回 None（调用方回 503）。电脑明确回的
+    `pending` / `approved` / `rejected` 都算"有结论"。
+    """
+    registry = getattr(getattr(request.app, "state", None), "registry", None)
+    info = await cloud_control.call_agent(
+        cloud_control.conn_for(registry, did), "pair_status",
+        {"request_id": request_id, "device_key": device_key})
+    if not isinstance(info, dict):
+        return None
+    state = str(info.get("state") or "")
+    if state not in ("pending", "approved", "rejected"):
+        return None
+    return info
+
+
+def _pending_reply(request: Request, pending: dict[str, Any], *,
+                   did: str, device_name: str) -> Response:
+    """202：申请已挂起，等电脑端批准（`docs/04` §3.5）。"""
+    log.info("配对申请已挂起 device=%s request=%s", did, pending["request_id"])
+    return json_reply({
+        "state": "pending",
+        "request_id": pending["request_id"],
+        "verify_code": pending["verify_code"],
+        "fingerprint": pending["fingerprint"],
+        "expires_at": pending["expires_at"],
+        "device_id": did,
+        "device_name": device_name,
+        "poll_after": 2,
+    }, status=202, request_id=_rid(request))
+
+
+async def pair_status(request: Request, db: CloudDB, registry: Any = None,
+                      device_id: str = "", request_id: str = "") -> Response:
+    """`POST /api/devices/{id}/pair/{request_id}`：手机轮询配对进度。
+
+    鉴权用**账号令牌**（与发起时同一条会话），请求体带设备密钥：
+    密钥把"这次申请"绑在发起它的那台手机上，别人拿到 `request_id`
+    也换不走令牌（电脑端按密钥比对后才放行，`pairing.redeem`）。
+
+    四种结局：
+    * `pending`  → 200，原样回核对码与到期时刻，手机继续轮询；
+    * `approved` → 电脑端已经**一次性**换出令牌，这里写 `clients` 并回
+      与旧配对接口完全相同的字段（前端 `applyPaired` 不用改）；
+    * `rejected` → 403 `E2008`（电脑上点了拒绝 / 申请已过期 / 已兑换过）；
+    * 电脑离线  → 503 `E2007`。
+    """
+    account = require_account(request, db)
+    if account is None:
+        return json_error("E2001", request_id=_rid(request))
+    did = (device_id or "").strip().lower()
+    rid = (request_id or "").strip().lower()
+    device = db.query_one(
+        "SELECT id, account_id, name, revoked, last_lan FROM devices WHERE id = ?",
+        (did,))
+    if device is None or str(device["account_id"]) != account["id"]:
+        return json_error("E1004", request_id=_rid(request))
+    if int(device["revoked"] or 0):
+        return json_error("E2006", request_id=_rid(request))
+    if not _ID_RE.fullmatch(rid):
+        return json_error("E1004", message="配对申请不存在",
+                          request_id=_rid(request))
+
+    try:
+        body = await _json_object(request)
+    except RequestBodyTooLarge:
+        return json_error("E1006", request_id=_rid(request))
+    if body is None:
+        return json_error("E1001", message="请求体必须是 JSON 对象",
+                          request_id=_rid(request))
+    key = body.get("device_key")
+    if not isinstance(key, str) or not _KEY_RE.fullmatch(key.strip().lower()):
+        return json_error("E1001", message="缺少设备密钥",
+                          request_id=_rid(request))
+    key = key.strip().lower()
+
+    info = await _status_via_agent(request, did, rid, key)
+    if info is None:
+        return json_error("E2007", message="电脑当前不在线，请稍后重试",
+                          request_id=_rid(request))
+
+    state = str(info.get("state") or "")
+    if state == "pending":
+        return json_reply({
+            "state": "pending",
+            "request_id": rid,
+            "verify_code": str(info.get("verify_code") or ""),
+            "expires_at": float(info.get("expires_at") or 0),
+            "poll_after": 2,
+        }, request_id=_rid(request))
+    if state == "rejected":
+        return json_error("E2008",
+                          message=str(info.get("reason")
+                                      or "电脑上没有批准这次配对"),
+                          request_id=_rid(request))
+
+    # approved：电脑端已经把令牌算好并**原子地**标记为已兑换（只能取一次）。
+    minted = {
+        "client_id": str(info.get("client_id") or ""),
+        "token": str(info.get("token") or ""),
+        "expires_at": float(info.get("expires_at") or 0.0),
+    }
+    if (not minted["client_id"] or not minted["token"]
+            or minted["expires_at"] <= time.time()):
+        return json_error("E3001", request_id=_rid(request))
+    client_name = str(info.get("client_name") or "")[:64].strip()
+    if not client_name:
+        client_name = "手机"
+    now = time.time()
+    if not _write_client(db, did=did, client_name=client_name,
+                         minted=minted, now=now):
+        return json_error("E2007", message="配对结果未能保存，请重试",
+                          request_id=_rid(request))
+    return _pair_reply(request, db, device, did, _client_ip(request), minted,
+                       via="本地批准")
 
 
 def _write_client(db: CloudDB, *, did: str, client_name: str,
@@ -465,7 +604,7 @@ def purge_expired_codes(db: CloudDB, *, older_than: float = 86400.0) -> int:
 
 async def _auto_pair(request: Request, db: CloudDB, registry: Any,
                      account: Any, device: Any, did: str,
-                     client_name: str) -> Response:
+                     client_name: str, device_key: str) -> Response:
     """`{"auto": true}` 分支：账号已验明，只差「这台电脑在不在线」。"""
     account_id = str(account["id"])
     ip = _client_ip(request)
@@ -480,20 +619,17 @@ async def _auto_pair(request: Request, db: CloudDB, registry: Any,
                           message="电脑当前不在线，请确认电脑开着并已联网",
                           request_id=_rid(request))
     _note_auto(account_id, ip)
-    now = time.time()
-    # ★ 审计 F04：自动配对同样是"等电脑签发"，同样不许在事务里等。
-    # 这条路没有配对码，所以失败时没有东西要释放；写库失败只回报错。
+    # ★ 自动配对同样要**电脑端批准**（渗透报告 A1.3）：账号口令只证明
+    #   "这台电脑属于你"，不证明"此刻你就在电脑旁边"。少了这一层，
+    #   账号密码泄露 = 直接拿到 90 天的照片访问权。
     try:
-        minted = await _mint_via_agent(request, did, client_name)
+        pending = await _request_via_agent(request, did, client_name, device_key)
     except _MintUnavailable:
         return json_error("E2007",
-                          message="电脑当前不在线，无法签发配对令牌",
+                          message="电脑当前不在线，无法发起配对申请",
                           request_id=_rid(request))
-    if not _write_client(db, did=did, client_name=client_name,
-                         minted=minted, now=now):
-        return json_error("E2007", message="配对结果未能保存，请重试",
-                          request_id=_rid(request))
-    return _pair_reply(request, db, device, did, ip, minted, via="账号登录")
+    return _pending_reply(request, pending, did=did,
+                          device_name=str(device["name"]))
 
 
 def _auto_limited(account_id: str, ip: str) -> float | None:

@@ -63,6 +63,8 @@ from cloud.relay.db import CloudDB  # noqa: E402
 from cloud.relay.main import create_app  # noqa: E402
 from shared.protocol import CREDIT_V2_CAP, FrameType, encode_frame  # noqa: E402
 
+from _pair_wire import DEVICE_KEY, pair_body                          # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # 装置
@@ -220,6 +222,7 @@ class _Rig:
         self.account_token = ""
         self.client_token = ""
         self.client_id = ""
+        self.pending_pair: dict[str, Any] = {}
         self._cloud_server: uvicorn.Server | None = None
         self._cloud_task: asyncio.Task | None = None
         self._hosts = hosts
@@ -428,15 +431,44 @@ class _Rig:
         self.account_token = str(body["account_token"])
         return self.account_token
 
+    async def approve(self, request_id: str) -> dict[str, Any]:
+        """在"电脑端"点「批准」（模拟用户核对 6 位数字后按下托盘按钮）。
+
+        `_Rig` 跑的是**真控制面**（`backend/app/control.py` 经真隧道被云端
+        调用），所以这里不能像 `FAKE` 那样替身状态机，只能真的去动本机库：
+        `pairing.decide()` 正是托盘「批准」按钮背后的那个函数。
+        """
+        from backend.app import pairing as pairing_mod
+
+        return pairing_mod.decide(self.state.db, request_id, approve=True,
+                                  source="test")
+
     async def apair(self, *, code: str | None = None,
                     client_name: str = "测试手机") -> tuple[int, Any]:
+        """走完云端配对三步：发起（202）→ 本机批准 → 轮询取令牌（200）。
+
+        2026-11-24（渗透报告 A1.3）之后 `POST /pair` 只登记申请，不再当场
+        签发：以前一次 POST 拿 token 的写法会拿到 202，`client_token` 仍是
+        空串，后面所有隧道请求都变成 `E2002`。
+        """
         if not self.account_token:
             await self.alogin()
         status, body, _ = await self.cloud.arequest(
             "POST", f"/api/devices/{self.device_id}/pair",
-            body={"code": code if code is not None else await self.aissue_pair_code(),
-                  "client_name": client_name},
+            body=pair_body(
+                code if code is not None else await self.aissue_pair_code(),
+                name=client_name),
             token=self.account_token)
+        if status != 202:
+            # 失败（错码 / 已用 / 电脑不在线）原样返回，让断言看到真状态码。
+            return status, body
+
+        request_id = str(body["request_id"])
+        self.pending_pair = body
+        await self.approve(request_id)
+        status, body, _ = await self.cloud.arequest(
+            "POST", f"/api/devices/{self.device_id}/pair/{request_id}",
+            body={"device_key": DEVICE_KEY}, token=self.account_token)
         if status == 200:
             self.client_token = str(body["client_token"])
             self.client_id = str(body["client_id"])
@@ -1331,11 +1363,18 @@ def test_revoked_client_is_pushed_to_agent(rig_factory) -> None:
     assert out["revoked"][0] == 204, out["revoked"]
     # `changed` 可以是 0：2026-10-26 起云端删掉手机的**那一下**就会通过
     # 控制通道推给电脑端（ISSUE-049），轮询再跑一遍自然是 0 行。
-    # 真正要证的是下面两条 401。
     assert out["changed"] >= 0, out
-    assert out["after"][0] == 401, (
+    # 真正要证的是下面两条：撤销后的令牌必须被拒。
+    # 2026-10-26 之后"已撤销"不再混进 401（B2.1b）：`docs/04` §3.6 规定
+    # E2002=401（凭据无效/过期），E2004=403（已被云端吊销）。手机端靠这个
+    # 差别决定"临时失败重试"还是"清掉旧凭据去重新配对"。
+    assert out["after"][0] == 403, (
         "撤销后电脑端必须停止接受该令牌（AC-5.8）", out["after"])
+    assert out["after"][1]["error"]["code"] == "E2004", out["after"]
+    # 隧道那条更早：中继自己就查云端 clients 表，撤销后行已删 → 401 E2002，
+    # 请求根本到不了电脑端。这里钉住的是"中继不转发"，不是电脑端的状态码。
     assert out["after_tunnel"][0] == 401, out["after_tunnel"]
+    assert out["after_tunnel"][1]["error"]["code"] == "E2002", out["after_tunnel"]
 
 
 def test_lan_paired_token_works_over_cloud(rig_factory) -> None:

@@ -324,6 +324,7 @@ def test_relay_root_account_login_sources() -> None:
     # 云端入口用配对码时，必须多一个"云端链接"输入框，否则不知道连哪台电脑
     assert "codeAvailable && mode === 'code' && entry === 'cloud' && !cloudPage" in view
     assert 'v-if="relayRoot && accountDevices.length"' in view, "中继首页要能列电脑"
-    # 账号配对的落地调用：中继首页列电脑时点哪台配哪台（第三个参数是基址）
-    assert "pairAccountDevice(id, accountToken.value, resolvedAccountBase.value)" in view
+    # 账号配对的落地调用：中继首页列电脑时点哪台配哪台（第三个参数是基址，
+    # 第四个是「等待电脑批准」的回调/取消句柄，见 A1.3 的 202 轮询协议）
+    assert "pairAccountDevice(id, accountToken.value, resolvedAccountBase.value, wait)" in view
     assert "chooseAccountDevice(d.id)" in view

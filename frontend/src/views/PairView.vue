@@ -7,11 +7,12 @@
  *   ② 手动输入 IP + 6 位码（最常见）
  *   ③ 直接粘贴一整条带参数的 URL（用户从聊天窗口复制过来的）
  */
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { errorText } from "../api/errorText";
 import { buildBase, cloudBaseFromLocation, relayRootBase } from "../api/storage";
-import type { AccountDevice } from "../stores/auth";
+import type { AccountDevice, PairApprovalInfo } from "../stores/auth";
 import {
+  isPairCancelled,
   loginAccount,
   pair,
   pairAccountDevice,
@@ -93,6 +94,100 @@ const email = ref("");
 const password = ref("");
 const accountBusy = ref(false);
 const accountError = ref("");
+
+/**
+ * 「等待电脑批准」状态（渗透报告 A1.3 之后的云端配对协议）。
+ *
+ * 云端不再"一换码就签发令牌"：它只登记申请并回 6 位核对码，用户要在电脑
+ * 托盘里核对数字并点「批准」，手机轮询到令牌才算配上。所以这不是三个请求
+ * 的中间产物，而是一个**需要用户等待并去电脑上操作**的界面状态 —— 核对码、
+ * 指纹、剩余时间、取消，四件事都得在同一屏里说清楚。
+ */
+type PendingPair = {
+  verifyCode: string;
+  /** 云端算好的密钥指纹（前 6 位 hex），前端不重算 —— 两边必须逐字符一致。 */
+  fingerprint: string;
+  /** Unix 秒。 */
+  expiresAt: number;
+  deviceName: string;
+};
+const pending = ref<PendingPair | null>(null);
+const waitStartedAt = ref(0);
+/** 每秒推进一次，让"已等待/剩余"有东西可算（不做 setInterval 就没有重渲染）。 */
+const nowMs = ref(Date.now());
+let waitTimer: number | null = null;
+/** 取消用：abort 会同时掐掉正在飞的那次轮询请求。 */
+let pairAbort: AbortController | null = null;
+
+const waitedSeconds = computed(() => (pending.value
+  ? Math.max(0, Math.floor((nowMs.value - waitStartedAt.value) / 1000))
+  : 0));
+const remainSeconds = computed(() => (pending.value
+  ? Math.max(0, Math.ceil(pending.value.expiresAt - nowMs.value / 1000))
+  : 0));
+const remainText = computed(() => {
+  const s = remainSeconds.value;
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+});
+
+/**
+ * 进入等待态，并把回调交给 `pairWithAccount` / `pairAccountDevice`。
+ *
+ * 第一次回调来自 202（带指纹与设备名），之后每次轮询 pending 都只带核对码
+ * 与到期时刻 —— 所以首次要建对象，后续只更新这两个字段，否则指纹会在第二
+ * 拍消失。
+ */
+function beginWait(): { onPending: (info: PairApprovalInfo) => void; signal: AbortSignal } {
+  const ctrl = new AbortController();
+  pairAbort = ctrl;
+  waitStartedAt.value = Date.now();
+  nowMs.value = Date.now();
+  if (waitTimer !== null) window.clearInterval(waitTimer);
+  waitTimer = window.setInterval(() => { nowMs.value = Date.now(); }, 1000);
+  return {
+    signal: ctrl.signal,
+    onPending: (info) => {
+      const cur = pending.value;
+      pending.value = cur
+        ? {
+          ...cur,
+          verifyCode: info.verifyCode || cur.verifyCode,
+          expiresAt: info.expiresAt || cur.expiresAt,
+        }
+        : {
+          verifyCode: info.verifyCode,
+          fingerprint: info.fingerprint || "",
+          expiresAt: info.expiresAt,
+          deviceName: info.deviceName || "",
+        };
+    },
+  };
+}
+
+/** 收尾：清计时器；`cancel` 时顺带 abort 轮询。 */
+function endWait(cancel = false): void {
+  if (waitTimer !== null) {
+    window.clearInterval(waitTimer);
+    waitTimer = null;
+  }
+  if (cancel) pairAbort?.abort();
+  pairAbort = null;
+  pending.value = null;
+}
+
+/**
+ * 「取消」：只停止轮询。
+ *
+ * 电脑端那张申请自己会过期，不需要（也没有接口能）回滚 —— 把它当成"用户
+ * 不想要了"就够了，回滚只会多一条可能失败的请求。
+ */
+function cancelWait(): void {
+  endWait(true);
+  busy.value = false;
+  accountBusy.value = false;
+  error.value = "";
+  accountError.value = "";
+}
 
 /**
  * 中继**首页**（`https://域名/`）：URL 里没有设备 id，既没有"电脑地址"
@@ -269,6 +364,10 @@ onMounted(() => {
   }
 });
 
+// 离开配对页就别再轮询：申请留在电脑端等它自己过期，后台继续请求只会让
+// 用户下次回来时叠出第二条循环。
+onUnmounted(() => { endWait(true); });
+
 /**
  * 把粘贴来的基址解析成 `URL`，解析不了返回 `null`。
  *
@@ -423,9 +522,14 @@ async function submitAccount(): Promise<void> {
   try {
     // 设备页：URL 已经指明是哪台电脑，一步到位
     if (cloudPage.value) {
-      const r = await pairWithAccount(email.value, password.value);
-      password.value = "";
-      toastOk(`已连接到 ${r.device_name}`);
+      const wait = beginWait();
+      try {
+        const r = await pairWithAccount(email.value, password.value, wait);
+        password.value = "";
+        toastOk(`已连接到 ${r.device_name}`);
+      } finally {
+        endWait();
+      }
       return;
     }
     // 局域网页 / 中继首页：先登录，再看这个账号下有几台电脑
@@ -444,12 +548,20 @@ async function submitAccount(): Promise<void> {
       return;
     }
     if (devices.length === 1) {
-      const r = await pairAccountDevice(devices[0]!.id, token, base);
-      accountDevices.value = [];
-      toastOk(`已连接到 ${r.device_name}`);
+      const wait = beginWait();
+      try {
+        const r = await pairAccountDevice(devices[0]!.id, token, base, wait);
+        accountDevices.value = [];
+        toastOk(`已连接到 ${r.device_name}`);
+      } finally {
+        endWait();
+      }
     }
   } catch (e) {
-    accountError.value = errorText(e, "登录失败，请检查邮箱与密码");
+    // 用户自己点了「取消」：不是失败，不弹一句"请求超时"
+    accountError.value = isPairCancelled(e)
+      ? ""
+      : errorText(e, "登录失败，请检查邮箱与密码");
   } finally {
     accountBusy.value = false;
   }
@@ -460,13 +572,17 @@ async function chooseAccountDevice(id: string): Promise<void> {
   if (accountBusy.value || !accountToken.value) return;
   accountError.value = "";
   accountBusy.value = true;
+  const wait = beginWait();
   try {
-    const r = await pairAccountDevice(id, accountToken.value, resolvedAccountBase.value);
+    const r = await pairAccountDevice(id, accountToken.value, resolvedAccountBase.value, wait);
     accountDevices.value = [];
     toastOk(`已连接到 ${r.device_name}`);
   } catch (e) {
-    accountError.value = errorText(e, "连接失败，请再试一次");
+    accountError.value = isPairCancelled(e)
+      ? ""
+      : errorText(e, "连接失败，请再试一次");
   } finally {
+    endWait();
     accountBusy.value = false;
   }
 }
@@ -489,7 +605,27 @@ function onCodeInput(e: Event): void {
       <p class="tagline">把手机里的照片，传到自己的电脑上</p>
     </div>
 
-    <div class="card">
+    <!-- 等待电脑批准：云端已登记这次申请（202），令牌要等托盘里点「批准」 -->
+    <div v-if="pending" class="card waiting" aria-live="polite">
+      <p class="wait-title">等待电脑批准</p>
+      <div class="verify">{{ pending.verifyCode }}</div>
+      <p v-if="pending.deviceName" class="wait-device">目标电脑：{{ pending.deviceName }}</p>
+      <p v-if="pending.fingerprint" class="wait-finger">
+        手机密钥指纹 <code>{{ pending.fingerprint }}</code>
+      </p>
+      <p class="wait-note">
+        请在电脑上打开 PhotoBridge 托盘 →「待批准的配对」，核对 6 位数字后点「批准」
+      </p>
+      <p class="wait-state">
+        <span v-if="remainSeconds > 0">
+          等待中… 已等待 {{ waitedSeconds }} 秒 · 剩余 {{ remainText }}
+        </span>
+        <span v-else>这条申请已过期，请重新发起</span>
+      </p>
+      <button class="btn ghost block" type="button" @click="cancelWait">取消</button>
+    </div>
+
+    <div v-else class="card">
       <div v-if="codeAvailable && accountAvailable" class="tabs" role="tablist" aria-label="登录方式">
         <button
           v-if="!relayRoot"
@@ -779,6 +915,52 @@ function onCodeInput(e: Event): void {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+/* 等待电脑批准：核对码是这一屏里唯一需要"逐位比对"的东西，字号最大 */
+.waiting {
+  align-items: center;
+  text-align: center;
+}
+
+.wait-title {
+  font-size: 15px;
+  color: var(--fg-1);
+}
+
+.verify {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 42px;
+  line-height: 1.15;
+  /* 字距会把整行往右推，用等量的 text-indent 拉回来，视觉才是居中 */
+  letter-spacing: 0.28em;
+  text-indent: 0.28em;
+  font-variant-numeric: tabular-nums;
+}
+
+.wait-device,
+.wait-finger {
+  font-size: 13px;
+  color: var(--fg-2);
+}
+
+.wait-finger code {
+  font-family: ui-monospace, Consolas, monospace;
+}
+
+.wait-note {
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--fg-1);
+  background: var(--bg-2, var(--bg-1));
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+
+.wait-state {
+  font-size: 13px;
+  color: var(--fg-2);
+  font-variant-numeric: tabular-nums;
 }
 
 .field {

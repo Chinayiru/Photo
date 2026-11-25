@@ -37,7 +37,7 @@ import logging
 import re
 import secrets
 import time
-from typing import Any, Final
+from typing import Any, Final, NoReturn
 
 from .core import Ctx
 from .netguard import check_host
@@ -716,12 +716,25 @@ def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
     name = str(claims.get("nam") or "")[:64] or "手机"
     exp = float(claims["exp"])
     now = time.time()
+
+    # ★ B2.1b：撤销与过期必须分开报。原来两者都 `return None`，于是"已移除"
+    # 落到 `require_client` 的 401 E2002「配对已失效」，手机端把它当成
+    # "临时失败"继续用旧令牌重试；正确的动作是"别再试，去重新配对"。
+    # 403 E2004 才会触发前端清理旧凭据并提示重新配对（`docs/04` §3.6）。
+    # 这段**必须在下面那个宽 try 之外**：宽 try 会把 AppError 一起吃成 401。
+    local = None
     try:
         local = db.query_one(
             "SELECT revoked, expires_at FROM devices WHERE id = ?", (client_id,))
-        if local is not None and (local["revoked"] or (
-                local["expires_at"] is not None and local["expires_at"] <= now)):
-            return None
+    except Exception as e:      # noqa: BLE001 —— 读不出来就走下面的缓存判定
+        log.debug("读取本地设备行失败 client_id=%s: %s", client_id, e)
+    if local is not None and int(local["revoked"] or 0):
+        _raise_revoked(ctx, client_id)
+    if local is not None and (local["expires_at"] is not None
+                              and local["expires_at"] <= now):
+        return None
+
+    try:
         _ensure_cloud_table(db)
         # ★ 撤销标记必须被 `DO UPDATE` 保留。
         #
@@ -766,10 +779,26 @@ def _verify_cloud_token(ctx: Ctx, db: Any, token: str) -> dict[str, Any] | None:
     except Exception:  # noqa: BLE001 —— 撤销状态不可用时拒绝访问
         log.warning("无法确认云端令牌撤销状态，拒绝访问 client_id=%s", client_id)
         return None
-    if row is None or float(row["expires_at"] or 0) <= now:
+    if row is None:
+        # 刚 upsert 过却查不到：库被动过，按"凭据无效"处理（401）。
+        return None
+    # `expires_at <= 0` 是撤销标记（不是过期）：云端撤销写 0，过期写真实 exp。
+    if float(row["expires_at"] or 0) <= 0:
+        _raise_revoked(ctx, client_id)
+    if float(row["expires_at"] or 0) <= now:
         return None
 
     return {"id": client_id, "name": name, "cloud": True, "expires_at": exp}
+
+
+def _raise_revoked(ctx: Ctx, client_id: str) -> NoReturn:
+    """已移除的设备一律 403 E2004（`docs/04` §3.6）。
+
+    cookie 必须一起清掉：不清的话下一次请求带着同一个 cookie 回来，
+    又是一轮 403 —— 手机端只会看到一个"点了同步就报错"的循环。
+    """
+    ctx.set_cookies.append((CLIENT_COOKIE, "", 0))
+    raise AppError(E2004, f"cloud client revoked id={client_id}")
 
 
 def require_client(ctx: Ctx) -> dict[str, Any]:

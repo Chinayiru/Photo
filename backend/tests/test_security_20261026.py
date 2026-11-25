@@ -102,15 +102,25 @@ def test_unseen_revoked_cloud_token_stays_revoked_after_restart(local):
     assert auth.sync_revoked_clients(st, ["cloud-client"]) >= 1
     assert auth.sync_revoked_clients(st, ["cloud-client"]) == 0
     st.db.close_all()
-    assert _get(st, router, token).status_code == 401
-    assert _get(st, router, token).status_code == 401
+    # 撤销写的是"墓碑"（`cloud_clients.expires_at = 0`），关库重开后必须
+    # 仍被判为已吊销。2026-10-26 的 B2.1b 把这一类从 401 改成 403 E2004：
+    # `docs/04` §3.6 要求"已移除"和"凭据无效/过期"可区分，手机端据此
+    # 清掉旧凭据而不是无限重试。
+    for _ in range(2):
+        resp = _get(st, router, token)
+        assert resp.status_code == 403, resp.text
+        assert resp.json()["error"]["code"] == "E2004", resp.text
 
 
 def test_new_signature_cannot_reactivate_revoked_local_client(local):
     st, router = local
     cid, _ = _pair(st, "123456")
     st.db.execute("UPDATE devices SET revoked = 1 WHERE id = ?", (cid,))
-    assert _get(st, router, _token(cid)).status_code == 401
+    # 换签名（重新签一枚 sub 相同的令牌）也不能复活已撤销的设备：
+    # `devices.revoked = 1` 优先于签名本身有效 —— 403 E2004。
+    resp = _get(st, router, _token(cid))
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "E2004", resp.text
 
 
 def test_revocation_lookup_failure_denies_access(local, monkeypatch):

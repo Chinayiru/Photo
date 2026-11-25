@@ -395,6 +395,66 @@ CREATE TABLE IF NOT EXISTS media_tags (
 );
 
 CREATE INDEX IF NOT EXISTS idx_media_tags_tag ON media_tags(tag_id);
+
+-- ============================================================
+-- pair_requests / pair_events：新设备配对的本地批准（2026-11-24 渗透 A1.3）
+--
+-- 为什么另起一张表而不是复用 `pair_codes`：那张表的语义是"**用户**在电脑前
+-- 生成一枚码、手机照着输"，码本身就是那次交互的凭据。云端配对没有"用户看到
+-- 码再输入"这一步 —— 发起请求的是中继，能决定签不签发的必须是电脑前的人。
+-- 混进 `pair_codes` 会让"码存在"与"申请存在"两种状态搅在一起，而它们的
+-- 撤销语义完全相反（码作废是常态，请求作废要先留痕）。
+--
+-- ★ 本表**不存令牌**：批准时只生成 `client_id` 与 `issued_at`，令牌在兑换时
+--   由 HMAC 重新算出来（`pairing.redeem`）。明文令牌落库等于把它交给每一个
+--   能读 db 文件的人。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS pair_requests (
+  request_id       TEXT PRIMARY KEY CHECK (length(request_id) = 32),
+  device_id        TEXT NOT NULL,
+  -- 手机的"设备密钥"（32 字节的 hex）。批准与兑换都要求它是同一个值：
+  -- 中继可以转发 request_id，但没有这枚密钥就换不到令牌。
+  device_key       TEXT NOT NULL CHECK (length(device_key) = 64),
+  client_name      TEXT NOT NULL,
+  -- 6 位核对码：给用户肉眼比对"电脑上这条 = 手机上这条"。
+  verify_code      TEXT NOT NULL,
+  ttl_days         INTEGER NOT NULL,
+  created_at       REAL NOT NULL,
+  -- 批准期限（未批准则作废），与令牌自己的过期时刻是两件事。
+  expires_at       REAL NOT NULL,
+  issued_at        REAL,
+  token_expires_at REAL,
+  decided_at       REAL,
+  consumed_at      REAL,
+  client_id        TEXT,
+  source           TEXT NOT NULL DEFAULT 'cloud',
+  state            TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (state IN ('pending','approved','rejected',
+                                      'consumed','expired'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pair_requests_state
+  ON pair_requests(state, created_at DESC);
+
+-- 配对事件：申请、批准、拒绝、拒绝兑换、兑换成功、过期。
+-- 与 `audit_log` 分开的理由是**字段不同**：这里要记设备密钥指纹、请求 id、
+-- 来源（cloud/local），而 `audit_log` 的列是为照片操作设计的。
+CREATE TABLE IF NOT EXISTS pair_events (
+  id          INTEGER PRIMARY KEY,
+  ts          REAL NOT NULL,
+  event       TEXT NOT NULL
+                CHECK (event IN ('requested','approved','rejected','denied',
+                                 'consumed','expired')),
+  request_id  TEXT,
+  client_id   TEXT,
+  -- 存的是**指纹**（sha256 前 6 位），不是密钥本身。
+  device_key  TEXT,
+  device_name TEXT,
+  source      TEXT,
+  result      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pair_events_ts ON pair_events(ts DESC);
 """
 
 

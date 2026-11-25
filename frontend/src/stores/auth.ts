@@ -35,7 +35,12 @@
 import { computed } from "vue";
 import { ApiError, api } from "../api/client";
 import { errorText } from "../api/errorText";
-import type { PairResponse, PingResponse } from "../api/types";
+import type {
+  PairPendingResponse,
+  PairPollPending,
+  PairResponse,
+  PingResponse,
+} from "../api/types";
 import {
   activeBase,
   clearPairing,
@@ -397,6 +402,276 @@ export async function pair(base: string, code: string,
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * 设备密钥与"申请 → 批准 → 轮询"（渗透报告 A1.3 之后的云端配对协议）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 本机设备密钥的 localStorage 键名。
+ *
+ * 不放进 `api/storage.ts`：那里管的是"配对结果"（令牌、基址、设备 id），
+ * 每一项都能让整台手机获得访问权；这枚密钥不是凭据 —— 丢了只是要重新发起
+ * 一次配对，所以两者的生命周期与敏感度都不同，不该并到一张表里。
+ */
+const K_DEVICE_KEY = "pb.device_key";
+
+/**
+ * 内存里再兜一层。
+ *
+ * ★ 为什么必须有：隐私模式/被禁用的 localStorage 里 `setItem` 会抛异常，
+ *   如果每次调用都现场生成，**发起**时用 A、**轮询**时用 B，电脑端按密钥
+ *   比对不上，用户只会看到"申请一直 pending 到过期"。同一页面里这枚值
+ *   必须稳定。
+ */
+let deviceKeyCache = "";
+
+/** 32 字节随机数 → 64 位小写 hex。 */
+function randomDeviceKey(): string {
+  const bytes = new Uint8Array(32);
+  const c = typeof crypto !== "undefined" ? crypto : undefined;
+  if (c && typeof c.getRandomValues === "function") {
+    c.getRandomValues(bytes);
+  } else {
+    // `crypto.subtle` 在纯 http 的局域网地址下不可用，而 `getRandomValues`
+    // 属于 Web Crypto 的基础能力、多数浏览器在非安全上下文仍给。整块缺失
+    // 时退到 Math.random：这枚值只用来把"这次申请"绑在这台手机上，不是
+    // 加密材料（令牌仍由电脑端签发），够用。
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  let out = "";
+  for (const b of bytes) out += b.toString(16).padStart(2, "0");
+  return out;
+}
+
+/**
+ * 本机的设备密钥（64 位小写 hex），没有就生成并落盘。
+ *
+ * ## 为什么存在 localStorage 里
+ *
+ * 它把"这次配对申请"绑在**发起它的这台手机**上：云端 202 里给出
+ * `request_id`，之后每次轮询都要带同一枚密钥，电脑端批准时按它比对 ——
+ * 别人捡到 `request_id` 也换不走令牌。用户可能关掉页面、过一会儿再回来
+ * 接着等，所以跨刷新必须不变；但它不是凭据，也不是加密材料，所以放在
+ * localStorage 而不是内存里（关了页面就丢）。
+ */
+export function deviceKey(): string {
+  if (deviceKeyCache) return deviceKeyCache;
+  try {
+    const saved = localStorage.getItem(K_DEVICE_KEY);
+    // 只认规范的形状：手改过的脏值（大写、长度不对）会让云端 400 E1001，
+    // 而"重新生成一枚"的代价只是这次申请作废。
+    if (saved && /^[0-9a-f]{64}$/.test(saved)) {
+      deviceKeyCache = saved;
+      return saved;
+    }
+  } catch {
+    /* 隐私模式读不到：往下走生成 + 内存缓存 */
+  }
+  const key = randomDeviceKey();
+  deviceKeyCache = key;
+  try {
+    localStorage.setItem(K_DEVICE_KEY, key);
+  } catch {
+    /* 写不进去也继续：本次页面生命周期内由 `deviceKeyCache` 保证一致 */
+  }
+  return key;
+}
+
+/** 发起配对的响应：202 挂起（新协议）或 200 + 令牌（兼容期 / 局域网直连）。 */
+type PairStartResponse = PairPendingResponse | PairResponse;
+/** 轮询的响应：200 仍在等，或 200 已批准（就是老的 PairResponse）。 */
+type PairPollResponse = PairPollPending | PairResponse;
+
+/** 这次拿到的是**已经签好的令牌**吗（`client_token` 非空即成立）。 */
+function isPairResponse(
+  r: PairStartResponse | PairPollResponse | null | undefined,
+): r is PairResponse {
+  return !!r && "client_token" in r
+    && typeof r.client_token === "string" && r.client_token.length > 0;
+}
+
+/** 等待批准时交给界面的东西（`PairView` 拿它渲染核对码与倒计时）。 */
+export interface PairApprovalInfo {
+  verifyCode: string;
+  /** Unix 秒。 */
+  expiresAt: number;
+  /** 只有 202 带：手机密钥指纹（云端算的，**不要**在前端重算）。 */
+  fingerprint?: string;
+  deviceName?: string;
+}
+
+/** 轮询被「取消」按钮 abort 时的错误码（`PairView` 据此静默收尾）。 */
+export const E_PAIR_CANCELLED = "E1018";
+
+/** 这条异常是不是"用户自己点了取消"（不该当失败弹提示）。 */
+export function isPairCancelled(e: unknown): boolean {
+  return e instanceof ApiError && e.code === E_PAIR_CANCELLED;
+}
+
+function pairCancelled(): ApiError {
+  return new ApiError({
+    // `status: 0` = 本地构造的错误：`errorText()` 对这类错误直接用 `userHint`
+    // 那句完整中文，不走错误码映射表（表里没有 E1018）。
+    status: 0,
+    code: E_PAIR_CANCELLED,
+    message: "已取消等待",
+    userHint: "已停止等待电脑批准",
+  });
+}
+
+/**
+ * 电脑端点了「拒绝」/ 申请过期 / 已被取走。
+ *
+ * ★ 这里**重新构造**一个错误、而不是把云端那个 403 原样抛出去：
+ *   云端给的是 `E2008`（配对专属码），但 `status: 0` 能让 `errorText()`
+ *   优先用 `userHint` 这句完整中文，不让用户去猜错误码表。
+ */
+function pairRejected(): ApiError {
+  return new ApiError({
+    status: 0,
+    code: "E2008",
+    message: "电脑上没有批准这次配对",
+    userHint: "电脑上没有批准这次配对，请重新发起",
+  });
+}
+
+function pairTimedOut(timeoutMs: number): ApiError {
+  const minutes = Math.max(1, Math.round(timeoutMs / 60_000));
+  return new ApiError({
+    status: 0,
+    code: "E1021",
+    message: "等待电脑批准超时",
+    userHint: `等了 ${minutes} 分钟仍没有批准，请重新发起配对`,
+  });
+}
+
+/**
+ * 轮询配对申请，直到电脑端批准（返回 PairResponse）或出错。
+ *
+ * ## 三条出路
+ *
+ *   - `client_token` 到手 → 返回该 body（形状与老的 `/api/pair` 完全一致，
+ *     调用方直接 `applyPaired()`）；
+ *   - 403 `E2008` → 抛"电脑上没有批准这次配对"（点了拒绝 / 过期 / 已被取走）；
+ *   - 总时长超过 `timeoutMs`（默认 5 分钟）→ 抛超时文案。
+ *
+ * ## 节奏
+ *
+ * 服务端在 202 与每次 pending 里都给 `poll_after`（当前是 2 秒）。按它等，
+ * 但夹在 1–5 秒之间：既不能把服务端打爆，也不能让用户在某次响应里给的
+ * 怪值上白等半分钟。每次请求自己还有 15 秒超时 + 一次重试（网格抖动/
+ * 5xx 不该让整次等待作废），但**不会**在死循环里空转 —— 每一轮要么返回、
+ * 要么抛错、要么真的睡够时间。
+ */
+export async function awaitPairApproval(
+  deviceId: string,
+  requestId: string,
+  base: string,
+  opts: {
+    accountToken: string;
+    deviceKey: string;
+    pollAfter?: number;
+    timeoutMs?: number;
+    onPending?: (info: PairApprovalInfo) => void;
+    /** 「取消」按钮：abort 后在下一拍（或正在飞的请求返回时）退出。 */
+    signal?: AbortSignal;
+  },
+): Promise<PairResponse> {
+  const timeoutMs = opts.timeoutMs ?? 300_000;
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  const pollMs = (sec: number | undefined): number => {
+    const s = Number(sec);
+    const safe = Number.isFinite(s) && s > 0 ? s : 2;
+    return Math.min(Math.max(safe, 1), 5) * 1000;
+  };
+  let waitMs = pollMs(opts.pollAfter);
+
+  for (;;) {
+    if (opts.signal?.aborted) throw pairCancelled();
+    if (Date.now() >= deadline) throw pairTimedOut(timeoutMs);
+
+    let body: PairPollResponse;
+    try {
+      body = await api.post<PairPollResponse>(
+        `/api/devices/${deviceId}/pair/${requestId}`,
+        { device_key: opts.deviceKey },
+        {
+          base,
+          // 这条路上没有任何客户端凭据：手机此刻还没配上，只有账号令牌
+          auth: "account",
+          accountToken: opts.accountToken,
+          // 401/403 的常规含义在这里是"申请没批准"，不该触发"配对失效"清盘
+          skipAuthLost: true,
+          timeoutMs: 15_000,
+          retry: 1,
+          signal: opts.signal,
+        },
+      );
+    } catch (e) {
+      // abort 抛出来的也是网络错（AbortError），必须抢在通用错误之前判断，
+      // 否则用户点「取消」会看到一句"请求超时"。
+      if (opts.signal?.aborted) throw pairCancelled();
+      if (e instanceof ApiError && e.code === "E2008") throw pairRejected();
+      throw e;
+    }
+
+    if (isPairResponse(body)) return body;
+
+    opts.onPending?.({
+      verifyCode: body.verify_code,
+      expiresAt: body.expires_at,
+    });
+    waitMs = pollMs(body.poll_after);
+    const left = deadline - Date.now();
+    if (left <= 0) throw pairTimedOut(timeoutMs);
+    await new Promise<void>((resolve) => {
+      window.setTimeout(resolve, Math.min(waitMs, left));
+    });
+  }
+}
+
+/**
+ * 发起配对之后的统一收尾。
+ *
+ * - 云端回的是 202（`state: "pending"`）→ 先把核对码/指纹交给界面，再轮询；
+ * - 回的是老形状（200 + `client_token`，兼容期或局域网直连）→ 原样返回，
+ *   调用方的行为与协议改造前完全一样。
+ */
+async function settlePair(
+  started: PairStartResponse,
+  deviceId: string,
+  base: string,
+  accountToken: string,
+  key: string,
+  wait: PairWaitOptions = {},
+): Promise<PairResponse> {
+  if (isPairResponse(started)) return started;
+  // 202 里有指纹与设备名，轮询的 pending 里没有 —— 先一次性交给界面：
+  // 用户在电脑托盘里核对的就是这枚指纹，界面晚一步显示就等于没显示。
+  wait.onPending?.({
+    verifyCode: started.verify_code,
+    expiresAt: started.expires_at,
+    fingerprint: started.fingerprint,
+    deviceName: started.device_name,
+  });
+  return awaitPairApproval(deviceId, started.request_id, base, {
+    accountToken,
+    deviceKey: key,
+    pollAfter: started.poll_after,
+    signal: wait.signal,
+    onPending: wait.onPending,
+  });
+}
+
+/** 账号配对两条入口共用的等待参数（见 `settlePair`）。 */
+export interface PairWaitOptions {
+  /** 申请挂起时回调（含指纹与设备名），之后每次轮询 pending 都回调一次。 */
+  onPending?: (info: PairApprovalInfo) => void;
+  /** 「取消」按钮：只停止轮询，电脑端那张单据自己会过期，不需要回滚。 */
+  signal?: AbortSignal;
+}
+
 /**
  * 账号登录自动配对（`docs/04` §3.5「自动配对」）。
  *
@@ -424,6 +699,7 @@ export async function pair(base: string, code: string,
 export async function pairWithAccount(
   email: string,
   password: string,
+  wait: PairWaitOptions = {},
 ): Promise<PairResponse> {
   const s = authStore.state;
   const here = cloudBaseFromLocation();
@@ -462,9 +738,11 @@ export async function pairWithAccount(
       });
     }
 
-    const r = await api.post<PairResponse>(
+    // 同一枚密钥要贯穿"发起"与"轮询"：云端按它把申请绑在这台手机上。
+    const key = deviceKey();
+    const started = await api.post<PairStartResponse>(
       `/api/devices/${did}/pair`,
-      { auto: true, client_name: clientName() },
+      { auto: true, client_name: clientName(), device_key: key },
       {
         base: origin,
         skipAuthLost: true,
@@ -474,6 +752,10 @@ export async function pairWithAccount(
         accountToken,
       },
     );
+
+    // 新协议：202 只登记申请，令牌要等电脑端批准后由轮询取走；
+    // 老形状（200 + client_token）原样返回，兼容期行为不变。
+    const r = await settlePair(started, did, origin, accountToken, key, wait);
 
     applyPaired(r, here);
     return r;
@@ -578,6 +860,7 @@ export async function pairAccountDevice(
   deviceId: string,
   token: string,
   baseOverride?: string,
+  wait: PairWaitOptions = {},
 ): Promise<PairResponse> {
   const origin = (baseOverride || relayRootBase()).replace(/\/+$/, "");
   if (!origin) {
@@ -586,9 +869,10 @@ export async function pairAccountDevice(
       userHint: "请刷新页面后重试",
     });
   }
-  const r = await api.post<PairResponse>(
+  const key = deviceKey();
+  const started = await api.post<PairStartResponse>(
     `/api/devices/${deviceId}/pair`,
-    { auto: true, client_name: clientName() },
+    { auto: true, client_name: clientName(), device_key: key },
     {
       base: origin,
       skipAuthLost: true,
@@ -597,6 +881,9 @@ export async function pairAccountDevice(
       accountToken: token,
     },
   );
+  // 自动配对同样要电脑端点头（A1.3）：账号只证明"这台电脑是你的"，
+  // 不证明"你此刻就在它旁边"。
+  const r = await settlePair(started, deviceId, origin, token, key, wait);
   applyPaired(r, `${origin}/d/${deviceId}`);
   return r;
 }

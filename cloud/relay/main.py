@@ -93,7 +93,12 @@ from ..relay.headers import (
     SecurityHeadersMiddleware,
 )
 from ..relay.pages import StaticPages
-from ..relay.pairing import issue_pair_code, purge_expired_codes, redeem_pair_code
+from ..relay.pairing import (
+    issue_pair_code,
+    pair_status,
+    purge_expired_codes,
+    redeem_pair_code,
+)
 from ..relay.reply import json_error, json_reply
 from ..relay.tunnel import TunnelServer
 
@@ -233,6 +238,10 @@ def create_app(db: CloudDB | None = None, *,
         # registry 是给「账号登录自动配对」用的：那条路要先确认电脑在线。
         Route("/api/devices/{device_id}/pair",
               _bind(redeem_pair_code, database, registry), methods=["POST"]),
+        # 手机轮询配对进度（`docs/04` §3.5）：`/pair` 现在只登记申请并回 202，
+        # 令牌要等用户在本机托盘里点「批准」，由这条路由一次性取走。
+        Route("/api/devices/{device_id}/pair/{request_id}",
+              _bind(pair_status, database, registry), methods=["POST"]),
         Route("/api/devices/{device_id}/paircode",
               _bind(issue_pair_code, database), methods=["POST"]),
         Route("/api/devices/{device_id}/clients/{client_id}",
@@ -325,6 +334,12 @@ def create_app(db: CloudDB | None = None, *,
     return app
 
 
+#: `_bind()` 会从 `request.path_params` 里往上找的路径参数名。
+#: ★ 加路由带新变量时**必须**把名字加进这里，否则 handler 静悄悄收到
+#: 默认空串（`_accepts()` 也不会报告它接受了这个参数）。
+_PATH_PARAMS: tuple[str, ...] = ("device_id", "client_id", "path", "request_id")
+
+
 def _bind(fn: Any, *deps: Any) -> Any:
     """把 `(request, *deps, device_id=...)` 形状的 handler 变成 Starlette 的 `(request)`。
 
@@ -349,7 +364,7 @@ def _bind(fn: Any, *deps: Any) -> Any:
         wanted = _accepts(fn)
         kwargs: dict[str, Any] = {
             name: params[name]
-            for name in ("device_id", "client_id", "path")
+            for name in _PATH_PARAMS
             if name in params and name in wanted
         }
         return await fn(request, *deps, **kwargs)
@@ -358,15 +373,14 @@ def _bind(fn: Any, *deps: Any) -> Any:
 
 
 def _accepts(fn: Any) -> frozenset[str]:
-    """`fn` 接受哪些关键字参数（只关心三个路径参数名）。"""
+    """`fn` 接受哪些关键字参数（只关心 `_PATH_PARAMS` 里的名字）。"""
     try:
         sig = inspect.signature(fn)
     except (TypeError, ValueError):     # pragma: no cover —— 内建/C 函数
         return frozenset()
-    names = {"device_id", "client_id", "path"}
     return frozenset(
         name for name, p in sig.parameters.items()
-        if name in names
+        if name in _PATH_PARAMS
         and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
     )
 

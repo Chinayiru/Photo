@@ -551,6 +551,45 @@ export interface PairResponse {
   server_time: number;
 }
 
+/**
+ * `POST /api/devices/{id}/pair` 的**挂起**响应，HTTP 202
+ * （`cloud/relay/pairing.py: _pending_reply()`）。
+ *
+ * ★ 2026-11-24 渗透报告 A1.3 之后，云端不再"一换码就签发令牌"：它只登记
+ * 一份申请，令牌要等电脑端用户在托盘里核对 6 位数字并点「批准」之后，
+ * 由轮询接口一次性取走。所以这个形状是**中间态**，不是配对成功。
+ */
+export interface PairPendingResponse {
+  state: "pending";
+  /** 32 位小写 hex，轮询路径里要带它。 */
+  request_id: string;
+  /** 6 位数字：用户在电脑托盘里核对的就是它。 */
+  verify_code: string;
+  /** 设备密钥指纹（云端算的，前端**不要**自己再算一遍）。 */
+  fingerprint: string;
+  /** Unix 秒。申请过期后轮询会回 403 `E2008`。 */
+  expires_at: number;
+  device_id: string;
+  device_name: string;
+  /** 建议的轮询间隔（秒）。 */
+  poll_after: number;
+}
+
+/**
+ * 轮询 `POST /api/devices/{id}/pair/{request_id}` 时"仍在等"的 200 形状
+ * （`cloud/relay/pairing.py: pair_status()`）。
+ *
+ * 比 202 少 `fingerprint` / `device_id` / `device_name` —— 那些只在发起时给过，
+ * 单独定义是为了不在类型上假装它们还在（读了会拿到 `undefined`）。
+ */
+export interface PairPollPending {
+  state: "pending";
+  request_id: string;
+  verify_code: string;
+  expires_at: number;
+  poll_after: number;
+}
+
 /** `GET /api/clients/me`（`backend/app/handlers/auth.py: me()`）。 */
 export interface MeResponse {
   client_id: string;

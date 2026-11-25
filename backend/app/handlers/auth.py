@@ -48,6 +48,7 @@ from ..auth import (
     store_pair_code,
 )
 from ..core import Ctx, Reply, empty_reply, json_reply
+from ..core.ctx import UNKNOWN_SOURCE
 from ..errors import E1001, E2003, E4001, AppError, NotFound
 
 log = logging.getLogger(__name__)
@@ -69,12 +70,46 @@ __all__ = [
 #: 配对码的计数器帮不上忙。
 _PAIR_WINDOW_SEC = 600.0
 _PAIR_WINDOW_MAX = 20
+
+#: 全局熔断：10 分钟内 120 次配对尝试。
+#:
+#: ★ 2026-11-24 渗透报告 B7.2：来源 IP 不可靠时（中继没带 `client_ip`、
+#: 或者部署在一条 NAT 后面），"按来源计数"要么把所有客户端压成一个桶、
+#: 要么根本无法计数。前者会让一个人刷满就锁住所有新手机（B7.2 实测：
+#: 25 次错码 → 真实手机被锁 10 分钟）。
+#:
+#: 所以分两层：
+#: * **能区分来源**（真实 IP）→ 单来源 20 次/10 分钟 + 全局熔断；
+#: * **不能区分来源**（`UNKNOWN_SOURCE`）→ **只**走全局熔断。
+#:   一个漏配的部署最多让"所有新配对变慢"，而不是"所有人都配不上"。
+#: 全局值取 120 而不是 20：正常用户一天也就配对一两次，而"某个来源
+#: 无法区分"本身是常见状态（家里的公网 IP 可能整栋楼共享）。
+_PAIR_GLOBAL_MAX = 120
 _pair_attempts: dict[str, Deque[float]] = {}
+_pair_global: Deque[float] = deque()
+
+#: `ctx.client_ip` 为空时的替代值，与隧道层用的是同一个常量。
+_UNKNOWN = UNKNOWN_SOURCE
 
 
 def _rate_limit(ctx: Ctx) -> None:
-    ip = (ctx.client_ip or "unknown").lower()
+    """配对尝试限速：单来源配额 + 全局熔断（见 `_PAIR_GLOBAL_MAX` 的注释）。"""
+    ip = (ctx.client_ip or _UNKNOWN).strip().lower() or _UNKNOWN
     now = time.time()
+
+    while _pair_global and now - _pair_global[0] > _PAIR_WINDOW_SEC:
+        _pair_global.popleft()
+    if len(_pair_global) >= _PAIR_GLOBAL_MAX:
+        log.warning("配对尝试总量超限（10 分钟 %d 次），全局熔断", _PAIR_GLOBAL_MAX)
+        raise AppError(E4001, "pair attempts globally limited")
+    _pair_global.append(now)
+
+    if ip == _UNKNOWN:
+        # 来源不可区分：不再往共享桶里记，否则"一个人刷满"就是"所有人被锁"。
+        # 这里只记一条日志，让运维看得出"来源没传进来"。
+        log.debug("配对尝试来源不可区分，仅计入全局熔断")
+        return
+
     q = _pair_attempts.setdefault(ip, deque())
     while q and now - q[0] > _PAIR_WINDOW_SEC:
         q.popleft()
